@@ -26,11 +26,17 @@ credentials are set on the radio itself, not an Icom account).
 import asyncio
 import importlib
 import math
+import os
+import platform
 import queue
+import re
+import shutil
+import subprocess
 import sys
 
-from PySide6.QtCore import QThread, Signal, Slot, Qt, QRectF, QPointF
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QImage, QRadialGradient
+from PySide6.QtCore import QThread, Signal, Slot, Qt, QRectF, QPointF, QSettings
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QImage, QRadialGradient, QPalette
+from PySide6.QtNetwork import QHostAddress, QTcpServer
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -47,6 +53,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QMessageBox,
     QMenu,
+    QFileDialog,
 )
 
 try:
@@ -234,6 +241,17 @@ DEGREES_PER_KNOB_STEP = 15
 # audio_codec/audio_tx_codec attributes, AudioBridge disables streaming
 # rather than sending bytes the radio won't understand (see AudioBridge).
 AUDIO_SAMPLE_WIDTH = 2   # bytes per sample, int16
+# A real device index is always >= 0, and None means "this direction
+# wasn't configured/selected at all -- don't open a stream for it" (set
+# by _setup_audio() when the connection dialog's device combo was left
+# on "None"). This sentinel is kept deliberately distinct from that None
+# so "please use whatever the system's current default device is" (used
+# by Virtual Cables, via PulseAudio's own default-sink/source redirection)
+# doesn't get treated as "don't open a stream at all" -- a real bug this
+# app hit and fixed: AudioBridge.start() gates on `is not None`, and
+# plain None is falsy in Python, so passing None to mean "use default"
+# would have silently skipped opening the stream entirely.
+AUDIO_DEVICE_SYSTEM_DEFAULT = -1
 AUDIO_CHANNELS = 1
 AUDIO_DEFAULT_SAMPLE_RATE = 8000  # fallback only, used if the radio doesn't expose audio_sample_rate
 # Confirmed via a runtime error, straight from push_audio_tx_pcm() itself:
@@ -585,7 +603,16 @@ CONTROL_DEFINITIONS = {
         # Digital Mode) -- no enum_import, since there's no equivalent
         # confirmed evidence of a dedicated enum here the way there was
         # for AGC.
+        #
+        # write_only=True: confirmed via a runtime error straight from
+        # rigplane -- "Command 0x08 is SELECT-only (no GET variant)" per
+        # Icom's own CI-V reference manual. There is NO way to read the
+        # current VFO/Memory state over CI-V at all, only to select into
+        # one or the other, so this is never polled (it would just fail
+        # forever) -- the button's label reflects the last command sent,
+        # not a live-confirmed radio state.
         "type": "vfo_toggle",
+        "write_only": True,
         "getter_candidates": ["get_memory_mode"],
         "setter_candidates": ["set_memory_mode"],
         "options": [("VFO", False), ("MEMORY", True)],
@@ -627,6 +654,145 @@ def amplitude_to_color(amp, max_amp=160):
             b = int(c0[2] + (c1[2] - c0[2]) * t)
             return QColor(r, g, b)
     return QColor(*_COLOR_ANCHORS[-1][1])
+
+
+# ==================== Virtual audio cables (Linux only) ====================
+#
+# There's no cross-platform way to create a virtual audio device at
+# runtime -- Windows/macOS need a separately-installed driver (VB-CABLE,
+# BlackHole) that this app can't install itself (kernel driver signing/
+# approval, admin privileges). On Linux, PulseAudio and PipeWire's pulse
+# compatibility layer both support creating "null sinks" at runtime via
+# `pactl`, with no driver installation needed -- that's what this uses.
+#
+# Two sinks are created:
+#   RX cable: this app's own AudioBridge plays received radio audio INTO
+#     it (as its output device); an external app (WSJT-X, etc.) selects
+#     the sink's auto-created ".monitor" source as ITS input device to
+#     "hear" what the radio is receiving.
+#   TX cable: an external app plays its generated audio (e.g. FT8 tones)
+#     INTO it (selecting the sink as ITS output device); this app's
+#     AudioBridge captures from the sink's monitor (as its input device)
+#     and sends that to the radio via push_tx().
+# This is the same routing pattern real hardware virtual-cable setups use
+# for FT8 -- just built from a null-sink instead of a purchased/installed
+# virtual cable driver.
+VIRTUAL_CABLE_RX_NAME = "RadioApp_RX_Cable"
+VIRTUAL_CABLE_RX_DESC = "RadioApp RX Cable"
+VIRTUAL_CABLE_TX_NAME = "RadioApp_TX_Cable"
+VIRTUAL_CABLE_TX_DESC = "RadioApp TX Cable"
+
+
+def pactl_available():
+    return shutil.which("pactl") is not None
+
+
+def create_null_sink(sink_name, description):
+    """Creates a PulseAudio/PipeWire-pulse null-sink via `pactl
+    load-module module-null-sink`. Returns the loaded module's ID (needed
+    to unload it later cleanly) -- raises RuntimeError with pactl's own
+    error text on failure."""
+    result = subprocess.run(
+        ["pactl", "load-module", "module-null-sink",
+         f"sink_name={sink_name}", f"sink_properties=device.description={description}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    output = result.stdout.strip()
+    if result.returncode != 0 or not output.isdigit():
+        raise RuntimeError(result.stderr.strip() or output or "pactl load-module failed")
+    return int(output)
+
+
+def unload_pactl_module(module_id):
+    """Best-effort cleanup -- doesn't raise on failure, since this is
+    normally called during teardown where there's nothing useful to do
+    with an error other than leave a stray sink behind."""
+    try:
+        subprocess.run(["pactl", "unload-module", str(module_id)], capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+
+
+def get_default_sink_name():
+    try:
+        result = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def get_default_source_name():
+    try:
+        result = subprocess.run(["pactl", "get-default-source"], capture_output=True, text=True, timeout=5)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def set_default_sink(name):
+    """Best-effort -- doesn't raise; a failure here just means the
+    virtual RX cable won't actually receive audio, which the caller
+    finds out about naturally when nothing comes through."""
+    try:
+        subprocess.run(["pactl", "set-default-sink", name], capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+
+
+def set_default_source(name):
+    try:
+        subprocess.run(["pactl", "set-default-source", name], capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+
+
+def _find_own_stream_ids(list_command, header_pattern, pid):
+    """Parses `pactl list sink-inputs`/`list source-outputs`'s classic
+    text output (more portable across pactl versions than relying on the
+    newer `-f json` mode) for entries belonging to this process (matched
+    by application.process.id against our own PID). Returns a list of
+    integer stream IDs."""
+    try:
+        result = subprocess.run(list_command, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    ids = []
+    current_id = None
+    for line in result.stdout.splitlines():
+        header = re.match(header_pattern, line.strip())
+        if header:
+            current_id = int(header.group(1))
+            continue
+        if current_id is not None and "application.process.id" in line:
+            match = re.search(r'"(\d+)"', line)
+            if match and int(match.group(1)) == pid:
+                ids.append(current_id)
+                current_id = None  # already matched -- no need to keep scanning this block
+    return ids
+
+
+def find_own_sink_input_ids(pid):
+    return _find_own_stream_ids(["pactl", "list", "sink-inputs"], r"Sink Input #(\d+)", pid)
+
+
+def find_own_source_output_ids(pid):
+    return _find_own_stream_ids(["pactl", "list", "source-outputs"], r"Source Output #(\d+)", pid)
+
+
+def move_sink_input(sink_input_id, sink_name):
+    try:
+        subprocess.run(["pactl", "move-sink-input", str(sink_input_id), sink_name], capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
+
+
+def move_source_output(source_output_id, source_name):
+    try:
+        subprocess.run(["pactl", "move-source-output", str(source_output_id), source_name], capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
 
 
 class AudioBridge:
@@ -677,6 +843,7 @@ class AudioBridge:
         self._tx_active = False
         self._rx_active = False
         self._rx_chunk_count = 0
+        self._rx_unrecognized_reported = False
         self._rx_watchdog_task = None
         self._tx_captured_count = 0  # chunks actually captured from the mic while active
         self._tx_sent_count = 0      # chunks actually handed to radio.push_tx()
@@ -714,10 +881,23 @@ class AudioBridge:
         messages. Falls back to the raw index if the name lookup fails."""
         if index is None:
             return "(none)"
+        if index == AUDIO_DEVICE_SYSTEM_DEFAULT:
+            return "system default"
         try:
             return f"'{sd.query_devices(index)['name']}' (index {index})"
         except Exception:
             return f"index {index}"
+
+    @staticmethod
+    def _resolve_device(device):
+        """Translates our AUDIO_DEVICE_SYSTEM_DEFAULT sentinel into the
+        actual None value sounddevice/PortAudio itself expects to mean
+        "use the current system default device". Kept as a distinct
+        sentinel internally (see the constant's comment) so it isn't
+        confused with our own None, which means "not configured, don't
+        open a stream" -- this is the one place that sentinel gets
+        translated to what the underlying library actually wants."""
+        return None if device == AUDIO_DEVICE_SYSTEM_DEFAULT else device
 
     def _check_pcm_codec(self):
         codec = getattr(self.radio, "audio_codec", None)
@@ -740,9 +920,9 @@ class AudioBridge:
             return
         if not self._pcm_ok:
             return
-        if self._output_device:
+        if self._output_device is not None:
             await self._start_rx()
-        if self._input_device:
+        if self._input_device is not None:
             self._open_input_stream()
             if self._in_stream:
                 # Confirmed via a dir(radio) scan: THREE separate families
@@ -796,7 +976,7 @@ class AudioBridge:
         blocksize = max(1, int(self.sample_rate * (AUDIO_OUTPUT_BLOCK_MS / 1000.0)))
         try:
             self._out_stream = sd.RawOutputStream(
-                device=self._output_device,
+                device=self._resolve_device(self._output_device),
                 samplerate=self.sample_rate,
                 channels=AUDIO_CHANNELS,
                 dtype="int16",
@@ -872,11 +1052,20 @@ class AudioBridge:
         audio arriving" from the outside."""
         data = self._extract_pcm_bytes(args, kwargs)
         if data is None:
-            self._status(
-                "RX audio: callback fired with args="
-                f"{[type(a).__name__ for a in args]} kwargs={list(kwargs)} -- "
-                "couldn't find raw PCM bytes in it."
-            )
+            # A lone None argument (and possibly other shapes) shows up
+            # periodically from rigplane -- most likely a benign
+            # keepalive/end-of-burst marker rather than a real error, and
+            # reporting it every single occurrence was confirmed to flood
+            # the console in a live test. Only the first unrecognized
+            # shape gets reported, in case it's worth investigating.
+            if not self._rx_unrecognized_reported:
+                self._rx_unrecognized_reported = True
+                self._status(
+                    "RX audio: callback fired with an unrecognized argument "
+                    f"shape (args={[type(a).__name__ for a in args]} "
+                    f"kwargs={list(kwargs)}) -- couldn't find raw PCM bytes "
+                    "in it. Only reporting this once; likely benign."
+                )
             return
         if self._rx_chunk_count == 0:
             self._status(f"RX audio: first chunk received ({len(data)} bytes).")
@@ -971,7 +1160,7 @@ class AudioBridge:
     def _open_input_stream(self):
         try:
             self._in_stream = sd.RawInputStream(
-                device=self._input_device,
+                device=self._resolve_device(self._input_device),
                 # Confirmed exact requirement (see AUDIO_TX_PCM_* comment
                 # above): 48000 Hz with a fixed 960-sample (1920-byte)
                 # blocksize, not self.sample_rate/PortAudio's default
@@ -1112,6 +1301,9 @@ class RadioWorker(QThread):
         self._radio_cm = None
         self._stop_requested = False
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
+        self._virtual_cable_modules = None  # (rx_module_id, tx_module_id) while virtual cables are active
+        self._virtual_cable_previous_sink = None    # PulseAudio's default sink before enabling virtual cables
+        self._virtual_cable_previous_source = None  # PulseAudio's default source before enabling virtual cables
         self._meter_getters = {}  # meter_type -> resolved getter name, populated by _setup_meters()
         self._control_methods = {}  # control key -> (get_name, set_name), populated by _setup_controls()
         self._control_enums = {}    # control key -> resolved enum class, for controls needing enum_import
@@ -1148,8 +1340,8 @@ class RadioWorker(QThread):
                 "for the correct USB/serial config class name."
             )
         return SerialBackendConfig(
-            port=d["serial_port"],
-            baud_rate=d["baud_rate"],
+            device=d["serial_port"],
+            baudrate=d["baud_rate"],
             radio_addr=d["addr"],
         )
 
@@ -1175,6 +1367,142 @@ class RadioWorker(QThread):
             status_callback=self.audio_status.emit,
         )
         await self.audio_bridge.start()
+
+    def enable_virtual_cables(self):
+        """Thread-safe: call from the GUI thread. Creates two PulseAudio/
+        PipeWire null-sinks (see the module-level comment above
+        AudioBridge) and switches this app's own audio bridge to use
+        them instead of whatever devices were chosen in the connection
+        dialog, so an external app can send/receive audio through this
+        app's radio connection. Linux/PulseAudio-or-PipeWire only."""
+        if self.loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._enable_virtual_cables(), self.loop)
+
+    async def _enable_virtual_cables(self):
+        if not pactl_available():
+            self.error.emit(
+                "Virtual Cables: requires Linux with PulseAudio or PipeWire "
+                "(pactl not found) -- on Windows/macOS, install a virtual "
+                "audio cable driver like VB-CABLE or BlackHole instead, "
+                "then select it directly in the connection dialog."
+            )
+            return
+
+        try:
+            rx_module = create_null_sink(VIRTUAL_CABLE_RX_NAME, VIRTUAL_CABLE_RX_DESC)
+            tx_module = create_null_sink(VIRTUAL_CABLE_TX_NAME, VIRTUAL_CABLE_TX_DESC)
+        except Exception as exc:
+            self.error.emit(f"Virtual Cables: couldn't create sinks ({exc}).")
+            return
+        self._virtual_cable_modules = (rx_module, tx_module)
+
+        # Confirmed via two live tests: trying to get PortAudio to
+        # enumerate each new sink as its own separately-named device
+        # doesn't work on this system -- its PortAudio build appears to
+        # only expose a generic "default" device (the same one the
+        # normal, non-virtual RX stream already uses successfully). So
+        # instead of fighting that, redirect PulseAudio's own DEFAULT
+        # sink/source at the new cables, and just use PortAudio's
+        # "default" device (device=None, which sounddevice/PortAudio
+        # resolves to whatever the system default currently is) -- a
+        # mechanism already proven to work, rather than one that isn't.
+        self._virtual_cable_previous_sink = get_default_sink_name()
+        self._virtual_cable_previous_source = get_default_source_name()
+        set_default_sink(VIRTUAL_CABLE_RX_NAME)
+        set_default_source(f"{VIRTUAL_CABLE_TX_NAME}.monitor")
+
+        if self.audio_bridge is not None:
+            await self.audio_bridge.stop()
+
+        self.audio_bridge = AudioBridge(
+            self.radio, self.loop,
+            input_device=AUDIO_DEVICE_SYSTEM_DEFAULT,
+            output_device=AUDIO_DEVICE_SYSTEM_DEFAULT,
+            status_callback=self.audio_status.emit,
+        )
+        await self.audio_bridge.start()
+
+        # Confirmed by direct testing: changing PulseAudio's default
+        # sink/source doesn't retroactively (or even prospectively, for
+        # this app's stream specifically) redirect where our own already-
+        # open stream connects -- what actually worked, done manually via
+        # pavucontrol, was MOVING the already-open stream to the new
+        # sink/source. Doing that automatically here instead of relying
+        # on the default-redirection alone. Retries briefly since the
+        # stream may take a moment to register with PulseAudio after
+        # opening.
+        my_pid = os.getpid()
+        sink_input_ids = []
+        source_output_ids = []
+        for _attempt in range(6):
+            if not sink_input_ids:
+                sink_input_ids = find_own_sink_input_ids(my_pid)
+            if not source_output_ids:
+                source_output_ids = find_own_source_output_ids(my_pid)
+            if sink_input_ids and source_output_ids:
+                break
+            await asyncio.sleep(0.3)
+
+        for sink_input_id in sink_input_ids:
+            move_sink_input(sink_input_id, VIRTUAL_CABLE_RX_NAME)
+        for source_output_id in source_output_ids:
+            move_source_output(source_output_id, f"{VIRTUAL_CABLE_TX_NAME}.monitor")
+
+        if not sink_input_ids or not source_output_ids:
+            missing = []
+            if not sink_input_ids:
+                missing.append("playback")
+            if not source_output_ids:
+                missing.append("recording")
+            self.audio_status.emit(
+                f"Virtual Cables: couldn't automatically find/move this app's "
+                f"own {' and '.join(missing)} stream in PulseAudio -- you may "
+                "need to reassign it manually in pavucontrol (Playback/"
+                "Recording tabs), same as before."
+            )
+
+        self.audio_status.emit(
+            f"Virtual Cables active. In WSJT-X (or similar), set its input "
+            f"device to \"Monitor of {VIRTUAL_CABLE_RX_DESC}\" and its "
+            f"output device to \"{VIRTUAL_CABLE_TX_DESC}\"."
+        )
+
+    def disable_virtual_cables(self):
+        """Thread-safe: call from the GUI thread. Restores the audio
+        devices originally chosen in the connection dialog and tears
+        down the virtual sinks."""
+        if self.loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._disable_virtual_cables(), self.loop)
+
+    async def _disable_virtual_cables(self):
+        if self.audio_bridge is not None:
+            await self.audio_bridge.stop()
+
+        if self._virtual_cable_previous_sink:
+            set_default_sink(self._virtual_cable_previous_sink)
+        if self._virtual_cable_previous_source:
+            set_default_source(self._virtual_cable_previous_source)
+        self._virtual_cable_previous_sink = None
+        self._virtual_cable_previous_source = None
+
+        if self._virtual_cable_modules:
+            for module_id in self._virtual_cable_modules:
+                unload_pactl_module(module_id)
+            self._virtual_cable_modules = None
+
+        input_device = self._details.get("audio_input_device")
+        output_device = self._details.get("audio_output_device")
+        if input_device or output_device:
+            self.audio_bridge = AudioBridge(
+                self.radio, self.loop, input_device, output_device,
+                status_callback=self.audio_status.emit,
+            )
+            await self.audio_bridge.start()
+        else:
+            self.audio_bridge = None
+        self.audio_status.emit("Virtual Cables disabled -- restored original audio devices.")
 
     def start_ptt(self):
         """Thread-safe: call from the GUI thread on PTT button press.
@@ -1499,19 +1827,32 @@ class RadioWorker(QThread):
         set_agc() rejected a plain string, wanting a real AgcMode enum
         member instead) -- imports the named class once and stores it in
         self._control_enums for _set_control_value() to look values up
-        against by name."""
+        against by name.
+
+        Entries marked "write_only" (confirmed needed for memory_mode:
+        Icom's own CI-V reference documents command 0x08 as SELECT-only,
+        no GET variant at all) only need a setter to resolve -- the poll
+        loop skips these entirely rather than polling something that is
+        guaranteed to fail every single cycle forever."""
         missing = []
         self._control_methods = {}
         self._control_enums = {}
         for key, definition in CONTROL_DEFINITIONS.items():
-            get_name = _find_method_name(self.radio, definition["getter_candidates"])
             set_name = _find_method_name(self.radio, definition["setter_candidates"])
-            if get_name and set_name:
-                self._control_methods[key] = (get_name, set_name)
+            if definition.get("write_only"):
+                get_name = None  # deliberately never resolved/polled -- see definition's comment
+                if set_name:
+                    self._control_methods[key] = (get_name, set_name)
+                else:
+                    missing.append(f"{definition['label']} (write-only, set=none)")
             else:
-                missing.append(
-                    f"{definition['label']} (get={get_name or 'none'}, set={set_name or 'none'})"
-                )
+                get_name = _find_method_name(self.radio, definition["getter_candidates"])
+                if get_name and set_name:
+                    self._control_methods[key] = (get_name, set_name)
+                else:
+                    missing.append(
+                        f"{definition['label']} (get={get_name or 'none'}, set={set_name or 'none'})"
+                    )
 
             enum_import = definition.get("enum_import")
             if enum_import and key in self._control_methods:
@@ -1578,6 +1919,8 @@ class RadioWorker(QThread):
                     self.error.emit(f"{definition['label']}: {exc}")
 
             for key, (get_name, _set_name) in self._control_methods.items():
+                if get_name is None:
+                    continue  # write-only control (e.g. memory_mode) -- no GET variant exists, never poll
                 definition = CONTROL_DEFINITIONS[key]
                 try:
                     getter = getattr(self.radio, get_name)
@@ -2257,6 +2600,249 @@ class TuningKnobWidget(QWidget):
             painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
 
+# WSJT-X's UDP Server settings (host/port/enable) live in its own .ini
+# config file, but the exact key names for that file aren't documented or
+# confirmed anywhere we could find -- writing them blind risks corrupting
+# a file we don't own (unlike a wrong guess in our own CONTROL_DEFINITIONS,
+# which just shows an error). Instead: launch WSJT-X into an entirely
+# separate, isolated profile using its confirmed --rig-name=NAME option
+# (documented in WSJT-X's own man page). First launch is a blank profile
+# needing one-time setup; every launch after that reuses the same profile
+# with those settings already in place -- this never touches the user's
+# main/default WSJT-X profile at all.
+WSJTX_RIG_NAME = "RadioApp"
+
+# Common install locations to check before asking the user to browse.
+# Not exhaustive -- package managers/custom installs vary -- just a
+# starting guess per platform.
+_WSJTX_CANDIDATE_PATHS = {
+    "Windows": [
+        r"C:\WSJT-X\bin\wsjtx.exe",
+        r"C:\Program Files\WSJT-X\wsjtx.exe",
+        r"C:\Program Files (x86)\WSJT-X\wsjtx.exe",
+    ],
+    "Darwin": [
+        "/Applications/WSJT-X.app/Contents/MacOS/wsjtx",
+    ],
+    "Linux": [
+        "/usr/bin/wsjtx",
+        "/usr/local/bin/wsjtx",
+    ],
+}
+
+
+def find_wsjtx_executable():
+    """Best-effort auto-detection: checks the PATH, then common per-OS
+    install locations. Returns a path string or None if nothing was found
+    -- callers should fall back to asking the user to browse for it."""
+    on_path = shutil.which("wsjtx")
+    if on_path:
+        return on_path
+    for candidate in _WSJTX_CANDIDATE_PATHS.get(platform.system(), []):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def launch_wsjtx(executable_path):
+    """Launches WSJT-X into its own isolated --rig-name profile (see
+    WSJTX_RIG_NAME above). Raises OSError/subprocess errors on failure --
+    callers should catch and report those."""
+    subprocess.Popen([executable_path, f"--rig-name={WSJTX_RIG_NAME}"])
+
+
+# ==================== rigctld ("NET rigctl") server ====================
+#
+# A minimal Hamlib rigctld-compatible TCP server, so other CAT-aware apps
+# (WSJT-X, JTDX, fldigi, ...) can drive THIS app's already-open radio
+# connection -- selecting rig model 2 ("Hamlib NET rigctl") pointed at
+# 127.0.0.1:4532 -- instead of needing their own separate CAT connection
+# to the radio (which the radio's CI-V/serial port often can't share
+# with two programs at once anyway).
+#
+# Protocol confirmed against Hamlib's own rigctld documentation: plain
+# ASCII, newline-terminated commands; lowercase = get, uppercase = set;
+# "RPRT x\n" (x=0 for success) replies to set commands; get commands
+# return one value per line. Default port 4532 is Hamlib's documented
+# default for "NET rigctl".
+#
+# The \dump_state handshake (WSJT-X's Hamlib backend sends this
+# immediately on connect and requires a correctly-shaped response before
+# it will proceed -- a real bug in another rigctld-compatible server,
+# AetherSDR GitHub issue #63, shows what a malformed one does: 9-55s
+# hangs or outright "IO error" connection failures) is now built by
+# tracing Hamlib's actual netrigctl_open() source line-by-line (see
+# RigctldServer._dump_state_response()'s docstring for the confirmed
+# field sequence) rather than reconstructed from documentation alone. An
+# earlier version of this got two things wrong that source-tracing
+# caught: it omitted a required ITU-region line (shifting every
+# subsequent field by one position) and sent trailing lines that were
+# never supposed to be there for protocol version 0. What's still
+# inferred rather than directly confirmed: the exact end-of-list
+# sentinel values (RIG_IS_FRNG_END etc.) -- based on long-established
+# Hamlib convention, not the literal macro source.
+RIGCTLD_DEFAULT_PORT = 4532
+
+
+class RigctldServer(QTcpServer):
+    """Runs on the GUI thread -- QTcpServer/QTcpSocket are event-driven
+    via Qt signals, so no separate thread is needed. Talks to the actual
+    radio only through the callback functions passed in, reusing
+    RadioWindow's existing worker/widget plumbing rather than
+    duplicating radio-control logic."""
+
+    def __init__(self, get_freq, set_freq, get_mode, set_mode, get_ptt, set_ptt,
+                 port=RIGCTLD_DEFAULT_PORT, parent=None):
+        super().__init__(parent)
+        self._get_freq = get_freq
+        self._set_freq = set_freq
+        self._get_mode = get_mode
+        self._set_mode = set_mode
+        self._get_ptt = get_ptt
+        self._set_ptt = set_ptt
+        self._port = port
+        self._buffers = {}  # QTcpSocket -> bytearray, for partial-line buffering
+        self.newConnection.connect(self._on_new_connection)
+
+    def start(self):
+        if not self.listen(QHostAddress.AnyIPv4, self._port):
+            raise RuntimeError(f"Couldn't listen on TCP port {self._port}: {self.errorString()}")
+
+    def stop(self):
+        for sock in list(self._buffers):
+            sock.disconnectFromHost()
+        self._buffers.clear()
+        self.close()
+
+    def _on_new_connection(self):
+        while self.hasPendingConnections():
+            sock = self.nextPendingConnection()
+            self._buffers[sock] = bytearray()
+            sock.readyRead.connect(lambda s=sock: self._on_ready_read(s))
+            sock.disconnected.connect(lambda s=sock: self._on_disconnected(s))
+
+    def _on_disconnected(self, sock):
+        self._buffers.pop(sock, None)
+        sock.deleteLater()
+
+    def _on_ready_read(self, sock):
+        if sock not in self._buffers:
+            return
+        self._buffers[sock] += bytes(sock.readAll())
+        while b"\n" in self._buffers[sock]:
+            line, _sep, rest = self._buffers[sock].partition(b"\n")
+            self._buffers[sock] = bytearray(rest)
+            self._handle_command(sock, line.decode("utf-8", errors="replace").strip())
+
+    def _handle_command(self, sock, line):
+        if not line:
+            return
+        long_form = line.startswith("\\")
+        body = line[1:] if long_form else line
+        cmd = body.split(None, 1)[0] if long_form else body[:1]
+        args_text = body[len(cmd):].strip() if long_form else body[1:].strip()
+        args = args_text.split()
+
+        try:
+            if cmd in ("f", "get_freq"):
+                self._respond(sock, f"{int(self._get_freq())}\n")
+            elif cmd in ("F", "set_freq"):
+                self._set_freq(float(args[0]))
+                self._respond(sock, "RPRT 0\n")
+            elif cmd in ("m", "get_mode"):
+                mode, passband = self._get_mode()
+                self._respond(sock, f"{mode}\n{passband}\n")
+            elif cmd in ("M", "set_mode"):
+                self._set_mode(args[0])
+                self._respond(sock, "RPRT 0\n")
+            elif cmd in ("t", "get_ptt"):
+                self._respond(sock, f"{1 if self._get_ptt() else 0}\n")
+            elif cmd in ("T", "set_ptt"):
+                self._set_ptt(args[0] not in ("0", ""))
+                self._respond(sock, "RPRT 0\n")
+            elif cmd in ("v", "get_vfo"):
+                self._respond(sock, "VFOA\n")
+            elif cmd in ("V", "set_vfo"):
+                self._respond(sock, "RPRT 0\n")  # accepted, no-op -- single-VFO from rigctld's perspective
+            elif cmd == "chk_vfo":
+                self._respond(sock, "CHKVFO 0\n")
+            elif cmd == "dump_state":
+                self._respond(sock, self._dump_state_response())
+            else:
+                self._respond(sock, "RPRT -11\n")  # -RIG_ENAVAIL: not implemented
+        except Exception:
+            self._respond(sock, "RPRT -1\n")  # -RIG_EINVAL: malformed args or callback failure
+
+    @staticmethod
+    def _respond(sock, text):
+        sock.write(text.encode("utf-8"))
+
+    @staticmethod
+    def _dump_state_response():
+        """Field sequence traced directly from Hamlib's own netrigctl_open()
+        source (rigs/dummy/netrigctl.c) -- this is what WSJT-X's "Hamlib
+        NET rigctl" backend actually parses, line by line, in this exact
+        order:
+          1. protocol version (int) -- 0 here
+          2. one line that netrigctl_open() reads but never uses for
+             anything (confirmed in the source: a second read_string()
+             call whose result is simply overwritten by the next one)
+          3. ITU region (int)
+          4+. rx_range_list entries: "startf endf modes(hex) low_power
+             high_power vfo(hex) ant(hex)", terminated by an all-zero line
+          N+. tx_range_list entries, same shape, same all-zero terminator
+          N+. tuning_steps entries: "modes(hex) step_hz", terminated by a
+             "0 0" line
+          N+. filters entries: "modes(hex) width_hz" (width must be
+             nonzero or it reads as the terminator), terminated by "0 0"
+          then six more single-value lines in this exact order: max_rit,
+          max_xit, max_ifshift, announces, preamp list, attenuator list,
+          has_get_func, has_set_func, has_get_level, has_set_level,
+          has_get_parm, has_set_parm.
+
+        Critically: since protocol version is 0, netrigctl_open() returns
+        successfully immediately after has_set_parm and reads NOTHING
+        further -- any extra trailing lines would sit unread in the
+        socket and corrupt the next command's response. An earlier
+        version of this method got this wrong two ways: it omitted the
+        ITU region line entirely (shifting every field after it by one
+        position) and included four extra trailing lines that were never
+        supposed to be sent for protocol version 0.
+
+        One thing NOT directly confirmed from the source (it's inferred
+        from long-established, widely-documented Hamlib convention): the
+        exact end-of-list sentinel checks (RIG_IS_FRNG_END/_TS_END/
+        _FLT_END) -- believed to be startf==0&&endf==0 for ranges, step==0
+        for tuning steps, and width==0 for filters, which is why the
+        filter entry below uses a nonzero width."""
+        return (
+            "0\n"                                                             # protocol version
+            "2\n"                                                             # unused line (confirmed discarded by the client)
+            "0\n"                                                             # ITU region
+            "150000.000000 1500000000.000000 0x1ff -1 -1 0x10000003 0x3\n"    # rx range
+            "0 0 0 0 0 0 0\n"                                                 # rx range list terminator
+            "150000.000000 1500000000.000000 0x1ff -1 -1 0x10000003 0x3\n"    # tx range
+            "0 0 0 0 0 0 0\n"                                                 # tx range list terminator
+            "0x1ff 1\n"                                                       # tuning step
+            "0 0\n"                                                           # tuning step list terminator
+            "0x1ff 2400\n"                                                    # filter (2400 Hz -- nonzero, so not read as the terminator)
+            "0 0\n"                                                           # filter list terminator
+            "0\n"                                                             # max_rit
+            "0\n"                                                             # max_xit
+            "0\n"                                                             # max_ifshift
+            "0\n"                                                             # announces
+            "0\n"                                                             # preamp list
+            "0\n"                                                             # attenuator list
+            "0\n"                                                             # has_get_func
+            "0\n"                                                             # has_set_func
+            "0\n"                                                             # has_get_level
+            "0\n"                                                             # has_set_level
+            "0\n"                                                             # has_get_parm
+            "0\n"                                                             # has_set_parm -- last line read when protocol version is 0
+        )
+
+
+
 class RadioWindow(QWidget):
     def __init__(self, details):
         super().__init__()
@@ -2270,7 +2856,10 @@ class RadioWindow(QWidget):
         self.freq_display = QLabel("-- MHz")
         self.freq_display.setStyleSheet(
             "font-size: 28px; font-weight: bold; color: white; "
-            "background-color: rgba(0, 0, 0, 160); padding: 4px 10px; border-radius: 4px;"
+            # Matches SpectrumWidget's own background fill (QColor(10, 10,
+            # 20)) exactly, rather than a semi-transparent black, since
+            # this label sits directly on top of that scope.
+            "background-color: rgb(10, 10, 20); padding: 4px 10px; border-radius: 4px;"
         )
         self.freq_display.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         # Fixed width sized for the longest realistic reading ("999.999999
@@ -2300,6 +2889,7 @@ class RadioWindow(QWidget):
         # already known from the connection dialog, before the radio itself
         # connects. Buttons stay disabled until _on_connected() enables them.
         self.band_buttons = []
+        self.band_button_ranges = []  # parallel list: (button, low_hz, high_hz), for highlighting the active band
         self.band_buttons_row = QHBoxLayout()
         for label, low_hz, high_hz in RADIO_BANDS.get(details["radio_model"], []):
             button = QPushButton(label)
@@ -2309,6 +2899,7 @@ class RadioWindow(QWidget):
                 lambda checked=False, lbl=label, f=low_hz: self._on_band_selected(lbl, f)
             )
             self.band_buttons.append(button)
+            self.band_button_ranges.append((button, low_hz, high_hz))
             self.band_buttons_row.addWidget(button)
 
         self.spectrum_widget = SpectrumWidget()
@@ -2337,6 +2928,47 @@ class RadioWindow(QWidget):
         self.ptt_button.setEnabled(False)
         self.ptt_button.setToolTip("Click to transmit, click again to release")
         self.ptt_button.toggled.connect(self._on_ptt_toggled)
+
+        self.wsjtx_button = QPushButton("Launch WSJT-X")
+        self.wsjtx_button.setToolTip(
+            f"Launches WSJT-X in its own isolated profile (--rig-name={WSJTX_RIG_NAME}), "
+            "separate from your main WSJT-X settings. Use the Rigctld button below to "
+            "let it control this radio."
+        )
+        self.wsjtx_button.clicked.connect(self._on_wsjtx_button_clicked)
+
+        self.rigctld_port_input = QSpinBox()
+        self.rigctld_port_input.setRange(1, 65535)
+        self.rigctld_port_input.setValue(RIGCTLD_DEFAULT_PORT)
+        self.rigctld_port_input.setToolTip("TCP port for the rigctld server to listen on.")
+
+        self.rigctld_button = QPushButton(f"Rigctld: OFF (port {RIGCTLD_DEFAULT_PORT})")
+        self.rigctld_button.setCheckable(True)
+        self.rigctld_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.rigctld_button.setToolTip(
+            "Lets other CAT-aware apps (WSJT-X, JTDX, fldigi, ...) control this "
+            "radio through this app's connection -- select \"Hamlib NET rigctl\" "
+            "(rig model 2) and 127.0.0.1:<port above> in that app."
+        )
+        self.rigctld_button.toggled.connect(self._on_rigctld_toggled)
+        self.rigctld_server = None  # created lazily on first enable
+
+        self.virtual_cable_button = QPushButton("Virtual Cables: OFF")
+        self.virtual_cable_button.setCheckable(True)
+        self.virtual_cable_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.virtual_cable_button.setEnabled(False)
+        self.virtual_cable_button.setToolTip(
+            "Creates two virtual audio devices (Linux/PulseAudio or PipeWire "
+            "only) so an external app (WSJT-X, etc.) can send/receive audio "
+            "through this app's radio connection, in place of the physical "
+            "devices chosen in the connection dialog. Click again to switch "
+            "back to those original devices."
+        )
+        self.virtual_cable_button.toggled.connect(self._on_virtual_cable_toggled)
 
         self.status_label = QLabel("Connecting...")
 
@@ -2394,12 +3026,20 @@ class RadioWindow(QWidget):
                 # A/B or V/M button -- click swaps to the other option,
                 # rather than a dropdown to pick from. Starts on the first
                 # option's label; _on_control_updated() corrects it to
-                # the radio's actual state once connected. All buttons of
-                # this type share one vertical column (e.g. VFO A/B with
-                # VFO/MEM stacked directly under it), rather than each
-                # getting its own flat slot in the row.
+                # the radio's actual state once connected (except for
+                # write_only entries, which never get corrected -- see
+                # the tooltip below). All buttons of this type share one
+                # vertical column (e.g. VFO A/B with VFO/MEM stacked
+                # directly under it), rather than each getting its own
+                # flat slot in the row.
                 widget = QPushButton(definition["options"][0][0])
                 widget.setEnabled(False)
+                if definition.get("write_only"):
+                    widget.setToolTip(
+                        "This radio can't report its current state for this control "
+                        "(CI-V read-only limitation) -- this button shows the last "
+                        "command sent, not a live-confirmed value."
+                    )
                 widget.clicked.connect(lambda checked=False, k=key: self._on_vfo_toggle_clicked(k))
                 if vfo_toggle_column is None:
                     vfo_toggle_column = QVBoxLayout()
@@ -2418,13 +3058,34 @@ class RadioWindow(QWidget):
                 controls_row.setAlignment(widget, Qt.AlignTop)
             self.control_widgets[key] = widget
 
+        # Extra action buttons (WSJT-X, Rigctld, and whatever gets added
+        # later) -- a horizontal row of its own, kept as an attribute so
+        # future buttons can just be appended to it directly.
+        rigctld_column = QVBoxLayout()
+        rigctld_column.addWidget(self.rigctld_port_input)
+        rigctld_column.addWidget(self.rigctld_button)
+
+        self.extra_buttons_row = QHBoxLayout()
+        self.extra_buttons_row.addWidget(self.wsjtx_button)
+        self.extra_buttons_row.addLayout(rigctld_column)
+        self.extra_buttons_row.addWidget(self.virtual_cable_button)
+        self.extra_buttons_row.addStretch()
+
+        # controls_row (Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO) and
+        # extra_buttons_row stack vertically together, to the left of the
+        # tuning knob -- not mixed into knob_row, which is the knob's own
+        # column on the right.
+        left_column = QVBoxLayout()
+        left_column.addLayout(controls_row)
+        left_column.addLayout(self.extra_buttons_row)
+
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.ptt_button)
 
         tuning_row = QHBoxLayout()
-        tuning_row.addLayout(controls_row)
+        tuning_row.addLayout(left_column)
         tuning_row.addStretch()
         tuning_row.addLayout(knob_row)
 
@@ -2461,6 +3122,7 @@ class RadioWindow(QWidget):
             slider.setEnabled(True)
         for widget in self.control_widgets.values():
             widget.setEnabled(True)
+        self.virtual_cable_button.setEnabled(True)
 
     @Slot(str)
     def _on_connection_failed(self, message):
@@ -2471,6 +3133,7 @@ class RadioWindow(QWidget):
     def _on_frequency_updated(self, freq_hz):
         self._current_freq_hz = freq_hz
         self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+        self._update_band_button_highlight()
 
     @Slot(str, int)
     def _on_meter_updated(self, meter_type, level):
@@ -2529,6 +3192,68 @@ class RadioWindow(QWidget):
         else:
             self.worker.stop_ptt()
 
+    def _on_wsjtx_button_clicked(self):
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        path = settings.value("wsjtx_executable_path", "")
+
+        if not path or not os.path.isfile(path):
+            path = find_wsjtx_executable()
+
+        if not path:
+            path, _filter = QFileDialog.getOpenFileName(
+                self, "Locate the WSJT-X executable",
+                "", "Executable (*.exe);;All files (*)" if platform.system() == "Windows" else "All files (*)",
+            )
+            if not path:
+                return  # user cancelled the browse dialog
+
+        try:
+            launch_wsjtx(path)
+        except OSError as exc:
+            QMessageBox.critical(self, "WSJT-X", f"Couldn't launch WSJT-X at:\n{path}\n\n{exc}")
+            return
+
+        # Only remember the path once it's actually confirmed to work
+        # (subprocess.Popen not raising means the OS accepted it).
+        settings.setValue("wsjtx_executable_path", path)
+
+    def _on_rigctld_toggled(self, checked):
+        if checked:
+            port = self.rigctld_port_input.value()
+            self.rigctld_server = RigctldServer(
+                get_freq=lambda: self._current_freq_hz or 0,
+                set_freq=lambda hz: self.worker.set_frequency(int(hz)),
+                get_mode=lambda: (self.control_widgets["mode"].currentData() or "USB", 0),
+                set_mode=lambda mode: self.worker.set_control_value("mode", mode),
+                get_ptt=lambda: self.ptt_button.isChecked(),
+                set_ptt=lambda on: self.ptt_button.setChecked(on),  # reuses the normal PTT path via its toggled signal
+                port=port,
+            )
+            try:
+                self.rigctld_server.start()
+            except RuntimeError as exc:
+                QMessageBox.critical(self, "Rigctld", str(exc))
+                self.rigctld_server = None
+                self.rigctld_button.setChecked(False)
+                return
+            self.rigctld_button.setText(f"Rigctld: ON (port {port})")
+            self.rigctld_port_input.setEnabled(False)  # changing port on a live server needs a stop/restart first
+        else:
+            port = self.rigctld_port_input.value()
+            if self.rigctld_server is not None:
+                self.rigctld_server.stop()
+                self.rigctld_server = None
+            self.rigctld_button.setText(f"Rigctld: OFF (port {port})")
+            self.rigctld_port_input.setEnabled(True)
+
+    def _on_virtual_cable_toggled(self, checked):
+        if checked:
+            self.virtual_cable_button.setText("Virtual Cables: ON")
+            self.worker.enable_virtual_cables()
+        else:
+            self.virtual_cable_button.setText("Virtual Cables: OFF")
+            self.worker.disable_virtual_cables()
+
     def _on_vfo_toggle_clicked(self, key):
         definition = CONTROL_DEFINITIONS[key]
         options = definition["options"]
@@ -2576,6 +3301,7 @@ class RadioWindow(QWidget):
         # band, the next poll cycle corrects this to the real value.
         self._current_freq_hz = low_edge_hz
         self.freq_display.setText(f"{low_edge_hz / 1e6:.6f} MHz")
+        self._update_band_button_highlight()
 
     def _on_knob_steps(self, steps):
         if self._current_freq_hz is None:
@@ -2587,15 +3313,79 @@ class RadioWindow(QWidget):
         # spinning the knob; the next poll cycle will confirm/correct it.
         self._current_freq_hz = new_freq_hz
         self.freq_display.setText(f"{new_freq_hz / 1e6:.6f} MHz")
+        self._update_band_button_highlight()
+
+    def _update_band_button_highlight(self):
+        """Turns the button for whichever band the current frequency
+        falls in green, matching the toggle-button convention used
+        elsewhere in this app -- and clears it for every other band."""
+        freq = self._current_freq_hz
+        for button, low_hz, high_hz in self.band_button_ranges:
+            active = freq is not None and low_hz <= freq <= high_hz
+            button.setStyleSheet(
+                "QPushButton { background-color: #2a6; color: white; font-weight: bold; }" if active else ""
+            )
 
     def closeEvent(self, event):
+        if self.rigctld_server is not None:
+            self.rigctld_server.stop()
+        if self.virtual_cable_button.isChecked():
+            self.worker.disable_virtual_cables()  # best-effort; worker.stop() below may cut this off before it finishes
         self.worker.stop()
         self.worker.wait(2000)  # give the polling loop a moment to exit cleanly
         event.accept()
 
 
+def apply_dark_theme(app):
+    """Applies an overall dark theme to the whole app -- the Fusion style
+    plus a matching QPalette, which QDialog/QWidget/etc all pick up
+    automatically (so this covers the connection dialog too, not just the
+    main window). The custom-painted widgets (scope, waterfall, meters,
+    tuning knob) already draw their own dark backgrounds regardless of
+    this; this is specifically for the standard Qt widgets -- buttons,
+    labels, combo boxes, sliders, dialogs -- that would otherwise use
+    whatever light/native theme the OS provides and look mismatched next
+    to those."""
+    app.setStyle("Fusion")
+
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(45, 45, 48))
+    palette.setColor(QPalette.WindowText, QColor(220, 220, 220))
+    palette.setColor(QPalette.Base, QColor(30, 30, 32))
+    palette.setColor(QPalette.AlternateBase, QColor(45, 45, 48))
+    palette.setColor(QPalette.ToolTipBase, QColor(45, 45, 48))
+    palette.setColor(QPalette.ToolTipText, QColor(220, 220, 220))
+    palette.setColor(QPalette.Text, QColor(220, 220, 220))
+    palette.setColor(QPalette.Button, QColor(55, 55, 58))
+    palette.setColor(QPalette.ButtonText, QColor(220, 220, 220))
+    palette.setColor(QPalette.BrightText, QColor(255, 80, 80))
+    palette.setColor(QPalette.Link, QColor(90, 160, 255))
+    palette.setColor(QPalette.Highlight, QColor(60, 120, 200))
+    palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+
+    # Disabled states need their own explicit entries -- otherwise
+    # disabled widgets (very common in this app before a radio connects)
+    # can end up nearly invisible against a dark background.
+    palette.setColor(QPalette.Disabled, QPalette.WindowText, QColor(120, 120, 120))
+    palette.setColor(QPalette.Disabled, QPalette.Text, QColor(120, 120, 120))
+    palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(120, 120, 120))
+    palette.setColor(QPalette.Disabled, QPalette.Base, QColor(40, 40, 42))
+
+    app.setPalette(palette)
+
+    # A couple of things Fusion+QPalette alone doesn't fully cover.
+    app.setStyleSheet("""
+        QToolTip {
+            color: #dcdcdc;
+            background-color: #2d2d30;
+            border: 1px solid #555555;
+        }
+    """)
+
+
 def main():
     app = QApplication(sys.argv)
+    apply_dark_theme(app)
 
     details = ConnectionDialog.get_details()
     if details is None:

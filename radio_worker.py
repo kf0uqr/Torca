@@ -791,6 +791,11 @@ class RadioWorker(QThread):
 
     # ---- Thread-safe command entry points (call these from the GUI thread) ----
 
+    def is_connected(self):
+        """Thread-safe: call from the GUI thread. True once the radio
+        connection is actually up, not just while it's being attempted."""
+        return self.radio is not None
+
     def set_frequency(self, freq_hz: int):
         if self.loop is None or self.radio is None:
             return

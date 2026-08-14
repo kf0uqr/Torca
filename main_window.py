@@ -136,8 +136,10 @@ class RadioWindow(QWidget):
         self.hamclock_button = QPushButton("Ham Dashboard")
         self.hamclock_button.setToolTip(
             "Opens a HamClock-inspired dashboard: day/night world map, UTC/"
-            "local clocks, and live solar-terrestrial data (SFI/SSN/K-index) "
-            "from NOAA's public feeds. Doesn't need the radio connected."
+            "local clocks, live solar-terrestrial data (SFI/SSN/K-index) from "
+            "NOAA's public feeds, and satellite tracking. Doesn't need the "
+            "radio connected, except to double-click a satellite and start "
+            "Doppler correction."
         )
         self.hamclock_button.clicked.connect(self._on_hamclock_button_clicked)
         self.hamclock_window = None  # created lazily on first click
@@ -409,7 +411,7 @@ class RadioWindow(QWidget):
 
     def _on_hamclock_button_clicked(self):
         if self.hamclock_window is None:
-            self.hamclock_window = HamClockWindow()
+            self.hamclock_window = HamClockWindow(worker=self.worker)
         self.hamclock_window.show()
         self.hamclock_window.raise_()
         self.hamclock_window.activateWindow()

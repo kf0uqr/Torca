@@ -8,6 +8,7 @@ and their footprint polygons, all drawn on top.
 """
 
 import datetime
+import math
 import pathlib
 import urllib.error
 import urllib.request
@@ -77,6 +78,8 @@ class WorldMapWidget(QWidget):
     a lat/long reference grid, the sub-solar point, and the operator's
     own location if set, drawn on top."""
 
+    satellite_double_clicked = Signal(str)  # satellite name, from the positions passed to set_satellite_positions
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(220)
@@ -114,6 +117,10 @@ class WorldMapWidget(QWidget):
         self._operator_lon = lon
         self._operator_label = label
         self.update()
+
+    def operator_location(self):
+        """Returns (lat, lon), or (None, None) if the operator hasn't set one."""
+        return self._operator_lat, self._operator_lon
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -193,6 +200,26 @@ class WorldMapWidget(QWidget):
     def set_satellite_positions(self, positions):
         self._satellite_positions = positions
         self.update()
+
+    # Pixel radius around a satellite's marker that still counts as a hit
+    # -- markers are drawn at a 4px radius (see _draw_satellite_marker),
+    # so this gives some slack for imprecise clicking without the hit
+    # areas of nearby satellites overlapping too much.
+    _SATELLITE_HIT_RADIUS_PX = 10
+
+    def mouseDoubleClickEvent(self, event):
+        if not self._satellite_mode or not self._satellite_positions:
+            return
+        pos = event.position()
+        w, h = self.width(), self.height()
+        closest_name, closest_dist = None, None
+        for sat in self._satellite_positions:
+            x, y = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)
+            dist = math.hypot(x - pos.x(), y - pos.y())
+            if dist <= self._SATELLITE_HIT_RADIUS_PX and (closest_dist is None or dist < closest_dist):
+                closest_name, closest_dist = sat["name"], dist
+        if closest_name is not None:
+            self.satellite_double_clicked.emit(closest_name)
 
     @staticmethod
     def _lonlat_to_xy(lat, lon, w, h):

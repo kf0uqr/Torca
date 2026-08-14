@@ -28,6 +28,7 @@ from solar_data import SolarDataWorker, BAND_CONDITION_RANGES, maidenhead_to_lat
 from world_map import WorldMapWidget
 from satellite_tracking import (
     SatelliteConfigDialog,
+    DopplerCorrectionDialog,
     load_satellite_data,
     save_satellite_data,
     propagate_satellite,
@@ -37,14 +38,18 @@ from satellite_tracking import (
 
 class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
-    section for what's in scope and why."""
+    section for what's in scope and why. `worker` (a RadioWorker, or
+    None) is only needed for the Doppler correction dialog -- everything
+    else here still works without a radio connection."""
 
-    def __init__(self, parent=None):
+    def __init__(self, worker=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ham Dashboard")
         self.resize(680, 520)
+        self._worker = worker
 
         self.map_widget = WorldMapWidget()
+        self.map_widget.satellite_double_clicked.connect(self._on_satellite_double_clicked)
 
         self.utc_label = QLabel("--:--:-- UTC")
         self.utc_label.setStyleSheet("font-size: 20px; font-weight: bold;")
@@ -208,6 +213,29 @@ class HamClockWindow(QWidget):
                 "footprint": footprint_points(lat, lon, altitude_km),
             })
         self.map_widget.set_satellite_positions(positions)
+
+    def _on_satellite_double_clicked(self, name):
+        satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
+        if satellite is None:
+            return
+        if not satellite.get("transponders"):
+            QMessageBox.information(
+                self, "Doppler Correction",
+                f"No transponder data stored for {name} yet. Right-click "
+                "Satellites and use \"Fetch Transponder Data\" or "
+                "\"Edit Transponders...\" to add some first."
+            )
+            return
+        observer_lat, observer_lon = self.map_widget.operator_location()
+        if observer_lat is None or observer_lon is None:
+            QMessageBox.warning(
+                self, "Doppler Correction",
+                "Set your location (grid square or lat,lon, below the map) first --"
+                " Doppler correction needs to know where you're observing from."
+            )
+            return
+        dialog = DopplerCorrectionDialog(satellite, self._worker, observer_lat, observer_lon, self)
+        dialog.exec()
 
     @Slot(dict)
     def _on_solar_data(self, data):

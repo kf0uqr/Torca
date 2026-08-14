@@ -178,10 +178,13 @@ def footprint_points(lat, lon, altitude_km, num_points=72):
 # database of satellite transmitters/transponders. Confirmed real
 # endpoint and field names from a live fetch of
 # https://db.satnogs.org/api/transmitters/: downlink_low/uplink_low are
-# integer Hz (not MHz), mode is a plain string, alive is a bool, and the
-# API supports filtering by norad_cat_id as a query parameter. Reads are
-# keyless -- "API access is open to anyone" per SatNOGS' own docs; a key
-# is only needed for write operations, which this app never does.
+# integer Hz (not MHz), mode is a plain string, alive is a bool. Filtering
+# is done with satellite__norad_cat_id -- a bare norad_cat_id query param
+# is silently ignored by the API (confirmed live: it returns the entire
+# ~5000-row unfiltered table instead of erroring), which is why every
+# satellite used to show every other satellite's transponders too. Reads
+# are keyless -- "API access is open to anyone" per SatNOGS' own docs; a
+# key is only needed for write operations, which this app never does.
 SATNOGS_TRANSMITTERS_URL = "https://db.satnogs.org/api/transmitters/"
 
 
@@ -203,7 +206,7 @@ def fetch_transponders(norad_cat_id):
     transmitters (e.g. a voice repeater vs. a telemetry beacon) and
     decommissioned ones are still useful reference but shouldn't be the
     default pick. Raises on failure -- callers should catch and report."""
-    url = f"{SATNOGS_TRANSMITTERS_URL}?norad_cat_id={norad_cat_id}&format=json"
+    url = f"{SATNOGS_TRANSMITTERS_URL}?satellite__norad_cat_id={norad_cat_id}&format=json"
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "IcomRadioControlApp/1.0 (desktop ham radio control application)"},
@@ -213,6 +216,10 @@ def fetch_transponders(norad_cat_id):
 
     results = []
     for entry in data:
+        # Defense in depth: only keep entries that actually match, in case
+        # the API's filtering behavior changes again in the future.
+        if entry.get("norad_cat_id") != norad_cat_id:
+            continue
         downlink_hz = entry.get("downlink_low")
         uplink_hz = entry.get("uplink_low")
         results.append({

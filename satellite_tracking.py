@@ -4,7 +4,10 @@ the sgp4 library (NORAD's standard SGP4/SDP4 algorithm -- not
 reimplemented here, same reasoning as not hand-rolling FT8 decoding),
 TLE data from CelesTrak, transponder data from SatNOGS DB, and the
 dialogs for managing tracked satellites (refresh TLEs, add/remove,
-choose which transponder to use, pick which satellites display).
+store all known transponder data per satellite, pick which satellites
+display). Picking which transponder to actually use when tuning is a
+later feature -- for now this just stores everything SatNOGS knows
+about a satellite.
 """
 
 import json
@@ -67,10 +70,35 @@ def load_satellite_data():
     if not SATELLITE_DATA_PATH.exists():
         return []
     try:
-        return json.loads(SATELLITE_DATA_PATH.read_text())
+        satellites = json.loads(SATELLITE_DATA_PATH.read_text())
     except Exception as exc:
         print(f"[ERROR] Ham Dashboard: couldn't read stored satellite data ({exc}); starting with an empty list.")
         return []
+    for sat in satellites:
+        _migrate_legacy_transponder_fields(sat)
+    return satellites
+
+
+def _migrate_legacy_transponder_fields(sat):
+    """Satellites used to store a single chosen uplink/downlink/mode
+    directly on the satellite dict; that's now a "transponders" list
+    holding everything SatNOGS knows about the satellite. Converts an
+    old-format entry in place the first time it's loaded."""
+    if "transponders" in sat:
+        return
+    uplink = sat.pop("uplink_mhz", "")
+    downlink = sat.pop("downlink_mhz", "")
+    mode = sat.pop("mode", "")
+    if uplink or downlink or mode:
+        sat["transponders"] = [{
+            "description": "Transponder",
+            "uplink_mhz": uplink,
+            "downlink_mhz": downlink,
+            "mode": mode,
+            "alive": True,
+        }]
+    else:
+        sat["transponders"] = []
 
 
 def save_satellite_data(satellites):
@@ -233,46 +261,91 @@ def fetch_transponders(norad_cat_id):
     return results
 
 
-class TransponderChoiceDialog(QDialog):
-    """Shown when SatNOGS DB has multiple known transmitters for a
-    satellite -- lets the user pick which one to use to fill in the
-    uplink/downlink/mode fields (e.g. a satellite's FM voice repeater
-    vs. its telemetry beacon)."""
+class TransponderEditDialog(QDialog):
+    """Shows/edits the full list of known transponders for one satellite
+    -- populated from a SatNOGS fetch, hand-entered, or both. Picking
+    which one to actually use when tuning is a later feature; this
+    dialog is just for storing and correcting the data."""
+
+    COLUMNS = ["Description", "Uplink (MHz)", "Downlink (MHz)", "Mode", "Active"]
 
     def __init__(self, satellite_name, transponders, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Choose Transponder -- {satellite_name}")
-        self.resize(460, 300)
-        self._transponders = transponders
+        self.setWindowTitle(f"Transponders -- {satellite_name}")
+        self.resize(560, 340)
 
-        self.list_widget = QTableWidget(len(transponders), 4)
-        self.list_widget.setHorizontalHeaderLabels(["Description", "Uplink (MHz)", "Downlink (MHz)", "Mode"])
-        self.list_widget.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.list_widget.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.list_widget.setSelectionBehavior(QTableWidget.SelectRows)
-        for row, transponder in enumerate(transponders):
-            description = transponder["description"] + ("" if transponder["alive"] else " (inactive)")
-            self.list_widget.setItem(row, 0, QTableWidgetItem(description))
-            self.list_widget.setItem(row, 1, QTableWidgetItem(transponder["uplink_mhz"]))
-            self.list_widget.setItem(row, 2, QTableWidgetItem(transponder["downlink_mhz"]))
-            self.list_widget.setItem(row, 3, QTableWidgetItem(transponder["mode"]))
-        self.list_widget.selectRow(0)
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._load_rows(transponders)
+
+        add_button = QPushButton("Add")
+        add_button.clicked.connect(self._on_add_row)
+        remove_button = QPushButton("Remove Selected")
+        remove_button.clicked.connect(self._on_remove_row)
+        button_row = QHBoxLayout()
+        button_row.addWidget(add_button)
+        button_row.addWidget(remove_button)
+        button_row.addStretch(1)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
 
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("SatNOGS DB found multiple transmitters for this satellite:"))
-        layout.addWidget(self.list_widget)
+        layout.addWidget(QLabel(
+            "All known transponders/transmitters for this satellite (e.g. a "
+            "voice repeater vs. a telemetry beacon)."
+        ))
+        layout.addWidget(self.table)
+        layout.addLayout(button_row)
         layout.addWidget(button_box)
         self.setLayout(layout)
 
-    def chosen_transponder(self):
-        row = self.list_widget.currentRow()
-        if 0 <= row < len(self._transponders):
-            return self._transponders[row]
-        return None
+    def _load_rows(self, transponders):
+        self.table.setRowCount(len(transponders))
+        for row, transponder in enumerate(transponders):
+            self._set_row(row, transponder)
+
+    def _set_row(self, row, transponder):
+        self.table.setItem(row, 0, QTableWidgetItem(transponder.get("description", "")))
+        self.table.setItem(row, 1, QTableWidgetItem(transponder.get("uplink_mhz", "")))
+        self.table.setItem(row, 2, QTableWidgetItem(transponder.get("downlink_mhz", "")))
+        self.table.setItem(row, 3, QTableWidgetItem(transponder.get("mode", "")))
+        active_item = QTableWidgetItem()
+        active_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        active_item.setCheckState(Qt.Checked if transponder.get("alive", True) else Qt.Unchecked)
+        self.table.setItem(row, 4, active_item)
+
+    def _on_add_row(self):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self._set_row(row, {"alive": True})
+        self.table.selectRow(row)
+
+    def _on_remove_row(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.table.removeRow(row)
+
+    def result_transponders(self):
+        transponders = []
+        for row in range(self.table.rowCount()):
+            description = self.table.item(row, 0).text().strip()
+            uplink = self.table.item(row, 1).text().strip()
+            downlink = self.table.item(row, 2).text().strip()
+            mode = self.table.item(row, 3).text().strip()
+            if not (description or uplink or downlink or mode):
+                continue  # skip fully-blank rows
+            transponders.append({
+                "description": description,
+                "uplink_mhz": uplink,
+                "downlink_mhz": downlink,
+                "mode": mode,
+                "alive": self.table.item(row, 4).checkState() == Qt.Checked,
+            })
+        return transponders
 
 
 class ManualTleDialog(QDialog):
@@ -316,7 +389,7 @@ class ManualTleDialog(QDialog):
             return
         self._result = {
             "name": name, "line1": line1, "line2": line2,
-            "uplink_mhz": "", "downlink_mhz": "", "mode": "", "selected": True,
+            "transponders": [], "selected": True,
         }
         self.accept()
 
@@ -327,7 +400,9 @@ class ManualTleDialog(QDialog):
 class SatelliteConfigDialog(QDialog):
     """Right-click the Satellites button to open this: manage tracked
     satellites -- refresh TLEs from CelesTrak, add/remove satellites,
-    edit transponder info, and choose which ones display on the map."""
+    store known transponder data (fetched from SatNOGS or hand-entered),
+    and choose which ones display on the map. Picking a transponder to
+    actually use is a later feature -- this just manages the data."""
 
     def __init__(self, satellites, parent=None):
         super().__init__(parent)
@@ -335,8 +410,8 @@ class SatelliteConfigDialog(QDialog):
         self.resize(560, 400)
         self._satellites = [dict(sat) for sat in satellites]  # local working copy until OK is pressed
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Show", "Name", "Uplink (MHz)", "Downlink (MHz)", "Mode"])
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Show", "Name", "Transponders"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._rebuild_table()
 
@@ -346,9 +421,14 @@ class SatelliteConfigDialog(QDialog):
         self.fetch_transponder_button.setToolTip(
             "Looks up known transmitters for the selected satellite(s) in "
             "SatNOGS DB (an open, community-maintained database) by NORAD "
-            "catalog number."
+            "catalog number, and stores all of them."
         )
         self.fetch_transponder_button.clicked.connect(self._on_fetch_transponders)
+        self.edit_transponder_button = QPushButton("Edit Transponders...")
+        self.edit_transponder_button.setToolTip(
+            "View or hand-edit the stored transponder list for the selected satellite."
+        )
+        self.edit_transponder_button.clicked.connect(self._on_edit_transponders)
         self.add_button = QPushButton("Add Satellite...")
         self.add_button.clicked.connect(self._on_add_satellite)
         self.remove_button = QPushButton("Remove Selected")
@@ -357,6 +437,7 @@ class SatelliteConfigDialog(QDialog):
         button_row = QHBoxLayout()
         button_row.addWidget(self.refresh_button)
         button_row.addWidget(self.fetch_transponder_button)
+        button_row.addWidget(self.edit_transponder_button)
         button_row.addWidget(self.add_button)
         button_row.addWidget(self.remove_button)
 
@@ -367,8 +448,9 @@ class SatelliteConfigDialog(QDialog):
         layout = QVBoxLayout()
         layout.addWidget(QLabel(
             "Check satellites to display on the map. Select one or more rows "
-            "and click \"Fetch Transponder Data\" to look up uplink/downlink/"
-            "mode from SatNOGS DB, or enter/edit it directly in the table."
+            "and click \"Fetch Transponder Data\" to pull all known "
+            "transponders from SatNOGS DB, or select one row and click "
+            "\"Edit Transponders...\" to view or hand-edit them."
         ))
         layout.addWidget(self.table)
         layout.addLayout(button_row)
@@ -387,9 +469,11 @@ class SatelliteConfigDialog(QDialog):
             name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, 1, name_item)
 
-            self.table.setItem(row, 2, QTableWidgetItem(sat.get("uplink_mhz", "")))
-            self.table.setItem(row, 3, QTableWidgetItem(sat.get("downlink_mhz", "")))
-            self.table.setItem(row, 4, QTableWidgetItem(sat.get("mode", "")))
+            count = len(sat.get("transponders", []))
+            summary = "None" if count == 0 else f"{count} transponder{'' if count == 1 else 's'}"
+            transponder_item = QTableWidgetItem(summary)
+            transponder_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table.setItem(row, 2, transponder_item)
 
     def _on_refresh_tles(self):
         try:
@@ -409,7 +493,7 @@ class SatelliteConfigDialog(QDialog):
             if name not in existing_names:
                 self._satellites.append({
                     "name": name, "line1": line1, "line2": line2,
-                    "uplink_mhz": "", "downlink_mhz": "", "mode": "",
+                    "transponders": [],
                     "selected": False,
                 })
                 added += 1
@@ -439,6 +523,7 @@ class SatelliteConfigDialog(QDialog):
                 self, "Fetch Transponder Data", "Select one or more satellites in the table first."
             )
             return
+        fetched = 0
         for row in rows:
             sat = self._satellites[row]
             norad_id = norad_id_from_tle_line1(sat.get("line1", ""))
@@ -456,34 +541,31 @@ class SatelliteConfigDialog(QDialog):
                     f"Couldn't fetch data for {sat.get('name', '?')} (NORAD {norad_id}):\n{exc}"
                 )
                 continue
-            if not transponders:
-                QMessageBox.information(
-                    self, "Fetch Transponder Data",
-                    f"SatNOGS DB has no transmitters listed for {sat.get('name', '?')} (NORAD {norad_id})."
-                )
-                continue
-            if len(transponders) == 1:
-                chosen = transponders[0]
-            else:
-                chooser = TransponderChoiceDialog(sat.get("name", "?"), transponders, self)
-                if chooser.exec() != QDialog.Accepted:
-                    continue
-                chosen = chooser.chosen_transponder()
-                if chosen is None:
-                    continue
-            sat["uplink_mhz"] = chosen["uplink_mhz"]
-            sat["downlink_mhz"] = chosen["downlink_mhz"]
-            sat["mode"] = chosen["mode"]
+            sat["transponders"] = transponders
+            fetched += 1
         self._rebuild_table()
+        if fetched:
+            QMessageBox.information(
+                self, "Fetch Transponder Data",
+                f"Updated stored transponder data for {fetched} satellite(s) from SatNOGS DB."
+            )
+
+    def _on_edit_transponders(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if len(rows) != 1:
+            QMessageBox.information(
+                self, "Edit Transponders", "Select exactly one satellite in the table first."
+            )
+            return
+        sat = self._satellites[rows[0]]
+        dialog = TransponderEditDialog(sat.get("name", "?"), sat.get("transponders", []), self)
+        if dialog.exec() == QDialog.Accepted:
+            sat["transponders"] = dialog.result_transponders()
+            self._rebuild_table()
 
     def _on_accept(self):
-        # Pull edited transponder text + checked state back out of the
-        # table before closing.
         for row, sat in enumerate(self._satellites):
             sat["selected"] = self.table.item(row, 0).checkState() == Qt.Checked
-            sat["uplink_mhz"] = self.table.item(row, 2).text()
-            sat["downlink_mhz"] = self.table.item(row, 3).text()
-            sat["mode"] = self.table.item(row, 4).text()
         self.accept()
 
     def result_satellites(self):

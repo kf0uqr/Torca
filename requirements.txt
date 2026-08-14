@@ -1,0 +1,4 @@
+PySide6>=6.8
+rigplane>=2.11
+sounddevice>=0.5
+sgp4>=2.22

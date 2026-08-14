@@ -1,0 +1,11 @@
+# Python venv (this directory doubles as the venv root)
+bin/
+lib/
+lib64
+include/
+pyvenv.cfg
+__pycache__/
+*.pyc
+
+# empty placeholder dir
+irc/

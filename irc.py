@@ -24,17 +24,23 @@ credentials are set on the radio itself, not an Icom account).
 """
 
 import asyncio
+import datetime
 import importlib
+import json
 import math
 import os
+import pathlib
 import platform
 import queue
 import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 
-from PySide6.QtCore import QThread, Signal, Slot, Qt, QRectF, QPointF, QSettings
+from PySide6.QtCore import QThread, Signal, Slot, Qt, QRectF, QPointF, QSettings, QTimer
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QImage, QRadialGradient, QPalette
 from PySide6.QtNetwork import QHostAddress, QTcpServer
 from PySide6.QtWidgets import (
@@ -54,6 +60,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QMenu,
     QFileDialog,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QSizePolicy,
 )
 
 try:
@@ -67,6 +77,20 @@ try:
 except ImportError:
     sd = None
     SOUNDDEVICE_AVAILABLE = False
+
+try:
+    # pip install sgp4 -- the standard, widely-used Python implementation
+    # of NORAD's SGP4/SDP4 satellite orbital propagation algorithm (by
+    # Brandon Rhodes). Used for the Ham Dashboard's satellite tracking
+    # mode. This is precise numerical algorithm work in the same category
+    # as FT8 decoding -- not something to hand-roll -- so a real,
+    # established library is used here rather than an approximation.
+    from sgp4.api import Satrec, jday
+    SGP4_AVAILABLE = True
+except ImportError:
+    Satrec = None
+    jday = None
+    SGP4_AVAILABLE = False
 
 from rigplane import create_radio, LanBackendConfig
 try:
@@ -2842,6 +2866,1122 @@ class RigctldServer(QTcpServer):
         )
 
 
+# ==================== Ham Dashboard (HamClock-inspired) ====================
+#
+# HamClock (WB0OEW) has many panes -- DX cluster, satellite tracking,
+# VOACAP propagation modeling -- each of which is a substantial project
+# on its own, in the same way WSJT-X's decode engine was. This is scoped
+# to the core "what's the current situation" data most operators actually
+# check at a glance: a day/night world map with terminator, UTC/local
+# clocks, and live solar-terrestrial indices -- pulled from the same
+# public NOAA SWPC data source HamClock itself uses, not reimplemented.
+#
+# Confirmed real, public, keyless endpoints (via direct lookup of NOAA
+# SWPC's own data service directories):
+NOAA_K_INDEX_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+NOAA_SOLAR_FLUX_URL = "https://services.swpc.noaa.gov/json/f107_cm_flux.json"
+NOAA_SUNSPOT_URL = "https://services.swpc.noaa.gov/json/solar-cycle/observed-solar-cycle-indices.json"
+
+# HF band-by-band Day/Night propagation conditions (Good/Fair/Poor/Band
+# Closed) come from N0NBH's widely-used, ham-radio-specific public feed --
+# the de facto community-standard source for this, used by countless ham
+# radio tools (Ham Radio Deluxe, DXView, and many others). This is real
+# ionospheric-model output computed by that feed, not something
+# approximated here -- genuine per-band propagation modeling (MUF, solar
+# zenith angle, disturbance effects) is real physics, not something to
+# guess at with an ad-hoc formula.
+HAMQSL_XML_URL = "https://www.hamqsl.com/solarxml.php"
+BAND_CONDITION_RANGES = ["80m-40m", "30m-20m", "17m-15m", "12m-10m"]
+
+
+def _fetch_json(url, timeout=10):
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_band_conditions():
+    """Fetches the Day/Night condition (Good/Fair/Poor/Band Closed) for
+    each of BAND_CONDITION_RANGES from N0NBH's feed. Returns
+    (conditions_dict, error_or_None); conditions_dict keys are
+    (band_range, "day"|"night") tuples.
+
+    The confirmed structure (from a live fetch of this exact feed):
+    <solarflux>, <aindex>, <kindex>, <sunspots> etc. as direct child
+    tags of <solardata>. The band-condition elements' exact nesting
+    wasn't independently confirmed the same way (only the widely-
+    referenced XPath pattern other tools use for this feed --
+    band[@name=...][@time=...] -- was), so parsing here is deliberately
+    tolerant: it searches the whole tree for any element carrying both a
+    name and time attribute, rather than assuming one exact parent path."""
+    try:
+        with urllib.request.urlopen(HAMQSL_XML_URL, timeout=10) as response:
+            xml_bytes = response.read()
+        root = ET.fromstring(xml_bytes)
+    except Exception as exc:
+        return {}, str(exc)
+
+    conditions = {}
+    for elem in root.iter():
+        name = elem.get("name")
+        time_of_day = elem.get("time")
+        if name and time_of_day and elem.text:
+            conditions[(name.strip(), time_of_day.strip().lower())] = elem.text.strip()
+
+    if not conditions:
+        # Didn't find the expected structure at all -- report what the
+        # actual tree looks like so this is fixable from real evidence
+        # rather than another guess.
+        tags = sorted({elem.tag for elem in root.iter()})
+        return {}, f"no band-condition elements found; actual tags present: {tags}"
+
+    return conditions, None
+
+
+def fetch_solar_data():
+    """Fetches current K-index, solar flux (SFI), and sunspot number
+    (SSN) from NOAA's public feeds. The endpoint URLs above are
+    confirmed real; the exact field NAMES within each response are NOT
+    individually confirmed (couldn't fetch live content directly during
+    development), so each value tries a few plausible key names
+    defensively -- same pattern used throughout this app for anything
+    where the exact shape wasn't directly verifiable. When none of the
+    candidates match, the error includes the ACTUAL keys/shape found in
+    the response, so a wrong guess is immediately diagnosable instead of
+    needing another round of blind guessing."""
+    result = {}
+
+    # K-index. Confirmed via a live error: this is NOT a header-row-plus-
+    # data-rows array (that assumption was wrong) -- it's a plain list of
+    # dicts, one per row. Handles both shapes defensively regardless,
+    # since NOAA's various endpoints aren't all consistent with each
+    # other.
+    try:
+        rows = _fetch_json(NOAA_K_INDEX_URL)
+        kp_value = None
+        if rows and isinstance(rows[0], dict):
+            last_row = rows[-1]
+            for candidate in ("Kp", "kp", "kp_index", "estimated_kp"):
+                if candidate in last_row:
+                    kp_value = last_row[candidate]
+                    break
+            if kp_value is None:
+                result["k_index_error"] = f"none of the expected keys found; actual keys: {list(last_row.keys())}"
+        elif rows and isinstance(rows[0], list):
+            header = rows[0]
+            data_rows = rows[1:]
+            kp_col = None
+            for candidate in ("Kp", "kp", "kp_index", "estimated_kp"):
+                if candidate in header:
+                    kp_col = header.index(candidate)
+                    break
+            if kp_col is not None and data_rows:
+                kp_value = data_rows[-1][kp_col]
+            else:
+                result["k_index_error"] = f"none of the expected column names found; actual header row: {header}"
+        else:
+            result["k_index_error"] = f"unexpected response shape: {type(rows).__name__}"
+        if kp_value is not None:
+            result["k_index"] = float(kp_value)
+    except Exception as exc:
+        result["k_index_error"] = str(exc)
+
+    # Solar flux (SFI, 10.7cm radio flux).
+    try:
+        data = _fetch_json(NOAA_SOLAR_FLUX_URL)
+        entry = data[-1] if isinstance(data, list) and data else data
+        found = False
+        for candidate in ("flux", "f10.7", "f107", "observed_flux", "adjusted_flux"):
+            if isinstance(entry, dict) and candidate in entry:
+                result["solar_flux"] = float(entry[candidate])
+                found = True
+                break
+        if not found:
+            shape = list(entry.keys()) if isinstance(entry, dict) else f"{type(entry).__name__}: {entry!r:.200}"
+            result["solar_flux_error"] = f"none of the expected field names found; actual keys/shape: {shape}"
+    except Exception as exc:
+        result["solar_flux_error"] = str(exc)
+
+    # Sunspot number (SSN). observed-solar-cycle-indices.json is NOAA's
+    # own aggregate monthly-mean product (confirmed by name against
+    # NOAA's own documented "Recent Solar Indices of Observed Monthly
+    # Mean Values") -- the earlier sunspot_report.json was confirmed (via
+    # its actual keys: Obsdate/Station/Region/Numspot/Zurich/Spotclass...)
+    # to be a raw PER-REGION observation report, not a single current SSN
+    # value at all, which is why that one never worked.
+    try:
+        data = _fetch_json(NOAA_SUNSPOT_URL)
+        entry = data[-1] if isinstance(data, list) and data else data
+        found = False
+        for candidate in ("ssn", "SSN", "sunspot_number", "spot_num", "observed_ssn", "ssn_smoothed"):
+            if isinstance(entry, dict) and candidate in entry:
+                result["sunspot_number"] = int(float(entry[candidate]))
+                found = True
+                break
+        if not found:
+            shape = list(entry.keys()) if isinstance(entry, dict) else f"{type(entry).__name__}: {entry!r:.200}"
+            result["sunspot_number_error"] = f"none of the expected field names found; actual keys/shape: {shape}"
+    except Exception as exc:
+        result["sunspot_number_error"] = str(exc)
+
+    # HF band conditions (Day/Night, per band range) from N0NBH's feed.
+    conditions, band_error = fetch_band_conditions()
+    if conditions:
+        result["band_conditions"] = conditions
+    if band_error:
+        result["band_conditions_error"] = band_error
+
+    return result
+
+
+class SolarDataWorker(QThread):
+    """Fetches solar-terrestrial data from NOAA every 15 minutes (matches
+    roughly how often these values actually change -- no need to hammer
+    a public endpoint more often than that) on its own thread, so the
+    blocking urllib calls never stall the GUI."""
+
+    data_updated = Signal(dict)
+
+    def run(self):
+        while not self.isInterruptionRequested():
+            try:
+                self.data_updated.emit(fetch_solar_data())
+            except Exception as exc:
+                self.data_updated.emit({"fetch_error": str(exc)})
+            for _ in range(15 * 60):
+                if self.isInterruptionRequested():
+                    return
+                self.msleep(1000)
+
+
+def maidenhead_to_latlon(grid):
+    """Converts a Maidenhead grid locator (4 or 6 characters, e.g.
+    "EM12" or "EM12ab") to the approximate (lat, lon) in degrees at the
+    center of that grid square. Standard, well-established algorithm."""
+    grid = grid.strip().upper()
+    if len(grid) < 4 or not grid[2].isdigit() or not grid[3].isdigit():
+        raise ValueError("expected a 4 or 6 character grid square, e.g. EM12 or EM12ab")
+    lon = (ord(grid[0]) - ord("A")) * 20 - 180
+    lat = (ord(grid[1]) - ord("A")) * 10 - 90
+    lon += int(grid[2]) * 2
+    lat += int(grid[3]) * 1
+    if len(grid) >= 6 and grid[4].isalpha() and grid[5].isalpha():
+        lon += (ord(grid[4]) - ord("A")) * (2 / 24.0) + (1 / 24.0)
+        lat += (ord(grid[5]) - ord("A")) * (1 / 24.0) + (0.5 / 24.0)
+    else:
+        lon += 1.0   # center of the 2-degree-wide square
+        lat += 0.5   # center of the 1-degree-tall square
+    return lat, lon
+
+
+def _solar_subpoint(dt_utc):
+    """Returns (lat, lon) in degrees of the point directly under the sun
+    at the given UTC datetime -- standard approximate formulas (Cooper's
+    declination approximation; equation-of-time correction skipped),
+    accurate to roughly a degree. Plenty for a visual terminator line on
+    a small dashboard map, not intended for precision astronomy."""
+    day_of_year = dt_utc.timetuple().tm_yday
+    declination = 23.44 * math.sin(math.radians(360 / 365.0 * (day_of_year - 81)))
+    hours_utc = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
+    longitude = -(hours_utc - 12.0) * 15.0
+    longitude = ((longitude + 180) % 360) - 180
+    return declination, longitude
+
+
+def _solar_elevation(lat, lon, dt_utc):
+    """Solar elevation angle in degrees at the given lat/lon and UTC
+    time -- negative means the sun is below the horizon (night)."""
+    decl_deg, subpoint_lon = _solar_subpoint(dt_utc)
+    decl = math.radians(decl_deg)
+    lat_rad = math.radians(lat)
+    hour_angle = math.radians(lon - subpoint_lon)
+    elevation = math.asin(
+        math.sin(lat_rad) * math.sin(decl)
+        + math.cos(lat_rad) * math.cos(decl) * math.cos(hour_angle)
+    )
+    return math.degrees(elevation)
+
+
+# Background world map image for WorldMapWidget -- a real equirectangular
+# coastline map, downloaded once and cached locally, rather than embedded
+# in the source (impractical at any reasonable resolution) or fetched
+# fresh every run. Wikimedia's Special:FilePath is a stable redirect to
+# whatever the current version of a named file is, so this doesn't depend
+# on guessing an internal upload-hash path. CC BY 4.0 -- attributed in
+# the map's own corner (see WorldMapWidget.paintEvent).
+WORLD_MAP_IMAGE_URL = (
+    "https://commons.wikimedia.org/wiki/Special:FilePath/"
+    "Blank_Map_of_The_World_Equirectangular_Projection.png"
+)
+WORLD_MAP_CACHE_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "world_map.png"
+WORLD_MAP_ATTRIBUTION = "Map: Wikimedia Commons (CC BY 4.0)"
+
+
+class WorldMapImageFetcher(QThread):
+    """Downloads the background map image once, if not already cached
+    locally -- after that, never touches the network again. Runs on its
+    own thread since it's a one-time blocking HTTP fetch; the map widget
+    itself keeps working (grid-only look, same as before this feature
+    existed) regardless of whether this succeeds."""
+
+    image_ready = Signal(str)   # local file path
+    failed = Signal(str)
+
+    def run(self):
+        if WORLD_MAP_CACHE_PATH.exists():
+            self.image_ready.emit(str(WORLD_MAP_CACHE_PATH))
+            return
+        try:
+            WORLD_MAP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Confirmed via a live 403 Forbidden: Wikimedia rejects
+            # requests using Python's default urllib User-Agent as a
+            # bot-prevention measure. They document requiring a
+            # descriptive one instead (meta.wikimedia.org/wiki/
+            # User-Agent_policy) -- a plain identifying string is enough
+            # to get past this, no API key/registration needed.
+            request = urllib.request.Request(
+                WORLD_MAP_IMAGE_URL,
+                headers={"User-Agent": "IcomRadioControlApp/1.0 (desktop ham radio control application)"},
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = response.read()
+            WORLD_MAP_CACHE_PATH.write_bytes(data)
+            self.image_ready.emit(str(WORLD_MAP_CACHE_PATH))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class WorldMapWidget(QWidget):
+    """A day/night map in the spirit of (not a reimplementation of)
+    HamClock's map pane: a real equirectangular coastline map as the
+    background (downloaded once via WorldMapImageFetcher, cached
+    locally; falls back to a plain dark background if that ever fails,
+    e.g. no internet on first run), with the night hemisphere shaded,
+    a lat/long reference grid, the sub-solar point, and the operator's
+    own location if set, drawn on top."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(220)
+        # Default QWidget size policy is Preferred/Preferred, which
+        # doesn't claim extra vertical space when the window grows --
+        # that's why only width was following the window's resize
+        # before (QVBoxLayout stretches children to the container's
+        # full width automatically regardless of size policy; height
+        # needs this explicit opt-in).
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._operator_lat = None
+        self._operator_lon = None
+        self._operator_label = ""
+        self._background_image = None  # QImage, once loaded (or None -- falls back to a plain fill)
+        self._satellite_mode = False
+        self._satellite_positions = []  # list of {"name", "lat", "lon", "altitude_km", "footprint"}
+
+        self._image_fetcher = WorldMapImageFetcher()
+        self._image_fetcher.image_ready.connect(self._on_image_ready)
+        self._image_fetcher.failed.connect(self._on_image_failed)
+        self._image_fetcher.start()
+
+    def _on_image_ready(self, path):
+        image = QImage(path)
+        if not image.isNull():
+            self._background_image = image
+        self.update()
+
+    def _on_image_failed(self, error):
+        print(f"[ERROR] Ham Dashboard: world map image download failed ({error}) -- using plain background instead.")
+        self.update()
+
+    def set_operator_location(self, lat, lon, label=""):
+        self._operator_lat = lat
+        self._operator_lon = lon
+        self._operator_label = label
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        if self._background_image is not None:
+            painter.drawImage(QRectF(0, 0, w, h), self._background_image)
+        else:
+            painter.fillRect(self.rect(), QColor(10, 20, 40))
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # Night-hemisphere shading -- brute-force grid sampling rather
+        # than deriving the terminator's closed-form curve. This redraws
+        # once a minute (see HamClockWindow's map_timer), so the cost is
+        # a non-issue at this grid resolution.
+        lon_step, lat_step = 4, 4
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 140))
+        for lon in range(-180, 180, lon_step):
+            for lat in range(-90, 90, lat_step):
+                if _solar_elevation(lat + lat_step / 2.0, lon + lon_step / 2.0, now) < 0:
+                    x = (lon + 180) / 360.0 * w
+                    y = (90 - (lat + lat_step)) / 180.0 * h
+                    painter.drawRect(QRectF(x, y, lon_step / 360.0 * w + 1, lat_step / 180.0 * h + 1))
+
+        # Lat/long grid every 30 degrees, for orientation.
+        painter.setPen(QPen(QColor(60, 80, 110), 1))
+        for lon in range(-180, 181, 30):
+            x = (lon + 180) / 360.0 * w
+            painter.drawLine(QPointF(x, 0), QPointF(x, h))
+        for lat in range(-90, 91, 30):
+            y = (90 - lat) / 180.0 * h
+            painter.drawLine(QPointF(0, y), QPointF(w, y))
+
+        # Equator/prime meridian, slightly brighter for orientation.
+        painter.setPen(QPen(QColor(90, 110, 140), 1))
+        painter.drawLine(QPointF(w / 2, 0), QPointF(w / 2, h))
+        painter.drawLine(QPointF(0, h / 2), QPointF(w, h / 2))
+
+        # Sub-solar point (directly overhead sun).
+        decl, sub_lon = _solar_subpoint(now)
+        sx = (sub_lon + 180) / 360.0 * w
+        sy = (90 - decl) / 180.0 * h
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 210, 60))
+        painter.drawEllipse(QPointF(sx, sy), 5, 5)
+
+        # Operator's own location, if set.
+        if self._operator_lat is not None and self._operator_lon is not None:
+            ox = (self._operator_lon + 180) / 360.0 * w
+            oy = (90 - self._operator_lat) / 180.0 * h
+            painter.setPen(QPen(QColor(255, 255, 255), 2))
+            painter.setBrush(QColor(255, 60, 60))
+            painter.drawEllipse(QPointF(ox, oy), 5, 5)
+            if self._operator_label:
+                painter.setPen(QColor(255, 255, 255))
+                painter.drawText(QPointF(ox + 8, oy - 8), self._operator_label)
+
+        # Attribution for the background map image, if it loaded (CC BY
+        # 4.0 requires this).
+        if self._background_image is not None:
+            painter.setPen(QColor(200, 200, 200, 180))
+            painter.drawText(QPointF(6, h - 6), WORLD_MAP_ATTRIBUTION)
+
+        if self._satellite_mode:
+            for sat in self._satellite_positions:
+                self._draw_satellite_footprint(painter, sat, w, h)
+            for sat in self._satellite_positions:
+                self._draw_satellite_marker(painter, sat, w, h)
+
+    def set_satellite_mode(self, enabled):
+        self._satellite_mode = enabled
+        self.update()
+
+    def set_satellite_positions(self, positions):
+        self._satellite_positions = positions
+        self.update()
+
+    @staticmethod
+    def _lonlat_to_xy(lat, lon, w, h):
+        return (lon + 180) / 360.0 * w, (90 - lat) / 180.0 * h
+
+    def _draw_satellite_footprint(self, painter, sat, w, h):
+        points = sat.get("footprint") or []
+        if len(points) < 3:
+            return
+        # Split into separate segments wherever the footprint boundary
+        # crosses the +/-180 antimeridian -- otherwise a single closed
+        # polygon would draw a spurious line straight across the whole
+        # map at that crossing.
+        segments = [[]]
+        prev_lon = None
+        for lat, lon in points:
+            if prev_lon is not None and abs(lon - prev_lon) > 180:
+                segments.append([])
+            segments[-1].append((lat, lon))
+            prev_lon = lon
+        painter.setPen(QPen(QColor(120, 200, 255, 180), 1, Qt.DashLine))
+        painter.setBrush(QColor(120, 200, 255, 30))
+        for segment in segments:
+            if len(segment) < 2:
+                continue
+            path = QPainterPath()
+            x0, y0 = self._lonlat_to_xy(segment[0][0], segment[0][1], w, h)
+            path.moveTo(x0, y0)
+            for lat, lon in segment[1:]:
+                x, y = self._lonlat_to_xy(lat, lon, w, h)
+                path.lineTo(x, y)
+            painter.drawPath(path)
+
+    def _draw_satellite_marker(self, painter, sat, w, h):
+        x, y = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 140, 0))
+        painter.drawEllipse(QPointF(x, y), 4, 4)
+        painter.setPen(QColor(255, 220, 180))
+        painter.drawText(QPointF(x + 6, y - 6), sat["name"])
+
+
+# ==================== Satellite tracking ====================
+#
+# Real orbital propagation (SGP4/SDP4) is precise numerical algorithm
+# work in the same category as FT8 decoding -- not something to hand-
+# roll -- so the well-established `sgp4` PyPI package (by Brandon
+# Rhodes) is used for that specifically. TLE data comes from CelesTrak's
+# confirmed current amateur-radio-satellite endpoint (their older .txt
+# format is being phased out due to a 5-digit catalog number limit).
+# Transponder info (uplink/downlink/mode) has no equivalently reliable
+# machine-readable public source that was found, so that's entered and
+# edited manually via SatelliteConfigDialog rather than guessed/assumed.
+SATELLITE_TLE_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=tle"
+SATELLITE_DATA_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "satellites.json"
+EARTH_RADIUS_KM = 6371.0
+
+
+def load_satellite_data():
+    """Loads the locally-stored satellite list (TLE + transponder info +
+    which ones are checked to display) -- a plain JSON file, same
+    pattern as this app's other local caches. Returns an empty list if
+    nothing's stored yet (e.g. first run)."""
+    if not SATELLITE_DATA_PATH.exists():
+        return []
+    try:
+        return json.loads(SATELLITE_DATA_PATH.read_text())
+    except Exception as exc:
+        print(f"[ERROR] Ham Dashboard: couldn't read stored satellite data ({exc}); starting with an empty list.")
+        return []
+
+
+def save_satellite_data(satellites):
+    try:
+        SATELLITE_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SATELLITE_DATA_PATH.write_text(json.dumps(satellites, indent=2))
+    except Exception as exc:
+        print(f"[ERROR] Ham Dashboard: couldn't save satellite data ({exc}).")
+
+
+def fetch_amateur_tles():
+    """Fetches current TLEs for amateur radio satellites from CelesTrak.
+    Returns a list of (name, line1, line2) tuples. Raises on failure --
+    callers should catch and report."""
+    request = urllib.request.Request(
+        SATELLITE_TLE_URL,
+        # Same lesson learned from Wikimedia's 403: send a descriptive
+        # User-Agent proactively rather than waiting for another block.
+        headers={"User-Agent": "IcomRadioControlApp/1.0 (desktop ham radio control application)"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        text = response.read().decode("utf-8", errors="replace")
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    entries = []
+    for i in range(0, len(lines) - 2, 3):
+        name, line1, line2 = lines[i], lines[i + 1], lines[i + 2]
+        if line1.startswith("1 ") and line2.startswith("2 "):
+            entries.append((name.strip(), line1, line2))
+    return entries
+
+
+def _gmst_degrees(jd, fr):
+    """Greenwich Mean Sidereal Time in degrees -- standard IAU 1982
+    formula. Needed because sgp4's output (TEME frame) is inertial
+    (fixed relative to the stars), while lat/lon needs an Earth-fixed
+    frame that accounts for Earth's rotation since epoch."""
+    t = jd + fr
+    d = t - 2451545.0
+    return (280.46061837 + 360.98564736629 * d) % 360.0
+
+
+def propagate_satellite(line1, line2, dt_utc):
+    """Computes (lat, lon, altitude_km) for a satellite at the given UTC
+    datetime. sgp4 does the actual orbital propagation (TEME-frame
+    position); converting that to geodetic lat/lon here uses a standard
+    GMST rotation with a SPHERICAL Earth approximation -- reasonable for
+    a map-scale dashboard visualization, not precision antenna pointing
+    (a full WGS84 ellipsoid conversion would add real complexity for a
+    negligible visual difference at this zoom level -- same tradeoff
+    already made for the day/night terminator). Returns None if sgp4
+    isn't installed or propagation fails for this specific TLE."""
+    if not SGP4_AVAILABLE:
+        return None
+    try:
+        sat = Satrec.twoline2rv(line1, line2)
+        jd, fr = jday(
+            dt_utc.year, dt_utc.month, dt_utc.day,
+            dt_utc.hour, dt_utc.minute, dt_utc.second + dt_utc.microsecond / 1e6,
+        )
+        error_code, position, _velocity = sat.sgp4(jd, fr)
+        if error_code != 0:
+            return None
+        x, y, z = position  # km, TEME frame
+        r = math.sqrt(x * x + y * y + z * z)
+        if r == 0:
+            return None
+        lat = math.degrees(math.asin(z / r))
+        gmst = _gmst_degrees(jd, fr)
+        lon = math.degrees(math.atan2(y, x)) - gmst
+        lon = ((lon + 180) % 360) - 180
+        altitude_km = r - EARTH_RADIUS_KM
+        return lat, lon, altitude_km
+    except Exception:
+        return None
+
+
+def footprint_points(lat, lon, altitude_km, num_points=72):
+    """Computes the actual great-circle boundary of a satellite's
+    footprint (the area from which it's above the horizon) as a list of
+    (lat, lon) points -- standard spherical navigation "destination
+    point given start point, bearing, and angular distance" formula, not
+    a naive ellipse (a great circle doesn't project to one on an
+    equirectangular map, especially approaching the poles)."""
+    if altitude_km is None or altitude_km <= 0:
+        return []
+    central_angle = math.acos(EARTH_RADIUS_KM / (EARTH_RADIUS_KM + altitude_km))
+    lat_rad = math.radians(lat)
+    lon_rad = math.radians(lon)
+    points = []
+    for i in range(num_points + 1):
+        bearing = math.radians(360.0 * i / num_points)
+        point_lat = math.asin(
+            math.sin(lat_rad) * math.cos(central_angle)
+            + math.cos(lat_rad) * math.sin(central_angle) * math.cos(bearing)
+        )
+        point_lon = lon_rad + math.atan2(
+            math.sin(bearing) * math.sin(central_angle) * math.cos(lat_rad),
+            math.cos(central_angle) - math.sin(lat_rad) * math.sin(point_lat),
+        )
+        points.append((math.degrees(point_lat), (math.degrees(point_lon) + 540) % 360 - 180))
+    return points
+
+
+# SatNOGS DB (Libre Space Foundation) -- an open, community-maintained
+# database of satellite transmitters/transponders. Confirmed real
+# endpoint and field names from a live fetch of
+# https://db.satnogs.org/api/transmitters/: downlink_low/uplink_low are
+# integer Hz (not MHz), mode is a plain string, alive is a bool, and the
+# API supports filtering by norad_cat_id as a query parameter. Reads are
+# keyless -- "API access is open to anyone" per SatNOGS' own docs; a key
+# is only needed for write operations, which this app never does.
+SATNOGS_TRANSMITTERS_URL = "https://db.satnogs.org/api/transmitters/"
+
+
+def norad_id_from_tle_line1(line1):
+    """Extracts the NORAD catalog number from a TLE's first line --
+    standard TLE format places it in columns 3-7 (1-indexed)."""
+    try:
+        return int(line1[2:7].strip())
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def fetch_transponders(norad_cat_id):
+    """Fetches known transmitters/transponders for a satellite from
+    SatNOGS DB. Returns a list of dicts: {"description", "uplink_mhz",
+    "downlink_mhz", "mode", "alive"} -- frequencies converted from
+    SatNOGS' native Hz to MHz (matching this app's display convention),
+    alive/active entries sorted first since a satellite can have several
+    transmitters (e.g. a voice repeater vs. a telemetry beacon) and
+    decommissioned ones are still useful reference but shouldn't be the
+    default pick. Raises on failure -- callers should catch and report."""
+    url = f"{SATNOGS_TRANSMITTERS_URL}?norad_cat_id={norad_cat_id}&format=json"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "IcomRadioControlApp/1.0 (desktop ham radio control application)"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    results = []
+    for entry in data:
+        downlink_hz = entry.get("downlink_low")
+        uplink_hz = entry.get("uplink_low")
+        results.append({
+            "description": entry.get("description") or entry.get("type") or "Transmitter",
+            "downlink_mhz": f"{downlink_hz / 1e6:.4f}" if downlink_hz else "",
+            "uplink_mhz": f"{uplink_hz / 1e6:.4f}" if uplink_hz else "",
+            "mode": entry.get("mode") or "",
+            "alive": bool(entry.get("alive")),
+        })
+    results.sort(key=lambda r: not r["alive"])
+    return results
+
+
+class TransponderChoiceDialog(QDialog):
+    """Shown when SatNOGS DB has multiple known transmitters for a
+    satellite -- lets the user pick which one to use to fill in the
+    uplink/downlink/mode fields (e.g. a satellite's FM voice repeater
+    vs. its telemetry beacon)."""
+
+    def __init__(self, satellite_name, transponders, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Choose Transponder -- {satellite_name}")
+        self.resize(460, 300)
+        self._transponders = transponders
+
+        self.list_widget = QTableWidget(len(transponders), 4)
+        self.list_widget.setHorizontalHeaderLabels(["Description", "Uplink (MHz)", "Downlink (MHz)", "Mode"])
+        self.list_widget.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.list_widget.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.list_widget.setSelectionBehavior(QTableWidget.SelectRows)
+        for row, transponder in enumerate(transponders):
+            description = transponder["description"] + ("" if transponder["alive"] else " (inactive)")
+            self.list_widget.setItem(row, 0, QTableWidgetItem(description))
+            self.list_widget.setItem(row, 1, QTableWidgetItem(transponder["uplink_mhz"]))
+            self.list_widget.setItem(row, 2, QTableWidgetItem(transponder["downlink_mhz"]))
+            self.list_widget.setItem(row, 3, QTableWidgetItem(transponder["mode"]))
+        self.list_widget.selectRow(0)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("SatNOGS DB found multiple transmitters for this satellite:"))
+        layout.addWidget(self.list_widget)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def chosen_transponder(self):
+        row = self.list_widget.currentRow()
+        if 0 <= row < len(self._transponders):
+            return self._transponders[row]
+        return None
+
+
+class ManualTleDialog(QDialog):
+    """Simple form for manually adding a satellite by pasting its name
+    and two TLE lines directly -- e.g. one not in CelesTrak's amateur
+    group, or a custom/private TLE."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Satellite")
+        self.name_input = QLineEdit()
+        self.line1_input = QLineEdit()
+        self.line1_input.setPlaceholderText("1 25544U 98067A   ...")
+        self.line2_input = QLineEdit()
+        self.line2_input.setPlaceholderText("2 25544  51.6400 ...")
+
+        form = QFormLayout()
+        form.addRow("Name:", self.name_input)
+        form.addRow("TLE Line 1:", self.line1_input)
+        form.addRow("TLE Line 2:", self.line2_input)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._on_accept)
+        button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+        self._result = None
+
+    def _on_accept(self):
+        name = self.name_input.text().strip()
+        line1 = self.line1_input.text().strip()
+        line2 = self.line2_input.text().strip()
+        if not name or not line1.startswith("1 ") or not line2.startswith("2 "):
+            QMessageBox.warning(
+                self, "Add Satellite",
+                "Name is required, and TLE lines must start with \"1 \" and \"2 \" respectively."
+            )
+            return
+        self._result = {
+            "name": name, "line1": line1, "line2": line2,
+            "uplink_mhz": "", "downlink_mhz": "", "mode": "", "selected": True,
+        }
+        self.accept()
+
+    def result_satellite(self):
+        return self._result
+
+
+class SatelliteConfigDialog(QDialog):
+    """Right-click the Satellites button to open this: manage tracked
+    satellites -- refresh TLEs from CelesTrak, add/remove satellites,
+    edit transponder info, and choose which ones display on the map."""
+
+    def __init__(self, satellites, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Satellite Tracking")
+        self.resize(560, 400)
+        self._satellites = [dict(sat) for sat in satellites]  # local working copy until OK is pressed
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Show", "Name", "Uplink (MHz)", "Downlink (MHz)", "Mode"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._rebuild_table()
+
+        self.refresh_button = QPushButton("Refresh TLEs from CelesTrak")
+        self.refresh_button.clicked.connect(self._on_refresh_tles)
+        self.fetch_transponder_button = QPushButton("Fetch Transponder Data (SatNOGS)")
+        self.fetch_transponder_button.setToolTip(
+            "Looks up known transmitters for the selected satellite(s) in "
+            "SatNOGS DB (an open, community-maintained database) by NORAD "
+            "catalog number."
+        )
+        self.fetch_transponder_button.clicked.connect(self._on_fetch_transponders)
+        self.add_button = QPushButton("Add Satellite...")
+        self.add_button.clicked.connect(self._on_add_satellite)
+        self.remove_button = QPushButton("Remove Selected")
+        self.remove_button.clicked.connect(self._on_remove_satellite)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.refresh_button)
+        button_row.addWidget(self.fetch_transponder_button)
+        button_row.addWidget(self.add_button)
+        button_row.addWidget(self.remove_button)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._on_accept)
+        button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel(
+            "Check satellites to display on the map. Select one or more rows "
+            "and click \"Fetch Transponder Data\" to look up uplink/downlink/"
+            "mode from SatNOGS DB, or enter/edit it directly in the table."
+        ))
+        layout.addWidget(self.table)
+        layout.addLayout(button_row)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def _rebuild_table(self):
+        self.table.setRowCount(len(self._satellites))
+        for row, sat in enumerate(self._satellites):
+            show_item = QTableWidgetItem()
+            show_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            show_item.setCheckState(Qt.Checked if sat.get("selected") else Qt.Unchecked)
+            self.table.setItem(row, 0, show_item)
+
+            name_item = QTableWidgetItem(sat.get("name", ""))
+            name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table.setItem(row, 1, name_item)
+
+            self.table.setItem(row, 2, QTableWidgetItem(sat.get("uplink_mhz", "")))
+            self.table.setItem(row, 3, QTableWidgetItem(sat.get("downlink_mhz", "")))
+            self.table.setItem(row, 4, QTableWidgetItem(sat.get("mode", "")))
+
+    def _on_refresh_tles(self):
+        try:
+            entries = fetch_amateur_tles()
+        except Exception as exc:
+            QMessageBox.critical(self, "Refresh TLEs", f"Couldn't fetch TLE data from CelesTrak:\n{exc}")
+            return
+        by_name = {name: (line1, line2) for name, line1, line2 in entries}
+        updated = 0
+        for sat in self._satellites:
+            if sat["name"] in by_name:
+                sat["line1"], sat["line2"] = by_name[sat["name"]]
+                updated += 1
+        existing_names = {sat["name"] for sat in self._satellites}
+        added = 0
+        for name, line1, line2 in entries:
+            if name not in existing_names:
+                self._satellites.append({
+                    "name": name, "line1": line1, "line2": line2,
+                    "uplink_mhz": "", "downlink_mhz": "", "mode": "",
+                    "selected": False,
+                })
+                added += 1
+        self._rebuild_table()
+        QMessageBox.information(
+            self, "Refresh TLEs",
+            f"Updated {updated} existing satellite(s), added {added} new one(s) "
+            "from CelesTrak's amateur radio satellite list."
+        )
+
+    def _on_add_satellite(self):
+        dialog = ManualTleDialog(self)
+        if dialog.exec() == QDialog.Accepted and dialog.result_satellite():
+            self._satellites.append(dialog.result_satellite())
+            self._rebuild_table()
+
+    def _on_remove_satellite(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            del self._satellites[row]
+        self._rebuild_table()
+
+    def _on_fetch_transponders(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(
+                self, "Fetch Transponder Data", "Select one or more satellites in the table first."
+            )
+            return
+        for row in rows:
+            sat = self._satellites[row]
+            norad_id = norad_id_from_tle_line1(sat.get("line1", ""))
+            if norad_id is None:
+                QMessageBox.warning(
+                    self, "Fetch Transponder Data",
+                    f"Couldn't determine a NORAD catalog number for {sat.get('name', '?')} from its TLE."
+                )
+                continue
+            try:
+                transponders = fetch_transponders(norad_id)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Fetch Transponder Data",
+                    f"Couldn't fetch data for {sat.get('name', '?')} (NORAD {norad_id}):\n{exc}"
+                )
+                continue
+            if not transponders:
+                QMessageBox.information(
+                    self, "Fetch Transponder Data",
+                    f"SatNOGS DB has no transmitters listed for {sat.get('name', '?')} (NORAD {norad_id})."
+                )
+                continue
+            if len(transponders) == 1:
+                chosen = transponders[0]
+            else:
+                chooser = TransponderChoiceDialog(sat.get("name", "?"), transponders, self)
+                if chooser.exec() != QDialog.Accepted:
+                    continue
+                chosen = chooser.chosen_transponder()
+                if chosen is None:
+                    continue
+            sat["uplink_mhz"] = chosen["uplink_mhz"]
+            sat["downlink_mhz"] = chosen["downlink_mhz"]
+            sat["mode"] = chosen["mode"]
+        self._rebuild_table()
+
+    def _on_accept(self):
+        # Pull edited transponder text + checked state back out of the
+        # table before closing.
+        for row, sat in enumerate(self._satellites):
+            sat["selected"] = self.table.item(row, 0).checkState() == Qt.Checked
+            sat["uplink_mhz"] = self.table.item(row, 2).text()
+            sat["downlink_mhz"] = self.table.item(row, 3).text()
+            sat["mode"] = self.table.item(row, 4).text()
+        self.accept()
+
+    def result_satellites(self):
+        return self._satellites
+
+
+class HamClockWindow(QWidget):
+    """The Ham Dashboard window -- see the module comment above this
+    section for what's in scope and why."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Ham Dashboard")
+        self.resize(680, 520)
+
+        self.map_widget = WorldMapWidget()
+
+        self.utc_label = QLabel("--:--:-- UTC")
+        self.utc_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        self.local_label = QLabel("--:--:-- Local")
+        self.local_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+
+        self.sfi_label = QLabel("SFI: --")
+        self.ssn_label = QLabel("SSN: --")
+        self.k_index_label = QLabel("K-index: --")
+        for label in (self.sfi_label, self.ssn_label, self.k_index_label):
+            label.setStyleSheet("font-size: 16px; font-weight: bold;")
+
+        self.solar_updated_label = QLabel("Solar data: waiting for first update from NOAA...")
+        self.solar_updated_label.setStyleSheet("color: #888; font-size: 11px;")
+
+        # Band conditions: rows = the four standard combined band ranges,
+        # columns = Day/Night. Colored per condition (green=Good,
+        # yellow=Fair, red=Poor/Band Closed) for a quick-glance read,
+        # matching the color conventions used elsewhere in this app.
+        self.band_conditions_table = QTableWidget(len(BAND_CONDITION_RANGES), 2)
+        self.band_conditions_table.setHorizontalHeaderLabels(["Day", "Night"])
+        self.band_conditions_table.setVerticalHeaderLabels(BAND_CONDITION_RANGES)
+        self.band_conditions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.band_conditions_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.band_conditions_table.setSelectionMode(QTableWidget.NoSelection)
+        self.band_conditions_table.setFixedHeight(
+            self.band_conditions_table.horizontalHeader().height()
+            + len(BAND_CONDITION_RANGES) * 28 + 4
+        )
+        for row in range(len(BAND_CONDITION_RANGES)):
+            for col in range(2):
+                item = QTableWidgetItem("--")
+                item.setTextAlignment(Qt.AlignCenter)
+                self.band_conditions_table.setItem(row, col, item)
+
+        self.grid_input = QLineEdit()
+        self.grid_input.setPlaceholderText("Your grid square (e.g. EM12) or \"lat,lon\"")
+        self.grid_set_button = QPushButton("Set")
+        self.grid_set_button.clicked.connect(self._on_set_location)
+
+        self.satellites = load_satellite_data()
+
+        self.satellite_button = QPushButton("Satellites: OFF")
+        self.satellite_button.setCheckable(True)
+        self.satellite_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.satellite_button.setToolTip(
+            "Toggle satellite tracking on the map. Right-click to manage TLE "
+            "data, transponder info, and which satellites are shown."
+        )
+        self.satellite_button.toggled.connect(self._on_satellite_toggled)
+        self.satellite_button.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.satellite_button.customContextMenuRequested.connect(self._on_satellite_config_requested)
+
+        clocks_row = QHBoxLayout()
+        clocks_row.addWidget(self.utc_label)
+        clocks_row.addWidget(self.local_label)
+        clocks_row.addWidget(self.satellite_button)
+
+        solar_row = QHBoxLayout()
+        solar_row.addWidget(self.sfi_label)
+        solar_row.addWidget(self.ssn_label)
+        solar_row.addWidget(self.k_index_label)
+
+        location_row = QHBoxLayout()
+        location_row.addWidget(self.grid_input)
+        location_row.addWidget(self.grid_set_button)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.map_widget, 1)
+        layout.addLayout(clocks_row)
+        layout.addLayout(solar_row)
+        layout.addWidget(self.solar_updated_label)
+        layout.addWidget(QLabel("HF Band Conditions:"))
+        layout.addWidget(self.band_conditions_table)
+        layout.addLayout(location_row)
+        self.setLayout(layout)
+
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._update_clocks)
+        self._clock_timer.start(1000)
+        self._update_clocks()
+
+        # The terminator moves slowly enough that redrawing once a
+        # minute is plenty -- no need to repaint every second.
+        self._map_timer = QTimer(self)
+        self._map_timer.timeout.connect(self.map_widget.update)
+        self._map_timer.start(60_000)
+
+        # Satellites move fast enough (LEO: ~7.8 km/s) that a much
+        # shorter interval than the terminator's makes sense, without
+        # being wasteful -- only actually runs while satellite mode is on.
+        self._satellite_timer = QTimer(self)
+        self._satellite_timer.timeout.connect(self._update_satellite_positions)
+
+        self.solar_worker = SolarDataWorker()
+        self.solar_worker.data_updated.connect(self._on_solar_data)
+        self.solar_worker.start()
+
+    def _update_clocks(self):
+        self.utc_label.setText(datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC"))
+        self.local_label.setText(datetime.datetime.now().strftime("%H:%M:%S Local"))
+
+    def _on_set_location(self):
+        text = self.grid_input.text().strip()
+        if not text:
+            return
+        try:
+            if "," in text:
+                lat_str, lon_str = text.split(",", 1)
+                lat, lon = float(lat_str), float(lon_str)
+            else:
+                lat, lon = maidenhead_to_latlon(text)
+        except Exception as exc:
+            QMessageBox.warning(self, "Location", f"Couldn't parse \"{text}\": {exc}")
+            return
+        self.map_widget.set_operator_location(lat, lon, text)
+
+    def _on_satellite_toggled(self, checked):
+        if checked and not SGP4_AVAILABLE:
+            QMessageBox.warning(
+                self, "Satellite Tracking",
+                "Satellite tracking needs the 'sgp4' package for orbital "
+                "propagation, which isn't installed.\n\n"
+                "Run: pip install sgp4 --break-system-packages"
+            )
+            self.satellite_button.setChecked(False)
+            return
+        self.satellite_button.setText("Satellites: ON" if checked else "Satellites: OFF")
+        self.map_widget.set_satellite_mode(checked)
+        if checked:
+            self._update_satellite_positions()
+            self._satellite_timer.start(5000)
+        else:
+            self._satellite_timer.stop()
+
+    def _on_satellite_config_requested(self, _pos):
+        dialog = SatelliteConfigDialog(self.satellites, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.satellites = dialog.result_satellites()
+            save_satellite_data(self.satellites)
+            if self.satellite_button.isChecked():
+                self._update_satellite_positions()
+
+    def _update_satellite_positions(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        positions = []
+        for sat in self.satellites:
+            if not sat.get("selected"):
+                continue
+            result = propagate_satellite(sat.get("line1", ""), sat.get("line2", ""), now)
+            if result is None:
+                continue
+            lat, lon, altitude_km = result
+            positions.append({
+                "name": sat.get("name", "?"),
+                "lat": lat,
+                "lon": lon,
+                "altitude_km": altitude_km,
+                "footprint": footprint_points(lat, lon, altitude_km),
+            })
+        self.map_widget.set_satellite_positions(positions)
+
+    @Slot(dict)
+    def _on_solar_data(self, data):
+        if "k_index" in data:
+            self.k_index_label.setText(f"K-index: {data['k_index']:.0f}")
+        if "solar_flux" in data:
+            self.sfi_label.setText(f"SFI: {data['solar_flux']:.0f}")
+        if "sunspot_number" in data:
+            self.ssn_label.setText(f"SSN: {data['sunspot_number']}")
+        if "band_conditions" in data:
+            self._update_band_conditions_table(data["band_conditions"])
+
+        errors = {k: v for k, v in data.items() if k.endswith("_error")}
+        if errors:
+            # Full detail goes to the console -- easier to copy/paste from
+            # there than out of a small status label -- while the label
+            # itself just shows a short summary.
+            for key, message in errors.items():
+                print(f"[ERROR] Ham Dashboard: {key}: {message}")
+            self.solar_updated_label.setText(
+                f"Solar data: partial update, some values unavailable "
+                f"({', '.join(errors)} -- see console for full detail)"
+            )
+        else:
+            self.solar_updated_label.setText(
+                f"Solar data: updated {datetime.datetime.now().strftime('%H:%M:%S')}"
+            )
+
+    _BAND_CONDITION_COLORS = {
+        "good": QColor(40, 130, 60),
+        "fair": QColor(160, 140, 30),
+        "poor": QColor(140, 50, 50),
+        "band closed": QColor(70, 70, 70),
+    }
+
+    def _update_band_conditions_table(self, conditions):
+        for row, band_range in enumerate(BAND_CONDITION_RANGES):
+            for col, time_of_day in enumerate(("day", "night")):
+                value = conditions.get((band_range, time_of_day), "--")
+                item = self.band_conditions_table.item(row, col)
+                item.setText(value)
+                color = self._BAND_CONDITION_COLORS.get(value.strip().lower())
+                if color:
+                    item.setBackground(color)
+                    item.setForeground(QColor(255, 255, 255))
+
+    def closeEvent(self, event):
+        self._satellite_timer.stop()
+        self.solar_worker.requestInterruption()
+        self.solar_worker.wait(2000)
+        event.accept()
+
 
 class RadioWindow(QWidget):
     def __init__(self, details):
@@ -2883,6 +4023,18 @@ class RadioWindow(QWidget):
         self.meters_row = QHBoxLayout()
         for widget in self.meter_widgets:
             self.meters_row.addWidget(widget)
+
+        # A second row of three more, same idea, covering the remaining
+        # meter types with useful defaults so all six show something
+        # different out of the box (all nine are still reachable from any
+        # of the six via double-click).
+        self.meter_widget_4 = MeterWidget(meter_type="alc")
+        self.meter_widget_5 = MeterWidget(meter_type="voltage")
+        self.meter_widget_6 = MeterWidget(meter_type="comp")
+        self.meter_widgets.extend([self.meter_widget_4, self.meter_widget_5, self.meter_widget_6])
+        self.meters_row_2 = QHBoxLayout()
+        for widget in (self.meter_widget_4, self.meter_widget_5, self.meter_widget_6):
+            self.meters_row_2.addWidget(widget)
 
         # One button per band this radio supports, rather than a dropdown --
         # built now since the radio model (and therefore band list) is
@@ -2928,6 +4080,15 @@ class RadioWindow(QWidget):
         self.ptt_button.setEnabled(False)
         self.ptt_button.setToolTip("Click to transmit, click again to release")
         self.ptt_button.toggled.connect(self._on_ptt_toggled)
+
+        self.hamclock_button = QPushButton("Ham Dashboard")
+        self.hamclock_button.setToolTip(
+            "Opens a HamClock-inspired dashboard: day/night world map, UTC/"
+            "local clocks, and live solar-terrestrial data (SFI/SSN/K-index) "
+            "from NOAA's public feeds. Doesn't need the radio connected."
+        )
+        self.hamclock_button.clicked.connect(self._on_hamclock_button_clicked)
+        self.hamclock_window = None  # created lazily on first click
 
         self.wsjtx_button = QPushButton("Launch WSJT-X")
         self.wsjtx_button.setToolTip(
@@ -3066,6 +4227,7 @@ class RadioWindow(QWidget):
         rigctld_column.addWidget(self.rigctld_button)
 
         self.extra_buttons_row = QHBoxLayout()
+        self.extra_buttons_row.addWidget(self.hamclock_button)
         self.extra_buttons_row.addWidget(self.wsjtx_button)
         self.extra_buttons_row.addLayout(rigctld_column)
         self.extra_buttons_row.addWidget(self.virtual_cable_button)
@@ -3093,6 +4255,7 @@ class RadioWindow(QWidget):
         layout.addWidget(self.spectrum_widget)
         layout.addWidget(self.waterfall_widget)
         layout.addLayout(self.meters_row)
+        layout.addLayout(self.meters_row_2)
         layout.addLayout(self.band_buttons_row)
         layout.addLayout(tuning_row)
         layout.addLayout(levels_row)
@@ -3191,6 +4354,13 @@ class RadioWindow(QWidget):
             self.worker.start_ptt()
         else:
             self.worker.stop_ptt()
+
+    def _on_hamclock_button_clicked(self):
+        if self.hamclock_window is None:
+            self.hamclock_window = HamClockWindow()
+        self.hamclock_window.show()
+        self.hamclock_window.raise_()
+        self.hamclock_window.activateWindow()
 
     def _on_wsjtx_button_clicked(self):
         settings = QSettings("IcomRadioApp", "RadioControl")
@@ -3327,6 +4497,8 @@ class RadioWindow(QWidget):
             )
 
     def closeEvent(self, event):
+        if self.hamclock_window is not None:
+            self.hamclock_window.close()
         if self.rigctld_server is not None:
             self.rigctld_server.stop()
         if self.virtual_cable_button.isChecked():

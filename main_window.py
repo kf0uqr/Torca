@@ -492,14 +492,17 @@ class RadioWindow(QWidget):
         tracking_active = self._active_satellite is not None and self._satellite_tracking_timer.isActive()
         if checked:
             if tracking_active and self.worker.is_connected():
-                self.worker.set_control_value("vfo", "B")
-                self._on_satellite_tracking_tick()  # Doppler-corrected uplink onto VFO B before keying up
+                # switch_to_vfo="B": selects VFO B and sets the Doppler-
+                # corrected uplink on it atomically (select_vfo_and_set_
+                # frequency, not two separate commands -- see its
+                # docstring for why that distinction actually matters
+                # here), before keying up.
+                self._on_satellite_tracking_tick(switch_to_vfo="B")
             self.worker.start_ptt()
         else:
             self.worker.stop_ptt()
             if tracking_active and self.worker.is_connected():
-                self.worker.set_control_value("vfo", "A")
-                self._on_satellite_tracking_tick()  # restore the Doppler-corrected downlink immediately
+                self._on_satellite_tracking_tick(switch_to_vfo="A")  # restores VFO A + downlink atomically
 
     def _on_hamclock_button_clicked(self):
         if self.hamclock_window is None:
@@ -570,15 +573,14 @@ class RadioWindow(QWidget):
 
     def _start_satellite_tracking(self):
         if self.worker.is_connected():
-            # rigplane/CI-V's "set frequency" always targets whichever VFO
-            # is currently selected on the radio -- make sure that's A
-            # (RX/downlink). Split is enabled here too so PTT (see
-            # _on_ptt_toggled) can swap to VFO B/uplink for the duration
-            # of a transmission without the radio's own RX ever moving
-            # off VFO A/downlink.
-            self.worker.set_control_value("vfo", "A")
+            # Split is enabled here so PTT (see _on_ptt_toggled) can swap
+            # to VFO B/uplink for the duration of a transmission without
+            # the radio's own RX ever moving off VFO A/downlink.
             self.worker.set_control_value("split", True)
-        self._on_satellite_tracking_tick()
+        # rigplane/CI-V's "set frequency" always targets whichever VFO is
+        # currently selected on the radio -- make sure that's A (RX/
+        # downlink) before/alongside the first correction.
+        self._on_satellite_tracking_tick(switch_to_vfo="A")
         self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
 
     def _stop_satellite_tracking(self):
@@ -590,7 +592,12 @@ class RadioWindow(QWidget):
         if self.worker.is_connected():
             self.worker.set_control_value("split", False)
 
-    def _on_satellite_tracking_tick(self):
+    def _on_satellite_tracking_tick(self, switch_to_vfo=None):
+        """switch_to_vfo ("A"/"B"/None): pass this when the tick needs
+        to switch VFO first (PTT press/release, or the very first tick
+        after selecting a satellite) -- see select_vfo_and_set_frequency()
+        for why that has to happen atomically with the frequency it's
+        paired with rather than as two separately-dispatched commands."""
         satellite = self._active_satellite
         if satellite is None:
             return
@@ -619,11 +626,11 @@ class RadioWindow(QWidget):
             crossing_text = f"{self._next_satellite_crossing['event']} in {format_countdown(remaining)}"
 
         doppler_text = ""
+        freq_hz = None
         transponder = self.satellite_transponder_combo.currentData()
         if transponder is not None:
-            # While PTT is held, correct the uplink (on VFO B, which
-            # _on_ptt_toggled already switched to) instead of the
-            # downlink -- this tick keeps running every
+            # While PTT is held, correct the uplink (on VFO B) instead of
+            # the downlink -- this tick keeps running every
             # SATELLITE_TRACKING_INTERVAL_MS the whole time PTT is down,
             # same as it does for the downlink at other times.
             transmitting = self.ptt_button.isChecked()
@@ -648,12 +655,19 @@ class RadioWindow(QWidget):
                     uplink=transmitting,
                 )
                 if result is not None:
-                    if self.worker.is_connected():
-                        self.worker.set_frequency(round(result["frequency_hz"]))
+                    freq_hz = round(result["frequency_hz"])
                     direction = "TX" if transmitting else "RX"
                     doppler_text = f"  {direction} Doppler {result['doppler_hz']:+.0f} Hz"
                     if not transmitting and self._satellite_freq_offset_hz:
                         doppler_text += f"  Offset {self._satellite_freq_offset_hz:+.0f} Hz"
+
+        if self.worker.is_connected():
+            if switch_to_vfo is not None and freq_hz is not None:
+                self.worker.select_vfo_and_set_frequency(switch_to_vfo, freq_hz)
+            elif switch_to_vfo is not None:
+                self.worker.set_control_value("vfo", switch_to_vfo)
+            elif freq_hz is not None:
+                self.worker.set_frequency(freq_hz)
 
         visibility = "up" if look["elevation_deg"] >= 0 else "down"
         self.satellite_overlay_label.setText(

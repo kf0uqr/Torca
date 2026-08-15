@@ -323,6 +323,58 @@ def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observe
     }
 
 
+def _find_crossing(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km,
+                    step_seconds, max_steps):
+    """Scans from dt_utc in steps of step_seconds (negative steps search
+    backward in time instead of forward) until elevation crosses zero,
+    then bisects for a precise crossing time. Direction-agnostic: the
+    bisection midpoint formula (lo + (hi-lo)/2) lands at the arithmetic
+    midpoint between two datetimes regardless of which is chronologically
+    earlier, so the same loop serves both next_aos_los() (forward) and
+    current_pass()'s backward search for a pass's actual start. Returns
+    the crossing datetime, or None if none found within max_steps or
+    propagation fails."""
+    current = satellite_look_angles(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km)
+    if current is None:
+        return None
+    prev_t, prev_elevation = dt_utc, current["elevation_deg"]
+    for step in range(1, max_steps + 1):
+        t = dt_utc + datetime.timedelta(seconds=step * step_seconds)
+        look = satellite_look_angles(line1, line2, t, observer_lat, observer_lon, observer_elevation_km)
+        if look is None:
+            return None
+        elevation = look["elevation_deg"]
+        if (elevation >= 0) != (prev_elevation >= 0):
+            lo, hi, lo_elevation = prev_t, t, prev_elevation
+            for _ in range(20):
+                mid = lo + (hi - lo) / 2
+                mid_look = satellite_look_angles(line1, line2, mid, observer_lat, observer_lon, observer_elevation_km)
+                if mid_look is None:
+                    break
+                if (mid_look["elevation_deg"] >= 0) == (lo_elevation >= 0):
+                    lo, lo_elevation = mid, mid_look["elevation_deg"]
+                else:
+                    hi = mid
+            return hi
+        prev_t, prev_elevation = t, elevation
+    return None
+
+
+def _pass_max_elevation_deg(line1, line2, aos_time, los_time, observer_lat, observer_lon, observer_elevation_km):
+    """Samples elevation across an AOS->LOS window (~40 samples) for the
+    peak reached during the pass -- shared by current_pass() and
+    find_passes(), which both need this over a known aos/los pair."""
+    max_elevation_deg = 0.0
+    sample_step = max(5.0, (los_time - aos_time).total_seconds() / 40.0)
+    t = aos_time
+    while t <= los_time:
+        look = satellite_look_angles(line1, line2, t, observer_lat, observer_lon, observer_elevation_km)
+        if look is not None:
+            max_elevation_deg = max(max_elevation_deg, look["elevation_deg"])
+        t += datetime.timedelta(seconds=sample_step)
+    return max_elevation_deg
+
+
 def next_aos_los(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0,
                   search_horizon_hours=48, coarse_step_seconds=30):
     """Finds this satellite's next horizon crossing (elevation 0
@@ -348,40 +400,74 @@ def next_aos_los(line1, line2, dt_utc, observer_lat, observer_lon, observer_elev
     if current is None:
         return None
     event = "LOS" if current["elevation_deg"] >= 0 else "AOS"
-
     max_steps = int(search_horizon_hours * 3600 / coarse_step_seconds)
-    prev_t, prev_elevation = dt_utc, current["elevation_deg"]
-    for step in range(1, max_steps + 1):
-        t = dt_utc + datetime.timedelta(seconds=step * coarse_step_seconds)
-        look = satellite_look_angles(line1, line2, t, observer_lat, observer_lon, observer_elevation_km)
-        if look is None:
-            return None
-        elevation = look["elevation_deg"]
-        if (elevation >= 0) != (prev_elevation >= 0):
-            lo, hi, lo_elevation = prev_t, t, prev_elevation
-            for _ in range(20):
-                mid = lo + (hi - lo) / 2
-                mid_look = satellite_look_angles(line1, line2, mid, observer_lat, observer_lon, observer_elevation_km)
-                if mid_look is None:
-                    break
-                if (mid_look["elevation_deg"] >= 0) == (lo_elevation >= 0):
-                    lo, lo_elevation = mid, mid_look["elevation_deg"]
-                else:
-                    hi = mid
-            return {"event": event, "time_utc": hi, "seconds_away": (hi - dt_utc).total_seconds()}
-        prev_t, prev_elevation = t, elevation
-    return None
+    crossing_time = _find_crossing(
+        line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km,
+        coarse_step_seconds, max_steps,
+    )
+    if crossing_time is None:
+        return None
+    return {"event": event, "time_utc": crossing_time, "seconds_away": (crossing_time - dt_utc).total_seconds()}
+
+
+def current_pass(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0,
+                  search_horizon_hours=24, coarse_step_seconds=30):
+    """If the satellite is above the horizon right now, returns the
+    full pass it's in the middle of: {"aos_time" (in the past),
+    "los_time" (upcoming), "duration_seconds", "max_elevation_deg"} --
+    by searching backward for when it actually rose (so max_elevation_deg
+    and duration_seconds cover the WHOLE pass, same as every entry
+    find_passes() returns, not just the part still ahead) and forward
+    for when it'll set. Returns None if it's not currently above the
+    horizon, or if either search/propagation fails.
+
+    24h default, not a tighter one matched to a typical LEO pass's
+    length (tens of minutes) -- confirmed live against AO-10 (a
+    Molniya-type highly elliptical orbit, not a LEO cubesat, also in
+    this app's own amateur-satellite list): elevation 45 degrees "now"
+    with an AOS that turned out to be ~9 hours earlier. A tighter bound
+    would silently miss that satellite's active pass entirely (it'd
+    just fall through to find_passes()'s forward search and report the
+    wrong, later pass as "next" instead of recognizing it's up right
+    now)."""
+    current = satellite_look_angles(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km)
+    if current is None or current["elevation_deg"] < 0:
+        return None
+    max_steps = int(search_horizon_hours * 3600 / coarse_step_seconds)
+    aos_time = _find_crossing(
+        line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km,
+        -coarse_step_seconds, max_steps,
+    )
+    los_time = _find_crossing(
+        line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km,
+        coarse_step_seconds, max_steps,
+    )
+    if aos_time is None or los_time is None:
+        return None
+    max_elevation_deg = max(
+        current["elevation_deg"],
+        _pass_max_elevation_deg(line1, line2, aos_time, los_time, observer_lat, observer_lon, observer_elevation_km),
+    )
+    return {
+        "aos_time": aos_time,
+        "los_time": los_time,
+        "duration_seconds": (los_time - aos_time).total_seconds(),
+        "max_elevation_deg": max_elevation_deg,
+    }
 
 
 def find_passes(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0,
                  max_passes=3, search_horizon_hours=168, coarse_step_seconds=60):
-    """Finds up to max_passes upcoming complete passes (AOS -> LOS) for
-    one satellite after dt_utc. Returns a list of dicts, soonest first:
-    {"aos_time", "los_time", "duration_seconds", "max_elevation_deg"}.
-    Stops early (possibly with fewer than max_passes, or an empty list)
-    once no further crossing is found within search_horizon_hours of
-    dt_utc -- e.g. a geometry where this satellite doesn't rise again
-    for this observer within that window, or a decayed/invalid TLE.
+    """Finds up to max_passes passes for one satellite starting from
+    dt_utc, soonest first -- including one already in progress right now
+    (see current_pass()), counted against max_passes same as any other.
+    Returns a list of dicts: {"aos_time", "los_time", "duration_seconds",
+    "max_elevation_deg", "active"} ("active" True only for a pass
+    already under way at dt_utc). Stops early (possibly with fewer than
+    max_passes, or an empty list) once no further crossing is found
+    within search_horizon_hours of dt_utc -- e.g. a geometry where this
+    satellite doesn't rise again for this observer within that window,
+    or a decayed/invalid TLE.
 
     coarse_step_seconds defaults coarser than next_aos_los()'s own 30s
     default -- fine for a multi-day-ahead pass *listing* (a minute of
@@ -390,6 +476,16 @@ def find_passes(line1, line2, dt_utc, observer_lat, observer_lon, observer_eleva
     multiple satellites adds up fast otherwise."""
     passes = []
     cursor = dt_utc
+
+    active = current_pass(
+        line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km,
+        search_horizon_hours=min(24, search_horizon_hours), coarse_step_seconds=coarse_step_seconds,
+    )
+    if active is not None:
+        active["active"] = True
+        passes.append(active)
+        cursor = active["los_time"] + datetime.timedelta(seconds=1)
+
     while len(passes) < max_passes:
         remaining_hours = search_horizon_hours - (cursor - dt_utc).total_seconds() / 3600.0
         if remaining_hours <= 0:
@@ -401,9 +497,10 @@ def find_passes(line1, line2, dt_utc, observer_lat, observer_lon, observer_eleva
         if first is None:
             break
         if first["event"] == "LOS":
-            # Currently mid-pass -- this LOS belongs to a pass that
-            # already started before dt_utc (no AOS in the future to
-            # report), so skip past it and look for the next real AOS.
+            # Shouldn't normally happen (the active-pass check above
+            # already accounts for a pass in progress at dt_utc) -- but
+            # if it does, skip past it rather than report a bare LOS
+            # with no AOS.
             cursor = first["time_utc"] + datetime.timedelta(seconds=1)
             continue
 
@@ -418,20 +515,14 @@ def find_passes(line1, line2, dt_utc, observer_lat, observer_lon, observer_eleva
             break  # an AOS should always be followed by a LOS -- bail out safely if not
 
         los_time = second["time_utc"]
-        max_elevation_deg = 0.0
-        sample_step = max(5.0, (los_time - aos_time).total_seconds() / 40.0)  # ~40 samples across the pass
-        t = aos_time
-        while t <= los_time:
-            look = satellite_look_angles(line1, line2, t, observer_lat, observer_lon, observer_elevation_km)
-            if look is not None:
-                max_elevation_deg = max(max_elevation_deg, look["elevation_deg"])
-            t += datetime.timedelta(seconds=sample_step)
-
         passes.append({
             "aos_time": aos_time,
             "los_time": los_time,
             "duration_seconds": (los_time - aos_time).total_seconds(),
-            "max_elevation_deg": max_elevation_deg,
+            "max_elevation_deg": _pass_max_elevation_deg(
+                line1, line2, aos_time, los_time, observer_lat, observer_lon, observer_elevation_km
+            ),
+            "active": False,
         })
         cursor = los_time + datetime.timedelta(seconds=1)
     return passes

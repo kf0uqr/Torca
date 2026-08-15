@@ -121,7 +121,7 @@ class HamClockWindow(QWidget):
         # found (never more than PASSES_DISPLAY_COUNT) rather than
         # padding out to a fixed 10 with blank rows.
         self.upcoming_passes_table = QTableWidget(0, 4)
-        self.upcoming_passes_table.setHorizontalHeaderLabels(["Satellite", "AOS", "Max El", "Duration"])
+        self.upcoming_passes_table.setHorizontalHeaderLabels(["Satellite", "Status", "Max El", "Duration"])
         self.upcoming_passes_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.upcoming_passes_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.upcoming_passes_table.setSelectionMode(QTableWidget.NoSelection)
@@ -130,6 +130,8 @@ class HamClockWindow(QWidget):
             self.upcoming_passes_table.horizontalHeader().height()
             + self.PASSES_DISPLAY_COUNT * 24 + 4
         )
+        self.upcoming_passes_table.setToolTip("Double-click a row to select that satellite, same as double-clicking it on the map.")
+        self.upcoming_passes_table.cellDoubleClicked.connect(self._on_pass_row_double_clicked)
 
         self.satellites = load_satellite_data()
         self._upcoming_passes = []  # cached results from the last upcoming_passes() call
@@ -301,11 +303,15 @@ class HamClockWindow(QWidget):
         self._update_passes_countdowns()
 
     def _update_passes_countdowns(self):
-        """Refreshes just the "AOS" column's countdown text from the
-        cached self._upcoming_passes -- plain subtraction against
-        already-known absolute times, no orbital math, cheap enough to
-        run on the 1-second clock timer even though the underlying
-        search only reruns every few minutes."""
+        """Refreshes just the "Status" column's text from the cached
+        self._upcoming_passes -- plain subtraction against already-known
+        absolute times, no orbital math, cheap enough to run on the
+        1-second clock timer even though the underlying search only
+        reruns every few minutes. Derived from a live now-vs-aos/los
+        comparison rather than the "active" flag set when the pass was
+        found, so a pass that starts (or ends) between full searches is
+        reflected correctly here too, not just at the next 5-minute
+        refresh."""
         if not self._upcoming_passes:
             return
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -313,12 +319,19 @@ class HamClockWindow(QWidget):
             if now < pass_info["aos_time"]:
                 text = f"in {format_countdown((pass_info['aos_time'] - now).total_seconds())}"
             elif now <= pass_info["los_time"]:
-                text = "ACTIVE now"
+                text = f"ACTIVE, sets in {format_countdown((pass_info['los_time'] - now).total_seconds())}"
             else:
                 text = "passed"  # stale -- _refresh_upcoming_passes will drop it at the next full search
             item = self.upcoming_passes_table.item(row, 1)
             if item is not None:
                 item.setText(text)
+
+    def _on_pass_row_double_clicked(self, row, _column):
+        """Double-clicking a row here is the same as double-clicking
+        that satellite's marker on the map."""
+        if row >= len(self._upcoming_passes):
+            return
+        self._on_satellite_double_clicked(self._upcoming_passes[row]["name"])
 
     def _on_satellite_double_clicked(self, name):
         satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)

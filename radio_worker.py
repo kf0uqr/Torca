@@ -807,6 +807,37 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(str(exc))
 
+    def select_vfo_and_set_frequency(self, vfo_value, freq_hz: int):
+        """Thread-safe: call from the GUI thread. Selects VFO A/B and
+        THEN sets its frequency, as one sequential coroutine rather than
+        two independently-scheduled ones (set_control_value("vfo", ...)
+        followed by set_frequency(...)). That pairing looks like it
+        should just work in order since it's called that way from the
+        GUI thread, but it doesn't actually guarantee anything: each
+        becomes its own asyncio Task, and once the first yields to the
+        event loop during its own real over-the-wire CI-V/serial round
+        trip, the second is free to start running before the first has
+        actually finished on the radio's side -- landing the frequency
+        change on whatever VFO was PREVIOUSLY active. A single coroutine
+        awaiting both in sequence has no such race: nothing about it
+        yields control back to some OTHER task between those two awaits.
+        Used for satellite split-mode PTT (main_window.py), where a
+        frequency has to land on the VFO just switched to, not whichever
+        one happened to still be selected."""
+        if self.loop is None or self.radio is None:
+            return
+        if "vfo" not in self._control_methods:
+            self.error.emit(
+                f"{CONTROL_DEFINITIONS['vfo']['label']}: not available on this radio/install "
+                "(no working getter+setter was found on connect) -- frequency not changed."
+            )
+            return
+        asyncio.run_coroutine_threadsafe(self._select_vfo_and_set_frequency(vfo_value, freq_hz), self.loop)
+
+    async def _select_vfo_and_set_frequency(self, vfo_value, freq_hz: int):
+        await self._set_control_value("vfo", vfo_value)
+        await self._set_frequency(freq_hz)
+
     def select_band(self, band_label: str, low_edge_hz: int):
         """Thread-safe. Tries Icom's confirmed get_bsr() band-stacking
         recall first -- reads whatever frequency was last used on that

@@ -575,8 +575,22 @@ class RadioWindow(QWidget):
         if self.worker.is_connected():
             # Split is enabled here so PTT (see _on_ptt_toggled) can swap
             # to VFO B/uplink for the duration of a transmission without
-            # the radio's own RX ever moving off VFO A/downlink.
-            self.worker.set_control_value("split", True)
+            # the radio's own RX ever moving off VFO A/downlink. Checked
+            # explicitly (not just left to set_control_value()'s own
+            # console [ERROR] line) since split's setter, like vfo's, was
+            # never confirmed against real hardware -- if it's silently
+            # not working, PTT would key up without split actually on,
+            # and better to say so up front than have that show up as an
+            # unexplained "nothing happens" on the next transmission.
+            if self.worker.control_available("split"):
+                self.worker.set_control_value("split", True)
+            else:
+                QMessageBox.warning(
+                    self, "Satellite Tracking",
+                    "Split mode control isn't available on this radio/install -- "
+                    "PTT won't be able to switch to the Doppler-corrected uplink. "
+                    "Downlink tracking will still work."
+                )
         # rigplane/CI-V's "set frequency" always targets whichever VFO is
         # currently selected on the radio -- make sure that's A (RX/
         # downlink) before/alongside the first correction.
@@ -661,18 +675,42 @@ class RadioWindow(QWidget):
                     if not transmitting and self._satellite_freq_offset_hz:
                         doppler_text += f"  Offset {self._satellite_freq_offset_hz:+.0f} Hz"
 
+        warning_text = ""
         if self.worker.is_connected():
-            if switch_to_vfo is not None and freq_hz is not None:
+            if switch_to_vfo is not None and not self.worker.control_available("vfo"):
+                # Surfaced here, inline, rather than only as a console
+                # [ERROR] line from set_control_value()/
+                # select_vfo_and_set_frequency() themselves -- "vfo"'s
+                # setter was never confirmed against real hardware (see
+                # its CONTROL_DEFINITIONS entry), so if it's not actually
+                # working on this radio, split-mode PTT would otherwise
+                # fail completely silently from the operator's chair:
+                # freq_hz still gets computed correctly below, but
+                # nothing would switch VFO, and the frequency command
+                # would land on whatever VFO was already selected.
+                warning_text = "  [VFO control unavailable -- can't switch bands]"
+            elif switch_to_vfo is not None and freq_hz is not None:
                 self.worker.select_vfo_and_set_frequency(switch_to_vfo, freq_hz)
             elif switch_to_vfo is not None:
                 self.worker.set_control_value("vfo", switch_to_vfo)
             elif freq_hz is not None:
                 self.worker.set_frequency(freq_hz)
 
+            if freq_hz is not None and not warning_text:
+                # Update optimistically, same as _on_knob_steps/
+                # _on_band_selected -- otherwise the main frequency
+                # readout and band-button highlight just sit still until
+                # the next 0.5s poll cycle confirms them, which reads as
+                # "frozen", especially right at a PTT-triggered VFO/band
+                # switch.
+                self._current_freq_hz = freq_hz
+                self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                self._update_band_button_highlight()
+
         visibility = "up" if look["elevation_deg"] >= 0 else "down"
         self.satellite_overlay_label.setText(
             f"{satellite.get('name', '?')} ({visibility})\n"
-            f"El {look['elevation_deg']:.1f}°  Az {look['azimuth_deg']:.1f}°{doppler_text}\n"
+            f"El {look['elevation_deg']:.1f}°  Az {look['azimuth_deg']:.1f}°{doppler_text}{warning_text}\n"
             f"{crossing_text}"
         )
         self.spectrum_widget.reposition_overlays()

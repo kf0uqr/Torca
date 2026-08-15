@@ -254,5 +254,13 @@ class WorldMapWidget(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(255, 140, 0))
         painter.drawEllipse(QPointF(x, y), 4, 4)
-        painter.setPen(QColor(255, 220, 180))
-        painter.drawText(QPointF(x + 6, y - 6), sat["name"])
+
+        # Outlined (dark halo + light fill) rather than a flat light
+        # color -- a flat color only reads well over the night-shaded
+        # hemisphere; over a light daytime landmass it nearly disappears.
+        # A stroked QPainterPath keeps it legible over either.
+        path = QPainterPath()
+        path.addText(QPointF(x + 6, y - 6), painter.font(), sat["name"])
+        painter.setPen(QPen(QColor(15, 15, 20), 3))
+        painter.setBrush(QColor(255, 230, 190))
+        painter.drawPath(path)

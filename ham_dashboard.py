@@ -319,7 +319,7 @@ class HamClockWindow(QWidget):
             if now < pass_info["aos_time"]:
                 text = f"in {format_countdown((pass_info['aos_time'] - now).total_seconds())}"
             elif now <= pass_info["los_time"]:
-                text = f"ACTIVE, sets in {format_countdown((pass_info['los_time'] - now).total_seconds())}"
+                text = "ACTIVE"
             else:
                 text = "passed"  # stale -- _refresh_upcoming_passes will drop it at the next full search
             item = self.upcoming_passes_table.item(row, 1)

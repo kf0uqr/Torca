@@ -796,6 +796,18 @@ class RadioWorker(QThread):
         connection is actually up, not just while it's being attempted."""
         return self.radio is not None
 
+    def control_available(self, key: str) -> bool:
+        """Thread-safe: call from the GUI thread. True once a working
+        getter+setter for this CONTROL_DEFINITIONS key was actually found
+        on this radio/install at connect time -- lets a caller check
+        before relying on set_control_value()/select_vfo_and_set_frequency()
+        actually doing anything, rather than only finding out from an
+        error message after the fact (both controls this matters most
+        for, "vfo" and "split", have setter names that were never fully
+        confirmed against real hardware -- see their CONTROL_DEFINITIONS
+        entries in constants.py)."""
+        return key in self._control_methods
+
     def set_frequency(self, freq_hz: int):
         if self.loop is None or self.radio is None:
             return

@@ -578,6 +578,7 @@ class RadioWindow(QWidget):
         look = satellite_look_angles(line1, line2, now, observer_lat, observer_lon, observer_elevation_km)
         if look is None:
             self.satellite_overlay_label.setText(f"{satellite.get('name', '?')}\nOrbit propagation failed (invalid TLE?)")
+            self.spectrum_widget.reposition_overlays()
             return
 
         # The AOS/LOS search is a real (if cheap) computation -- only
@@ -623,6 +624,7 @@ class RadioWindow(QWidget):
             f"El {look['elevation_deg']:.1f}°  Az {look['azimuth_deg']:.1f}°{doppler_text}\n"
             f"{crossing_text}"
         )
+        self.spectrum_widget.reposition_overlays()
 
     def _on_wsjtx_button_clicked(self):
         settings = QSettings("IcomRadioApp", "RadioControl")

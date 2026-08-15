@@ -40,8 +40,23 @@ from satellite_tracking import (
     save_satellite_data,
     propagate_satellite,
     footprint_points,
+    upcoming_passes,
+    format_countdown,
     SGP4_AVAILABLE,
 )
+
+# Recomputing pass predictions (upcoming_passes) is real work -- SGP4
+# propagation across a multi-day search window for every selected
+# satellite -- unlike the map position update, which is one propagation
+# call per selected satellite per tick. Confirmed live: ~1s for 10
+# selected satellites, ~4s worst case with all 97 in this app's own
+# amateur-satellite list selected at once. A 5-minute refresh keeps that
+# cost rare and pass predictions don't meaningfully change minute to
+# minute anyway; the *displayed* countdown to each pass still updates
+# every second by simple subtraction from the cached absolute times
+# (see _update_passes_countdowns), piggybacked on the existing clock
+# timer rather than a separate one.
+PASSES_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
 class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
@@ -49,6 +64,7 @@ class HamClockWindow(QWidget):
     observer_elevation_m come from ConnectionDialog."""
 
     satellite_selected = Signal(dict)  # emitted on a valid double-click; RadioWindow does the rest
+    PASSES_DISPLAY_COUNT = 10
 
     def __init__(self, observer_lat=None, observer_lon=None,
                  observer_elevation_m=0.0, parent=None):
@@ -98,7 +114,25 @@ class HamClockWindow(QWidget):
                 item.setTextAlignment(Qt.AlignCenter)
                 self.band_conditions_table.setItem(row, col, item)
 
+        # Upcoming passes: the next PASSES_DISPLAY_COUNT AOS/LOS windows
+        # across every satellite currently checked to display on the map
+        # (same "selected" scope as the map itself), soonest first. Row
+        # count grows/shrinks with however many passes were actually
+        # found (never more than PASSES_DISPLAY_COUNT) rather than
+        # padding out to a fixed 10 with blank rows.
+        self.upcoming_passes_table = QTableWidget(0, 4)
+        self.upcoming_passes_table.setHorizontalHeaderLabels(["Satellite", "AOS", "Max El", "Duration"])
+        self.upcoming_passes_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.upcoming_passes_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.upcoming_passes_table.setSelectionMode(QTableWidget.NoSelection)
+        self.upcoming_passes_table.verticalHeader().setVisible(False)
+        self.upcoming_passes_table.setFixedHeight(
+            self.upcoming_passes_table.horizontalHeader().height()
+            + self.PASSES_DISPLAY_COUNT * 24 + 4
+        )
+
         self.satellites = load_satellite_data()
+        self._upcoming_passes = []  # cached results from the last upcoming_passes() call
 
         self.satellite_button = QPushButton("Satellites: OFF")
         self.satellite_button.setCheckable(True)
@@ -123,13 +157,24 @@ class HamClockWindow(QWidget):
         solar_row.addWidget(self.ssn_label)
         solar_row.addWidget(self.k_index_label)
 
+        band_conditions_column = QVBoxLayout()
+        band_conditions_column.addWidget(QLabel("HF Band Conditions:"))
+        band_conditions_column.addWidget(self.band_conditions_table)
+
+        upcoming_passes_column = QVBoxLayout()
+        upcoming_passes_column.addWidget(QLabel("Upcoming Satellite Passes:"))
+        upcoming_passes_column.addWidget(self.upcoming_passes_table)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addLayout(band_conditions_column)
+        bottom_row.addLayout(upcoming_passes_column)
+
         layout = QVBoxLayout()
         layout.addWidget(self.map_widget, 1)
         layout.addLayout(clocks_row)
         layout.addLayout(solar_row)
         layout.addWidget(self.solar_updated_label)
-        layout.addWidget(QLabel("HF Band Conditions:"))
-        layout.addWidget(self.band_conditions_table)
+        layout.addLayout(bottom_row)
         self.setLayout(layout)
 
         if self._observer_lat is not None and self._observer_lon is not None:
@@ -155,6 +200,12 @@ class HamClockWindow(QWidget):
         self._satellite_timer = QTimer(self)
         self._satellite_timer.timeout.connect(self._update_satellite_positions)
 
+        # The actual pass search only reruns on this much coarser timer
+        # (also only while satellite mode is on) -- see the module
+        # comment on PASSES_REFRESH_INTERVAL_MS for why.
+        self._passes_timer = QTimer(self)
+        self._passes_timer.timeout.connect(self._refresh_upcoming_passes)
+
         self.solar_worker = SolarDataWorker()
         self.solar_worker.data_updated.connect(self._on_solar_data)
         self.solar_worker.start()
@@ -162,6 +213,7 @@ class HamClockWindow(QWidget):
     def _update_clocks(self):
         self.utc_label.setText(datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC"))
         self.local_label.setText(datetime.datetime.now().strftime("%H:%M:%S Local"))
+        self._update_passes_countdowns()  # cheap (no orbital math) -- piggybacks on this 1s timer
 
     def _on_satellite_toggled(self, checked):
         if checked and not SGP4_AVAILABLE:
@@ -178,8 +230,11 @@ class HamClockWindow(QWidget):
         if checked:
             self._update_satellite_positions()
             self._satellite_timer.start(5000)
+            self._refresh_upcoming_passes()
+            self._passes_timer.start(PASSES_REFRESH_INTERVAL_MS)
         else:
             self._satellite_timer.stop()
+            self._passes_timer.stop()
 
     def _on_satellite_config_requested(self, _pos):
         def persist(satellites):
@@ -195,6 +250,7 @@ class HamClockWindow(QWidget):
             persist(dialog.result_satellites())
             if self.satellite_button.isChecked():
                 self._update_satellite_positions()
+                self._refresh_upcoming_passes()  # the selected/TLE list may have changed
 
     def _update_satellite_positions(self):
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -214,6 +270,55 @@ class HamClockWindow(QWidget):
                 "footprint": footprint_points(lat, lon, altitude_km),
             })
         self.map_widget.set_satellite_positions(positions)
+
+    def _refresh_upcoming_passes(self):
+        """Reruns the actual pass search (upcoming_passes()) -- the
+        expensive part; see PASSES_REFRESH_INTERVAL_MS. No-op (clears
+        the table) without a configured location, same as Doppler
+        correction -- there's no meaningful pass prediction without
+        knowing where the observer is."""
+        selected = [sat for sat in self.satellites if sat.get("selected")]
+        if not selected or (not self._observer_lat and not self._observer_lon):
+            self._upcoming_passes = []
+        else:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            observer_elevation_km = self._observer_elevation_m / 1000.0
+            self._upcoming_passes = upcoming_passes(
+                selected, now, self._observer_lat, self._observer_lon, observer_elevation_km,
+                count=self.PASSES_DISPLAY_COUNT,
+            )
+
+        self.upcoming_passes_table.setRowCount(len(self._upcoming_passes))
+        for row, pass_info in enumerate(self._upcoming_passes):
+            name_item = QTableWidgetItem(pass_info["name"])
+            self.upcoming_passes_table.setItem(row, 0, name_item)
+            for col in (1, 2, 3):
+                item = QTableWidgetItem("")
+                item.setTextAlignment(Qt.AlignCenter)
+                self.upcoming_passes_table.setItem(row, col, item)
+            self.upcoming_passes_table.item(row, 2).setText(f"{pass_info['max_elevation_deg']:.0f}°")
+            self.upcoming_passes_table.item(row, 3).setText(format_countdown(pass_info["duration_seconds"]))
+        self._update_passes_countdowns()
+
+    def _update_passes_countdowns(self):
+        """Refreshes just the "AOS" column's countdown text from the
+        cached self._upcoming_passes -- plain subtraction against
+        already-known absolute times, no orbital math, cheap enough to
+        run on the 1-second clock timer even though the underlying
+        search only reruns every few minutes."""
+        if not self._upcoming_passes:
+            return
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for row, pass_info in enumerate(self._upcoming_passes):
+            if now < pass_info["aos_time"]:
+                text = f"in {format_countdown((pass_info['aos_time'] - now).total_seconds())}"
+            elif now <= pass_info["los_time"]:
+                text = "ACTIVE now"
+            else:
+                text = "passed"  # stale -- _refresh_upcoming_passes will drop it at the next full search
+            item = self.upcoming_passes_table.item(row, 1)
+            if item is not None:
+                item.setText(text)
 
     def _on_satellite_double_clicked(self, name):
         satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
@@ -287,6 +392,7 @@ class HamClockWindow(QWidget):
 
     def closeEvent(self, event):
         self._satellite_timer.stop()
+        self._passes_timer.stop()
         self.solar_worker.requestInterruption()
         self.solar_worker.wait(2000)
         event.accept()

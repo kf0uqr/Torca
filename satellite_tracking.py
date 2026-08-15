@@ -355,6 +355,95 @@ def next_aos_los(line1, line2, dt_utc, observer_lat, observer_lon, observer_elev
     return None
 
 
+def find_passes(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0,
+                 max_passes=3, search_horizon_hours=168, coarse_step_seconds=60):
+    """Finds up to max_passes upcoming complete passes (AOS -> LOS) for
+    one satellite after dt_utc. Returns a list of dicts, soonest first:
+    {"aos_time", "los_time", "duration_seconds", "max_elevation_deg"}.
+    Stops early (possibly with fewer than max_passes, or an empty list)
+    once no further crossing is found within search_horizon_hours of
+    dt_utc -- e.g. a geometry where this satellite doesn't rise again
+    for this observer within that window, or a decayed/invalid TLE.
+
+    coarse_step_seconds defaults coarser than next_aos_los()'s own 30s
+    default -- fine for a multi-day-ahead pass *listing* (a minute of
+    slop on when a pass starts days out doesn't matter the way it does
+    for a live countdown), and multiple searches per satellite times
+    multiple satellites adds up fast otherwise."""
+    passes = []
+    cursor = dt_utc
+    while len(passes) < max_passes:
+        remaining_hours = search_horizon_hours - (cursor - dt_utc).total_seconds() / 3600.0
+        if remaining_hours <= 0:
+            break
+        first = next_aos_los(
+            line1, line2, cursor, observer_lat, observer_lon, observer_elevation_km,
+            search_horizon_hours=remaining_hours, coarse_step_seconds=coarse_step_seconds,
+        )
+        if first is None:
+            break
+        if first["event"] == "LOS":
+            # Currently mid-pass -- this LOS belongs to a pass that
+            # already started before dt_utc (no AOS in the future to
+            # report), so skip past it and look for the next real AOS.
+            cursor = first["time_utc"] + datetime.timedelta(seconds=1)
+            continue
+
+        aos_time = first["time_utc"]
+        remaining_hours = search_horizon_hours - (aos_time - dt_utc).total_seconds() / 3600.0
+        second = next_aos_los(
+            line1, line2, aos_time + datetime.timedelta(seconds=1),
+            observer_lat, observer_lon, observer_elevation_km,
+            search_horizon_hours=remaining_hours, coarse_step_seconds=coarse_step_seconds,
+        )
+        if second is None or second["event"] != "LOS":
+            break  # an AOS should always be followed by a LOS -- bail out safely if not
+
+        los_time = second["time_utc"]
+        max_elevation_deg = 0.0
+        sample_step = max(5.0, (los_time - aos_time).total_seconds() / 40.0)  # ~40 samples across the pass
+        t = aos_time
+        while t <= los_time:
+            look = satellite_look_angles(line1, line2, t, observer_lat, observer_lon, observer_elevation_km)
+            if look is not None:
+                max_elevation_deg = max(max_elevation_deg, look["elevation_deg"])
+            t += datetime.timedelta(seconds=sample_step)
+
+        passes.append({
+            "aos_time": aos_time,
+            "los_time": los_time,
+            "duration_seconds": (los_time - aos_time).total_seconds(),
+            "max_elevation_deg": max_elevation_deg,
+        })
+        cursor = los_time + datetime.timedelta(seconds=1)
+    return passes
+
+
+def upcoming_passes(satellites, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0, count=10):
+    """Combines find_passes() across every satellite in `satellites`
+    (each a dict with "name"/"line1"/"line2") into one soonest-first
+    list of the next `count` passes overall, each tagged with "name".
+
+    Asks each satellite for at most a handful of its own passes (not
+    `count` from every one of them, which scales badly with satellite
+    count for no benefit -- filling a combined top-10 practically never
+    needs more than 2-3 upcoming passes from any single satellite,
+    unless there's only one or two satellites total, which the max(...)
+    below covers)."""
+    per_satellite_cap = max(3, -(-count // max(1, len(satellites))) + 1)  # ceil(count / n) + 1, floored at 3
+    all_passes = []
+    for sat in satellites:
+        name = sat.get("name", "?")
+        for pass_info in find_passes(
+            sat.get("line1", ""), sat.get("line2", ""), dt_utc,
+            observer_lat, observer_lon, observer_elevation_km, max_passes=per_satellite_cap,
+        ):
+            pass_info["name"] = name
+            all_passes.append(pass_info)
+    all_passes.sort(key=lambda p: p["aos_time"])
+    return all_passes[:count]
+
+
 def format_countdown(seconds):
     """Formats a duration in seconds as "MM:SS" or "H:MM:SS" for
     display (AOS/LOS countdowns). Negative/None input clamps to 0."""

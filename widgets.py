@@ -54,18 +54,28 @@ class SpectrumWidget(QWidget):
         the main frequency readout at "top-right", satellite tracking
         info at "top-left") -- Qt composites child widgets on top of a
         parent's own paintEvent automatically, so no z-order trick is
-        needed beyond normal parenting. The widget keeps its own size
-        (give it setFixedWidth()/setFixedHeight() beforehand so its box
-        doesn't jump around as its text changes); only its position is
-        recalculated here, on every resize of the scope. Corners are
-        independent -- multiple widgets can coexist as long as each has
-        its own corner."""
+        needed beyond normal parenting. Corners are independent --
+        multiple widgets can coexist as long as each has its own corner.
+
+        A widget outside a real layout (which every overlay is, by
+        definition -- it's just moved to a fixed position) doesn't
+        auto-resize when its content changes; _position_overlays() calls
+        adjustSize() on every reposition to compensate, so a widget with
+        setFixedWidth()/setFixedHeight() stays fixed (adjustSize()
+        respects those) while one without shrinks/grows to fit its
+        current content. Call reposition_overlays() after changing an
+        overlay's content (e.g. QLabel.setText()) if you're not also
+        relying on the next resizeEvent to catch it."""
         self._overlays[corner] = (widget, margin)
         widget.setParent(self)
         self._position_overlays()
 
+    def reposition_overlays(self):
+        self._position_overlays()
+
     def _position_overlays(self):
         for corner, (widget, margin) in self._overlays.items():
+            widget.adjustSize()
             x = self.width() - widget.width() - margin if "right" in corner else margin
             y = self.height() - widget.height() - margin if "bottom" in corner else margin
             widget.move(max(0, x), max(0, y))

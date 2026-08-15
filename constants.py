@@ -469,6 +469,23 @@ CONTROL_DEFINITIONS = {
         "setter_candidates": ["set_memory_mode"],
         "options": [("VFO", False), ("MEMORY", True)],
     },
+    "split": {
+        "label": "Split",
+        # Plain bool toggle -- rigplane.SplitCapable (confirmed present:
+        # `python -c "import rigplane; print(rigplane.SplitCapable)"`) is
+        # a documented tier-1 protocol with get_split() -> bool and
+        # set_split(bool), no enum involved. Its own docstring: "Split
+        # applies to the whole transceiver, not a per-receiver toggle" --
+        # confirmed rig-global (Icom CI-V 0x0F / Yaesu `ST;` under the
+        # hood), so no radio-model-specific handling needed. Placed last
+        # here (after "vfo"/"memory_mode") so it lands immediately after
+        # the VFO A/B column in controls_row's left-to-right order --
+        # same generic CONTROL_DEFINITIONS machinery as every other
+        # toggle, not a hand-rolled one-off button.
+        "type": "toggle",
+        "getter_candidates": ["get_split"],
+        "setter_candidates": ["set_split"],
+    },
 }
 
 # Radio-specific control-option exclusions, keyed (radio_model, control

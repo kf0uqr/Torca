@@ -1091,6 +1091,33 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(str(exc))
 
+    def select_receiver_vfo(self, receiver: int, vfo_slot: str = "A"):
+        """Thread-safe: call from the GUI thread. Selects a VFO slot on
+        `receiver` WITHOUT touching its frequency at all -- the
+        VFO-slot-select half of select_receiver_vfo_and_set_frequency()
+        above, for establishing that context on its own when there's no
+        specific frequency to set yet. Confirmed live on a real 9700:
+        set_receiver_frequency() alone, with no VFO slot ever explicitly
+        selected for that receiver in the current connection, doesn't
+        reliably reach it at all -- manually switching Active to Sub and
+        then adjusting the tuning knob (main_window.py's _on_knob_steps,
+        which only ever calls the bare set_receiver_frequency) was
+        actually landing on Main's own VFO B instead. Called once, right
+        when Sub becomes the active receiver
+        (_on_active_receiver_toggle_clicked), so every bare frequency
+        write after that correctly reaches it -- same "select once, then
+        bare writes are fine" pattern already used by satellite mode's
+        first tracking tick (main_window.py's _sub_vfo_a_selected)."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._select_receiver_vfo(receiver, vfo_slot), self.loop)
+
+    async def _select_receiver_vfo(self, receiver: int, vfo_slot: str):
+        try:
+            await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
+        except Exception as exc:
+            self.error.emit(f"VFO slot select (receiver {receiver}): set_vfo_slot({vfo_slot!r}) failed ({exc}).")
+
     def select_vfo_and_set_frequency(self, vfo_value, freq_hz: int):
         """Thread-safe: call from the GUI thread. Selects VFO A/B and
         THEN sets its frequency, as one sequential coroutine rather than

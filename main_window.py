@@ -220,6 +220,20 @@ class RadioWindow(QWidget):
         # transponder changes, since it's only meaningful relative to
         # whichever nominal frequency it was dialed in against.
         self._satellite_freq_offset_hz = 0
+        # Dual-receiver (9700/7610) only: which direction (True=Sub/
+        # uplink, False=Main/downlink, None=neither yet) the active
+        # receiver's VFO slot was last explicitly selected for. Confirmed
+        # live on a real 9700 that re-selecting an ALREADY-selected VFO
+        # slot (e.g. re-sending "VFO A" every tick while it's already on
+        # VFO A) doesn't just idempotently confirm it -- it makes the
+        # radio flip-flop, as if the select behaves like a toggle once
+        # you're already on the target. So the VFO slot is only
+        # (re)selected when this direction actually changes (PTT edge,
+        # or first tick after tracking starts) -- see
+        # _on_satellite_tracking_tick and _on_ptt_toggled. Reset to None
+        # in _start_satellite_tracking so the next tick always reasserts
+        # it fresh.
+        self._satellite_dual_vfo_confirmed_for = None
         self._satellite_tracking_timer = QTimer(self)
         self._satellite_tracking_timer.timeout.connect(self._on_satellite_tracking_tick)
 
@@ -539,6 +553,12 @@ class RadioWindow(QWidget):
                 self.worker.start_ptt_after_receiver_vfo(receiver, freq_hz)
             else:
                 self.worker.stop_ptt_then_receiver_vfo(receiver, freq_hz)
+            # This PTT edge just (re)selected the VFO slot for this
+            # direction -- the next tracking tick, while still in this
+            # same direction, should only touch frequency (see
+            # _satellite_dual_vfo_confirmed_for above and
+            # _on_satellite_tracking_tick).
+            self._satellite_dual_vfo_confirmed_for = checked
             self._current_freq_hz = freq_hz
             self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
             self._update_band_button_highlight()
@@ -637,6 +657,7 @@ class RadioWindow(QWidget):
         # simultaneously instead (see _on_satellite_tracking_tick) --
         # true full-duplex, no split/VFO-switching involved at all, so
         # there's nothing to enable here for that radio type.
+        self._satellite_dual_vfo_confirmed_for = None
         if self.worker.is_connected() and not self.worker.is_dual_receiver:
             # Checked explicitly (not just left to set_control_value()'s
             # own console [ERROR] line) since split's setter, like vfo's,
@@ -780,13 +801,22 @@ class RadioWindow(QWidget):
           turned out, confirmed live on a real 9700, to also visibly
           focus/select it. Only the ONE currently relevant to RX or TX
           ever gets touched here -- Main while receiving, Sub while
-          transmitting, never both -- via select_receiver_vfo_and_set_
-          frequency() (each receiver has its own independent VFO A/B
-          pair; the bare frequency write alone wasn't reaching the VFO
-          context -- "VFO A-2" on a real 9700's own display, for Sub --
-          that actually drives the uplink transmitter). Both directions'
-          Doppler are still shown together in the overlay (pure math, no
-          radio I/O) even though only one is actually being sent."""
+          transmitting, never both. Its VFO slot (each receiver has its
+          own independent VFO A/B pair; the bare frequency write alone
+          wasn't reaching the VFO context -- "VFO A-2" on a real 9700's
+          own display, for Sub -- that actually drives the uplink
+          transmitter) is only (re)selected, via select_receiver_vfo_
+          and_set_frequency(), when this tick's direction doesn't match
+          _satellite_dual_vfo_confirmed_for; otherwise it's a bare
+          set_receiver_frequency() call. Confirmed live on a real 9700
+          that redundantly re-selecting an already-selected VFO slot
+          every single tick, rather than only at the actual RX/TX edges,
+          made the radio flip-flop between the uplink and downlink VFO
+          on its own during a held transmission -- as if re-sending
+          "select A" while already on A behaves like a toggle rather
+          than idempotently confirming it. Both directions' Doppler are
+          still shown together in the overlay (pure math, no radio I/O)
+          even though only one is actually being sent."""
         satellite = self._active_satellite
         if satellite is None:
             return
@@ -801,15 +831,32 @@ class RadioWindow(QWidget):
         transmitting = self.ptt_button.isChecked()
         if self.worker.is_connected():
             if self.worker.is_dual_receiver:
+                # Only (re)select the VFO slot when this tick's direction
+                # doesn't match the last one it was confirmed for (a real
+                # PTT edge, or the first tick after tracking (re)starts);
+                # otherwise just update frequency on whichever receiver's
+                # already correctly selected. See
+                # _satellite_dual_vfo_confirmed_for's definition above --
+                # redundantly re-selecting an already-selected VFO slot
+                # every tick is what caused the uplink/downlink flip-flop
+                # confirmed live on a real 9700.
                 if transmitting:
                     if uplink_hz is not None:
-                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, uplink_hz)
+                        if self._satellite_dual_vfo_confirmed_for is not True:
+                            self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, uplink_hz)
+                            self._satellite_dual_vfo_confirmed_for = True
+                        else:
+                            self.worker.set_receiver_frequency(RECEIVER_SUB, uplink_hz)
                         self._current_freq_hz = uplink_hz
                         self.freq_display.setText(f"{uplink_hz / 1e6:.6f} MHz")
                         self._update_band_button_highlight()
                 else:
                     if downlink_hz is not None:
-                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_MAIN, downlink_hz)
+                        if self._satellite_dual_vfo_confirmed_for is not False:
+                            self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_MAIN, downlink_hz)
+                            self._satellite_dual_vfo_confirmed_for = False
+                        else:
+                            self.worker.set_receiver_frequency(RECEIVER_MAIN, downlink_hz)
                         self._current_freq_hz = downlink_hz
                         self.freq_display.setText(f"{downlink_hz / 1e6:.6f} MHz")
                         self._update_band_button_highlight()

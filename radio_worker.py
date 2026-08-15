@@ -1086,6 +1086,41 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Select scope receiver ({receiver}) failed: {exc}")
 
+    def set_dual_receiver_linking(self, on: bool):
+        """Thread-safe: call from the GUI thread. Dual-receiver only --
+        disables (or enables) two RADIO-SIDE features that automatically
+        link/alternate Main and Sub on their own, independent of
+        anything this app commands: dual watch (rigplane's
+        set_dual_watch(), CI-V 0x07 0xC0/0xC1 -- alternates listening
+        between Main and Sub on a schedule, a real Icom feature for
+        casually monitoring two frequencies with one ear) and Main/Sub
+        tracking (set_main_sub_tracking() -- links Sub's tuning to
+        Main's). Confirmed live on a real 9700 that the active receiver
+        kept oscillating between Main and Sub even after every
+        software-side fix that could plausibly cause that (redundant
+        vs. one-time select_receiver() calls, either way) -- strongly
+        suggesting the radio itself, not this app's own commands, was
+        doing the switching the whole time. Disabled when satellite
+        mode starts (_start_satellite_tracking) since either feature
+        would directly fight this app's own from-scratch Main=uplink/
+        Sub=downlink management; failures are reported but don't block
+        satellite mode from proceeding (the radio may not support one
+        or both -- e.g. an IC-7610 profile might differ from the
+        9700's)."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_dual_receiver_linking(on), self.loop)
+
+    async def _set_dual_receiver_linking(self, on: bool):
+        try:
+            await self.radio.set_dual_watch(on)
+        except Exception as exc:
+            self.error.emit(f"Dual watch ({'on' if on else 'off'}) failed: {exc}")
+        try:
+            await self.radio.set_main_sub_tracking(on)
+        except Exception as exc:
+            self.error.emit(f"Main/Sub tracking ({'on' if on else 'off'}) failed: {exc}")
+
     def set_receiver_frequency(self, receiver: int, freq_hz: int):
         """Thread-safe: call from the GUI thread. Only meaningful on a
         genuine dual-receiver radio (check self.is_dual_receiver first) --

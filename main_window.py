@@ -755,6 +755,18 @@ class RadioWindow(QWidget):
         # deliberately leaves the scope on Sub throughout, to see
         # yourself on the downlink while transmitting.
         if self.worker.is_connected() and self.worker.is_dual_receiver:
+            # Radio-side dual watch / Main-Sub tracking (real Icom
+            # features -- alternating-listen and linked-tuning,
+            # respectively) directly fight this app's own from-scratch
+            # Main=uplink/Sub=downlink management -- confirmed live on
+            # a real 9700 that the active receiver kept oscillating
+            # between Main and Sub no matter how the software-side
+            # select_receiver() calls were adjusted (redundant every
+            # tick, or only once), strongly suggesting the radio itself
+            # was doing the switching regardless of what this app
+            # commanded. Explicitly disabled here so satellite mode
+            # starts from a clean, from-scratch state.
+            self.worker.set_dual_receiver_linking(False)
             self.worker.select_receiver(RECEIVER_SUB)
             self.worker.set_scope_receiver(RECEIVER_SUB)
             self._update_active_receiver_ui(RECEIVER_SUB)
@@ -769,7 +781,12 @@ class RadioWindow(QWidget):
         restores Main as the active receiver/scope (dual-receiver only),
         undoing _start_satellite_tracking's switch to Sub -- otherwise
         normal (non-satellite) operation would silently be left
-        controlling/watching Sub instead of Main."""
+        controlling/watching Sub instead of Main. Deliberately does NOT
+        re-enable dual watch/Main-Sub tracking (disabled on start) --
+        this app never reads their original state before disabling
+        them, so there's nothing to correctly restore; if wanted for
+        normal (non-satellite) operation, they can be turned back on
+        directly on the radio itself."""
         self._satellite_tracking_timer.stop()
         if self.worker.is_connected() and self.worker.is_dual_receiver:
             self.worker.select_receiver(RECEIVER_MAIN)

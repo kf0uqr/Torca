@@ -13,8 +13,8 @@ import pathlib
 import urllib.error
 import urllib.request
 
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QThread
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QImage
+from PySide6.QtCore import Qt, QRect, QRectF, QPointF, Signal, QThread
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QImage, QFont
 from PySide6.QtWidgets import QWidget, QSizePolicy
 
 from solar_data import _solar_subpoint, _solar_elevation
@@ -80,16 +80,28 @@ class WorldMapWidget(QWidget):
 
     satellite_double_clicked = Signal(str)  # satellite name, from the positions passed to set_satellite_positions
 
+    # The background image (and the whole lat/lon grid it's drawn
+    # against) is a standard equirectangular projection: 2:1 width:height.
+    # Stretching the widget to some other ratio would distort it, so the
+    # actual map content is always letterboxed to this ratio within
+    # whatever box the widget is given -- see _map_rect().
+    MAP_ASPECT_RATIO = 2.0
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(220)
-        # Default QWidget size policy is Preferred/Preferred, which
-        # doesn't claim extra vertical space when the window grows --
-        # that's why only width was following the window's resize
-        # before (QVBoxLayout stretches children to the container's
-        # full width automatically regardless of size policy; height
-        # needs this explicit opt-in).
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Expanding/Preferred, not Expanding/Expanding -- the old
+        # Expanding/Expanding + a stretch factor of 1 in HamClockWindow's
+        # layout (the only stretchy item there) meant this widget grabbed
+        # *all* extra vertical space in the window, which severely
+        # distorted the map once HamClockWindow started occupying a tall/
+        # narrow half-screen region (e.g. 960x1200) rather than a wider
+        # squarer window -- a naturally 2:1 map stretched to nearly 2:2.5.
+        # heightForWidth (below) lets layouts that respect it size this
+        # proportionally in the first place; _map_rect()'s letterboxing
+        # in paintEvent is the actual guarantee regardless of whether a
+        # given layout honors that.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._operator_lat = None
         self._operator_lon = None
         self._operator_label = ""
@@ -118,15 +130,51 @@ class WorldMapWidget(QWidget):
         self._operator_label = label
         self.update()
 
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return max(self.minimumHeight(), int(width / self.MAP_ASPECT_RATIO))
+
+    def _map_rect(self):
+        """The largest MAP_ASPECT_RATIO-shaped rect that fits centered
+        within the widget's current size -- everything actually drawn
+        (background image, grid, satellites, etc.) goes inside this, not
+        the raw self.rect(), so the map itself is never stretched out of
+        proportion regardless of what box the surrounding layout ends up
+        giving the widget."""
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return QRect(0, 0, w, h)
+        if w / self.MAP_ASPECT_RATIO <= h:
+            map_w, map_h = w, w / self.MAP_ASPECT_RATIO
+        else:
+            map_w, map_h = h * self.MAP_ASPECT_RATIO, h
+        x0 = (w - map_w) / 2.0
+        y0 = (h - map_h) / 2.0
+        return QRectF(x0, y0, map_w, map_h)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
+
+        # Letterbox bars (if the widget's actual box isn't exactly
+        # MAP_ASPECT_RATIO) in a neutral color matching the rest of the
+        # app's dark theme, rather than an unstyled stark black -- then
+        # translate into the letterboxed rect's own coordinate space so
+        # everything below this can keep using plain (0,0)-origin math
+        # against just mw/mh, same as it did against the whole widget
+        # before letterboxing existed.
+        painter.fillRect(self.rect(), QColor(45, 45, 48))
+        map_rect = self._map_rect()
+        painter.save()
+        painter.translate(map_rect.x(), map_rect.y())
+        w, h = map_rect.width(), map_rect.height()
 
         if self._background_image is not None:
             painter.drawImage(QRectF(0, 0, w, h), self._background_image)
         else:
-            painter.fillRect(self.rect(), QColor(10, 20, 40))
+            painter.fillRect(QRectF(0, 0, w, h), QColor(10, 20, 40))
 
         now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -189,6 +237,8 @@ class WorldMapWidget(QWidget):
             for sat in self._satellite_positions:
                 self._draw_satellite_marker(painter, sat, w, h)
 
+        painter.restore()
+
     def set_satellite_mode(self, enabled):
         self._satellite_mode = enabled
         self.update()
@@ -206,8 +256,14 @@ class WorldMapWidget(QWidget):
     def mouseDoubleClickEvent(self, event):
         if not self._satellite_mode or not self._satellite_positions:
             return
-        pos = event.position()
-        w, h = self.width(), self.height()
+        # Markers are drawn in the letterboxed map rect's own (0,0)-origin
+        # coordinate space (see paintEvent's painter.translate()) -- shift
+        # the click position into that same space before comparing, or
+        # every hit-test would be off by the letterbox's offset whenever
+        # the widget's box isn't exactly MAP_ASPECT_RATIO.
+        map_rect = self._map_rect()
+        pos = event.position() - map_rect.topLeft()
+        w, h = map_rect.width(), map_rect.height()
         closest_name, closest_dist = None, None
         for sat in self._satellite_positions:
             x, y = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)
@@ -258,9 +314,17 @@ class WorldMapWidget(QWidget):
         # Outlined (dark halo + light fill) rather than a flat light
         # color -- a flat color only reads well over the night-shaded
         # hemisphere; over a light daytime landmass it nearly disappears.
-        # A stroked QPainterPath keeps it legible over either.
+        # A stroked QPainterPath keeps it legible over either. Explicit
+        # regular-weight font at a modest size, and a thin (not 3px)
+        # stroke -- a heavier outline on small map-label text fills in
+        # letters' counters (the inside of an "a"/"e"/"o") and runs
+        # adjacent letters' outlines together, reading as one bold blob
+        # instead of legible text.
+        font = QFont(painter.font())
+        font.setPointSizeF(9.0)
+        font.setBold(False)
         path = QPainterPath()
-        path.addText(QPointF(x + 6, y - 6), painter.font(), sat["name"])
-        painter.setPen(QPen(QColor(15, 15, 20), 3))
+        path.addText(QPointF(x + 6, y - 6), font, sat["name"])
+        painter.setPen(QPen(QColor(15, 15, 20), 1.2))
         painter.setBrush(QColor(255, 230, 190))
         painter.drawPath(path)

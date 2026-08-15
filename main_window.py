@@ -492,17 +492,16 @@ class RadioWindow(QWidget):
         tracking_active = self._active_satellite is not None and self._satellite_tracking_timer.isActive()
         if checked:
             if tracking_active and self.worker.is_connected():
-                # switch_to_vfo="B": selects VFO B and sets the Doppler-
-                # corrected uplink on it atomically (select_vfo_and_set_
-                # frequency, not two separate commands -- see its
-                # docstring for why that distinction actually matters
-                # here), before keying up.
-                self._on_satellite_tracking_tick(switch_to_vfo="B")
+                # ptt_button.isChecked() is already True by the time this
+                # slot runs, so the tick sees target_vfo="B" and selects
+                # it + sets the Doppler-corrected uplink atomically,
+                # before keying up.
+                self._on_satellite_tracking_tick()
             self.worker.start_ptt()
         else:
             self.worker.stop_ptt()
             if tracking_active and self.worker.is_connected():
-                self._on_satellite_tracking_tick(switch_to_vfo="A")  # restores VFO A + downlink atomically
+                self._on_satellite_tracking_tick()  # now sees target_vfo="A", restores VFO A + downlink atomically
 
     def _on_hamclock_button_clicked(self):
         if self.hamclock_window is None:
@@ -591,10 +590,7 @@ class RadioWindow(QWidget):
                     "PTT won't be able to switch to the Doppler-corrected uplink. "
                     "Downlink tracking will still work."
                 )
-        # rigplane/CI-V's "set frequency" always targets whichever VFO is
-        # currently selected on the radio -- make sure that's A (RX/
-        # downlink) before/alongside the first correction.
-        self._on_satellite_tracking_tick(switch_to_vfo="A")
+        self._on_satellite_tracking_tick()
         self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
 
     def _stop_satellite_tracking(self):
@@ -606,12 +602,25 @@ class RadioWindow(QWidget):
         if self.worker.is_connected():
             self.worker.set_control_value("split", False)
 
-    def _on_satellite_tracking_tick(self, switch_to_vfo=None):
-        """switch_to_vfo ("A"/"B"/None): pass this when the tick needs
-        to switch VFO first (PTT press/release, or the very first tick
-        after selecting a satellite) -- see select_vfo_and_set_frequency()
-        for why that has to happen atomically with the frequency it's
-        paired with rather than as two separately-dispatched commands."""
+    def _on_satellite_tracking_tick(self):
+        """Called every SATELLITE_TRACKING_INTERVAL_MS by the tracking
+        timer, and also immediately (for responsiveness) on satellite/
+        transponder selection, PTT press/release, and knob input.
+
+        Which VFO to target is derived fresh from ptt_button.isChecked()
+        on EVERY call, not just remembered from the last PTT edge, and
+        reasserted via select_vfo_and_set_frequency() (VFO select +
+        frequency, atomically) every single tick rather than only at
+        transitions. An earlier version only did the VFO switch at PTT
+        press/release and left the VFO alone (plain set_frequency()) on
+        the steady-state ticks in between -- which turned out to let the
+        radio's actual selected VFO drift back on its own while PTT was
+        still held, and this tick would then just keep re-correcting
+        whatever frequency was on THAT vfo, producing a repeating
+        band-then-back-then-band oscillation instead of a stable TX
+        frequency. Reasserting the VFO alongside the frequency every
+        tick, unconditionally, closes that off regardless of why the
+        selected VFO was drifting in the first place."""
         satellite = self._active_satellite
         if satellite is None:
             return
@@ -641,13 +650,14 @@ class RadioWindow(QWidget):
 
         doppler_text = ""
         freq_hz = None
+        transmitting = self.ptt_button.isChecked()
+        target_vfo = "B" if transmitting else "A"
         transponder = self.satellite_transponder_combo.currentData()
         if transponder is not None:
             # While PTT is held, correct the uplink (on VFO B) instead of
             # the downlink -- this tick keeps running every
             # SATELLITE_TRACKING_INTERVAL_MS the whole time PTT is down,
             # same as it does for the downlink at other times.
-            transmitting = self.ptt_button.isChecked()
             freq_key = "uplink_mhz" if transmitting else "downlink_mhz"
             try:
                 base_freq_hz = round(float(transponder.get(freq_key)) * 1e6)
@@ -677,7 +687,7 @@ class RadioWindow(QWidget):
 
         warning_text = ""
         if self.worker.is_connected():
-            if switch_to_vfo is not None and not self.worker.control_available("vfo"):
+            if not self.worker.control_available("vfo"):
                 # Surfaced here, inline, rather than only as a console
                 # [ERROR] line from set_control_value()/
                 # select_vfo_and_set_frequency() themselves -- "vfo"'s
@@ -689,12 +699,10 @@ class RadioWindow(QWidget):
                 # nothing would switch VFO, and the frequency command
                 # would land on whatever VFO was already selected.
                 warning_text = "  [VFO control unavailable -- can't switch bands]"
-            elif switch_to_vfo is not None and freq_hz is not None:
-                self.worker.select_vfo_and_set_frequency(switch_to_vfo, freq_hz)
-            elif switch_to_vfo is not None:
-                self.worker.set_control_value("vfo", switch_to_vfo)
             elif freq_hz is not None:
-                self.worker.set_frequency(freq_hz)
+                self.worker.select_vfo_and_set_frequency(target_vfo, freq_hz)
+            else:
+                self.worker.set_control_value("vfo", target_vfo)
 
             if freq_hz is not None and not warning_text:
                 # Update optimistically, same as _on_knob_steps/

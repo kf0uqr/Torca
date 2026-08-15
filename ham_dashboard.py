@@ -172,7 +172,15 @@ class HamClockWindow(QWidget):
         bottom_row.addLayout(upcoming_passes_column)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.map_widget, 1)
+        # No stretch factor -- the map claims only what its own
+        # (letterboxed, aspect-correct) heightForWidth calls for, rather
+        # than greedily taking all extra vertical space in the window
+        # (which is what a stretch factor of 1 here used to do, and the
+        # only thing keeping the map from severely distorting once
+        # HamClockWindow started occupying a tall/narrow half-screen
+        # region). Leaves more room below for the clocks/solar/band-
+        # conditions/passes rows -- and for whatever gets added there later.
+        layout.addWidget(self.map_widget)
         layout.addLayout(clocks_row)
         layout.addLayout(solar_row)
         layout.addWidget(self.solar_updated_label)

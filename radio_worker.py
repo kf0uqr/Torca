@@ -186,6 +186,15 @@ class RadioWorker(QThread):
         # radio profile does or doesn't have this CI-V "cmd29" route for
         # without just trying it.
         self._receiver_unsupported_getters = set()
+        # Dual-receiver diagnostic: last value observed from
+        # get_active_receiver() (a pure, instant read of rigplane's own
+        # internal RadioState.active belief -- no extra CI-V traffic) --
+        # _poll_loop() emits an audio_status message (visible in the
+        # console via [AUDIO], no special setup needed) every time this
+        # changes, so an unexpected flip-flop is directly observable
+        # instead of inferred from symptoms like the band-button
+        # highlight or the frequency readout.
+        self._last_observed_active_receiver = None
         self._radio_cm = None
         self._stop_requested = False
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
@@ -860,6 +869,19 @@ class RadioWorker(QThread):
         whichever type it's currently showing, rather than the worker
         needing to track which widget wants which type."""
         while not self._stop_requested:
+            if self.is_dual_receiver:
+                try:
+                    observed = await self.radio.get_active_receiver()
+                    if observed != self._last_observed_active_receiver:
+                        previous = self._last_observed_active_receiver
+                        previous_label = "unknown" if previous is None else ("SUB" if previous else "MAIN")
+                        self.audio_status.emit(
+                            f"Active receiver observed: {'SUB' if observed else 'MAIN'} (was {previous_label})"
+                        )
+                        self._last_observed_active_receiver = observed
+                except Exception as exc:
+                    self.error.emit(f"get_active_receiver: {exc}")
+
             try:
                 # get_frequency's receiver param is NOT a Main/Sub
                 # identity selector -- confirmed by reading rigplane's

@@ -925,6 +925,92 @@ class RadioWorker(QThread):
         await self._set_control_value("vfo", vfo_value)
         await self._set_frequency(freq_hz)
 
+    def start_ptt_after_vfo(self, vfo_value, freq_hz: int):
+        """Thread-safe: call from the GUI thread. Single-receiver radios
+        (7300/705): selects VFO A/B, sets its frequency, THEN keys PTT --
+        all as ONE coroutine, not select_vfo_and_set_frequency() followed
+        by a separately-dispatched start_ptt(). That pairing has the
+        exact same non-guarantee select_vfo_and_set_frequency() itself
+        exists to fix (see its docstring) -- each independently-scheduled
+        command is its own asyncio Task with no real ordering guarantee
+        relative to the other -- except here the stakes are worse: a
+        real CI-V radio can outright refuse VFO/frequency changes once
+        it's already transmitting. If start_ptt() ever won that race
+        (confirmed live on a real 9700), the retune arrives after PTT
+        already keyed up, the radio ignores it, and the whole
+        transmission holds the RX frequency instead of switching to the
+        uplink at all. Always keys PTT regardless of whether the VFO
+        switch itself succeeds -- pressing PTT should always actually
+        transmit, never silently do nothing because a retune failed."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._start_ptt_after_vfo(vfo_value, freq_hz), self.loop)
+
+    async def _start_ptt_after_vfo(self, vfo_value, freq_hz: int):
+        if "vfo" in self._control_methods:
+            await self._select_vfo_and_set_frequency(vfo_value, freq_hz)
+        else:
+            self.error.emit(
+                f"{CONTROL_DEFINITIONS['vfo']['label']}: not available on this radio/install "
+                "-- transmitting without switching to the uplink."
+            )
+        await self._start_ptt()
+
+    def stop_ptt_then_vfo(self, vfo_value, freq_hz: int):
+        """Thread-safe: call from the GUI thread. The release-side
+        counterpart to start_ptt_after_vfo() -- stops transmitting
+        FIRST, then (once that's actually finished, not just dispatched)
+        selects VFO A/B and restores its frequency, all as one
+        coroutine. Same reasoning as the press side: unkeying and
+        retuning as two separately-dispatched commands doesn't guarantee
+        the radio has actually stopped transmitting before the retune
+        arrives, and a radio that refuses VFO changes while transmitting
+        would just ignore it if it arrived too early."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._stop_ptt_then_vfo(vfo_value, freq_hz), self.loop)
+
+    async def _stop_ptt_then_vfo(self, vfo_value, freq_hz: int):
+        await self._stop_ptt()
+        if "vfo" in self._control_methods:
+            await self._select_vfo_and_set_frequency(vfo_value, freq_hz)
+        else:
+            self.error.emit(
+                f"{CONTROL_DEFINITIONS['vfo']['label']}: not available on this radio/install "
+                "-- frequency not restored to the downlink."
+            )
+
+    def start_ptt_after_receiver_vfo(self, receiver: int, freq_hz: int, vfo_slot: str = "A"):
+        """Thread-safe: call from the GUI thread. Dual-receiver radios
+        (9700/7610) counterpart to start_ptt_after_vfo() -- selects VFO A
+        on the given receiver, sets its frequency, THEN keys PTT, all as
+        one coroutine. See start_ptt_after_vfo()'s docstring for why that
+        ordering has to be atomic, not just called in order."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._start_ptt_after_receiver_vfo(receiver, vfo_slot, freq_hz), self.loop
+        )
+
+    async def _start_ptt_after_receiver_vfo(self, receiver: int, vfo_slot: str, freq_hz: int):
+        await self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz)
+        await self._start_ptt()
+
+    def stop_ptt_then_receiver_vfo(self, receiver: int, freq_hz: int, vfo_slot: str = "A"):
+        """Thread-safe: call from the GUI thread. Dual-receiver radios
+        (9700/7610) counterpart to stop_ptt_then_vfo() -- stops
+        transmitting first, then selects VFO A on the given receiver and
+        restores its frequency, all as one coroutine."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._stop_ptt_then_receiver_vfo(receiver, vfo_slot, freq_hz), self.loop
+        )
+
+    async def _stop_ptt_then_receiver_vfo(self, receiver: int, vfo_slot: str, freq_hz: int):
+        await self._stop_ptt()
+        await self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz)
+
     def select_band(self, band_label: str, low_edge_hz: int):
         """Thread-safe. Tries Icom's confirmed get_bsr() band-stacking
         recall first -- reads whatever frequency was last used on that

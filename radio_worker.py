@@ -845,19 +845,50 @@ class RadioWorker(QThread):
         """Thread-safe: call from the GUI thread. Only meaningful on a
         genuine dual-receiver radio (check self.is_dual_receiver first) --
         sets ONE of its two independent receivers' frequency directly
-        (receiver=RECEIVER_MAIN or RECEIVER_SUB), bypassing VFO A/B
-        entirely. Satellite split on a dual-receiver radio (e.g. IC-9700)
-        works by keeping Main tuned to the downlink and Sub to the uplink
-        continuously and simultaneously -- true full-duplex, not a
-        single shared VFO context switched back and forth around PTT the
-        way single-receiver radios (7300/705) need. set_frequency()
-        (above) always targets receiver 0 implicitly; this is the only
-        way to reach receiver 1 (Sub) at all."""
+        (receiver=RECEIVER_MAIN or RECEIVER_SUB). Low-level: doesn't
+        touch which VFO slot is selected within that receiver -- see
+        select_receiver_vfo_and_set_frequency() below, which is what
+        satellite tracking (main_window.py) actually uses."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._set_receiver_frequency(receiver, freq_hz), self.loop)
 
     async def _set_receiver_frequency(self, receiver: int, freq_hz: int):
+        try:
+            await self.radio.set_frequency(freq_hz, receiver=receiver)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+    def select_receiver_vfo_and_set_frequency(self, receiver: int, freq_hz: int, vfo_slot: str = "A"):
+        """Thread-safe: call from the GUI thread. On a genuine dual-
+        receiver radio, "which receiver" (Main/Sub) and "which VFO"
+        (A/B) turned out to be two independent axes, not one -- each
+        receiver has its OWN VFO A/B pair (rigplane's VfoSlotCapable,
+        confirmed via its own docstring: "Radio exposes VFO A/B slots
+        per receiver" -- get_vfo_slot()/set_vfo_slot() both take an
+        explicit receiver= kwarg, not a guess). set_receiver_frequency()
+        alone only ever writes into whatever VFO slot that receiver
+        already happens to have selected; this also explicitly selects
+        VFO A on that receiver first. Confirmed live (a real 9700):
+        without this, the radio's own display never actually switches
+        to (and its transmitter never actually uses) the VFO context it
+        labels "VFO A-2" for Sub -- receiver-only writes weren't
+        reaching the VFO slot that's actually driving the uplink.
+        Sequential in one coroutine (VFO select, then frequency), same
+        reasoning as select_vfo_and_set_frequency() above: two
+        separately-dispatched commands don't actually guarantee
+        anything about their real-world ordering on the radio's side."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz), self.loop
+        )
+
+    async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int):
+        try:
+            await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
+        except Exception as exc:
+            self.error.emit(f"VFO slot select (receiver {receiver}): set_vfo_slot({vfo_slot!r}) failed ({exc}).")
         try:
             await self.radio.set_frequency(freq_hz, receiver=receiver)
         except Exception as exc:

@@ -737,15 +737,23 @@ class RadioWindow(QWidget):
                 # as the single-receiver path below never touching the
                 # inactive VFO either, just without a shared context to
                 # explicitly switch.
+                # select_receiver_vfo_and_set_frequency(), not the bare
+                # set_receiver_frequency() -- each receiver has its own
+                # independent VFO A/B pair (confirmed live on a real
+                # 9700: the frequency wasn't reaching the VFO context
+                # -- "VFO A-2" on that radio's own display, for Sub --
+                # that actually drives the uplink transmitter, without
+                # also explicitly selecting VFO A on the target receiver
+                # every time, not just writing its frequency).
                 if transmitting:
                     if uplink_hz is not None:
-                        self.worker.set_receiver_frequency(RECEIVER_SUB, uplink_hz)
+                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, uplink_hz)
                         self._current_freq_hz = uplink_hz
                         self.freq_display.setText(f"{uplink_hz / 1e6:.6f} MHz")
                         self._update_band_button_highlight()
                 else:
                     if downlink_hz is not None:
-                        self.worker.set_receiver_frequency(RECEIVER_MAIN, downlink_hz)
+                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_MAIN, downlink_hz)
                         self._current_freq_hz = downlink_hz
                         self.freq_display.setText(f"{downlink_hz / 1e6:.6f} MHz")
                         self._update_band_button_highlight()

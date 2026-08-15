@@ -608,13 +608,23 @@ class SatelliteConfigDialog(QDialog):
     satellites -- refresh TLEs from CelesTrak, add/remove satellites,
     store known transponder data (fetched from SatNOGS or hand-entered),
     and choose which ones display on the map. Picking a transponder to
-    actually use is a later feature -- this just manages the data."""
+    actually use is a later feature -- this just manages the data.
 
-    def __init__(self, satellites, parent=None):
+    Everything else here is only kept if OK is pressed (Cancel/closing
+    the window discards it, same as any other form) -- EXCEPT
+    transponder fetches/edits, which call on_change() (if given)
+    immediately, right when they happen. Those go through a real
+    network fetch and already show a "success" confirmation, so losing
+    them to an accidental window-close (Qt's default for the X button/
+    Escape is the same as Cancel) would be a surprising, silent data
+    loss -- not just an unsaved-edit annoyance."""
+
+    def __init__(self, satellites, parent=None, on_change=None):
         super().__init__(parent)
         self.setWindowTitle("Satellite Tracking")
         self.resize(560, 400)
         self._satellites = [dict(sat) for sat in satellites]  # local working copy until OK is pressed
+        self._on_change = on_change
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Show", "Name", "Transponders"])
@@ -751,6 +761,8 @@ class SatelliteConfigDialog(QDialog):
             fetched += 1
         self._rebuild_table()
         if fetched:
+            if self._on_change:
+                self._on_change(self._satellites)
             QMessageBox.information(
                 self, "Fetch Transponder Data",
                 f"Updated stored transponder data for {fetched} satellite(s) from SatNOGS DB."
@@ -768,6 +780,8 @@ class SatelliteConfigDialog(QDialog):
         if dialog.exec() == QDialog.Accepted:
             sat["transponders"] = dialog.result_transponders()
             self._rebuild_table()
+            if self._on_change:
+                self._on_change(self._satellites)
 
     def _on_accept(self):
         for row, sat in enumerate(self._satellites):

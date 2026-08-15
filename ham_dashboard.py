@@ -174,10 +174,17 @@ class HamClockWindow(QWidget):
             self._satellite_timer.stop()
 
     def _on_satellite_config_requested(self, _pos):
-        dialog = SatelliteConfigDialog(self.satellites, self)
-        if dialog.exec() == QDialog.Accepted:
-            self.satellites = dialog.result_satellites()
+        def persist(satellites):
+            self.satellites = satellites
             save_satellite_data(self.satellites)
+
+        # persist() also runs immediately on every transponder fetch/edit
+        # inside the dialog (see SatelliteConfigDialog's on_change) -- so
+        # that data survives even if the dialog gets closed/cancelled
+        # afterward instead of OK'd.
+        dialog = SatelliteConfigDialog(self.satellites, self, on_change=persist)
+        if dialog.exec() == QDialog.Accepted:
+            persist(dialog.result_satellites())
             if self.satellite_button.isChecked():
                 self._update_satellite_positions()
 

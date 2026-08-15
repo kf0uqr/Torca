@@ -246,26 +246,23 @@ class RadioWindow(QWidget):
         # transponder changes, since it's only meaningful relative to
         # whichever nominal frequency it was dialed in against.
         self._satellite_freq_offset_hz = 0
-        # Dual-receiver (9700/7610) only: whether Sub's own VFO A has
-        # already been explicitly selected in the current connection.
-        # Confirmed live on a real 9700 that a BARE receiver-addressed
-        # frequency write (set_receiver_frequency, no prior VFO-slot
-        # select for that receiver at all) doesn't reliably reach Sub --
-        # manually toggling Active to Sub and then adjusting the tuning
-        # knob was actually landing on Main's own VFO B instead, since
-        # Sub had never had a VFO slot explicitly established in that
-        # session. Once selected via select_receiver_vfo_and_set_
-        # frequency()/select_receiver_vfo() (satellite mode's first
-        # tracking tick, or _on_active_receiver_toggle_clicked's manual
-        # switch to Sub -- either one sets this), subsequent bare
-        # frequency writes correctly reach it -- Sub's direction never
-        # changes on its own once established (downlink only, tracked
-        # continuously while receiving -- see _on_satellite_tracking_
-        # tick), so it doesn't need reselecting every tick like Main's
-        # VFO A/B does (confirmed live on a real 705). Reset to False in
-        # _start_satellite_tracking so a fresh satellite-tracking
-        # session always reselects it, even if manual use already had
-        # it selected.
+        # Dual-receiver (9700/7610) only, satellite mode's periodic
+        # tracking tick specifically: whether Sub's own VFO A has
+        # already been explicitly selected for the current tracking
+        # session (via select_receiver_vfo_and_set_frequency). Once
+        # selected, Sub's direction never changes on its own (downlink
+        # only, tracked continuously while receiving -- see
+        # _on_satellite_tracking_tick), so subsequent ticks can just use
+        # a bare set_receiver_frequency instead of reselecting every
+        # time -- confirmed working for this specific, tightly-looped
+        # (2-second) use. Manual Sub frequency adjustment (the tuning
+        # knob, band selection) does NOT reuse this flag -- confirmed
+        # live on a real 9700 that a one-time-select-then-bare-writes
+        # approach for those, mirroring this, did NOT reliably work
+        # (nothing on Sub moved at all); they instead bundle the VFO-A
+        # select into every single write, unconditionally. Reset to
+        # False in _start_satellite_tracking so a fresh tracking session
+        # always reselects it.
         self._sub_vfo_a_selected = False
         self._satellite_tracking_timer = QTimer(self)
         self._satellite_tracking_timer.timeout.connect(self._on_satellite_tracking_tick)
@@ -1058,18 +1055,6 @@ class RadioWindow(QWidget):
         receiver = RECEIVER_MAIN if self.active_receiver_button.text() == "Active: SUB" else RECEIVER_SUB
         self.worker.select_receiver(receiver)
         self.worker.set_scope_receiver(receiver)
-        if receiver == RECEIVER_SUB and not self._sub_vfo_a_selected:
-            # Confirmed live on a real 9700: bare receiver-addressed
-            # frequency writes (the tuning knob, _on_knob_steps) don't
-            # reliably reach Sub at all until its VFO slot has been
-            # explicitly selected at least once in this connection --
-            # without this, they were actually landing on Main's own
-            # VFO B instead. Establish it once here, right when Sub
-            # becomes active manually (satellite mode's first tracking
-            # tick does the same thing for its own purposes -- see
-            # _sub_vfo_a_selected).
-            self.worker.select_receiver_vfo(RECEIVER_SUB, "A")
-            self._sub_vfo_a_selected = True
         self._update_active_receiver_ui(receiver)
 
     def _update_active_receiver_ui(self, receiver):
@@ -1186,9 +1171,24 @@ class RadioWindow(QWidget):
         # always defaulting to Main -- set_frequency() (used for single-
         # receiver/Main) has no receiver concept at all, so this would
         # otherwise silently retune Main while Sub was the active/
-        # displayed receiver, same bug _on_band_selected had.
+        # displayed receiver, same bug _on_band_selected had. Bundles
+        # Sub's VFO A select with every single write (select_receiver_
+        # vfo_and_set_frequency), not a bare set_receiver_frequency --
+        # confirmed live on a real 9700 that establishing Sub's VFO slot
+        # ONCE, separately, then relying on later bare writes (an
+        # earlier version of this did, matching the pattern satellite
+        # mode's periodic tick already uses successfully) did NOT
+        # reliably work for the knob: nothing on Sub moved at all.
+        # Bundling every time matches the ONE pattern confirmed to
+        # actually work in every context so far (Main's own VFO A/B
+        # every tick, Sub's very first downlink tick) -- the extra VFO-
+        # slot-select is a no-op on the radio's side once already
+        # selected, and the knob is a user-paced action, not a rapid
+        # automatic timer, so the earlier "redundant reselect behaves
+        # like a toggle" risk (confirmed for automatic 2-second ticks)
+        # is far less likely to bite here.
         if self.worker.is_dual_receiver and self.active_receiver_button.text() == "Active: SUB":
-            self.worker.set_receiver_frequency(RECEIVER_SUB, new_freq_hz)
+            self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, new_freq_hz, "A")
         else:
             self.worker.set_frequency(new_freq_hz)
         # Update optimistically so the readout feels responsive while

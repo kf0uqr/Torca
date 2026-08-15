@@ -872,7 +872,15 @@ class RadioWindow(QWidget):
         having a second receiver. Sub's own VFO slot only needs
         selecting once (_satellite_sub_vfo_selected, reset whenever
         tracking (re)starts) since its direction never changes;
-        subsequent ticks just update its frequency."""
+        subsequent ticks just update its frequency. Every tick still
+        writes a frequency to BOTH Main and Sub though, which (writing a
+        receiver's frequency also visibly focusing/activating it,
+        confirmed live on a real 9700) would otherwise flip-flop which
+        receiver is active every single cycle regardless of RX/TX state
+        -- so the tick ends by explicitly re-asserting which one
+        actually should be active (Main while transmitting, Sub
+        otherwise) after both writes, every time, not just at the PTT
+        edges that first set it."""
         satellite = self._active_satellite
         if satellite is None:
             return
@@ -904,12 +912,33 @@ class RadioWindow(QWidget):
                 self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
                 self._update_band_button_highlight()
 
-            if self.worker.is_dual_receiver and downlink_hz is not None:
-                if not self._satellite_sub_vfo_selected:
-                    self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, downlink_hz)
-                    self._satellite_sub_vfo_selected = True
-                else:
-                    self.worker.set_receiver_frequency(RECEIVER_SUB, downlink_hz)
+            if self.worker.is_dual_receiver:
+                if downlink_hz is not None:
+                    if not self._satellite_sub_vfo_selected:
+                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, downlink_hz)
+                        self._satellite_sub_vfo_selected = True
+                    else:
+                        self.worker.set_receiver_frequency(RECEIVER_SUB, downlink_hz)
+                # This tick just wrote a frequency to BOTH Main (above)
+                # and Sub (just now) -- confirmed live on a real 9700,
+                # all the way back at the start of this whole dual-
+                # receiver investigation, that writing either receiver's
+                # frequency also visibly focuses/activates it. With true
+                # full-duplex sat mode needing BOTH written every tick
+                # (Sub for the continuous downlink, Main for whichever
+                # direction PTT has it in), that means every single tick
+                # was knocking focus onto Sub last, regardless of RX/TX
+                # state -- and then PTT's own bundled select_receiver()
+                # would only correct it until the NEXT tick immediately
+                # knocked it away again. Confirmed live as exactly the
+                # reported "active vfo constantly shifts back and forth
+                # ... during both transmit and receive." Explicitly
+                # re-asserting which receiver should actually be active
+                # here, every tick, after both writes, keeps it stable
+                # regardless of whatever focus side effect they just
+                # caused -- not touching the scope, which stays on Sub
+                # throughout (see _start_satellite_tracking).
+                self.worker.select_receiver(RECEIVER_MAIN if transmitting else RECEIVER_SUB)
 
         self._update_satellite_overlay(satellite, look, crossing_text, downlink_doppler_hz, uplink_doppler_hz, warning_text)
 

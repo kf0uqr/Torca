@@ -50,7 +50,8 @@ Location can be entered by hand, or looked up approximately from your public IP 
 ### Using satellite tracking + Doppler correction
 
 1. In the Ham Dashboard, click **Satellites** to turn tracking on; right-click the button to manage the tracked list (refresh TLEs from CelesTrak, add satellites by hand, fetch transponder data from SatNOGS DB for every tracked satellite, or hand-edit transponders, and choose which satellites show on the map).
-2. Double-click a satellite marker on the map. Tracking starts in the *main radio window*, not the dashboard: pick a transponder from the dropdown that appears there, and VFO A gets continuously Doppler-corrected while elevation/azimuth/Doppler shift/time-to-AOS-or-LOS show as an overlay on the spectrum scope. Click **Stop Tracking** to stop, or just double-click a different satellite on the map to switch -- no need to stop first.
+2. Double-click a satellite marker on the map. Tracking starts in the *main radio window*, not the dashboard: pick a transponder from the dropdown that appears there, and VFO A gets continuously Doppler-corrected while elevation/azimuth/Doppler shift/time-to-AOS-or-LOS show as an overlay on the spectrum scope. The tuning knob adjusts an offset from the transponder's nominal downlink (applied before Doppler correction) instead of the radio directly while tracking's running -- use it to tune within a linear satellite's passband or nudge to better match where it's actually transmitting.
+3. **Start/Stop Tracking** pauses and resumes re-tuning without losing the selection -- the satellite (and any tuning offset) stays put until you double-click a different one on the map.
 
 ## Project layout
 

@@ -182,17 +182,39 @@ class RadioWindow(QWidget):
             "correct VFO A against."
         )
         self.satellite_transponder_combo.currentIndexChanged.connect(self._on_satellite_transponder_changed)
-        self.satellite_stop_button = QPushButton("Stop Tracking")
-        self.satellite_stop_button.setEnabled(False)
-        self.satellite_stop_button.clicked.connect(self._on_satellite_tracking_stop_clicked)
+        # Toggle, not a one-way stop button -- pausing/resuming keeps the
+        # satellite selected (only double-clicking a different one on the
+        # map replaces it). Starts unchecked/disabled; _on_satellite_selected
+        # enables it and checks it (tracking starts immediately on select,
+        # same as before this was a toggle).
+        self.satellite_tracking_button = QPushButton("Start Tracking")
+        self.satellite_tracking_button.setCheckable(True)
+        self.satellite_tracking_button.setEnabled(False)
+        self.satellite_tracking_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.satellite_tracking_button.setToolTip(
+            "Pause/resume Doppler re-tuning. The satellite stays selected "
+            "either way -- double-click a different one on the map to switch."
+        )
+        self.satellite_tracking_button.toggled.connect(self._on_satellite_tracking_toggled)
 
         self.satellite_row = QHBoxLayout()
         self.satellite_row.addWidget(self.satellite_label)
         self.satellite_row.addWidget(self.satellite_transponder_combo, 1)
-        self.satellite_row.addWidget(self.satellite_stop_button)
+        self.satellite_row.addWidget(self.satellite_tracking_button)
 
         self._active_satellite = None
         self._next_satellite_crossing = None
+        # Added to a transponder's nominal downlink before Doppler
+        # correction, via the tuning knob while tracking is active (see
+        # _on_knob_steps) -- lets the operator tune within a linear
+        # satellite's passband, or nudge to better match where it's
+        # actually transmitting, without the next tracking tick
+        # overwriting the adjustment. Reset whenever the satellite or
+        # transponder changes, since it's only meaningful relative to
+        # whichever nominal frequency it was dialed in against.
+        self._satellite_freq_offset_hz = 0
         self._satellite_tracking_timer = QTimer(self)
         self._satellite_tracking_timer.timeout.connect(self._on_satellite_tracking_tick)
 
@@ -477,13 +499,16 @@ class RadioWindow(QWidget):
     def _on_satellite_selected(self, satellite):
         """A satellite was double-clicked on the Ham Dashboard map --
         (re)start tracking it here, replacing whatever was active
-        before. Doesn't require the radio to be connected: elevation/
-        azimuth/AOS-LOS are still useful on their own, only the actual
-        VFO re-tuning is gated on that (checked every tick, not just
-        here, so it picks up automatically if the radio connects mid-
+        before (it stays selected/tracked until another double-click
+        replaces it -- pausing via the toggle button doesn't clear it).
+        Doesn't require the radio to be connected: elevation/azimuth/
+        AOS-LOS are still useful on their own, only the actual VFO
+        re-tuning is gated on that (checked every tick, not just here,
+        so it picks up automatically if the radio connects mid-
         session)."""
         self._active_satellite = satellite
         self._next_satellite_crossing = None
+        self._satellite_freq_offset_hz = 0
         self.satellite_label.setText(satellite.get("name", "?"))
 
         self.satellite_transponder_combo.blockSignals(True)
@@ -501,9 +526,32 @@ class RadioWindow(QWidget):
             self.satellite_transponder_combo.setEnabled(False)
         self.satellite_transponder_combo.blockSignals(False)
 
-        self.satellite_stop_button.setEnabled(True)
+        self.satellite_tracking_button.setEnabled(True)
         self.satellite_overlay_label.setVisible(True)
 
+        # Tracking always (re)starts on selection, same as before this
+        # button became a toggle -- if it's already checked (switching
+        # straight from one satellite to another), setChecked(True) won't
+        # re-emit toggled, so start explicitly rather than relying on it.
+        self.satellite_tracking_button.blockSignals(True)
+        self.satellite_tracking_button.setChecked(True)
+        self.satellite_tracking_button.blockSignals(False)
+        self.satellite_tracking_button.setText("Stop Tracking")
+        self._start_satellite_tracking()
+
+    def _on_satellite_transponder_changed(self, _index):
+        self._satellite_freq_offset_hz = 0  # only meaningful relative to the transponder it was dialed in against
+        if self._active_satellite is not None:
+            self._on_satellite_tracking_tick()  # reflect the new choice immediately, don't wait for the timer
+
+    def _on_satellite_tracking_toggled(self, checked):
+        self.satellite_tracking_button.setText("Stop Tracking" if checked else "Start Tracking")
+        if checked:
+            self._start_satellite_tracking()
+        else:
+            self._stop_satellite_tracking()
+
+    def _start_satellite_tracking(self):
         if self.worker.is_connected():
             # rigplane/CI-V's "set frequency" always targets whichever VFO
             # is currently selected on the radio -- make sure that's A.
@@ -511,19 +559,11 @@ class RadioWindow(QWidget):
         self._on_satellite_tracking_tick()
         self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
 
-    def _on_satellite_transponder_changed(self, _index):
-        if self._active_satellite is not None:
-            self._on_satellite_tracking_tick()  # reflect the new choice immediately, don't wait for the timer
-
-    def _on_satellite_tracking_stop_clicked(self):
+    def _stop_satellite_tracking(self):
+        """Pauses re-tuning -- the satellite stays selected (name,
+        transponder list, last-known overlay reading) until either
+        resumed or replaced by double-clicking another one."""
         self._satellite_tracking_timer.stop()
-        self._active_satellite = None
-        self._next_satellite_crossing = None
-        self.satellite_label.setText("No satellite selected")
-        self.satellite_transponder_combo.clear()
-        self.satellite_transponder_combo.setEnabled(False)
-        self.satellite_stop_button.setEnabled(False)
-        self.satellite_overlay_label.setVisible(False)
 
     def _on_satellite_tracking_tick(self):
         satellite = self._active_satellite
@@ -560,6 +600,13 @@ class RadioWindow(QWidget):
             except (TypeError, ValueError):
                 base_freq_hz = None
             if base_freq_hz is not None:
+                # The tuning knob adjusts this offset instead of the radio
+                # directly while tracking is active (_on_knob_steps) -- so
+                # manual tuning within a linear satellite's passband, or a
+                # nudge to line up with where it's actually transmitting,
+                # survives the next tick instead of being overwritten by
+                # a recompute from the transponder's bare nominal downlink.
+                base_freq_hz += self._satellite_freq_offset_hz
                 result = doppler_correction(
                     base_freq_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km
                 )
@@ -567,6 +614,8 @@ class RadioWindow(QWidget):
                     if self.worker.is_connected():
                         self.worker.set_frequency(round(result["frequency_hz"]))
                     doppler_text = f"  Doppler {result['doppler_hz']:+.0f} Hz"
+                    if self._satellite_freq_offset_hz:
+                        doppler_text += f"  Offset {self._satellite_freq_offset_hz:+.0f} Hz"
 
         visibility = "up" if look["elevation_deg"] >= 0 else "down"
         self.satellite_overlay_label.setText(
@@ -687,9 +736,22 @@ class RadioWindow(QWidget):
         self._update_band_button_highlight()
 
     def _on_knob_steps(self, steps):
+        step_hz = self.step_combo.currentData()
+        # While actively Doppler-tracking a transponder, the knob adjusts
+        # the offset applied to that transponder's nominal downlink
+        # instead of commanding the radio directly -- otherwise the next
+        # tracking tick (up to 2s later) would just overwrite any manual
+        # adjustment with a fresh nominal+Doppler computation. This is
+        # how an operator tunes within a linear satellite's passband, or
+        # nudges to better match where it's actually transmitting.
+        if (self._active_satellite is not None and self._satellite_tracking_timer.isActive()
+                and self.satellite_transponder_combo.currentData() is not None):
+            self._satellite_freq_offset_hz += steps * step_hz
+            self._on_satellite_tracking_tick()  # apply immediately, don't wait for the next timer tick
+            return
+
         if self._current_freq_hz is None:
             return  # haven't heard a frequency from the radio yet
-        step_hz = self.step_combo.currentData()
         new_freq_hz = max(0, self._current_freq_hz + steps * step_hz)
         self.worker.set_frequency(new_freq_hz)
         # Update optimistically so the readout feels responsive while

@@ -159,7 +159,7 @@ class RadioWindow(QWidget):
         self.ptt_button.setEnabled(False)
         self.ptt_button.setToolTip(
             "Click to transmit, click again to release. While satellite "
-            "tracking is running, this also swaps split VFO B (uplink, "
+            "tracking is running, this also swaps VFO B (uplink, "
             "Doppler-corrected) in for the transmission and back to VFO A "
             "(downlink) on release."
         )
@@ -496,10 +496,12 @@ class RadioWindow(QWidget):
     def _on_ptt_toggled(self, checked):
         self.ptt_button.setText("TRANSMITTING" if checked else "PTT")
         # While actively Doppler-tracking a satellite, PTT also drives the
-        # split VFO swap: B (uplink)/A (downlink) around the transmission,
-        # not just start/stop_ptt() on their own. Split itself was already
-        # turned on when tracking started (_start_satellite_tracking), so
-        # the radio's RX never leaves VFO A regardless of what VFO B does.
+        # VFO swap: B (uplink)/A (downlink) around the transmission, not
+        # just start/stop_ptt() on their own -- explicitly commanding
+        # the VFO/frequency itself rather than relying on the radio's
+        # own split feature to do it, which turns out to not need to be
+        # on at all (confirmed live on a real 705: identical behavior
+        # either way) -- see _start_satellite_tracking.
         #
         # The retune and the PTT command are bundled into ONE atomic
         # worker call (start_ptt_after_vfo/stop_ptt_then_vfo -- same for
@@ -551,20 +553,17 @@ class RadioWindow(QWidget):
             else:
                 self.worker.stop_ptt()
         else:
-            # Same VFO A(RX)/B(TX) split swap on Main for BOTH radio
-            # types now -- confirmed live on a real 9700, with a
-            # controlled test that gave each VFO its own distinct mode
-            # to tell them apart directly, that PTT-driven transmission
-            # always follows Main's own current VFO A/B context and
-            # NEVER Sub, regardless of what's written to Sub's frequency/
-            # VFO slot or whether split is on -- with split off Main
-            # stays on VFO A the whole time and transmits from there;
-            # with split on, PTT swaps Main itself to VFO B and
-            # transmits from there. So Split on this radio means exactly
-            # what it does on a single-receiver one (one receiver's own
-            # A/B pair, RX/TX), not "route TX to Sub" as previously
-            # assumed. Sub is only ever used for continuous full-duplex
-            # downlink RX now -- see _on_satellite_tracking_tick.
+            # Same VFO A(RX)/B(TX) swap on Main for BOTH radio types now
+            # -- confirmed live on a real 9700, with a controlled test
+            # that gave each VFO its own distinct mode to tell them
+            # apart directly, that PTT-driven transmission always
+            # follows Main's own current VFO A/B context and NEVER Sub,
+            # regardless of what's written to Sub's frequency/VFO slot.
+            # (The radio's own split feature doesn't need to be on for
+            # this at all -- see _start_satellite_tracking -- this
+            # explicitly commands the VFO/frequency itself either way.)
+            # Sub is only ever used for continuous full-duplex downlink
+            # RX now -- see _on_satellite_tracking_tick.
             target_vfo = "B" if checked else "A"
             if checked:
                 self.worker.start_ptt_after_vfo(target_vfo, freq_hz)
@@ -644,46 +643,24 @@ class RadioWindow(QWidget):
             self._stop_satellite_tracking()
 
     def _start_satellite_tracking(self):
-        # Split is required on a dual-receiver radio (9700/7610) too,
-        # not just single-receiver (7300/705) -- confirmed live on a
-        # real 9700 that without it, PTT transmits from whatever Main's
-        # current VFO A already is, regardless of what's written to Sub;
-        # with it on, PTT swaps Main itself to VFO B and transmits from
-        # there (see _on_ptt_toggled/_on_satellite_tracking_tick -- it's
-        # the exact same VFO A/B mechanism a single-receiver radio uses,
-        # applied to Main; Sub is never involved in TX at all). So this
-        # enables it unconditionally now rather than only for
-        # single-receiver.
+        # Split doesn't need to be turned on for this -- confirmed live
+        # on a real 705 that PTT switches to the Doppler-corrected
+        # uplink and back the same way whether split is on or off,
+        # since select_vfo_and_set_frequency()/start_ptt_after_vfo()
+        # already explicitly command the VFO A/B swap themselves rather
+        # than relying on split to do it. (An earlier version of this
+        # enabled split here, on the theory a 9700 needed it for PTT to
+        # follow Main's VFO B at all -- that turned out to be wrong too;
+        # PTT already follows Main's VFO A/B regardless of split state.)
         self._satellite_sub_vfo_selected = False
-        if self.worker.is_connected():
-            # Checked explicitly (not just left to set_control_value()'s
-            # own console [ERROR] line) since split's setter, like vfo's,
-            # was never confirmed against real hardware -- if it's
-            # silently not working, PTT would key up without split
-            # actually on, and better to say so up front than have that
-            # show up as an unexplained "nothing happens" on the next
-            # transmission.
-            if self.worker.control_available("split"):
-                self.worker.set_control_value("split", True)
-            else:
-                QMessageBox.warning(
-                    self, "Satellite Tracking",
-                    "Split mode control isn't available on this radio/install -- "
-                    "PTT won't be able to switch to the Doppler-corrected uplink. "
-                    "Downlink tracking will still work."
-                )
         self._on_satellite_tracking_tick()
         self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
 
     def _stop_satellite_tracking(self):
         """Pauses re-tuning -- the satellite stays selected (name,
         transponder list, last-known overlay reading) until either
-        resumed or replaced by double-clicking another one. Also drops
-        split back off (see _start_satellite_tracking), since it was
-        only turned on for this -- both radio types now."""
+        resumed or replaced by double-clicking another one."""
         self._satellite_tracking_timer.stop()
-        if self.worker.is_connected():
-            self.worker.set_control_value("split", False)
 
     def _compute_satellite_state(self, satellite):
         """Pure computation, no radio I/O -- look angles, next AOS/LOS,

@@ -617,12 +617,24 @@ def norad_id_from_tle_line1(line1):
 def fetch_transponders(norad_cat_id):
     """Fetches known transmitters/transponders for a satellite from
     SatNOGS DB. Returns a list of dicts: {"description", "uplink_mhz",
-    "downlink_mhz", "mode", "alive"} -- frequencies converted from
-    SatNOGS' native Hz to MHz (matching this app's display convention),
-    alive/active entries sorted first since a satellite can have several
-    transmitters (e.g. a voice repeater vs. a telemetry beacon) and
-    decommissioned ones are still useful reference but shouldn't be the
-    default pick. Raises on failure -- callers should catch and report."""
+    "downlink_mhz", "mode", "uplink_mode", "invert", "alive"} --
+    frequencies converted from SatNOGS' native Hz to MHz (matching this
+    app's display convention), alive/active entries sorted first since a
+    satellite can have several transmitters (e.g. a voice repeater vs. a
+    telemetry beacon) and decommissioned ones are still useful reference
+    but shouldn't be the default pick. Raises on failure -- callers
+    should catch and report.
+
+    "mode" is the DOWNLINK mode; "uplink_mode" is captured separately --
+    confirmed via a live fetch of https://db.satnogs.org/api/
+    transmitters/?satellite__norad_cat_id=7530 (AO-7, a known inverting
+    linear transponder) that SatNOGS records these independently, along
+    with an "invert" bool, specifically because some linear transponders
+    invert sidebands between uplink and downlink (e.g. that fetch showed
+    a Mode U/V AO-7 entry with mode="USB"/uplink_mode="LSB"/invert=true).
+    Without uplink_mode, there'd be no reliable way to auto-set Main's
+    TX mode correctly for those -- see radio_mode_for_transponder and
+    RadioWindow._apply_transponder_mode."""
     url = f"{SATNOGS_TRANSMITTERS_URL}?satellite__norad_cat_id={norad_cat_id}&format=json"
     request = urllib.request.Request(
         url,
@@ -644,6 +656,8 @@ def fetch_transponders(norad_cat_id):
             "downlink_mhz": f"{downlink_hz / 1e6:.4f}" if downlink_hz else "",
             "uplink_mhz": f"{uplink_hz / 1e6:.4f}" if uplink_hz else "",
             "mode": entry.get("mode") or "",
+            "uplink_mode": entry.get("uplink_mode") or "",
+            "invert": bool(entry.get("invert")),
             "alive": bool(entry.get("alive")),
         })
     results.sort(key=lambda r: not r["alive"])
@@ -698,7 +712,7 @@ class TransponderEditDialog(QDialog):
     which one to actually use when tuning is a later feature; this
     dialog is just for storing and correcting the data."""
 
-    COLUMNS = ["Description", "Uplink (MHz)", "Downlink (MHz)", "Mode", "Active"]
+    COLUMNS = ["Description", "Uplink (MHz)", "Downlink (MHz)", "Mode", "Uplink Mode", "Active"]
 
     def __init__(self, satellite_name, transponders, parent=None):
         super().__init__(parent)
@@ -744,10 +758,16 @@ class TransponderEditDialog(QDialog):
         self.table.setItem(row, 1, QTableWidgetItem(transponder.get("uplink_mhz", "")))
         self.table.setItem(row, 2, QTableWidgetItem(transponder.get("downlink_mhz", "")))
         self.table.setItem(row, 3, QTableWidgetItem(transponder.get("mode", "")))
+        # Separate from "Mode" (the downlink mode) since some linear
+        # transponders invert sidebands between uplink and downlink
+        # (e.g. LSB up/USB down or vice versa) -- see fetch_transponders'
+        # docstring. Left blank for e.g. FM transponders, where uplink
+        # and downlink mode are the same anyway.
+        self.table.setItem(row, 4, QTableWidgetItem(transponder.get("uplink_mode", "")))
         active_item = QTableWidgetItem()
         active_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
         active_item.setCheckState(Qt.Checked if transponder.get("alive", True) else Qt.Unchecked)
-        self.table.setItem(row, 4, active_item)
+        self.table.setItem(row, 5, active_item)
 
     def _on_add_row(self):
         row = self.table.rowCount()
@@ -767,14 +787,16 @@ class TransponderEditDialog(QDialog):
             uplink = self.table.item(row, 1).text().strip()
             downlink = self.table.item(row, 2).text().strip()
             mode = self.table.item(row, 3).text().strip()
-            if not (description or uplink or downlink or mode):
+            uplink_mode = self.table.item(row, 4).text().strip()
+            if not (description or uplink or downlink or mode or uplink_mode):
                 continue  # skip fully-blank rows
             transponders.append({
                 "description": description,
                 "uplink_mhz": uplink,
                 "downlink_mhz": downlink,
                 "mode": mode,
-                "alive": self.table.item(row, 4).checkState() == Qt.Checked,
+                "uplink_mode": uplink_mode,
+                "alive": self.table.item(row, 5).checkState() == Qt.Checked,
             })
         return transponders
 

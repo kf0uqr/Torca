@@ -739,8 +739,14 @@ class RadioWindow(QWidget):
             for transponder in transponders:
                 downlink = transponder.get("downlink_mhz") or "?"
                 mode = transponder.get("mode") or "?"
+                uplink_mode = transponder.get("uplink_mode") or ""
+                # Only show a "mode/uplink_mode" split when they actually
+                # differ (an inverting linear transponder) -- redundant
+                # otherwise (FM transponders, or entries with no
+                # uplink_mode recorded at all).
+                mode_label = f"{uplink_mode}/{mode}" if uplink_mode and uplink_mode != mode else mode
                 description = transponder.get("description") or "Transponder"
-                self.satellite_transponder_combo.addItem(f"{description} -- {downlink} MHz {mode}", transponder)
+                self.satellite_transponder_combo.addItem(f"{description} -- {downlink} MHz {mode_label}", transponder)
             self.satellite_transponder_combo.setEnabled(True)
         else:
             self.satellite_transponder_combo.addItem("No transponders stored -- Doppler correction unavailable", None)
@@ -816,27 +822,35 @@ class RadioWindow(QWidget):
         self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
 
     def _apply_transponder_mode(self, transponder):
-        """Sets the radio's mode from the transponder's stored mode
-        string, if it maps unambiguously to one of this app's confirmed-
-        valid radio modes (see satellite_tracking.
-        radio_mode_for_transponder) -- called on tracking start and
-        whenever the transponder selection changes, so switching from an
-        FM bird to a linear one mid-session re-applies the right mode
-        too, not just on first start. Does nothing (leaves mode alone)
-        if the transponder has no mode recorded or it isn't one of the
-        unambiguous ones -- see that function's docstring for why
-        guessing further would be worse than doing nothing.
+        """Sets the radio's mode(s) from the transponder's stored mode
+        data, if they map unambiguously to this app's confirmed-valid
+        radio modes (see satellite_tracking.radio_mode_for_transponder)
+        -- called on tracking start and whenever the transponder
+        selection changes, so switching from an FM bird to a linear one
+        mid-session re-applies the right mode too, not just on first
+        start. Does nothing for either side (leaves mode alone) when it
+        can't be mapped confidently -- see that function's docstring for
+        why guessing further would be worse than doing nothing.
 
-        FM only sets BOTH Main and Sub (dual-receiver): FM transponders
-        don't invert sidebands, so the same mode is correct for both
-        uplink and downlink. Any other mapped mode (LSB/USB/AM/CW) only
-        sets the downlink (Sub, or the single receiver on a single-
-        receiver radio) -- some linear/SSB transponders invert sidebands
-        between uplink and downlink (e.g. LSB up/USB down or vice versa),
-        and this app has no separate uplink-mode data to get that right
-        automatically, so Main's mode is left for the operator to verify/
-        set manually for those birds rather than risk transmitting on the
-        wrong sideband.
+        Downlink (Sub, or the single receiver on a single-receiver
+        radio) is set from the transponder's "mode" field whenever it
+        maps. Uplink (Main, dual-receiver only) is set two ways:
+          - If the transponder has its own "uplink_mode" recorded
+            (SatNOGS DB tracks this separately from "mode" specifically
+            because some linear transponders invert sidebands between
+            uplink and downlink -- confirmed via a live fetch of AO-7's
+            entry, mode=USB/uplink_mode=LSB/invert=true -- see
+            fetch_transponders' docstring) and it maps too, that's used,
+            correctly handling inverting transponders.
+          - Otherwise, only when the downlink mode is FM/WFM: mirrors
+            the downlink mode onto Main, since FM transponders don't
+            invert sidebands, so uplink==downlink is a safe default even
+            without explicit uplink_mode data (most FM entries don't
+            bother recording one, since it'd always just repeat "mode").
+          - Any other case (no uplink_mode AND downlink isn't FM/WFM)
+            leaves Main's mode alone for the operator to set/verify
+            manually, rather than risk transmitting on the wrong
+            sideband from an unconfirmed guess.
 
         set_control_value (not set_receiver_control_value) is used for
         the downlink half deliberately: it targets whichever receiver is
@@ -855,12 +869,17 @@ class RadioWindow(QWidget):
             return
         if "mode" not in self.control_widgets:
             return
-        mode_value = radio_mode_for_transponder(transponder.get("mode"))
-        if mode_value is None:
+        downlink_mode_value = radio_mode_for_transponder(transponder.get("mode"))
+        if downlink_mode_value is not None:
+            self.worker.set_control_value("mode", downlink_mode_value)
+
+        if not self.worker.is_dual_receiver:
             return
-        self.worker.set_control_value("mode", mode_value)
-        if self.worker.is_dual_receiver and mode_value in ("FM", "WFM"):
-            self.worker.set_receiver_control_value(RECEIVER_MAIN, "mode", mode_value)
+        uplink_mode_value = radio_mode_for_transponder(transponder.get("uplink_mode"))
+        if uplink_mode_value is None and downlink_mode_value in ("FM", "WFM"):
+            uplink_mode_value = downlink_mode_value
+        if uplink_mode_value is not None:
+            self.worker.set_receiver_control_value(RECEIVER_MAIN, "mode", uplink_mode_value)
 
     def _stop_satellite_tracking(self):
         """Pauses re-tuning -- the satellite stays selected (name,

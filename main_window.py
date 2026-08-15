@@ -1136,7 +1136,16 @@ class RadioWindow(QWidget):
         if self._current_freq_hz is None:
             return  # haven't heard a frequency from the radio yet
         new_freq_hz = max(0, self._current_freq_hz + steps * step_hz)
-        self.worker.set_frequency(new_freq_hz)
+        # Dual-receiver: target whichever receiver is actually active
+        # right now (same pattern as _on_band_selected) rather than
+        # always defaulting to Main -- set_frequency() (used for single-
+        # receiver/Main) has no receiver concept at all, so this would
+        # otherwise silently retune Main while Sub was the active/
+        # displayed receiver, same bug _on_band_selected had.
+        if self.worker.is_dual_receiver and self.active_receiver_button.text() == "Active: SUB":
+            self.worker.set_receiver_frequency(RECEIVER_SUB, new_freq_hz)
+        else:
+            self.worker.set_frequency(new_freq_hz)
         # Update optimistically so the readout feels responsive while
         # spinning the knob; the next poll cycle will confirm/correct it.
         self._current_freq_hz = new_freq_hz

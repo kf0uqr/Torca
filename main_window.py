@@ -615,10 +615,27 @@ class RadioWindow(QWidget):
             # Sub is only ever used for continuous full-duplex downlink
             # RX now -- see _on_satellite_tracking_tick.
             target_vfo = "B" if checked else "A"
+            # Satellite mode, dual-receiver only: PTT also switches the
+            # active receiver -- Main for the transmission (so the
+            # tuning knob/AF/RF/squelch controls follow it, since Main
+            # is what's actually being adjusted while transmitting),
+            # back to Sub on release. Bundled into the same atomic
+            # worker call as the VFO retune and PTT keying (receiver
+            # param on start_ptt_after_vfo/stop_ptt_then_vfo) rather
+            # than a separately-dispatched select_receiver(), for the
+            # same ordering reasons as everything else here. Never
+            # touches the scope -- that stays on Sub throughout a
+            # transmission (_start_satellite_tracking) so you can see
+            # yourself on the downlink while transmitting.
+            receiver = None
+            if self.worker.is_dual_receiver:
+                receiver = RECEIVER_MAIN if checked else RECEIVER_SUB
             if checked:
-                self.worker.start_ptt_after_vfo(target_vfo, freq_hz)
+                self.worker.start_ptt_after_vfo(target_vfo, freq_hz, receiver)
             else:
-                self.worker.stop_ptt_then_vfo(target_vfo, freq_hz)
+                self.worker.stop_ptt_then_vfo(target_vfo, freq_hz, receiver)
+            if receiver is not None:
+                self._update_active_receiver_ui(receiver)
             self._current_freq_hz = freq_hz
             self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
             self._update_band_button_highlight()
@@ -703,14 +720,37 @@ class RadioWindow(QWidget):
         # follow Main's VFO B at all -- that turned out to be wrong too;
         # PTT already follows Main's VFO A/B regardless of split state.)
         self._satellite_sub_vfo_selected = False
+
+        # Satellite mode, dual-receiver only: Sub is the active receiver
+        # (tuning knob/AF/RF/squelch controls) and the scope both default
+        # to Sub -- receiving, that's the Doppler-corrected downlink
+        # Sub continuously tracks (_on_satellite_tracking_tick), so
+        # that's what's worth looking at/listening to and adjusting.
+        # PTT itself switches the active receiver to Main for the
+        # duration of each transmission (_on_ptt_toggled) but
+        # deliberately leaves the scope on Sub throughout, to see
+        # yourself on the downlink while transmitting.
+        if self.worker.is_connected() and self.worker.is_dual_receiver:
+            self.worker.select_receiver(RECEIVER_SUB)
+            self.worker.set_scope_receiver(RECEIVER_SUB)
+            self._update_active_receiver_ui(RECEIVER_SUB)
+
         self._on_satellite_tracking_tick()
         self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
 
     def _stop_satellite_tracking(self):
         """Pauses re-tuning -- the satellite stays selected (name,
         transponder list, last-known overlay reading) until either
-        resumed or replaced by double-clicking another one."""
+        resumed or replaced by double-clicking another one. Also
+        restores Main as the active receiver/scope (dual-receiver only),
+        undoing _start_satellite_tracking's switch to Sub -- otherwise
+        normal (non-satellite) operation would silently be left
+        controlling/watching Sub instead of Main."""
         self._satellite_tracking_timer.stop()
+        if self.worker.is_connected() and self.worker.is_dual_receiver:
+            self.worker.select_receiver(RECEIVER_MAIN)
+            self.worker.set_scope_receiver(RECEIVER_MAIN)
+            self._update_active_receiver_ui(RECEIVER_MAIN)
 
     def _compute_satellite_state(self, satellite):
         """Pure computation, no radio I/O -- look angles, next AOS/LOS,
@@ -950,29 +990,34 @@ class RadioWindow(QWidget):
         self.worker.set_control_value(key, target_value)
 
     def _on_active_receiver_toggle_clicked(self):
-        # Optimistic label, same as the vfo_toggle buttons -- no polling
-        # of get_active_receiver() wired up (yet); this is a manual
-        # diagnostic first, not something depending on confirmed
-        # round-trip feedback. Confirmed live on a real 9700 (plus
-        # independently by Icom's own documented behavior): PTT always
-        # transmits from Main no matter which receiver is active -- a
-        # real hardware limitation, not a software gap -- so this no
-        # longer has anything to do with automating PTT/TX. Kept as a
-        # manual control, now also driving the scope/waterfall (set_
-        # scope_receiver -- confirmed live it doesn't follow
-        # select_receiver() on its own) so you can look at Sub's
-        # downlink (e.g. to see your own signal) while Main handles TX.
+        # Manual control -- switches which receiver is active AND which
+        # one the scope/waterfall shows (set_scope_receiver -- confirmed
+        # live it doesn't follow select_receiver() on its own), together.
+        # During active satellite-mode tracking, PTT itself also
+        # switches the active receiver automatically (_on_ptt_toggled)
+        # but deliberately leaves the scope alone -- this button is the
+        # only thing that moves the scope, so it stays under manual
+        # control even while satellite mode is running.
         receiver = RECEIVER_MAIN if self.active_receiver_button.text() == "Active: SUB" else RECEIVER_SUB
         self.worker.select_receiver(receiver)
         self.worker.set_scope_receiver(receiver)
-        self.active_receiver_button.setText("Active: SUB" if receiver == RECEIVER_SUB else "Active: MAIN")
+        self._update_active_receiver_ui(receiver)
 
-        # AF Gain/Squelch/RF Level are confirmed, live on a real 9700, to
-        # follow whichever receiver is active rather than any receiver=
-        # addressing -- relabel them so it's clear which one they're now
-        # actually affecting. The displayed percentage itself catches up
-        # within one poll cycle (_on_level_updated) since the sliders
-        # keep polling/writing the same way regardless.
+    def _update_active_receiver_ui(self, receiver):
+        """Reflects `receiver` as the active one in the UI -- the
+        active_receiver_button label, and a live "(Sub)" suffix on the
+        AF Gain/Squelch/RF Level labels (DUAL_RECEIVER_LEVEL_KEYS,
+        confirmed live on a real 9700 to follow whichever receiver is
+        active rather than any receiver= addressing) so it's clear
+        which receiver they're actually affecting. The displayed
+        percentage itself catches up within one poll cycle
+        (_on_level_updated) since the sliders keep polling/writing the
+        same way regardless. Optimistic, same as the vfo_toggle buttons
+        -- no polling of get_active_receiver() wired up (yet). Shared by
+        the manual toggle above and satellite mode's automatic
+        PTT-driven switching (_on_ptt_toggled, _start_satellite_
+        tracking, _stop_satellite_tracking)."""
+        self.active_receiver_button.setText("Active: SUB" if receiver == RECEIVER_SUB else "Active: MAIN")
         suffix = " (Sub)" if receiver == RECEIVER_SUB else ""
         for key in DUAL_RECEIVER_LEVEL_KEYS:
             self._level_receiver_suffix[key] = suffix

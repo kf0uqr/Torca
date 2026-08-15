@@ -2,9 +2,8 @@
 Solar-terrestrial data for the Ham Dashboard: NOAA SWPC's public
 K-index/solar-flux/sunspot-number feeds, N0NBH's widely-used HF band
 conditions feed, a background QThread that polls both periodically, plus
-two small standalone helpers used by the dashboard's map -- Maidenhead
-grid-square conversion and basic day/night solar-position astronomy
-(sub-solar point, solar elevation at a given lat/lon/time).
+basic day/night solar-position astronomy (sub-solar point, solar
+elevation at a given lat/lon/time) used by the dashboard's map.
 """
 
 import datetime
@@ -201,26 +200,6 @@ class SolarDataWorker(QThread):
                 if self.isInterruptionRequested():
                     return
                 self.msleep(1000)
-
-
-def maidenhead_to_latlon(grid):
-    """Converts a Maidenhead grid locator (4 or 6 characters, e.g.
-    "EM12" or "EM12ab") to the approximate (lat, lon) in degrees at the
-    center of that grid square. Standard, well-established algorithm."""
-    grid = grid.strip().upper()
-    if len(grid) < 4 or not grid[2].isdigit() or not grid[3].isdigit():
-        raise ValueError("expected a 4 or 6 character grid square, e.g. EM12 or EM12ab")
-    lon = (ord(grid[0]) - ord("A")) * 20 - 180
-    lat = (ord(grid[1]) - ord("A")) * 10 - 90
-    lon += int(grid[2]) * 2
-    lat += int(grid[3]) * 1
-    if len(grid) >= 6 and grid[4].isalpha() and grid[5].isalpha():
-        lon += (ord(grid[4]) - ord("A")) * (2 / 24.0) + (1 / 24.0)
-        lat += (ord(grid[5]) - ord("A")) * (1 / 24.0) + (0.5 / 24.0)
-    else:
-        lon += 1.0   # center of the 2-degree-wide square
-        lat += 0.5   # center of the 1-degree-tall square
-    return lat, lon
 
 
 def _solar_subpoint(dt_utc):

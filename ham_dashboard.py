@@ -3,7 +3,8 @@ HamClockWindow: the Ham Dashboard window itself, tying together the
 day/night world map, live clocks, solar-terrestrial data, HF band
 conditions, and satellite tracking into one window. Opened via the "Ham
 Dashboard" button in the main radio window -- doesn't need a radio
-connection.
+connection. The operator's location (used for Doppler correction, and
+shown as a marker on the map) is set in ConnectionDialog, not here.
 """
 
 import datetime
@@ -16,7 +17,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QMessageBox,
     QTableWidget,
@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
 )
 
-from solar_data import SolarDataWorker, BAND_CONDITION_RANGES, maidenhead_to_latlon
+from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
 from world_map import WorldMapWidget
 from satellite_tracking import (
     SatelliteConfigDialog,
@@ -40,13 +40,18 @@ class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
     section for what's in scope and why. `worker` (a RadioWorker, or
     None) is only needed for the Doppler correction dialog -- everything
-    else here still works without a radio connection."""
+    else here still works without a radio connection. observer_lat/
+    observer_lon/observer_elevation_m come from ConnectionDialog."""
 
-    def __init__(self, worker=None, parent=None):
+    def __init__(self, worker=None, observer_lat=None, observer_lon=None,
+                 observer_elevation_m=0.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ham Dashboard")
         self.resize(680, 520)
         self._worker = worker
+        self._observer_lat = observer_lat
+        self._observer_lon = observer_lon
+        self._observer_elevation_m = observer_elevation_m or 0.0
 
         self.map_widget = WorldMapWidget()
         self.map_widget.satellite_double_clicked.connect(self._on_satellite_double_clicked)
@@ -85,11 +90,6 @@ class HamClockWindow(QWidget):
                 item.setTextAlignment(Qt.AlignCenter)
                 self.band_conditions_table.setItem(row, col, item)
 
-        self.grid_input = QLineEdit()
-        self.grid_input.setPlaceholderText("Your grid square (e.g. EM12) or \"lat,lon\"")
-        self.grid_set_button = QPushButton("Set")
-        self.grid_set_button.clicked.connect(self._on_set_location)
-
         self.satellites = load_satellite_data()
 
         self.satellite_button = QPushButton("Satellites: OFF")
@@ -115,10 +115,6 @@ class HamClockWindow(QWidget):
         solar_row.addWidget(self.ssn_label)
         solar_row.addWidget(self.k_index_label)
 
-        location_row = QHBoxLayout()
-        location_row.addWidget(self.grid_input)
-        location_row.addWidget(self.grid_set_button)
-
         layout = QVBoxLayout()
         layout.addWidget(self.map_widget, 1)
         layout.addLayout(clocks_row)
@@ -126,8 +122,13 @@ class HamClockWindow(QWidget):
         layout.addWidget(self.solar_updated_label)
         layout.addWidget(QLabel("HF Band Conditions:"))
         layout.addWidget(self.band_conditions_table)
-        layout.addLayout(location_row)
         self.setLayout(layout)
+
+        if self._observer_lat is not None and self._observer_lon is not None:
+            self.map_widget.set_operator_location(
+                self._observer_lat, self._observer_lon,
+                f"{self._observer_lat:.3f}, {self._observer_lon:.3f}",
+            )
 
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._update_clocks)
@@ -153,21 +154,6 @@ class HamClockWindow(QWidget):
     def _update_clocks(self):
         self.utc_label.setText(datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC"))
         self.local_label.setText(datetime.datetime.now().strftime("%H:%M:%S Local"))
-
-    def _on_set_location(self):
-        text = self.grid_input.text().strip()
-        if not text:
-            return
-        try:
-            if "," in text:
-                lat_str, lon_str = text.split(",", 1)
-                lat, lon = float(lat_str), float(lon_str)
-            else:
-                lat, lon = maidenhead_to_latlon(text)
-        except Exception as exc:
-            QMessageBox.warning(self, "Location", f"Couldn't parse \"{text}\": {exc}")
-            return
-        self.map_widget.set_operator_location(lat, lon, text)
 
     def _on_satellite_toggled(self, checked):
         if checked and not SGP4_AVAILABLE:
@@ -226,15 +212,21 @@ class HamClockWindow(QWidget):
                 "\"Edit Transponders...\" to add some first."
             )
             return
-        observer_lat, observer_lon = self.map_widget.operator_location()
-        if observer_lat is None or observer_lon is None:
+        # (0, 0) is what an unset lat/lon defaults to (nobody's actual
+        # station is at 0N 0E), so treat it the same as "not set".
+        if not self._observer_lat and not self._observer_lon:
             QMessageBox.warning(
                 self, "Doppler Correction",
-                "Set your location (grid square or lat,lon, below the map) first --"
-                " Doppler correction needs to know where you're observing from."
+                "Set your location in the Connect dialog first (Latitude/"
+                "Longitude/Elevation) -- Doppler correction needs to know "
+                "where you're observing from. You'll need to restart the "
+                "app to change it."
             )
             return
-        dialog = DopplerCorrectionDialog(satellite, self._worker, observer_lat, observer_lon, self)
+        dialog = DopplerCorrectionDialog(
+            satellite, self._worker, self._observer_lat, self._observer_lon,
+            self._observer_elevation_m, self,
+        )
         dialog.exec()
 
     @Slot(dict)

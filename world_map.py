@@ -118,10 +118,6 @@ class WorldMapWidget(QWidget):
         self._operator_label = label
         self.update()
 
-    def operator_location(self):
-        """Returns (lat, lon), or (None, None) if the operator hasn't set one."""
-        return self._operator_lat, self._operator_lon
-
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)

@@ -411,7 +411,12 @@ class RadioWindow(QWidget):
 
     def _on_hamclock_button_clicked(self):
         if self.hamclock_window is None:
-            self.hamclock_window = HamClockWindow(worker=self.worker)
+            self.hamclock_window = HamClockWindow(
+                worker=self.worker,
+                observer_lat=self._details.get("observer_lat"),
+                observer_lon=self._details.get("observer_lon"),
+                observer_elevation_m=self._details.get("observer_elevation_m", 0.0),
+            )
         self.hamclock_window.show()
         self.hamclock_window.raise_()
         self.hamclock_window.activateWindow()

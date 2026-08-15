@@ -198,12 +198,17 @@ EARTH_ROTATION_RATE_RAD_S = math.radians(360.98564736629) / 86400.0
 SPEED_OF_LIGHT_KM_S = 299792.458
 
 
-def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observer_lon):
+def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observer_lon,
+                        observer_elevation_km=0.0):
     """Corrects base_freq_hz (a transponder's downlink) for the
-    satellite's Doppler shift at dt_utc, as seen from observer_lat/lon.
-    Same spherical-Earth approximation as propagate_satellite -- Earth's
-    oblateness affects this by well under the resolution a human retunes
-    a radio to, nowhere near worth a full WGS84 conversion for.
+    satellite's Doppler shift at dt_utc, as seen from observer_lat/lon/
+    elevation. Same spherical-Earth approximation as propagate_satellite
+    (observer_elevation_km is added straight onto EARTH_RADIUS_KM rather
+    than modeled against a WGS84 ellipsoid) -- Earth's oblateness affects
+    this by well under the resolution a human retunes a radio to, nowhere
+    near worth a full ellipsoid conversion for. Elevation matters more
+    for LEO passes near the horizon, where slant range is smallest and
+    the observer's exact position has the most relative effect.
 
     Standard non-relativistic Doppler: f_observed = f_transmitted *
     (1 - range_rate / c), where range_rate is how fast the slant range
@@ -225,11 +230,12 @@ def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observe
     jd, fr, sat_pos, sat_vel = result
     gmst_rad = math.radians(_gmst_degrees(jd, fr))
 
+    obs_radius_km = EARTH_RADIUS_KM + observer_elevation_km
     lat_rad = math.radians(observer_lat)
     lon_rad = math.radians(observer_lon) + gmst_rad  # Earth-fixed longitude -> TEME longitude
-    obs_x = EARTH_RADIUS_KM * math.cos(lat_rad) * math.cos(lon_rad)
-    obs_y = EARTH_RADIUS_KM * math.cos(lat_rad) * math.sin(lon_rad)
-    obs_z = EARTH_RADIUS_KM * math.sin(lat_rad)
+    obs_x = obs_radius_km * math.cos(lat_rad) * math.cos(lon_rad)
+    obs_y = obs_radius_km * math.cos(lat_rad) * math.sin(lon_rad)
+    obs_z = obs_radius_km * math.sin(lat_rad)
     # Observer's TEME-frame velocity = Earth's rotation vector (0, 0, omega) crossed with its position.
     obs_vx = -EARTH_ROTATION_RATE_RAD_S * obs_y
     obs_vy = EARTH_ROTATION_RATE_RAD_S * obs_x
@@ -245,7 +251,7 @@ def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observe
     # straight out from Earth's center through the observer, so the
     # observer's own (unit) position vector doubles as that zenith
     # direction -- no separate ENU frame needed.
-    zenith_component = sum(c * u for c, u in zip(range_vec, (obs_x, obs_y, obs_z))) / EARTH_RADIUS_KM
+    zenith_component = sum(c * u for c, u in zip(range_vec, (obs_x, obs_y, obs_z))) / obs_radius_km
     elevation_deg = math.degrees(math.asin(max(-1.0, min(1.0, zenith_component / range_km))))
 
     corrected_hz = base_freq_hz * (1.0 - range_rate_km_s / SPEED_OF_LIGHT_KM_S)
@@ -441,7 +447,8 @@ class DopplerCorrectionDialog(QDialog):
 
     UPDATE_INTERVAL_MS = 2000
 
-    def __init__(self, satellite, worker, observer_lat, observer_lon, parent=None):
+    def __init__(self, satellite, worker, observer_lat, observer_lon,
+                 observer_elevation_m=0.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Doppler Correction -- {satellite.get('name', '?')}")
         self.resize(440, 200)
@@ -449,6 +456,7 @@ class DopplerCorrectionDialog(QDialog):
         self._worker = worker
         self._observer_lat = observer_lat
         self._observer_lon = observer_lon
+        self._observer_elevation_km = (observer_elevation_m or 0.0) / 1000.0
 
         self.transponder_combo = QComboBox()
         for transponder in satellite.get("transponders", []):
@@ -525,7 +533,7 @@ class DopplerCorrectionDialog(QDialog):
         result = doppler_correction(
             base_freq_hz,
             self._satellite.get("line1", ""), self._satellite.get("line2", ""),
-            now, self._observer_lat, self._observer_lon,
+            now, self._observer_lat, self._observer_lon, self._observer_elevation_km,
         )
         if result is None:
             self.status_label.setText("Couldn't propagate this satellite's orbit (missing/invalid TLE?).")

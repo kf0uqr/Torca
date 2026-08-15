@@ -899,6 +899,32 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(str(exc))
 
+    def select_receiver(self, receiver: int):
+        """Thread-safe: call from the GUI thread. Dual-receiver only --
+        makes `receiver` the radio's active receiver via rigplane's
+        select_receiver(), confirmed via its own docstring to issue the
+        real main_select/sub_select CI-V opcode (0x07 0xD0/0xD1) and
+        update RadioState.active. Genuinely different from addressing a
+        specific receiver via receiver= on set_frequency/set_vfo_slot/
+        etc elsewhere in this file -- those write into that receiver's
+        own registers without necessarily making it "active" for
+        anything else, which is exactly what every previous attempt to
+        route PTT/TX to Sub on a real 9700 ran into: the write always
+        landed, but had no effect on which receiver actually
+        transmitted. Manual diagnostic control (active_receiver_button,
+        main_window.py) for finding out whether THIS is what actually
+        determines that, before automating whatever the answer turns
+        out to be."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._select_receiver(receiver), self.loop)
+
+    async def _select_receiver(self, receiver: int):
+        try:
+            await self.radio.select_receiver(receiver)
+        except Exception as exc:
+            self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+
     def set_receiver_frequency(self, receiver: int, freq_hz: int):
         """Thread-safe: call from the GUI thread. Only meaningful on a
         genuine dual-receiver radio (check self.is_dual_receiver first) --

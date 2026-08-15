@@ -38,7 +38,7 @@ from constants import (
     CONTROL_OPTION_EXCLUDED,
     TUNING_STEPS,
 )
-from radio_worker import RadioWorker, RECEIVER_SUB
+from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
 from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from ham_dashboard import HamClockWindow
@@ -164,6 +164,29 @@ class RadioWindow(QWidget):
             "(downlink) on release."
         )
         self.ptt_button.toggled.connect(self._on_ptt_toggled)
+
+        # Dual-receiver (9700/7610) only -- rigplane's select_receiver()/
+        # get_active_receiver(), confirmed via their own docstrings to
+        # issue the real main_select/sub_select CI-V opcode (0x07 0xD0/
+        # 0xD1) and update RadioState.active. Genuinely different from
+        # addressing a specific receiver via receiver= on set_frequency
+        # etc (which writes into that receiver's own registers without
+        # necessarily making it "active") -- a manual way to test,
+        # button press by button press, whether PTT/TX actually follows
+        # THIS rather than Main's own VFO context regardless, before
+        # trying to automate whatever the answer turns out to be. Hidden
+        # for single-receiver radios (_on_connected).
+        self.active_receiver_button = QPushButton("Active: MAIN")
+        self.active_receiver_button.setEnabled(False)
+        self.active_receiver_button.setVisible(False)
+        self.active_receiver_button.setToolTip(
+            "Dual-receiver only: makes Main or Sub the radio's active "
+            "receiver (rigplane select_receiver() -- CI-V main_select/"
+            "sub_select), separate from which one has a given frequency "
+            "written to it. Manual diagnostic for finding out which of "
+            "these actually controls where PTT transmits."
+        )
+        self.active_receiver_button.clicked.connect(self._on_active_receiver_toggle_clicked)
 
         self.hamclock_button = QPushButton("Ham Dashboard")
         self.hamclock_button.setToolTip(
@@ -389,6 +412,7 @@ class RadioWindow(QWidget):
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.ptt_button)
+        knob_row.addWidget(self.active_receiver_button)
 
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
@@ -424,6 +448,9 @@ class RadioWindow(QWidget):
         self.status_label.setText(f"Connected to {self._connection_label}")
         self.tuning_knob.setEnabled(True)
         self.ptt_button.setEnabled(True)
+        if self.worker.is_dual_receiver:
+            self.active_receiver_button.setVisible(True)
+            self.active_receiver_button.setEnabled(True)
         for button in self.band_buttons:
             button.setEnabled(True)
         for slider in self.level_sliders.values():
@@ -898,6 +925,15 @@ class RadioWindow(QWidget):
         # than two, but VFO A/B only ever has two).
         target_label, target_value = options[(index + 1) % len(options)]
         self.worker.set_control_value(key, target_value)
+
+    def _on_active_receiver_toggle_clicked(self):
+        # Optimistic label, same as the vfo_toggle buttons -- no polling
+        # of get_active_receiver() wired up (yet); this is a manual
+        # diagnostic first, not something depending on confirmed
+        # round-trip feedback.
+        going_to_sub = self.active_receiver_button.text() == "Active: MAIN"
+        self.worker.select_receiver(RECEIVER_SUB if going_to_sub else RECEIVER_MAIN)
+        self.active_receiver_button.setText("Active: SUB" if going_to_sub else "Active: MAIN")
 
     @Slot(str, object)
     def _on_control_updated(self, key, value):

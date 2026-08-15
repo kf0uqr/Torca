@@ -160,19 +160,19 @@ class RadioWorker(QThread):
         self.loop = None       # asyncio event loop, created inside run()
         self.radio = None      # rigplane Radio, set once connected
         self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
-        # Dual-receiver only: whichever of RECEIVER_MAIN/RECEIVER_SUB was
-        # last actually written to (_set_receiver_frequency/
-        # _select_receiver_vfo_and_set_frequency, so every satellite-
-        # tracking receiver-touching call updates it). _poll_loop() reads
-        # this receiver's frequency instead of unconditionally defaulting
-        # to Main -- confirmed live on a real 9700 that the poll loop's
-        # own unconditional, independent get_frequency() (defaulting to
-        # Main, every POLL_INTERVAL_SEC, regardless of PTT/satellite
-        # state) was itself enough to keep yanking the radio's focus back
-        # to Main during a held Sub/uplink transmission, producing an
-        # uplink/downlink flip-flop that had nothing to do with -- and
-        # wasn't fixed by -- anything in the satellite-tracking retune
-        # logic itself.
+        # Dual-receiver only: which receiver every receiver-aware
+        # getter/setter (see _receiver_kwargs) targets when none is
+        # explicitly given -- fixed at RECEIVER_MAIN and never changed.
+        # Confirmed live on a real 9700 (a controlled test giving each
+        # VFO a distinct mode to tell them apart) that PTT/split-driven
+        # transmission always follows Main's own VFO A/B context, never
+        # Sub, regardless of what's written to Sub -- so Main is the
+        # right target for every generic single-value control (mode,
+        # frequency readout, squelch, etc.) unconditionally. Sub is only
+        # ever touched directly, by receiver number, for its own
+        # continuous downlink tracking (main_window.py's
+        # _on_satellite_tracking_tick) -- that never needs to change
+        # what this defaults to.
         self._active_receiver = RECEIVER_MAIN
         self._radio_cm = None
         self._stop_requested = False
@@ -905,14 +905,18 @@ class RadioWorker(QThread):
         sets ONE of its two independent receivers' frequency directly
         (receiver=RECEIVER_MAIN or RECEIVER_SUB). Low-level: doesn't
         touch which VFO slot is selected within that receiver -- see
-        select_receiver_vfo_and_set_frequency() below, which is what
-        satellite tracking (main_window.py) actually uses."""
+        select_receiver_vfo_and_set_frequency() below. PTT/split doesn't
+        actually follow Sub on a real 9700 (confirmed live), so in
+        practice this is only ever used to keep Sub locked to the
+        continuous downlink for full-duplex RX (main_window.py's
+        _on_satellite_tracking_tick) -- Main's own VFO A/B, via
+        select_vfo_and_set_frequency() instead, is what actually
+        matters for TX."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._set_receiver_frequency(receiver, freq_hz), self.loop)
 
     async def _set_receiver_frequency(self, receiver: int, freq_hz: int):
-        self._active_receiver = receiver
         try:
             await self.radio.set_frequency(freq_hz, receiver=receiver)
         except Exception as exc:
@@ -930,13 +934,12 @@ class RadioWorker(QThread):
         already happens to have selected; this also explicitly selects
         VFO A on that receiver first. Confirmed live (a real 9700):
         without this, the radio's own display never actually switches
-        to (and its transmitter never actually uses) the VFO context it
-        labels "VFO A-2" for Sub -- receiver-only writes weren't
-        reaching the VFO slot that's actually driving the uplink.
-        Sequential in one coroutine (VFO select, then frequency), same
-        reasoning as select_vfo_and_set_frequency() above: two
-        separately-dispatched commands don't actually guarantee
-        anything about their real-world ordering on the radio's side."""
+        to the VFO context it labels "VFO A-2" for Sub -- receiver-only
+        writes weren't reaching the VFO slot. Sequential in one
+        coroutine (VFO select, then frequency), same reasoning as
+        select_vfo_and_set_frequency() above: two separately-dispatched
+        commands don't actually guarantee anything about their
+        real-world ordering on the radio's side."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(
@@ -944,7 +947,6 @@ class RadioWorker(QThread):
         )
 
     async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int):
-        self._active_receiver = receiver
         try:
             await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
         except Exception as exc:
@@ -1039,37 +1041,6 @@ class RadioWorker(QThread):
                 f"{CONTROL_DEFINITIONS['vfo']['label']}: not available on this radio/install "
                 "-- frequency not restored to the downlink."
             )
-
-    def start_ptt_after_receiver_vfo(self, receiver: int, freq_hz: int, vfo_slot: str = "A"):
-        """Thread-safe: call from the GUI thread. Dual-receiver radios
-        (9700/7610) counterpart to start_ptt_after_vfo() -- selects VFO A
-        on the given receiver, sets its frequency, THEN keys PTT, all as
-        one coroutine. See start_ptt_after_vfo()'s docstring for why that
-        ordering has to be atomic, not just called in order."""
-        if self.loop is None or self.radio is None:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self._start_ptt_after_receiver_vfo(receiver, vfo_slot, freq_hz), self.loop
-        )
-
-    async def _start_ptt_after_receiver_vfo(self, receiver: int, vfo_slot: str, freq_hz: int):
-        await self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz)
-        await self._start_ptt()
-
-    def stop_ptt_then_receiver_vfo(self, receiver: int, freq_hz: int, vfo_slot: str = "A"):
-        """Thread-safe: call from the GUI thread. Dual-receiver radios
-        (9700/7610) counterpart to stop_ptt_then_vfo() -- stops
-        transmitting first, then selects VFO A on the given receiver and
-        restores its frequency, all as one coroutine."""
-        if self.loop is None or self.radio is None:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self._stop_ptt_then_receiver_vfo(receiver, vfo_slot, freq_hz), self.loop
-        )
-
-    async def _stop_ptt_then_receiver_vfo(self, receiver: int, vfo_slot: str, freq_hz: int):
-        await self._stop_ptt()
-        await self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz)
 
     def select_band(self, band_label: str, low_edge_hz: int):
         """Thread-safe. Tries Icom's confirmed get_bsr() band-stacking

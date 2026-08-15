@@ -633,16 +633,22 @@ class RadioWindow(QWidget):
           Confirmed working correctly on a real 705.
 
         - Dual-receiver radios (9700/7610): Main and Sub are independent
-          receivers, not a single switched VFO context -- Main stays on
-          the downlink and Sub on the uplink continuously and
-          simultaneously, true full-duplex, no VFO/split involved at
-          all. Confirmed live: applying the single-receiver approach
-          unmodified to a 9700 produced the same switch-then-revert
-          oscillation the fix above was for, because "select VFO B" and
-          "set frequency" on that radio don't actually mean what they
-          mean on a 7300/705 -- IcomRadio.set_frequency() always targets
-          receiver 0 (Main) unless told otherwise via its own separate
-          receiver= parameter, which VFO A/B selection doesn't touch."""
+          RF chains, not a single switched VFO context -- but addressing
+          either one to write its frequency (IcomRadio.set_frequency()'s
+          receiver= kwarg) turned out, confirmed live on a real 9700, to
+          also visibly focus/select it, the same way VFO selection does
+          on a single-receiver radio. Writing both every tick regardless
+          of PTT state (an earlier version of this) made the radio flip
+          which one was active back and forth, exactly the oscillation
+          this is trying to avoid. So despite Main/Sub genuinely being
+          independent hardware, the fix ends up structurally similar to
+          the single-receiver path: only the ONE currently relevant to
+          RX or TX ever gets a set_receiver_frequency() call -- Main
+          while receiving, Sub while transmitting, never both -- so the
+          radio has no reason to move off whichever one it's already on.
+          Both directions' Doppler are still computed and shown together
+          in the overlay (pure math, no radio I/O) even though only one
+          is actually being sent."""
         satellite = self._active_satellite
         if satellite is None:
             return
@@ -717,22 +723,40 @@ class RadioWindow(QWidget):
         transmitting = self.ptt_button.isChecked()
         if self.worker.is_connected():
             if self.worker.is_dual_receiver:
-                # Main = downlink (RX), Sub = uplink (TX) -- both live
-                # simultaneously and continuously, independent of PTT.
-                # That's the actual mechanism a real dual-receiver radio
-                # (9700/7610) uses for satellite full-duplex operation;
-                # no VFO A/B or split involved, so PTT here just keys/
-                # unkeys Sub's already-correct transmitter, nothing more.
-                if downlink_hz is not None:
-                    self.worker.set_receiver_frequency(RECEIVER_MAIN, downlink_hz)
-                    self._current_freq_hz = downlink_hz
-                    self.freq_display.setText(f"{downlink_hz / 1e6:.6f} MHz")
-                    self._update_band_button_highlight()
-                if uplink_hz is not None:
-                    self.worker.set_receiver_frequency(RECEIVER_SUB, uplink_hz)
+                # Main = downlink (RX), Sub = uplink (TX) -- but only the
+                # ONE that's actually relevant right now gets touched,
+                # not both every tick. Confirmed live (a real 9700):
+                # setting both regardless of PTT state makes the radio
+                # visibly flip which receiver is active/selected back and
+                # forth -- addressing a receiver to write its frequency
+                # apparently also focuses it, even though Main/Sub are
+                # independent RF chains at the hardware level. Only ever
+                # commanding the one currently in use (Main while
+                # receiving, Sub while transmitting) is what actually
+                # keeps the radio sitting still on it -- same principle
+                # as the single-receiver path below never touching the
+                # inactive VFO either, just without a shared context to
+                # explicitly switch.
+                if transmitting:
+                    if uplink_hz is not None:
+                        self.worker.set_receiver_frequency(RECEIVER_SUB, uplink_hz)
+                        self._current_freq_hz = uplink_hz
+                        self.freq_display.setText(f"{uplink_hz / 1e6:.6f} MHz")
+                        self._update_band_button_highlight()
+                else:
+                    if downlink_hz is not None:
+                        self.worker.set_receiver_frequency(RECEIVER_MAIN, downlink_hz)
+                        self._current_freq_hz = downlink_hz
+                        self.freq_display.setText(f"{downlink_hz / 1e6:.6f} MHz")
+                        self._update_band_button_highlight()
+
+                # Doppler for both directions still shown together (pure
+                # math, no radio I/O) so the operator can see what TX
+                # Doppler will be before ever keying up, even though only
+                # the active direction is actually being sent to the radio.
                 if downlink_doppler_hz is not None:
                     doppler_text += f"  RX Doppler {downlink_doppler_hz:+.0f} Hz"
-                    if self._satellite_freq_offset_hz:
+                    if not transmitting and self._satellite_freq_offset_hz:
                         doppler_text += f"  Offset {self._satellite_freq_offset_hz:+.0f} Hz"
                 if uplink_doppler_hz is not None:
                     doppler_text += f"  TX Doppler {uplink_doppler_hz:+.0f} Hz"

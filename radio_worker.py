@@ -159,6 +159,20 @@ class RadioWorker(QThread):
         self.loop = None       # asyncio event loop, created inside run()
         self.radio = None      # rigplane Radio, set once connected
         self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
+        # Dual-receiver only: whichever of RECEIVER_MAIN/RECEIVER_SUB was
+        # last actually written to (_set_receiver_frequency/
+        # _select_receiver_vfo_and_set_frequency, so every satellite-
+        # tracking receiver-touching call updates it). _poll_loop() reads
+        # this receiver's frequency instead of unconditionally defaulting
+        # to Main -- confirmed live on a real 9700 that the poll loop's
+        # own unconditional, independent get_frequency() (defaulting to
+        # Main, every POLL_INTERVAL_SEC, regardless of PTT/satellite
+        # state) was itself enough to keep yanking the radio's focus back
+        # to Main during a held Sub/uplink transmission, producing an
+        # uplink/downlink flip-flop that had nothing to do with -- and
+        # wasn't fixed by -- anything in the satellite-tracking retune
+        # logic itself.
+        self._active_receiver = RECEIVER_MAIN
         self._radio_cm = None
         self._stop_requested = False
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
@@ -766,7 +780,15 @@ class RadioWorker(QThread):
         needing to track which widget wants which type."""
         while not self._stop_requested:
             try:
-                freq_hz = await self.radio.get_frequency()
+                # Dual-receiver: read whichever receiver is actually in
+                # use right now (see _active_receiver's definition in
+                # __init__) rather than unconditionally defaulting to
+                # Main -- reading a receiver turned out, same as writing
+                # one, to also visibly focus/select it on a real 9700.
+                if self.is_dual_receiver:
+                    freq_hz = await self.radio.get_frequency(receiver=self._active_receiver)
+                else:
+                    freq_hz = await self.radio.get_frequency()
                 self.frequency_updated.emit(freq_hz)
             except Exception as exc:
                 self.error.emit(str(exc))
@@ -854,6 +876,7 @@ class RadioWorker(QThread):
         asyncio.run_coroutine_threadsafe(self._set_receiver_frequency(receiver, freq_hz), self.loop)
 
     async def _set_receiver_frequency(self, receiver: int, freq_hz: int):
+        self._active_receiver = receiver
         try:
             await self.radio.set_frequency(freq_hz, receiver=receiver)
         except Exception as exc:
@@ -885,6 +908,7 @@ class RadioWorker(QThread):
         )
 
     async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int):
+        self._active_receiver = receiver
         try:
             await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
         except Exception as exc:

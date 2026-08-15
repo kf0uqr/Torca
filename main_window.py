@@ -649,16 +649,17 @@ class RadioWindow(QWidget):
             self._stop_satellite_tracking()
 
     def _start_satellite_tracking(self):
-        # Split (VFO A/B sharing one receiver, swapped around PTT) is
-        # only the right mechanism on a single-receiver radio (7300/705).
-        # A genuine dual-receiver radio (9700/7610 -- self.worker.
-        # is_dual_receiver, confirmed at connect time) keeps Main tuned
-        # to the downlink and Sub to the uplink continuously and
-        # simultaneously instead (see _on_satellite_tracking_tick) --
-        # true full-duplex, no split/VFO-switching involved at all, so
-        # there's nothing to enable here for that radio type.
+        # Split turns out to be required on a dual-receiver radio
+        # (9700/7610) too, not just single-receiver (7300/705) -- despite
+        # Main/Sub being independent RF chains, confirmed live on a real
+        # 9700 that PTT only actually transmits from Sub's tuned
+        # frequency/mode while split is on; with it off, PTT transmits
+        # from Main regardless of what Sub is tuned to (its VFO A-2
+        # retune from start_ptt_after_receiver_vfo still lands, it's just
+        # not what actually goes out over the air). So this enables it
+        # unconditionally now rather than only for single-receiver.
         self._satellite_dual_vfo_confirmed_for = None
-        if self.worker.is_connected() and not self.worker.is_dual_receiver:
+        if self.worker.is_connected():
             # Checked explicitly (not just left to set_control_value()'s
             # own console [ERROR] line) since split's setter, like vfo's,
             # was never confirmed against real hardware -- if it's
@@ -682,10 +683,10 @@ class RadioWindow(QWidget):
         """Pauses re-tuning -- the satellite stays selected (name,
         transponder list, last-known overlay reading) until either
         resumed or replaced by double-clicking another one. Also drops
-        split back off (single-receiver radios only -- see
-        _start_satellite_tracking), since it was only turned on for this."""
+        split back off (see _start_satellite_tracking), since it was
+        only turned on for this -- both radio types now."""
         self._satellite_tracking_timer.stop()
-        if self.worker.is_connected() and not self.worker.is_dual_receiver:
+        if self.worker.is_connected():
             self.worker.set_control_value("split", False)
 
     def _compute_satellite_state(self, satellite):

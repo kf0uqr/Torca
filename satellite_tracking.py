@@ -650,6 +650,48 @@ def fetch_transponders(norad_cat_id):
     return results
 
 
+# Maps a transponder's stored "mode" string (SatNOGS DB or hand-entered
+# via TransponderEditDialog) to one of this app's own confirmed-valid
+# radio mode control values -- see CONTROL_DEFINITIONS["mode"]["options"]
+# in constants.py: LSB, USB, AM, CW, RTTY, FM, WFM, CW_R, RTTY_R, DV,
+# confirmed via a real set_mode() runtime error message. Distinct raw
+# mode strings sampled from a live fetch of
+# https://db.satnogs.org/api/transmitters/ (2026-08): USB, FMN, FM, CW,
+# AFSK, FSK, BPSK, LSB, APT, HRPT, PSK, GMSK, DSB, SSTV, QPSK, DVB-S2, AM.
+#
+# Deliberately only maps the ones that correspond UNAMBIGUOUSLY to one of
+# the radio's own real RF modes. Everything else here (AFSK/FSK/BPSK/
+# PSK/QPSK/GMSK/DSB/SSTV/DVB-S2/APT/HRPT, and anything unrecognized) is a
+# digital protocol/encoding layered on top of some actual RF carrier --
+# which carrier varies satellite to satellite and isn't reliably
+# inferable from the mode string alone (e.g. GMSK telemetry might ride
+# on FM or a raw carrier depending on the bird). Guessing wrong here
+# would silently mistune the radio for an actual reception/transmission
+# attempt, which is worse than leaving mode alone -- callers should treat
+# None as "tell the operator to set mode manually" rather than apply a
+# guess.
+_TRANSPONDER_MODE_TO_RADIO_MODE = {
+    "FM": "FM",
+    "FMN": "FM",  # narrow FM -- no separate narrow-FM value in this app's mode control
+    "USB": "USB",
+    "LSB": "LSB",
+    "CW": "CW",
+    "AM": "AM",
+}
+
+
+def radio_mode_for_transponder(transponder_mode):
+    """Maps a transponder's stored mode string to one of this app's own
+    confirmed-valid radio mode control values (see
+    _TRANSPONDER_MODE_TO_RADIO_MODE's comment), or None if it isn't one
+    of the unambiguous ones -- callers should leave the radio's mode
+    alone and let the operator set it manually when this returns None,
+    rather than guess."""
+    if not transponder_mode:
+        return None
+    return _TRANSPONDER_MODE_TO_RADIO_MODE.get(transponder_mode.strip().upper())
+
+
 class TransponderEditDialog(QDialog):
     """Shows/edits the full list of known transponders for one satellite
     -- populated from a SatNOGS fetch, hand-entered, or both. Picking

@@ -980,6 +980,55 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"{definition['label']}: {set_name}({value!r}) failed ({exc}).")
 
+    def set_receiver_control_value(self, receiver: int, key: str, value):
+        """Thread-safe: call from the GUI thread. Like set_control_value,
+        but sets `key` on a SPECIFIC receiver regardless of which one is
+        currently active -- e.g. setting Main's mode while Sub is the
+        active/listening receiver during satellite tracking, which
+        set_control_value can't do (it always targets self._active_receiver,
+        i.e. whichever one the operator is currently listening to/tuning)."""
+        if self.loop is None:
+            return
+        if key not in self._control_methods:
+            self.error.emit(
+                f"{CONTROL_DEFINITIONS[key]['label']}: not available on this radio/install "
+                "(no working getter+setter was found on connect)."
+            )
+            return
+        asyncio.run_coroutine_threadsafe(self._set_receiver_control_value(receiver, key, value), self.loop)
+
+    async def _set_receiver_control_value(self, receiver: int, key: str, value):
+        """Temporarily selects `receiver` (if it isn't already active),
+        sets `key` on it via the same path _set_control_value uses, then
+        restores whichever receiver was active before -- a single bundled
+        coroutine, not three separately-dispatched calls, for the same
+        reason every other multi-step dual-receiver operation in this
+        file is bundled: two independently-scheduled
+        run_coroutine_threadsafe() calls don't guarantee real-world
+        completion order (see _set_receiver_frequency's docstring for the
+        self-perpetuating-oscillation bug this caused the one time it
+        wasn't followed). Single-receiver radios have no "other receiver"
+        to switch to or restore, so this is a no-op wrapper around the
+        normal _set_control_value path for them."""
+        if not self.is_dual_receiver:
+            await self._set_control_value(key, value)
+            return
+        previously_active = self._active_receiver
+        if receiver != previously_active:
+            try:
+                await self.radio.select_receiver(receiver)
+                self._active_receiver = receiver
+            except Exception as exc:
+                self.error.emit(f"Select receiver ({receiver}) for {key} failed: {exc}")
+                return
+        await self._set_control_value(key, value)
+        if receiver != previously_active:
+            try:
+                await self.radio.select_receiver(previously_active)
+                self._active_receiver = previously_active
+            except Exception as exc:
+                self.error.emit(f"Restoring active receiver ({previously_active}) after {key} failed: {exc}")
+
     async def _poll_loop(self):
         """Periodically reads live values: frequency, plus every
         confirmed-supported meter (see _setup_meters()). There are only a

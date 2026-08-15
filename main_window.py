@@ -43,7 +43,10 @@ from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
 from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from ham_dashboard import HamClockWindow
-from satellite_tracking import doppler_correction, satellite_look_angles, next_aos_los, format_countdown
+from satellite_tracking import (
+    doppler_correction, satellite_look_angles, next_aos_los, format_countdown,
+    radio_mode_for_transponder,
+)
 
 SATELLITE_TRACKING_INTERVAL_MS = 2000
 
@@ -760,6 +763,7 @@ class RadioWindow(QWidget):
     def _on_satellite_transponder_changed(self, _index):
         self._satellite_freq_offset_hz = 0  # only meaningful relative to the transponder it was dialed in against
         if self._active_satellite is not None:
+            self._apply_transponder_mode(self.satellite_transponder_combo.currentData())
             self._on_satellite_tracking_tick()  # reflect the new choice immediately, don't wait for the timer
 
     def _on_satellite_tracking_toggled(self, checked):
@@ -807,8 +811,56 @@ class RadioWindow(QWidget):
             self.worker.set_scope_receiver(RECEIVER_SUB)
             self._update_active_receiver_ui(RECEIVER_SUB)
 
+        self._apply_transponder_mode(self.satellite_transponder_combo.currentData())
         self._on_satellite_tracking_tick()
         self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
+
+    def _apply_transponder_mode(self, transponder):
+        """Sets the radio's mode from the transponder's stored mode
+        string, if it maps unambiguously to one of this app's confirmed-
+        valid radio modes (see satellite_tracking.
+        radio_mode_for_transponder) -- called on tracking start and
+        whenever the transponder selection changes, so switching from an
+        FM bird to a linear one mid-session re-applies the right mode
+        too, not just on first start. Does nothing (leaves mode alone)
+        if the transponder has no mode recorded or it isn't one of the
+        unambiguous ones -- see that function's docstring for why
+        guessing further would be worse than doing nothing.
+
+        FM only sets BOTH Main and Sub (dual-receiver): FM transponders
+        don't invert sidebands, so the same mode is correct for both
+        uplink and downlink. Any other mapped mode (LSB/USB/AM/CW) only
+        sets the downlink (Sub, or the single receiver on a single-
+        receiver radio) -- some linear/SSB transponders invert sidebands
+        between uplink and downlink (e.g. LSB up/USB down or vice versa),
+        and this app has no separate uplink-mode data to get that right
+        automatically, so Main's mode is left for the operator to verify/
+        set manually for those birds rather than risk transmitting on the
+        wrong sideband.
+
+        set_control_value (not set_receiver_control_value) is used for
+        the downlink half deliberately: it targets whichever receiver is
+        CURRENTLY active, which is correct here because every call site
+        of this method (tracking start, transponder change) only calls
+        it once Sub is already the intended active receiver -- using
+        set_receiver_control_value's explicit select-then-restore
+        machinery for Sub too would race against _start_satellite_
+        tracking's own already-in-flight select_receiver(RECEIVER_SUB)
+        dispatch (two independently-scheduled coroutines with no
+        guaranteed completion order -- the exact class of bug documented
+        at length elsewhere in this file). Main genuinely needs the
+        explicit version, since it's never the active receiver at this
+        point."""
+        if transponder is None or not self.worker.is_connected():
+            return
+        if "mode" not in self.control_widgets:
+            return
+        mode_value = radio_mode_for_transponder(transponder.get("mode"))
+        if mode_value is None:
+            return
+        self.worker.set_control_value("mode", mode_value)
+        if self.worker.is_dual_receiver and mode_value in ("FM", "WFM"):
+            self.worker.set_receiver_control_value(RECEIVER_MAIN, "mode", mode_value)
 
     def _stop_satellite_tracking(self):
         """Pauses re-tuning -- the satellite stays selected (name,

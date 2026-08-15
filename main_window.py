@@ -554,8 +554,9 @@ class RadioWindow(QWidget):
         # either way) -- see _start_satellite_tracking.
         #
         # The retune and the PTT command are bundled into ONE atomic
-        # worker call (start_ptt_after_vfo/stop_ptt_then_vfo -- same for
-        # every radio type, see below) instead of calling
+        # worker call (start_ptt_after_vfo -- every radio type -- and
+        # stop_ptt_then_vfo/stop_ptt_and_select_receiver depending on
+        # the radio type, see below) instead of calling
         # _on_satellite_tracking_tick() and then separately
         # self.worker.start_ptt()/stop_ptt() -- confirmed live on a real
         # 9700 that those two, dispatched as independently-scheduled
@@ -624,19 +625,31 @@ class RadioWindow(QWidget):
             # is what's actually being adjusted while transmitting),
             # back to Sub on release. Bundled into the same atomic
             # worker call as the VFO retune and PTT keying (receiver
-            # param on start_ptt_after_vfo/stop_ptt_then_vfo) rather
-            # than a separately-dispatched select_receiver(), for the
-            # same ordering reasons as everything else here. Never
-            # touches the scope -- that stays on Sub throughout a
-            # transmission (_start_satellite_tracking) so you can see
-            # yourself on the downlink while transmitting.
+            # param on start_ptt_after_vfo) rather than a separately-
+            # dispatched select_receiver(), for the same ordering
+            # reasons as everything else here. Never touches the scope
+            # -- that stays on Sub throughout a transmission
+            # (_start_satellite_tracking) so you can see yourself on the
+            # downlink while transmitting.
             receiver = None
             if self.worker.is_dual_receiver:
                 receiver = RECEIVER_MAIN if checked else RECEIVER_SUB
             if checked:
                 self.worker.start_ptt_after_vfo(target_vfo, freq_hz, receiver)
+            elif self.worker.is_dual_receiver:
+                # Release, dual-receiver only: does NOT retune Main to
+                # VFO A/downlink_hz -- confirmed live on a real 9700,
+                # Main can't switch to a band Sub currently occupies,
+                # and Sub is sitting on exactly that downlink band
+                # continuously throughout the transmission
+                # (_on_satellite_tracking_tick never touches it during
+                # TX). Main just stays wherever the transmission left it
+                # (the uplink band, VFO B) until the next PTT press
+                # retunes it fresh -- nothing needs Main in between,
+                # since Sub is what's actually active/watched during RX.
+                self.worker.stop_ptt_and_select_receiver(receiver)
             else:
-                self.worker.stop_ptt_then_vfo(target_vfo, freq_hz, receiver)
+                self.worker.stop_ptt_then_vfo(target_vfo, freq_hz)
             if receiver is not None:
                 self._update_active_receiver_ui(receiver)
             self._current_freq_hz = freq_hz

@@ -1111,7 +1111,7 @@ class RadioWorker(QThread):
             )
         await self._start_ptt()
 
-    def stop_ptt_then_vfo(self, vfo_value, freq_hz: int, receiver: int = None):
+    def stop_ptt_then_vfo(self, vfo_value, freq_hz: int):
         """Thread-safe: call from the GUI thread. The release-side
         counterpart to start_ptt_after_vfo() -- stops transmitting
         FIRST, then (once that's actually finished, not just dispatched)
@@ -1122,14 +1122,17 @@ class RadioWorker(QThread):
         arrives, and a radio that refuses VFO changes while transmitting
         would just ignore it if it arrived too early.
 
-        receiver, when given, also selects it as the active receiver
-        last, in this same atomic coroutine -- e.g. switching back to
-        Sub on release. See start_ptt_after_vfo()."""
+        Single-receiver radios only -- dual-receiver satellite mode
+        uses stop_ptt_and_select_receiver() below instead, since Main
+        can't be retuned back to VFO A/downlink on release there: Sub
+        is sitting on exactly that band continuously, and Main can't
+        switch to a band Sub currently occupies (confirmed live on a
+        real 9700)."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_ptt_then_vfo(vfo_value, freq_hz, receiver), self.loop)
+        asyncio.run_coroutine_threadsafe(self._stop_ptt_then_vfo(vfo_value, freq_hz), self.loop)
 
-    async def _stop_ptt_then_vfo(self, vfo_value, freq_hz: int, receiver: int = None):
+    async def _stop_ptt_then_vfo(self, vfo_value, freq_hz: int):
         await self._stop_ptt()
         if "vfo" in self._control_methods:
             await self._select_vfo_and_set_frequency(vfo_value, freq_hz)
@@ -1138,11 +1141,35 @@ class RadioWorker(QThread):
                 f"{CONTROL_DEFINITIONS['vfo']['label']}: not available on this radio/install "
                 "-- frequency not restored to the downlink."
             )
-        if receiver is not None:
-            try:
-                await self.radio.select_receiver(receiver)
-            except Exception as exc:
-                self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+
+    def stop_ptt_and_select_receiver(self, receiver: int):
+        """Thread-safe: call from the GUI thread. Dual-receiver
+        satellite mode's PTT-release counterpart when Main's VFO
+        shouldn't be retuned at all -- confirmed live on a real 9700
+        that Main can't switch to a band Sub currently occupies (you
+        have to move one of them to a third band first to free it up),
+        and Sub is sitting on exactly that downlink band continuously
+        throughout the transmission (_on_satellite_tracking_tick never
+        touches it during TX) -- so stop_ptt_then_vfo's usual "restore
+        Main to VFO A/downlink" on release would send Main straight
+        into the band Sub's already on. Stops transmitting, then
+        selects `receiver` (Sub) as active, both in one coroutine --
+        no VFO/frequency command to Main at all; it just stays wherever
+        the just-finished transmission left it (the uplink band, VFO B)
+        until the next PTT press retunes it fresh -- nothing needs
+        Main in between, since Sub is what's actually active/watched
+        during RX."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._stop_ptt_and_select_receiver(receiver), self.loop)
+
+    async def _stop_ptt_and_select_receiver(self, receiver: int):
+        await self._stop_ptt()
+        try:
+            await self.radio.select_receiver(receiver)
+        except Exception as exc:
+            self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+        self._active_receiver = receiver
 
     def select_band(self, band_label: str, low_edge_hz: int):
         """Thread-safe. Tries Icom's confirmed get_bsr() band-stacking

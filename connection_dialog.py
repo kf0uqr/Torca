@@ -3,10 +3,12 @@ ConnectionDialog: collects radio connection details (model, network/USB
 settings, CI-V address, audio device selection) and the operator's own
 location (for Doppler correction) before the main window opens. Call
 ConnectionDialog.get_details() rather than instantiating directly --
-see the class docstring below.
+see the class docstring below. All of that can be saved as a named
+profile and reloaded from a dropdown on a later run.
 """
 
 import json
+import pathlib
 import urllib.request
 
 from PySide6.QtCore import QSettings
@@ -14,6 +16,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QVBoxLayout,
+    QHBoxLayout,
     QFormLayout,
     QLineEdit,
     QSpinBox,
@@ -21,6 +24,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QPushButton,
     QLabel,
+    QInputDialog,
     QMessageBox,
 )
 
@@ -61,6 +65,38 @@ def fetch_ip_location():
         raise RuntimeError("response didn't include coordinates")
     return float(lat), float(lon)
 
+
+# Saved connection profiles -- everything ConnectionDialog collects,
+# under a name the user picks, so a whole setup (radio, network/USB
+# settings, audio devices, location) can be swapped in from one dropdown
+# instead of re-entered by hand. Plain JSON, same pattern as the
+# satellite list. Passwords land in here in plaintext -- consistent with
+# how this app already handles them (DEFAULT_PASSWORD, the password
+# field itself) since this is a radio's own local-network CI-V/LAN
+# credential, not a personal account, and this file never leaves disk.
+CONNECTION_PROFILES_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "connection_profiles.json"
+
+
+def load_connection_profiles():
+    """Loads saved connection profiles as {name: details_dict}. Returns
+    {} if none are saved yet."""
+    if not CONNECTION_PROFILES_PATH.exists():
+        return {}
+    try:
+        return json.loads(CONNECTION_PROFILES_PATH.read_text())
+    except Exception as exc:
+        print(f"[ERROR] Connection profiles: couldn't read saved profiles ({exc}); starting with none.")
+        return {}
+
+
+def save_connection_profiles(profiles):
+    try:
+        CONNECTION_PROFILES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONNECTION_PROFILES_PATH.write_text(json.dumps(profiles, indent=2))
+    except Exception as exc:
+        print(f"[ERROR] Connection profiles: couldn't save profiles ({exc}).")
+
+
 class ConnectionDialog(QDialog):
     """Collects radio connection details before the main window opens.
 
@@ -72,6 +108,15 @@ class ConnectionDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Connect to Radio")
+
+        self._profiles = load_connection_profiles()
+
+        self.profile_combo = QComboBox()
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
+        self.save_profile_button = QPushButton("Save Profile...")
+        self.save_profile_button.clicked.connect(self._on_save_profile_clicked)
+        self.delete_profile_button = QPushButton("Delete Profile")
+        self.delete_profile_button.clicked.connect(self._on_delete_profile_clicked)
 
         self.radio_combo = QComboBox()
         self.radio_combo.addItems(RADIO_PROFILES.keys())
@@ -140,6 +185,13 @@ class ConnectionDialog(QDialog):
         self.gps_button.clicked.connect(self._on_get_gps_clicked)
 
         form = QFormLayout()
+
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(self.profile_combo, 1)
+        profile_row.addWidget(self.save_profile_button)
+        profile_row.addWidget(self.delete_profile_button)
+        form.addRow("Profile:", profile_row)
+
         form.addRow("Radio:", self.radio_combo)
         form.addRow("Connection:", self.connection_combo)
         form.addRow("CI-V Address (hex):", self.addr_input)
@@ -180,8 +232,15 @@ class ConnectionDialog(QDialog):
 
         self.details = None  # populated on successful accept
 
-        # Apply initial defaults for whichever radio is selected first.
+        # Apply initial defaults for whichever radio is selected first,
+        # then the last-used profile (if any) on top of that -- a saved
+        # profile should win over the plain per-radio defaults.
         self._on_radio_changed(self.radio_combo.currentText())
+        self._refresh_profile_combo()
+        last_profile = QSettings("IcomRadioApp", "RadioControl").value("last_connection_profile", "")
+        if last_profile and last_profile in self._profiles:
+            # Triggers _on_profile_selected, which applies it.
+            self.profile_combo.setCurrentIndex(self.profile_combo.findData(last_profile))
 
     def _populate_audio_devices(self):
         """Fill the audio combos by querying sounddevice/PortAudio
@@ -214,6 +273,125 @@ class ConnectionDialog(QDialog):
                 self.audio_input_combo.addItem(device["name"], index)
             if device.get("max_output_channels", 0) > 0:
                 self.audio_output_combo.addItem(device["name"], index)
+
+    def _refresh_profile_combo(self, select_name=None):
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        self.profile_combo.addItem("-- Select Profile --", None)
+        for name in sorted(self._profiles.keys()):
+            self.profile_combo.addItem(name, name)
+        if select_name:
+            index = self.profile_combo.findData(select_name)
+            if index != -1:
+                self.profile_combo.setCurrentIndex(index)
+        self.profile_combo.blockSignals(False)
+
+    def _current_profile_dict(self):
+        """Everything needed to fully restore this dialog's state later
+        -- both connection-type field sets regardless of which is active
+        (so switching types afterward doesn't lose the other one's
+        values), and audio devices by NAME rather than PortAudio index
+        (indices aren't stable across runs/machines; names are re-
+        resolved against whatever's actually plugged in when loaded)."""
+        return {
+            "radio_model": self.radio_combo.currentText(),
+            "connection_type": self.connection_combo.currentData(),
+            "addr_hex": self.addr_input.text().strip(),
+            "host": self.host_input.text().strip(),
+            "port": self.port_input.value(),
+            "username": self.username_input.text().strip(),
+            "password": self.password_input.text(),
+            "serial_port": self.serial_port_input.text().strip(),
+            "baud_rate": self.baud_rate_input.value(),
+            "audio_input_name": self.audio_input_combo.currentText(),
+            "audio_output_name": self.audio_output_combo.currentText(),
+            "observer_lat": self.lat_input.value(),
+            "observer_lon": self.lon_input.value(),
+            "observer_elevation_m": self.elevation_input.value(),
+        }
+
+    def _apply_profile(self, profile):
+        radio_model = profile.get("radio_model")
+        if radio_model in RADIO_PROFILES:
+            self.radio_combo.setCurrentText(radio_model)  # applies that radio's own addr/connection-type defaults first
+
+        connection_index = self.connection_combo.findData(profile.get("connection_type"))
+        if connection_index != -1:
+            self.connection_combo.setCurrentIndex(connection_index)
+
+        if profile.get("addr_hex"):
+            self.addr_input.setText(profile["addr_hex"])
+        if profile.get("host"):
+            self.host_input.setText(profile["host"])
+        if profile.get("port"):
+            self.port_input.setValue(profile["port"])
+        if "username" in profile:
+            self.username_input.setText(profile["username"])
+        if "password" in profile:
+            self.password_input.setText(profile["password"])
+        if profile.get("serial_port"):
+            self.serial_port_input.setText(profile["serial_port"])
+        if profile.get("baud_rate"):
+            self.baud_rate_input.setValue(profile["baud_rate"])
+
+        audio_input_index = self.audio_input_combo.findText(profile.get("audio_input_name", ""))
+        if audio_input_index != -1:
+            self.audio_input_combo.setCurrentIndex(audio_input_index)
+        audio_output_index = self.audio_output_combo.findText(profile.get("audio_output_name", ""))
+        if audio_output_index != -1:
+            self.audio_output_combo.setCurrentIndex(audio_output_index)
+
+        if "observer_lat" in profile:
+            self.lat_input.setValue(profile["observer_lat"])
+        if "observer_lon" in profile:
+            self.lon_input.setValue(profile["observer_lon"])
+        if "observer_elevation_m" in profile:
+            self.elevation_input.setValue(profile["observer_elevation_m"])
+
+    def _on_profile_selected(self, _index):
+        name = self.profile_combo.currentData()
+        if not name:
+            return
+        profile = self._profiles.get(name)
+        if profile:
+            self._apply_profile(profile)
+        QSettings("IcomRadioApp", "RadioControl").setValue("last_connection_profile", name)
+
+    def _on_save_profile_clicked(self):
+        current_name = self.profile_combo.currentData() or ""
+        name, ok = QInputDialog.getText(self, "Save Profile", "Profile name:", text=current_name)
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in self._profiles:
+            confirm = QMessageBox.question(
+                self, "Save Profile", f'A profile named "{name}" already exists. Overwrite it?',
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
+        self._profiles[name] = self._current_profile_dict()
+        save_connection_profiles(self._profiles)
+        self._refresh_profile_combo(select_name=name)
+        QSettings("IcomRadioApp", "RadioControl").setValue("last_connection_profile", name)
+
+    def _on_delete_profile_clicked(self):
+        name = self.profile_combo.currentData()
+        if not name:
+            QMessageBox.information(self, "Delete Profile", "Select a saved profile first.")
+            return
+        confirm = QMessageBox.question(
+            self, "Delete Profile", f'Delete the profile "{name}"?',
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self._profiles.pop(name, None)
+        save_connection_profiles(self._profiles)
+        self._refresh_profile_combo()
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        if settings.value("last_connection_profile") == name:
+            settings.remove("last_connection_profile")
 
     def _on_get_gps_clicked(self):
         try:

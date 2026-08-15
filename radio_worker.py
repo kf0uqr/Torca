@@ -178,16 +178,23 @@ class RadioWorker(QThread):
         # 9700: AGC/Preamp/AF Gain/Squelch/RF Gain's own getters raise
         # CommandError ("receiver=1 is unsupported for profile IC-9700:
         # command 0x16/0x12 has no cmd29 route") for a non-Main
-        # receiver, even though their SETTERS silently accept (and,
-        # confirmed separately, functionally ignore) it -- only the read
-        # side is actually broken, and only for some commands, not
-        # others (frequency/vfo_slot's getters both confirmed working
-        # fine with an explicit receiver=). Populated as each one is
-        # actually hit (_poll_receiver_aware) rather than hand-listing
-        # them, since there's no way to predict which commands a given
-        # radio profile does or doesn't have this CI-V "cmd29" route for
+        # receiver, and (corrected -- see _receiver_unsupported_setters
+        # right below) their SETTERS raise the exact same CommandError
+        # for the exact same reason, not "silently ignore it" as
+        # originally assumed here -- live logs showed set_squelch()/
+        # set_rf_gain() failing outright with the identical cmd29-route
+        # message, meaning those writes were never reaching the radio
+        # at all while Sub was active, not just logging noise. Only
+        # some commands are affected, not others (frequency/vfo_slot's
+        # getters both confirmed working fine with an explicit
+        # receiver=). Populated as each one is actually hit
+        # (_poll_receiver_aware) rather than hand-listing them, since
+        # there's no way to predict which commands a given radio
+        # profile does or doesn't have this CI-V "cmd29" route for
         # without just trying it.
         self._receiver_unsupported_getters = set()
+        # Write-side counterpart to the above -- see _call_receiver_aware.
+        self._receiver_unsupported_setters = set()
         # Dual-receiver diagnostic: last value observed from
         # get_active_receiver() (a pure, instant read of rigplane's own
         # internal RadioState.active belief -- no extra CI-V traffic) --
@@ -575,6 +582,39 @@ class RadioWorker(QThread):
             )
             return await getter()
 
+    async def _call_receiver_aware(self, key: str, func, *args):
+        """Write-side counterpart to _poll_receiver_aware: calls
+        func(*args, receiver=self._active_receiver) when
+        self.is_dual_receiver and func's signature accepts a receiver
+        kwarg -- UNLESS key is already known
+        (_receiver_unsupported_setters) to reject that at runtime for
+        this radio/profile. On the first CommandError, remembers it
+        (so later calls for this key go straight to the safe bare call
+        instead of repeating -- and re-reporting -- the same failure
+        forever, and so the value actually reaches the radio instead
+        of being dropped) and retries once without the receiver kwarg
+        -- confirmed live on a real 9700 that AF gain/squelch/RF gain
+        all still land correctly on whichever receiver is actually
+        active (select_receiver()) with no receiver kwarg at all, so
+        the bare retry doesn't lose anything; it's the only form these
+        setters actually accept for a non-Main receiver on this
+        profile. Only catches CommandError specifically -- anything
+        else still propagates to the caller's own try/except."""
+        kwargs = {}
+        if self.is_dual_receiver and key not in self._receiver_unsupported_setters:
+            kwargs = self._receiver_kwargs(func, self._active_receiver)
+        if not kwargs:
+            return await func(*args)
+        try:
+            return await func(*args, **kwargs)
+        except CommandError as exc:
+            self._receiver_unsupported_setters.add(key)
+            self.error.emit(
+                f"{key}: writing with an explicit receiver isn't supported on this "
+                f"radio/profile ({exc}) -- writing to the active receiver instead from now on."
+            )
+            return await func(*args)
+
     @staticmethod
     def _normalize_level_value(raw):
         """Getter values might come back as a 0.0-1.0 float or, like the
@@ -594,28 +634,27 @@ class RadioWorker(QThread):
         elsewhere in this app (e.g. the S-meter). Whichever form works
         is cached per cache_key so later calls don't re-probe.
 
-        Passes receiver=self._active_receiver wherever the setter
-        accepts it (dual-receiver only), same as every other call in
-        this file -- but confirmed live on a real 9700 that AF gain/
-        squelch/RF gain don't actually respect it at all: they follow
-        whichever receiver is active (select_receiver()) regardless of
-        what's passed here. Left in anyway since it's harmless (the
-        radio just ignores it) and _active_receiver is correct for
-        every other receiver-aware level/control that DOES respect it.
-        See DUAL_RECEIVER_LEVEL_KEYS in constants.py and
-        main_window.py's active_receiver_button for how the UI actually
-        exposes control over these three."""
+        Goes through _call_receiver_aware for the receiver= kwarg
+        (dual-receiver only) -- confirmed live on a real 9700 that AF
+        gain/squelch/RF gain's setters actually RAISE CommandError for
+        a non-Main receiver (the same cmd29-route rejection their
+        getters have), not silently ignore it as originally assumed
+        here; _call_receiver_aware catches that once per key and falls
+        back to a bare call (which does correctly land on whichever
+        receiver is active via select_receiver()) from then on. See
+        DUAL_RECEIVER_LEVEL_KEYS in constants.py and main_window.py's
+        active_receiver_button for how the UI actually exposes control
+        over these three."""
         setter = getattr(self.radio, setter_name)
-        kwargs = self._receiver_kwargs(setter, self._active_receiver) if self.is_dual_receiver else {}
         mode = self._level_value_mode.get(cache_key, "float")
         if mode == "float":
             try:
-                await setter(value, **kwargs)
+                await self._call_receiver_aware(cache_key, setter, value)
                 self._level_value_mode[cache_key] = "float"
                 return
             except (TypeError, ValueError):
                 pass  # fall through and try the raw-int scale instead
-        await setter(int(round(value * 255)), **kwargs)
+        await self._call_receiver_aware(cache_key, setter, int(round(value * 255)))
         self._level_value_mode[cache_key] = "int255"
 
     def set_level_value(self, key: str, value: float):
@@ -857,8 +896,7 @@ class RadioWorker(QThread):
                 pass  # fall through and try the raw value anyway
         try:
             setter = getattr(self.radio, set_name)
-            kwargs = self._receiver_kwargs(setter, self._active_receiver) if self.is_dual_receiver else {}
-            await setter(value, **kwargs)
+            await self._call_receiver_aware(key, setter, value)
         except Exception as exc:
             self.error.emit(f"{definition['label']}: {set_name}({value!r}) failed ({exc}).")
 

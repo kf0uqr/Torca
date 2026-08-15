@@ -15,12 +15,17 @@ from PySide6.QtCore import QThread, Signal
 
 from rigplane import create_radio, LanBackendConfig, CommandError, AudioCodec
 try:
-    # NOTE: rigplane's docs/PyPI page only show LanBackendConfig in examples --
-    # a serial/USB config class isn't documented anywhere we could find. This
-    # name and its kwargs (port, baud_rate, radio_addr) are inferred by
-    # symmetry with LanBackendConfig, not confirmed. Verify with
-    # `python -c "import rigplane; help(rigplane)"` before trusting the USB
-    # path below.
+    # Confirmed by reading rigplane's own source
+    # (backends/config.py's SerialBackendConfig.__init__): the real
+    # signature is (device: str, baudrate: int, radio_addr: int | None,
+    # ...) -- exactly what _build_config()'s serial branch below
+    # already passes. (This class also exposes rx_device/tx_device for
+    # rigplane's own built-in USB audio bridging, deliberately unused
+    # here -- this app manages its own separate sounddevice/PortAudio
+    # streams via AudioBridge instead, using whatever system audio
+    # device the user picks in the connection dialog, including the
+    # radio's own USB audio interface if the OS exposes it as a normal
+    # soundcard.)
     from rigplane import SerialBackendConfig
 except ImportError:
     SerialBackendConfig = None

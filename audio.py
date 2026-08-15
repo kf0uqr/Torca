@@ -447,11 +447,16 @@ class AudioBridge:
             return
 
         try:
-            if hasattr(self.radio, "on_audio_rx"):
-                self.radio.on_audio_rx(self._on_rx_audio)
-                await self.radio.start_rx()
-            else:
-                await self.radio.start_rx(self._on_rx_audio)
+            # Confirmed by reading rigplane's own source
+            # (runtime/_audio_runtime_mixin.py): start_rx's real
+            # signature is `async def start_rx(self, callback, *,
+            # jitter_depth=5)` -- the callback is passed directly, no
+            # separate registration step. `on_audio_rx` (the other
+            # calling convention this used to also try, in case
+            # rigplane used the on_scope_data(cb)+enable pattern like it
+            # does for the scope) doesn't exist anywhere in rigplane at
+            # all -- that branch never once fired.
+            await self.radio.start_rx(self._on_rx_audio)
             self._rx_active = True
             self._status(
                 f"RX audio streaming started: output "
@@ -459,27 +464,19 @@ class AudioBridge:
             )
             self._rx_watchdog_task = asyncio.ensure_future(self._rx_watchdog())
         except Exception as exc:
-            self._status(
-                f"RX audio: start_rx() didn't accept the calling convention "
-                f"tried here ({exc}). Check the real signature with "
-                "`import inspect; inspect.signature(radio.start_rx)`."
-            )
+            self._status(f"RX audio: start_rx() failed ({exc}).")
 
     async def _rx_watchdog(self):
         """Speaks up if start_rx() reported success but no audio ever
-        actually arrived -- distinguishes "wrong callback convention,
-        silently accepted" from "genuinely no signal/PTT active"."""
+        actually arrived -- distinguishes "genuinely no signal/PTT
+        active" from a real problem worth investigating."""
         await asyncio.sleep(3.0)
         if self._rx_active and self._rx_chunk_count == 0:
             self._status(
                 "RX audio: start_rx() registered without error, but no "
-                "audio has arrived after 3s. Likely causes: the radio needs "
-                "a separate enable step beyond start_rx(), or delivers audio "
-                "through something other than this callback (an async "
-                "iterator/queue, for instance). Try "
-                "`import inspect; inspect.signature(radio.start_rx)` and "
-                "look for anything like 'audio_rx_queue' or 'iter' on "
-                "`dir(radio)`."
+                "audio has arrived after 3s. If this persists, check that "
+                "the radio isn't already claimed by another client (only "
+                "one control-program connection at a time)."
             )
 
     async def _stop_rx(self):
@@ -495,35 +492,40 @@ class AudioBridge:
         if self._out_stream:
             self._out_stream.stop()
 
-    def _on_rx_audio(self, *args, **kwargs):
+    def _on_rx_audio(self, packet=None):
         """Called by rigplane when audio arrives from the radio -- runs
         on the asyncio loop thread. Only touches the thread-safe
         queue.Queue, never a Qt widget.
 
-        Signature is deliberately *args/**kwargs: the real calling
-        convention isn't documented, so this extracts raw PCM bytes from
-        whatever was actually passed (see _extract_pcm_bytes) rather
-        than assuming a single positional bytes argument and potentially
-        raising inside rigplane's own dispatch code -- a TypeError there
-        could easily be swallowed silently, which looks identical to "no
-        audio arriving" from the outside."""
-        data = self._extract_pcm_bytes(args, kwargs)
+        Confirmed by reading rigplane's own source
+        (runtime/_audio_runtime_mixin.py's start_rx and audio/
+        lan_stream.py's AudioPacket dataclass): this is always called
+        with exactly one positional argument, either an AudioPacket
+        (`.data: bytes` holds the raw codec payload) or None (a jitter-
+        buffer gap placeholder) -- never a bare bytes object directly.
+        _extract_pcm_bytes still degrades gracefully rather than raising
+        if that ever turns out not to hold on some future rigplane
+        version, instead of assuming and potentially raising inside
+        rigplane's own dispatch code -- a TypeError there could easily
+        be swallowed silently, which looks identical to "no audio
+        arriving" from the outside."""
+        data = self._extract_pcm_bytes(packet)
         if data is not None and self._rx_stereo:
             data = _downmix_stereo_to_mono(data, channel=self._rx_downmix_channel)
         if data is None:
-            # A lone None argument (and possibly other shapes) shows up
-            # periodically from rigplane -- most likely a benign
-            # keepalive/end-of-burst marker rather than a real error, and
-            # reporting it every single occurrence was confirmed to flood
-            # the console in a live test. Only the first unrecognized
-            # shape gets reported, in case it's worth investigating.
+            # packet=None is a genuine, expected case (a jitter-buffer
+            # gap placeholder -- confirmed via AudioPacket's own docs),
+            # not an error; reporting it every single occurrence was
+            # confirmed to flood the console in a live test. Only the
+            # first occurrence (None or any other unrecognized shape)
+            # gets reported, in case a truly unexpected shape is worth
+            # investigating.
             if not self._rx_unrecognized_reported:
                 self._rx_unrecognized_reported = True
                 self._status(
-                    "RX audio: callback fired with an unrecognized argument "
-                    f"shape (args={[type(a).__name__ for a in args]} "
-                    f"kwargs={list(kwargs)}) -- couldn't find raw PCM bytes "
-                    "in it. Only reporting this once; likely benign."
+                    f"RX audio: callback fired with {packet!r} -- couldn't "
+                    "find raw PCM bytes in it. Only reporting this once; "
+                    "likely just a jitter-buffer gap placeholder (benign)."
                 )
             return
         if self._rx_chunk_count == 0:
@@ -545,20 +547,19 @@ class AudioBridge:
                 pass
 
     @staticmethod
-    def _extract_pcm_bytes(args, kwargs):
-        """Best-effort: find a bytes-like payload among the callback's
-        arguments, checking raw positional/keyword values first, then a
-        few common attribute names in case it's wrapped in a frame
-        object (mirroring rigplane's own ScopeFrame.pixels pattern)."""
-        candidates = list(args) + list(kwargs.values())
-        for value in candidates:
-            if isinstance(value, (bytes, bytearray, memoryview)):
-                return bytes(value)
-        for value in candidates:
-            for attr in ("data", "pcm", "payload", "audio", "samples", "raw"):
-                inner = getattr(value, attr, None)
-                if isinstance(inner, (bytes, bytearray, memoryview)):
-                    return bytes(inner)
+    def _extract_pcm_bytes(packet):
+        """Pulls the raw codec payload out of an AudioPacket (its `.data`
+        field, confirmed via rigplane's own audio/lan_stream.py). Also
+        accepts a bare bytes-like object directly, and falls back to
+        None (rather than raising) for anything else -- including
+        AudioPacket's own documented None gap placeholder -- so a future
+        rigplane version changing this shape degrades gracefully instead
+        of crashing inside rigplane's own dispatch code."""
+        if isinstance(packet, (bytes, bytearray, memoryview)):
+            return bytes(packet)
+        data = getattr(packet, "data", None)
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            return bytes(data)
         return None
 
     def _on_output_needed(self, outdata, frames, time_info, status):

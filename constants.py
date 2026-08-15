@@ -145,46 +145,60 @@ AUDIO_OUTPUT_BLOCK_MS = 20
 # immediately visible and fixable rather than silently wrong.
 #
 # Every entry gets a slider built generically (see RadioWindow's level
-# slider loop). getter_candidates/setter_candidates confirmed present via
-# a dir(radio) scan except AF gain/Squelch's first guesses (see above).
+# slider loop). af_gain/squelch/rf_level's single candidates are
+# confirmed, by reading rigplane's own source
+# (core/radio_protocol.py's LevelsCapable Protocol), to be guaranteed
+# present on any radio object that passes _setup_levels()'s own
+# isinstance(self.radio, LevelsCapable) gate -- no need to keep
+# candidate-list guessing (including af_gain's original get_af_gain/
+# set_af_gain guess, confirmed by that same protocol to not exist at
+# all) for names the protocol itself already guarantees. monitor/
+# tx_level aren't part of that (or any other) formal rigplane
+# Protocol, so those still probe multiple plausible names via
+# find_method_name, same as before.
 LEVEL_DEFINITIONS = {
     "af_gain": {
         "label": "AF Gain",
-        "getter_candidates": ["get_af_gain", "get_af_level", "get_af", "get_volume", "get_audio_gain"],
-        "setter_candidates": ["set_af_gain", "set_af_level", "set_af", "set_volume", "set_audio_gain"],
+        "getter_candidates": ["get_af_level"],
+        "setter_candidates": ["set_af_level"],
     },
     "squelch": {
         "label": "Squelch",
-        "getter_candidates": ["get_squelch", "get_squelch_level", "get_sql"],
-        "setter_candidates": ["set_squelch", "set_squelch_level", "set_sql"],
+        "getter_candidates": ["get_squelch"],
+        "setter_candidates": ["set_squelch"],
     },
     "monitor": {
         "label": "Monitor",
         # MONI: lets you hear your own transmitted audio through the
         # speaker, for checking audio quality/compression while
-        # transmitting. get_monitor_gain/get_monitor both confirmed
-        # present via a dir(radio) scan; the _gain-suffixed one is tried
-        # first since it's more likely to be the actual level (vs. an
-        # on/off toggle for the feature itself).
-        "getter_candidates": ["get_monitor_gain", "get_monitor"],
-        "setter_candidates": ["set_monitor_gain", "set_monitor"],
+        # transmitting. get_monitor_gain/set_monitor_gain (the actual
+        # 0-255 level) confirmed present via a dir(radio) scan -- no
+        # get_monitor/set_monitor fallback: reading rigplane's own
+        # source (core/radio_protocol.py) confirms those are a
+        # DIFFERENT, boolean on/off toggle for the feature itself, not
+        # a level at all, so falling back to them here would silently
+        # misinterpret a True/False as a 0-255 gain value on any radio
+        # lacking get_monitor_gain specifically.
+        "getter_candidates": ["get_monitor_gain"],
+        "setter_candidates": ["set_monitor_gain"],
     },
     "tx_level": {
         "label": "TX Level",
         # get_power/set_power confirmed (via the Power Output meter fix
         # earlier) to be the TX power OUTPUT LEVEL control itself --
         # NOT a meter (that's the separate get_power_meter, used for the
-        # Power Output meter). Same raw-int/float scale ambiguity
-        # _call_level_setter already handles for AF gain/squelch applies
-        # here too.
+        # Power Output meter). Not part of any formal rigplane Protocol
+        # (confirmed by reading core/radio_protocol.py), so this stays a
+        # single best-known name rather than a guaranteed one. Same raw-
+        # int/float scale ambiguity _call_level_setter already handles
+        # for AF gain/squelch applies here too.
         "getter_candidates": ["get_power"],
         "setter_candidates": ["set_power"],
     },
     "rf_level": {
         "label": "RF Level",
         # RF Gain: receiver sensitivity/gain control (distinct from RF
-        # power output above). get_rf_gain/set_rf_gain confirmed present
-        # via a dir(radio) scan.
+        # power output above).
         "getter_candidates": ["get_rf_gain"],
         "setter_candidates": ["set_rf_gain"],
     },
@@ -292,23 +306,28 @@ METER_DEFINITIONS = {
     },
     "alc": {
         "label": "ALC",
-        # get_alc() confirmed NOT to exist on at least one install. ALC is
-        # always a live, read-only TX-drive indicator on real Icom radios
-        # (never an adjustable setting -- what's adjustable is things like
-        # RF power/mic gain, which affect ALC, not ALC itself), so every
-        # candidate here is a read-style name; _setup_meters() below picks
-        # whichever one actually exists rather than betting on one guess.
-        "getter": "get_alc",
-        "getter_candidates": ["get_alc", "get_alc_meter", "get_alc_level", "read_alc"],
+        # get_alc_meter confirmed as the real name by reading rigplane's
+        # own source (core/radio_protocol.py's MetersCapable Protocol:
+        # "Get ALC meter reading (raw 0-255)"). _setup_meters() doesn't
+        # gate on isinstance(radio, MetersCapable) though (some radios/
+        # backends may expose meters outside that formal protocol), so
+        # the other candidates stay as fallbacks -- just reordered so
+        # the confirmed name wins first instead of risking an
+        # unrelated-but-present earlier guess (find_method_name takes
+        # the first match in list order).
+        "getter": "get_alc_meter",
+        "getter_candidates": ["get_alc_meter", "get_alc", "get_alc_level", "read_alc"],
         "kind": "linear",
         "unit": "",
         "raw_max": 255,
         "display_max": 100,
     },
     "voltage": {
-        "label": "Voltage",  # confirmed working via discovery
-        "getter": "get_voltage",
-        "getter_candidates": ["get_voltage", "get_supply_voltage", "get_vd", "get_vd_meter", "get_dc_voltage"],
+        "label": "Voltage",
+        # get_vd_meter confirmed as the real name (MetersCapable: "Get Vd
+        # meter reading"). Reordered for the same reason as ALC above.
+        "getter": "get_vd_meter",
+        "getter_candidates": ["get_vd_meter", "get_voltage", "get_supply_voltage", "get_vd", "get_dc_voltage"],
         "kind": "linear",
         "unit": "V",
         "raw_max": 255,
@@ -318,10 +337,11 @@ METER_DEFINITIONS = {
         "label": "COMP",
         # Speech compressor meter -- confirmed as one of Icom's own 6
         # official TX meter parameters (PO/SWR/ALC/COMP/VD/ID, per the
-        # IC-7300 manual). Same discovery approach as ALC/Voltage since
-        # the exact method name isn't documented.
-        "getter": "get_comp",
-        "getter_candidates": ["get_comp", "get_comp_meter", "get_compression"],
+        # IC-7300 manual). get_comp_meter confirmed as the real name
+        # (MetersCapable: "Get compression meter reading"). Reordered
+        # for the same reason as ALC above.
+        "getter": "get_comp_meter",
+        "getter_candidates": ["get_comp_meter", "get_comp", "get_compression"],
         "kind": "linear",
         "unit": "",
         "raw_max": 255,
@@ -333,8 +353,11 @@ METER_DEFINITIONS = {
         # not yet covered. IC-7300/IC-9700 draw up to ~20-25A on TX;
         # IC-705 much less on internal battery -- display_max is a rough
         # full-scale guess either way, adjust if it looks off in practice.
-        "getter": "get_current",
-        "getter_candidates": ["get_current", "get_id", "get_id_meter", "get_drain_current"],
+        # get_id_meter confirmed as the real name (MetersCapable: "Get
+        # drive (Id) meter reading"). Reordered for the same reason as
+        # ALC above.
+        "getter": "get_id_meter",
+        "getter_candidates": ["get_id_meter", "get_current", "get_id", "get_drain_current"],
         "kind": "linear",
         "unit": "A",
         "raw_max": 255,
@@ -451,16 +474,25 @@ CONTROL_DEFINITIONS = {
         "label": "VFO",
         # Not "combo"/"toggle" -- a dedicated single button that swaps
         # A<->B on click, matching the real A/B button on these radios,
-        # rather than a dropdown. get_vfo_slot was seen in a dir(radio)
-        # scan; the setter name isn't confirmed. rigplane's confirmed
-        # tier-1 protocol list includes "VfoSlotCapable", which suggests
-        # a dedicated VfoSlot enum may exist the same way AgcMode did for
-        # AGC -- tried first via enum_import, falling back to plain
-        # "A"/"B" strings if that import fails.
+        # rather than a dropdown.
+        #
+        # No enum_import: confirmed by reading rigplane's own source
+        # (runtime/_dual_rx_runtime.py) that set_vfo_slot's real
+        # signature is `(self, slot: str, receiver: int = 0)` -- plain
+        # str, not an enum. There IS a VfoSlot class in rigplane (a
+        # StrEnum), but it lives at
+        # rigplane.core.state_pipeline_contracts, not rigplane.types --
+        # an earlier guess at that path (before this app started
+        # reading rigplane's source directly) always failed to import,
+        # silently falling back to the plain "A"/"B" strings below on
+        # every single connection. Since the setter wants a plain str
+        # anyway, that fallback was already the objectively correct
+        # behavior -- removed the dead import attempt instead of fixing
+        # its path, rather than adding back a dependency that was never
+        # actually needed.
         "type": "vfo_toggle",
         "getter_candidates": ["get_vfo_slot", "get_vfo", "get_active_vfo"],
         "setter_candidates": ["set_vfo_slot", "set_vfo", "select_vfo"],
-        "enum_import": ("rigplane.types", "VfoSlot"),
         "options": [("VFO A", "A"), ("VFO B", "B")],
     },
     "memory_mode": {

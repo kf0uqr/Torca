@@ -861,14 +861,22 @@ class RadioWorker(QThread):
         needing to track which widget wants which type."""
         while not self._stop_requested:
             try:
-                getter = self.radio.get_frequency
-                # Dual-receiver: read whichever receiver is actually in
-                # use right now (see _active_receiver's definition in
-                # __init__) rather than unconditionally defaulting to
-                # Main -- reading a receiver turned out, same as writing
-                # one, to also visibly focus/select it on a real 9700.
-                kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
-                freq_hz = await getter(**kwargs)
+                # get_frequency's receiver param is NOT a Main/Sub
+                # identity selector -- confirmed by reading rigplane's
+                # own source (runtime/_dual_rx_runtime.py): receiver=0
+                # means "whichever receiver is currently SELECTED" (a
+                # bare, no-cmd29 CI-V read that just returns whatever's
+                # active), receiver=1 means "the UNSELECTED one"
+                # specifically (CI-V 0x25 0x01, a dedicated "read the
+                # other receiver" command). So once Sub is genuinely
+                # selected (select_receiver), asking for receiver=1
+                # actually reads Main -- the OPPOSITE of what
+                # self._active_receiver was meant to express. Always
+                # asking for receiver=0/"selected" is what correctly
+                # follows whichever receiver select_receiver() last
+                # made active, regardless of whether that's genuinely
+                # Main or Sub.
+                freq_hz = await self.radio.get_frequency(receiver=RECEIVER_MAIN)
                 self.frequency_updated.emit(freq_hz)
             except Exception as exc:
                 self.error.emit(str(exc))
@@ -904,13 +912,24 @@ class RadioWorker(QThread):
                 definition = CONTROL_DEFINITIONS[key]
                 try:
                     getter = getattr(self.radio, get_name)
-                    # See _receiver_kwargs's/_poll_receiver_aware's
-                    # docstrings -- confirmed live on a real 9700 that
-                    # "vfo" alone wasn't the only control causing the
-                    # flip-flop ("mode" was too), and that AGC/Preamp's
-                    # getters outright reject a non-Main receiver at
-                    # runtime rather than just ignoring it.
-                    value = await self._poll_receiver_aware(key, getter)
+                    if key == "mode":
+                        # get_mode's receiver param has the exact same
+                        # "selected(0)/unselected(1)" semantic as
+                        # get_frequency (confirmed by reading rigplane's
+                        # source -- both route through _get_..._main /
+                        # _get_unselected_... in the same way) -- NOT a
+                        # Main/Sub identity selector. receiver=0 means
+                        # "whichever receiver is currently selected",
+                        # which is what should always be asked for here.
+                        value = await getter(receiver=RECEIVER_MAIN)
+                    else:
+                        # See _receiver_kwargs's/_poll_receiver_aware's
+                        # docstrings -- confirmed live on a real 9700
+                        # that "vfo" alone wasn't the only control
+                        # causing the flip-flop, and that AGC/Preamp's
+                        # getters outright reject a non-Main receiver at
+                        # runtime rather than just ignoring it.
+                        value = await self._poll_receiver_aware(key, getter)
                     if definition.get("tuple_result") and isinstance(value, tuple):
                         value = value[0]
                     # Generic enum unwrap: any Enum/IntEnum member has a

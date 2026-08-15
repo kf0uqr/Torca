@@ -4,7 +4,9 @@ A PySide6 GUI for controlling Icom radios (7300, 9700, 705) via [rigplane](https
 
 Also included:
 
-- **Ham Dashboard** - solar conditions (NOAA/hamqsl), a day/night world map, and SGP4-based satellite tracking with TLE/SatNOGS fetching.
+- **Connection profiles** - save a whole setup (radio, network/USB settings, audio devices, location) under a name in the Connect dialog, and reload it from a dropdown next time instead of re-entering everything. Handy for e.g. a home station vs. a portable/field-day setup.
+- **Ham Dashboard** - solar conditions (NOAA/hamqsl), a day/night world map, and SGP4-based satellite tracking with TLE (CelesTrak) and transponder (SatNOGS DB) fetching. Stores every known transponder per satellite, editable by hand too.
+- **Satellite Doppler correction** - double-click a tracked satellite on the map, pick one of its stored transponders, and the radio's VFO A is continuously re-tuned to track that transponder's downlink through its Doppler shift, computed from real SGP4 orbital velocity against your set location (lat/lon/elevation).
 - **WSJT-X bridge** - launch WSJT-X/JTDX/fldigi into an isolated profile and drive it through this app's radio connection via a built-in Hamlib `rigctld`-compatible server (no external Hamlib install required).
 - **Audio streaming** - mic/speaker audio to and from the radio via rigplane's `AudioTransport`, plus Linux/PulseAudio virtual-audio-cable helpers.
 - Spectrum, waterfall, meter, and tuning-knob widgets, and a dark theme throughout.
@@ -41,7 +43,14 @@ pip install -r requirements.txt
 python main.py
 ```
 
-You'll be prompted for connection details (serial or LAN) before the main window opens.
+You'll be prompted for connection details (serial or LAN), plus your location (lat/lon/elevation, used for satellite Doppler correction), before the main window opens. Click **Save Profile...** in that dialog to save the whole setup under a name for next time -- the last-used profile (or a fresh one you pick from the dropdown) loads automatically.
+
+Location can be entered by hand, or looked up approximately from your public IP via **Get GPS Coordinates (from IP)** -- that's an IP-geolocation lookup, not a real GPS fix, so it's typically only accurate to city level. Elevation always has to be entered manually and measurably improves Doppler accuracy on low satellite passes.
+
+### Using satellite tracking + Doppler correction
+
+1. In the Ham Dashboard, click **Satellites** to turn tracking on; right-click the button to manage the tracked list (refresh TLEs from CelesTrak, add satellites by hand, fetch transponder data from SatNOGS DB, or hand-edit transponders, and choose which satellites show on the map).
+2. Double-click a satellite marker on the map to open the Doppler Correction dialog, pick one of its stored transponders, and click **Start** -- the radio switches to VFO A and its frequency is continuously corrected for the satellite's Doppler shift until you click **Stop** or close the dialog.
 
 ## Project layout
 
@@ -52,12 +61,12 @@ You'll be prompted for connection details (serial or LAN) before the main window
 | `rig_discovery.py` | Shared "find the real method name" helper |
 | `audio.py` | `AudioBridge` + Linux virtual-audio-cable helpers |
 | `radio_worker.py` | `RadioWorker` (QThread owning the radio connection) |
-| `connection_dialog.py` | `ConnectionDialog`, shown before the main window |
+| `connection_dialog.py` | `ConnectionDialog` (connection details, location, saved profiles), shown before the main window |
 | `widgets.py` | `SpectrumWidget`, `WaterfallWidget`, `MeterWidget`, `TuningKnobWidget` |
 | `wsjtx_rigctld.py` | WSJT-X launcher + `RigctldServer` |
 | `solar_data.py` | NOAA/hamqsl fetching, `SolarDataWorker`, astronomy helpers |
-| `world_map.py` | `WorldMapWidget` (Ham Dashboard's day/night map) |
-| `satellite_tracking.py` | SGP4 propagation, TLE/SatNOGS fetching, satellite dialogs |
+| `world_map.py` | `WorldMapWidget` (Ham Dashboard's day/night map, satellite markers) |
+| `satellite_tracking.py` | SGP4 propagation, TLE/SatNOGS fetching, Doppler correction math, satellite/transponder dialogs |
 | `ham_dashboard.py` | `HamClockWindow`, ties the above three together |
 | `main_window.py` | `RadioWindow`, the main application window |
 | `theme.py` | Dark theme applied to the whole app |

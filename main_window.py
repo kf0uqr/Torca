@@ -38,7 +38,7 @@ from constants import (
     CONTROL_OPTION_EXCLUDED,
     TUNING_STEPS,
 )
-from radio_worker import RadioWorker
+from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
 from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from ham_dashboard import HamClockWindow
@@ -571,16 +571,22 @@ class RadioWindow(QWidget):
             self._stop_satellite_tracking()
 
     def _start_satellite_tracking(self):
-        if self.worker.is_connected():
-            # Split is enabled here so PTT (see _on_ptt_toggled) can swap
-            # to VFO B/uplink for the duration of a transmission without
-            # the radio's own RX ever moving off VFO A/downlink. Checked
-            # explicitly (not just left to set_control_value()'s own
-            # console [ERROR] line) since split's setter, like vfo's, was
-            # never confirmed against real hardware -- if it's silently
-            # not working, PTT would key up without split actually on,
-            # and better to say so up front than have that show up as an
-            # unexplained "nothing happens" on the next transmission.
+        # Split (VFO A/B sharing one receiver, swapped around PTT) is
+        # only the right mechanism on a single-receiver radio (7300/705).
+        # A genuine dual-receiver radio (9700/7610 -- self.worker.
+        # is_dual_receiver, confirmed at connect time) keeps Main tuned
+        # to the downlink and Sub to the uplink continuously and
+        # simultaneously instead (see _on_satellite_tracking_tick) --
+        # true full-duplex, no split/VFO-switching involved at all, so
+        # there's nothing to enable here for that radio type.
+        if self.worker.is_connected() and not self.worker.is_dual_receiver:
+            # Checked explicitly (not just left to set_control_value()'s
+            # own console [ERROR] line) since split's setter, like vfo's,
+            # was never confirmed against real hardware -- if it's
+            # silently not working, PTT would key up without split
+            # actually on, and better to say so up front than have that
+            # show up as an unexplained "nothing happens" on the next
+            # transmission.
             if self.worker.control_available("split"):
                 self.worker.set_control_value("split", True)
             else:
@@ -597,9 +603,10 @@ class RadioWindow(QWidget):
         """Pauses re-tuning -- the satellite stays selected (name,
         transponder list, last-known overlay reading) until either
         resumed or replaced by double-clicking another one. Also drops
-        split back off, since it was only turned on for this."""
+        split back off (single-receiver radios only -- see
+        _start_satellite_tracking), since it was only turned on for this."""
         self._satellite_tracking_timer.stop()
-        if self.worker.is_connected():
+        if self.worker.is_connected() and not self.worker.is_dual_receiver:
             self.worker.set_control_value("split", False)
 
     def _on_satellite_tracking_tick(self):
@@ -607,20 +614,35 @@ class RadioWindow(QWidget):
         timer, and also immediately (for responsiveness) on satellite/
         transponder selection, PTT press/release, and knob input.
 
-        Which VFO to target is derived fresh from ptt_button.isChecked()
-        on EVERY call, not just remembered from the last PTT edge, and
-        reasserted via select_vfo_and_set_frequency() (VFO select +
-        frequency, atomically) every single tick rather than only at
-        transitions. An earlier version only did the VFO switch at PTT
-        press/release and left the VFO alone (plain set_frequency()) on
-        the steady-state ticks in between -- which turned out to let the
-        radio's actual selected VFO drift back on its own while PTT was
-        still held, and this tick would then just keep re-correcting
-        whatever frequency was on THAT vfo, producing a repeating
-        band-then-back-then-band oscillation instead of a stable TX
-        frequency. Reasserting the VFO alongside the frequency every
-        tick, unconditionally, closes that off regardless of why the
-        selected VFO was drifting in the first place."""
+        Two genuinely different mechanisms depending on
+        self.worker.is_dual_receiver (confirmed at connect time against
+        rigplane's DualReceiverCapable protocol):
+
+        - Single-receiver radios (7300/705): one shared VFO context,
+          A for RX / B for TX, swapped around PTT via split mode. Which
+          VFO to target is derived fresh from ptt_button.isChecked() on
+          EVERY call, not just remembered from the last PTT edge, and
+          reasserted via select_vfo_and_set_frequency() (VFO select +
+          frequency, atomically) every single tick rather than only at
+          transitions -- an earlier version only did the VFO switch at
+          PTT press/release and left the VFO alone (plain
+          set_frequency()) on the steady-state ticks in between, which
+          let the radio's actual selected VFO drift back on its own
+          while PTT was still held, producing a repeating band-then-
+          back-then-band oscillation instead of a stable TX frequency.
+          Confirmed working correctly on a real 705.
+
+        - Dual-receiver radios (9700/7610): Main and Sub are independent
+          receivers, not a single switched VFO context -- Main stays on
+          the downlink and Sub on the uplink continuously and
+          simultaneously, true full-duplex, no VFO/split involved at
+          all. Confirmed live: applying the single-receiver approach
+          unmodified to a 9700 produced the same switch-then-revert
+          oscillation the fix above was for, because "select VFO B" and
+          "set frequency" on that radio don't actually mean what they
+          mean on a 7300/705 -- IcomRadio.set_frequency() always targets
+          receiver 0 (Main) unless told otherwise via its own separate
+          receiver= parameter, which VFO A/B selection doesn't touch."""
         satellite = self._active_satellite
         if satellite is None:
             return
@@ -648,72 +670,109 @@ class RadioWindow(QWidget):
             remaining = (self._next_satellite_crossing["time_utc"] - now).total_seconds()
             crossing_text = f"{self._next_satellite_crossing['event']} in {format_countdown(remaining)}"
 
-        doppler_text = ""
-        freq_hz = None
-        transmitting = self.ptt_button.isChecked()
-        target_vfo = "B" if transmitting else "A"
+        # Compute both directions' Doppler correction every tick,
+        # regardless of PTT -- which one(s) actually get sent to the
+        # radio, and how, depends on whether it's dual-receiver (below).
         transponder = self.satellite_transponder_combo.currentData()
+        downlink_hz, downlink_doppler_hz = None, None
+        uplink_hz, uplink_doppler_hz = None, None
         if transponder is not None:
-            # While PTT is held, correct the uplink (on VFO B) instead of
-            # the downlink -- this tick keeps running every
-            # SATELLITE_TRACKING_INTERVAL_MS the whole time PTT is down,
-            # same as it does for the downlink at other times.
-            freq_key = "uplink_mhz" if transmitting else "downlink_mhz"
             try:
-                base_freq_hz = round(float(transponder.get(freq_key)) * 1e6)
+                base_downlink_hz = round(float(transponder.get("downlink_mhz")) * 1e6)
             except (TypeError, ValueError):
-                base_freq_hz = None
-            if base_freq_hz is not None:
-                if not transmitting:
-                    # The tuning knob adjusts this offset instead of the
-                    # radio directly while tracking is active
-                    # (_on_knob_steps) -- so manual tuning within a linear
-                    # satellite's passband, or a nudge to line up with
-                    # where it's actually transmitting, survives the next
-                    # tick instead of being overwritten by a recompute
-                    # from the transponder's bare nominal downlink. Only
-                    # applies to RX -- there's no equivalent TX offset.
-                    base_freq_hz += self._satellite_freq_offset_hz
+                base_downlink_hz = None
+            if base_downlink_hz is not None:
+                # The tuning knob adjusts this offset instead of the
+                # radio directly while tracking is active (_on_knob_
+                # steps) -- so manual tuning within a linear satellite's
+                # passband, or a nudge to line up with where it's
+                # actually transmitting, survives the next tick instead
+                # of being overwritten by a recompute from the
+                # transponder's bare nominal downlink. RX only -- there's
+                # no equivalent TX offset.
+                base_downlink_hz += self._satellite_freq_offset_hz
                 result = doppler_correction(
-                    base_freq_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km,
-                    uplink=transmitting,
+                    base_downlink_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km,
+                    uplink=False,
                 )
                 if result is not None:
-                    freq_hz = round(result["frequency_hz"])
-                    direction = "TX" if transmitting else "RX"
-                    doppler_text = f"  {direction} Doppler {result['doppler_hz']:+.0f} Hz"
+                    downlink_hz = round(result["frequency_hz"])
+                    downlink_doppler_hz = result["doppler_hz"]
+
+            try:
+                base_uplink_hz = round(float(transponder.get("uplink_mhz")) * 1e6)
+            except (TypeError, ValueError):
+                base_uplink_hz = None
+            if base_uplink_hz is not None:
+                result = doppler_correction(
+                    base_uplink_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km,
+                    uplink=True,
+                )
+                if result is not None:
+                    uplink_hz = round(result["frequency_hz"])
+                    uplink_doppler_hz = result["doppler_hz"]
+
+        doppler_text = ""
+        warning_text = ""
+        transmitting = self.ptt_button.isChecked()
+        if self.worker.is_connected():
+            if self.worker.is_dual_receiver:
+                # Main = downlink (RX), Sub = uplink (TX) -- both live
+                # simultaneously and continuously, independent of PTT.
+                # That's the actual mechanism a real dual-receiver radio
+                # (9700/7610) uses for satellite full-duplex operation;
+                # no VFO A/B or split involved, so PTT here just keys/
+                # unkeys Sub's already-correct transmitter, nothing more.
+                if downlink_hz is not None:
+                    self.worker.set_receiver_frequency(RECEIVER_MAIN, downlink_hz)
+                    self._current_freq_hz = downlink_hz
+                    self.freq_display.setText(f"{downlink_hz / 1e6:.6f} MHz")
+                    self._update_band_button_highlight()
+                if uplink_hz is not None:
+                    self.worker.set_receiver_frequency(RECEIVER_SUB, uplink_hz)
+                if downlink_doppler_hz is not None:
+                    doppler_text += f"  RX Doppler {downlink_doppler_hz:+.0f} Hz"
+                    if self._satellite_freq_offset_hz:
+                        doppler_text += f"  Offset {self._satellite_freq_offset_hz:+.0f} Hz"
+                if uplink_doppler_hz is not None:
+                    doppler_text += f"  TX Doppler {uplink_doppler_hz:+.0f} Hz"
+            else:
+                # Single-receiver radio (7300/705): one shared VFO
+                # context -- A for RX, B for TX, swapped around PTT.
+                target_vfo = "B" if transmitting else "A"
+                freq_hz = uplink_hz if transmitting else downlink_hz
+                if not self.worker.control_available("vfo"):
+                    # Surfaced here, inline, rather than only as a
+                    # console [ERROR] line from set_control_value()/
+                    # select_vfo_and_set_frequency() themselves -- "vfo"'s
+                    # setter was never confirmed against real hardware
+                    # (see its CONTROL_DEFINITIONS entry), so if it's not
+                    # actually working on this radio, split-mode PTT
+                    # would otherwise fail completely silently from the
+                    # operator's chair.
+                    warning_text = "  [VFO control unavailable -- can't switch bands]"
+                elif freq_hz is not None:
+                    self.worker.select_vfo_and_set_frequency(target_vfo, freq_hz)
+                else:
+                    self.worker.set_control_value("vfo", target_vfo)
+
+                if freq_hz is not None and not warning_text:
+                    # Update optimistically, same as _on_knob_steps/
+                    # _on_band_selected -- otherwise the main frequency
+                    # readout and band-button highlight just sit still
+                    # until the next 0.5s poll cycle confirms them, which
+                    # reads as "frozen", especially right at a PTT-
+                    # triggered VFO/band switch.
+                    self._current_freq_hz = freq_hz
+                    self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                    self._update_band_button_highlight()
+
+                direction = "TX" if transmitting else "RX"
+                active_doppler_hz = uplink_doppler_hz if transmitting else downlink_doppler_hz
+                if active_doppler_hz is not None:
+                    doppler_text = f"  {direction} Doppler {active_doppler_hz:+.0f} Hz"
                     if not transmitting and self._satellite_freq_offset_hz:
                         doppler_text += f"  Offset {self._satellite_freq_offset_hz:+.0f} Hz"
-
-        warning_text = ""
-        if self.worker.is_connected():
-            if not self.worker.control_available("vfo"):
-                # Surfaced here, inline, rather than only as a console
-                # [ERROR] line from set_control_value()/
-                # select_vfo_and_set_frequency() themselves -- "vfo"'s
-                # setter was never confirmed against real hardware (see
-                # its CONTROL_DEFINITIONS entry), so if it's not actually
-                # working on this radio, split-mode PTT would otherwise
-                # fail completely silently from the operator's chair:
-                # freq_hz still gets computed correctly below, but
-                # nothing would switch VFO, and the frequency command
-                # would land on whatever VFO was already selected.
-                warning_text = "  [VFO control unavailable -- can't switch bands]"
-            elif freq_hz is not None:
-                self.worker.select_vfo_and_set_frequency(target_vfo, freq_hz)
-            else:
-                self.worker.set_control_value("vfo", target_vfo)
-
-            if freq_hz is not None and not warning_text:
-                # Update optimistically, same as _on_knob_steps/
-                # _on_band_selected -- otherwise the main frequency
-                # readout and band-button highlight just sit still until
-                # the next 0.5s poll cycle confirms them, which reads as
-                # "frozen", especially right at a PTT-triggered VFO/band
-                # switch.
-                self._current_freq_hz = freq_hz
-                self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
-                self._update_band_button_highlight()
 
         visibility = "up" if look["elevation_deg"] >= 0 else "down"
         self.satellite_overlay_label.setText(

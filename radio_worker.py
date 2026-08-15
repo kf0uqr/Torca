@@ -51,6 +51,26 @@ try:
 except ImportError:
     LevelsCapable = None
 
+try:
+    # Confirmed via rigplane's own type signatures: "Radio has two
+    # independent receivers (e.g. IC-7610 Main/Sub)" -- the IC-9700 is
+    # the other one, per its own docs. Confirmed live (a real 9700 vs.
+    # 705 side by side): treating Main/Sub as if it were the same as a
+    # single-receiver radio's VFO A/B split -- which is what this app
+    # did before this was added -- produces a repeating switch-then-
+    # revert on a 9700 but works fine on a 705, because they're genuinely
+    # different mechanisms. IcomRadio.set_frequency()/get_frequency()
+    # both take a `receiver` kwarg (0=Main, 1=Sub, matching rigplane's
+    # own RECEIVER_MAIN/RECEIVER_SUB) regardless of whether a given radio
+    # is actually dual-receiver -- isinstance-checking against this
+    # protocol is what tells RadioWorker whether passing receiver=1
+    # there means anything real, vs. classic single-receiver VFO A/B
+    # split being the only thing that actually exists on that radio.
+    from rigplane import DualReceiverCapable, RECEIVER_MAIN, RECEIVER_SUB
+except ImportError:
+    DualReceiverCapable = None
+    RECEIVER_MAIN, RECEIVER_SUB = 0, 1
+
 from constants import (
     BAND_STACKING_CODES,
     BAND_STACKING_REGISTER_LATEST,
@@ -138,6 +158,7 @@ class RadioWorker(QThread):
         self._details = details
         self.loop = None       # asyncio event loop, created inside run()
         self.radio = None      # rigplane Radio, set once connected
+        self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
         self._radio_cm = None
         self._stop_requested = False
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
@@ -578,6 +599,7 @@ class RadioWorker(QThread):
             self.connection_failed.emit(str(exc))
             return
 
+        self.is_dual_receiver = DualReceiverCapable is not None and isinstance(self.radio, DualReceiverCapable)
         self.connected.emit()
         self._print_radio_attribute_diagnostic()
         await self._probe_band_stack_methods()
@@ -816,6 +838,28 @@ class RadioWorker(QThread):
     async def _set_frequency(self, freq_hz: int):
         try:
             await self.radio.set_frequency(freq_hz)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+    def set_receiver_frequency(self, receiver: int, freq_hz: int):
+        """Thread-safe: call from the GUI thread. Only meaningful on a
+        genuine dual-receiver radio (check self.is_dual_receiver first) --
+        sets ONE of its two independent receivers' frequency directly
+        (receiver=RECEIVER_MAIN or RECEIVER_SUB), bypassing VFO A/B
+        entirely. Satellite split on a dual-receiver radio (e.g. IC-9700)
+        works by keeping Main tuned to the downlink and Sub to the uplink
+        continuously and simultaneously -- true full-duplex, not a
+        single shared VFO context switched back and forth around PTT the
+        way single-receiver radios (7300/705) need. set_frequency()
+        (above) always targets receiver 0 implicitly; this is the only
+        way to reach receiver 1 (Sub) at all."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_receiver_frequency(receiver, freq_hz), self.loop)
+
+    async def _set_receiver_frequency(self, receiver: int, freq_hz: int):
+        try:
+            await self.radio.set_frequency(freq_hz, receiver=receiver)
         except Exception as exc:
             self.error.emit(str(exc))
 

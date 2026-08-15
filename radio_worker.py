@@ -77,6 +77,8 @@ from constants import (
     BAND_STACKING_REGISTER_LATEST,
     BAND_STACKING_EXCLUDED,
     LEVEL_DEFINITIONS,
+    DUAL_RECEIVER_LEVEL_KEYS,
+    SUB_LEVEL_KEY_SUFFIX,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     DIAGNOSTIC_DIR_KEYWORDS,
@@ -535,16 +537,25 @@ class RadioWorker(QThread):
             value = value / 255.0
         return max(0.0, min(1.0, value))
 
-    async def _call_level_setter(self, setter_name, value, cache_key):
+    async def _call_level_setter(self, setter_name, value, cache_key, receiver=None):
         """Calls a discovered LevelsCapable setter with a 0.0-1.0 value.
         Tries a plain float first; if the setter rejects that with a
         TypeError/ValueError (as set_squelch() did -- it formats the
         value with Python's `:d` spec, which only accepts ints), retries
         as int(round(value * 255)), the raw Icom CI-V level scale used
         elsewhere in this app (e.g. the S-meter). Whichever form works
-        is cached per cache_key so later calls don't re-probe."""
+        is cached per cache_key so later calls don't re-probe.
+
+        receiver overrides self._active_receiver when given -- lets a
+        dedicated per-receiver slider (Sub's AF/RF/Squelch,
+        set_level_value_for_receiver below) stay independent of
+        whichever receiver the generic single-value controls currently
+        target, without needing its own separate cache_key (the
+        float-vs-int255 probe result is a property of the setter
+        function itself, not of which receiver it's called for)."""
         setter = getattr(self.radio, setter_name)
-        kwargs = self._receiver_kwargs(setter, self._active_receiver) if self.is_dual_receiver else {}
+        target_receiver = self._active_receiver if receiver is None else receiver
+        kwargs = self._receiver_kwargs(setter, target_receiver) if self.is_dual_receiver else {}
         mode = self._level_value_mode.get(cache_key, "float")
         if mode == "float":
             try:
@@ -567,6 +578,25 @@ class RadioWorker(QThread):
         definition = LEVEL_DEFINITIONS[key]
         try:
             await self._call_level_setter(set_name, value, key)
+        except Exception as exc:
+            self.error.emit(f"{definition['label']}: {set_name}() failed ({exc}).")
+
+    def set_level_value_for_receiver(self, key: str, value: float, receiver: int):
+        """Thread-safe: call from the GUI thread. Same as
+        set_level_value() but targets an explicit receiver rather than
+        self._active_receiver -- confirmed live on a real 9700 that AF
+        gain, squelch, and RF gain are all controlled independently per
+        receiver, so Sub needs its own slider (main_window.py) that
+        doesn't move Main's. value is 0.0-1.0."""
+        if self.loop is None or key not in self._level_methods:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_level_value_for_receiver(key, value, receiver), self.loop)
+
+    async def _set_level_value_for_receiver(self, key: str, value: float, receiver: int):
+        _get_name, set_name = self._level_methods[key]
+        definition = LEVEL_DEFINITIONS[key]
+        try:
+            await self._call_level_setter(set_name, value, key, receiver=receiver)
         except Exception as exc:
             self.error.emit(f"{definition['label']}: {set_name}() failed ({exc}).")
 
@@ -859,13 +889,27 @@ class RadioWorker(QThread):
 
             for key, (get_name, _set_name) in self._level_methods.items():
                 definition = LEVEL_DEFINITIONS[key]
+                getter = getattr(self.radio, get_name)
                 try:
-                    getter = getattr(self.radio, get_name)
                     kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
                     raw_value = await getter(**kwargs)
                     self.level_updated.emit(key, self._normalize_level_value(raw_value))
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
+
+                # AF gain/squelch/RF gain are controlled independently
+                # per receiver on a real 9700 (confirmed live) -- also
+                # poll Sub's own value for these, under a synthetic
+                # "<key>_sub" signal key, so main_window.py's dedicated
+                # Sub sliders can reflect it without a second entry in
+                # LEVEL_DEFINITIONS.
+                if self.is_dual_receiver and key in DUAL_RECEIVER_LEVEL_KEYS:
+                    try:
+                        sub_kwargs = self._receiver_kwargs(getter, RECEIVER_SUB)
+                        raw_value = await getter(**sub_kwargs)
+                        self.level_updated.emit(f"{key}{SUB_LEVEL_KEY_SUFFIX}", self._normalize_level_value(raw_value))
+                    except Exception as exc:
+                        self.error.emit(f"{definition['label']} (Sub): {exc}")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 

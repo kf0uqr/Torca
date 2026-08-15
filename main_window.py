@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
 from constants import (
     RADIO_BANDS,
     LEVEL_DEFINITIONS,
+    DUAL_RECEIVER_LEVEL_KEYS,
+    SUB_LEVEL_KEY_SUFFIX,
     CONTROL_DEFINITIONS,
     CONTROL_OPTION_EXCLUDED,
     TUNING_STEPS,
@@ -320,6 +322,36 @@ class RadioWindow(QWidget):
             self.level_sliders[key] = slider
             self.level_labels[key] = label
 
+        # Dual-receiver (9700/7610) only: AF Gain/Squelch/RF Level are
+        # controlled independently per receiver (confirmed live on a
+        # real 9700) -- a second slider per DUAL_RECEIVER_LEVEL_KEYS
+        # entry, targeting Sub explicitly (set_level_value_for_receiver)
+        # rather than whichever receiver the sliders above target.
+        # Hidden/disabled until _on_connected() confirms
+        # self.worker.is_dual_receiver.
+        self.sub_level_sliders = {}
+        self.sub_level_labels = {}
+        self.sub_level_widgets = []  # both label and slider per row, for the show/hide-as-a-group in _on_connected
+        for key in LEVEL_DEFINITIONS:
+            if key not in DUAL_RECEIVER_LEVEL_KEYS:
+                continue
+            definition = LEVEL_DEFINITIONS[key]
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 100)
+            slider.setEnabled(False)
+            slider.setVisible(False)
+            slider.valueChanged.connect(lambda value, k=key: self._on_sub_level_changed(k, value))
+            label = QLabel(f"{definition['label']} (Sub): --")
+            label.setEnabled(False)
+            label.setVisible(False)
+            row = QHBoxLayout()
+            row.addWidget(label)
+            row.addWidget(slider)
+            levels_row.addLayout(row)
+            self.sub_level_sliders[key] = slider
+            self.sub_level_labels[key] = label
+            self.sub_level_widgets.extend((label, slider))
+
         # Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO -- built generically
         # from CONTROL_DEFINITIONS: a combo box ("combo" type), a
         # checkable toggle button ("toggle" type), or a plain click-to-
@@ -453,6 +485,9 @@ class RadioWindow(QWidget):
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
             self.active_receiver_button.setEnabled(True)
+            for widget in self.sub_level_widgets:
+                widget.setVisible(True)
+                widget.setEnabled(True)
         for button in self.band_buttons:
             button.setEnabled(True)
         for slider in self.level_sliders.values():
@@ -497,8 +532,20 @@ class RadioWindow(QWidget):
 
     @Slot(str, float)
     def _on_level_updated(self, key, value):
-        slider = self.level_sliders.get(key)
-        label = self.level_labels.get(key)
+        # A "<key>_sub" payload (radio_worker.py's poll loop, dual-
+        # receiver only) is a Sub-targeted reading for one of
+        # DUAL_RECEIVER_LEVEL_KEYS -- route it to that slider instead of
+        # the Main-focused one LEVEL_DEFINITIONS[key] would otherwise
+        # match.
+        if key.endswith(SUB_LEVEL_KEY_SUFFIX):
+            base_key = key[: -len(SUB_LEVEL_KEY_SUFFIX)]
+            slider = self.sub_level_sliders.get(base_key)
+            label = self.sub_level_labels.get(base_key)
+            label_text = f"{LEVEL_DEFINITIONS[base_key]['label']} (Sub)"
+        else:
+            slider = self.level_sliders.get(key)
+            label = self.level_labels.get(key)
+            label_text = LEVEL_DEFINITIONS[key]["label"]
         if slider is None:
             return
         percent = round(value * 100)
@@ -509,11 +556,15 @@ class RadioWindow(QWidget):
             slider.blockSignals(True)
             slider.setValue(percent)
             slider.blockSignals(False)
-        label.setText(f"{LEVEL_DEFINITIONS[key]['label']}: {percent}%")
+        label.setText(f"{label_text}: {percent}%")
 
     def _on_level_changed(self, key, value):
         self.level_labels[key].setText(f"{LEVEL_DEFINITIONS[key]['label']}: {value}%")
         self.worker.set_level_value(key, value / 100.0)
+
+    def _on_sub_level_changed(self, key, value):
+        self.sub_level_labels[key].setText(f"{LEVEL_DEFINITIONS[key]['label']} (Sub): {value}%")
+        self.worker.set_level_value_for_receiver(key, value / 100.0, RECEIVER_SUB)
 
     def _on_control_combo_changed(self, key, widget):
         value = widget.currentData()

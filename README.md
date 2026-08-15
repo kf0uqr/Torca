@@ -6,7 +6,7 @@ Also included:
 
 - **Connection profiles** - save a whole setup (radio, network/USB settings, audio devices, location) under a name in the Connect dialog, and reload it from a dropdown next time instead of re-entering everything. Handy for e.g. a home station vs. a portable/field-day setup.
 - **Ham Dashboard** - solar conditions (NOAA/hamqsl), a day/night world map, and SGP4-based satellite tracking with TLE (CelesTrak) and transponder (SatNOGS DB) fetching. Stores every known transponder per satellite, editable by hand too.
-- **Satellite Doppler correction** - double-click a tracked satellite on the map, pick one of its stored transponders, and the radio's VFO A is continuously re-tuned to track that transponder's downlink through its Doppler shift, computed from real SGP4 orbital velocity against your set location (lat/lon/elevation).
+- **Satellite Doppler correction** - double-click a tracked satellite on the Ham Dashboard map to start live tracking in the *main* window: pick one of its stored transponders from a dropdown there, and VFO A is continuously re-tuned to track that transponder's downlink through its Doppler shift (real SGP4 orbital velocity against your set location), with elevation/azimuth/Doppler/time-to-AOS-or-LOS overlaid on the spectrum scope, next to the frequency readout. Double-click another satellite any time to switch -- tracking keeps running rather than blocking either window.
 - **WSJT-X bridge** - launch WSJT-X/JTDX/fldigi into an isolated profile and drive it through this app's radio connection via a built-in Hamlib `rigctld`-compatible server (no external Hamlib install required).
 - **Audio streaming** - mic/speaker audio to and from the radio via rigplane's `AudioTransport`, plus Linux/PulseAudio virtual-audio-cable helpers.
 - Spectrum, waterfall, meter, and tuning-knob widgets, and a dark theme throughout.
@@ -49,8 +49,8 @@ Location can be entered by hand, or looked up approximately from your public IP 
 
 ### Using satellite tracking + Doppler correction
 
-1. In the Ham Dashboard, click **Satellites** to turn tracking on; right-click the button to manage the tracked list (refresh TLEs from CelesTrak, add satellites by hand, fetch transponder data from SatNOGS DB, or hand-edit transponders, and choose which satellites show on the map).
-2. Double-click a satellite marker on the map to open the Doppler Correction dialog, pick one of its stored transponders, and click **Start** -- the radio switches to VFO A and its frequency is continuously corrected for the satellite's Doppler shift until you click **Stop** or close the dialog.
+1. In the Ham Dashboard, click **Satellites** to turn tracking on; right-click the button to manage the tracked list (refresh TLEs from CelesTrak, add satellites by hand, fetch transponder data from SatNOGS DB for every tracked satellite, or hand-edit transponders, and choose which satellites show on the map).
+2. Double-click a satellite marker on the map. Tracking starts in the *main radio window*, not the dashboard: pick a transponder from the dropdown that appears there, and VFO A gets continuously Doppler-corrected while elevation/azimuth/Doppler shift/time-to-AOS-or-LOS show as an overlay on the spectrum scope. Click **Stop Tracking** to stop, or just double-click a different satellite on the map to switch -- no need to stop first.
 
 ## Project layout
 
@@ -66,7 +66,7 @@ Location can be entered by hand, or looked up approximately from your public IP 
 | `wsjtx_rigctld.py` | WSJT-X launcher + `RigctldServer` |
 | `solar_data.py` | NOAA/hamqsl fetching, `SolarDataWorker`, astronomy helpers |
 | `world_map.py` | `WorldMapWidget` (Ham Dashboard's day/night map, satellite markers) |
-| `satellite_tracking.py` | SGP4 propagation, TLE/SatNOGS fetching, Doppler correction math, satellite/transponder dialogs |
+| `satellite_tracking.py` | SGP4 propagation, TLE/SatNOGS fetching, Doppler/look-angle/AOS-LOS math, satellite/transponder dialogs |
 | `ham_dashboard.py` | `HamClockWindow`, ties the above three together |
 | `main_window.py` | `RadioWindow`, the main application window |
 | `theme.py` | Dark theme applied to the whole app |

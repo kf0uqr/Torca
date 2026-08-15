@@ -47,32 +47,32 @@ class SpectrumWidget(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(120)
         self._frame = None
-        self._overlay_widget = None
-        self._overlay_margin = 8
+        self._overlays = {}  # corner -> (widget, margin)
 
-    def set_overlay_widget(self, widget, margin=8):
-        """Reparents `widget` onto this scope as a fixed top-right
-        overlay (e.g. the main frequency readout) -- Qt composites child
-        widgets on top of a parent's own paintEvent automatically, so no
-        z-order trick is needed beyond normal parenting. The widget keeps
-        its own size (give it setFixedWidth()/setFixedHeight() beforehand
-        so its box doesn't jump around as its text changes); only its
-        position is recalculated here, on every resize of the scope."""
-        self._overlay_widget = widget
-        self._overlay_margin = margin
+    def set_overlay_widget(self, widget, margin=8, corner="top-right"):
+        """Reparents `widget` onto this scope as a fixed overlay (e.g.
+        the main frequency readout at "top-right", satellite tracking
+        info at "top-left") -- Qt composites child widgets on top of a
+        parent's own paintEvent automatically, so no z-order trick is
+        needed beyond normal parenting. The widget keeps its own size
+        (give it setFixedWidth()/setFixedHeight() beforehand so its box
+        doesn't jump around as its text changes); only its position is
+        recalculated here, on every resize of the scope. Corners are
+        independent -- multiple widgets can coexist as long as each has
+        its own corner."""
+        self._overlays[corner] = (widget, margin)
         widget.setParent(self)
-        self._position_overlay()
+        self._position_overlays()
 
-    def _position_overlay(self):
-        if self._overlay_widget is None:
-            return
-        x = self.width() - self._overlay_widget.width() - self._overlay_margin
-        y = self._overlay_margin
-        self._overlay_widget.move(max(0, x), y)
+    def _position_overlays(self):
+        for corner, (widget, margin) in self._overlays.items():
+            x = self.width() - widget.width() - margin if "right" in corner else margin
+            y = self.height() - widget.height() - margin if "bottom" in corner else margin
+            widget.move(max(0, x), max(0, y))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._position_overlay()
+        self._position_overlays()
 
     def set_frame(self, frame):
         self._frame = frame

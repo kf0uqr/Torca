@@ -2,14 +2,22 @@
 RadioWindow: the main application window. Ties together the radio
 connection (via RadioWorker), all the live controls/meters/sliders, the
 spectrum scope and waterfall, band buttons, and the "extra" action
-buttons (Ham Dashboard, Launch WSJT-X, Rigctld, Virtual Cables).
+buttons (Ham Dashboard, Launch WSJT-X, Rigctld, Virtual Cables). Also
+owns live satellite Doppler tracking -- double-clicking a satellite on
+the Ham Dashboard map selects it here (via HamClockWindow's
+satellite_selected signal) rather than opening a dialog of its own, so
+tracking keeps running in the background (VFO A retuned every couple
+seconds, elevation/azimuth/Doppler/AOS-LOS overlaid on the spectrum
+scope, like the frequency readout) and switching to another satellite
+is just another double-click away.
 """
 
+import datetime
 import os
 import platform
 import sys
 
-from PySide6.QtCore import Qt, Slot, QSettings
+from PySide6.QtCore import Qt, QTimer, Slot, QSettings
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -34,6 +42,9 @@ from radio_worker import RadioWorker
 from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from ham_dashboard import HamClockWindow
+from satellite_tracking import doppler_correction, satellite_look_angles, next_aos_los, format_countdown
+
+SATELLITE_TRACKING_INTERVAL_MS = 2000
 
 class RadioWindow(QWidget):
     def __init__(self, details):
@@ -110,6 +121,22 @@ class RadioWindow(QWidget):
         self.spectrum_widget.set_overlay_widget(self.freq_display)
         self.waterfall_widget = WaterfallWidget()
 
+        # Live satellite tracking overlay -- populated by double-clicking
+        # a satellite on the Ham Dashboard map (see _on_satellite_selected
+        # below). Hidden until a satellite is actually selected. No fixed
+        # width, unlike freq_display -- satellite names and countdown
+        # digits both vary enough in length that a fixed box would either
+        # clip or float awkwardly; a little jitter on update is the
+        # tradeoff, and this is informational rather than something a
+        # user is reading a tuning offset off of.
+        self.satellite_overlay_label = QLabel("")
+        self.satellite_overlay_label.setStyleSheet(
+            "font-size: 13px; color: white; "
+            "background-color: rgb(10, 10, 20); padding: 4px 10px; border-radius: 4px;"
+        )
+        self.satellite_overlay_label.setVisible(False)
+        self.spectrum_widget.set_overlay_widget(self.satellite_overlay_label, corner="top-left")
+
         self.tuning_knob = TuningKnobWidget()
         self.tuning_knob.setEnabled(False)
         self.tuning_knob.steps_changed.connect(self._on_knob_steps)
@@ -137,12 +164,37 @@ class RadioWindow(QWidget):
         self.hamclock_button.setToolTip(
             "Opens a HamClock-inspired dashboard: day/night world map, UTC/"
             "local clocks, live solar-terrestrial data (SFI/SSN/K-index) from "
-            "NOAA's public feeds, and satellite tracking. Doesn't need the "
-            "radio connected, except to double-click a satellite and start "
-            "Doppler correction."
+            "NOAA's public feeds, and satellite tracking. Double-click a "
+            "tracked satellite there to start live elevation/azimuth/AOS-LOS "
+            "and Doppler-corrected VFO A tracking here in the main window."
         )
         self.hamclock_button.clicked.connect(self._on_hamclock_button_clicked)
         self.hamclock_window = None  # created lazily on first click
+
+        # Satellite tracking: populated by double-clicking a satellite on
+        # the Ham Dashboard map (see _on_satellite_selected). Disabled
+        # until then; "Stop Tracking" clears it back to this state.
+        self.satellite_label = QLabel("No satellite selected")
+        self.satellite_transponder_combo = QComboBox()
+        self.satellite_transponder_combo.setEnabled(False)
+        self.satellite_transponder_combo.setToolTip(
+            "Which of the selected satellite's stored transponders to Doppler-"
+            "correct VFO A against."
+        )
+        self.satellite_transponder_combo.currentIndexChanged.connect(self._on_satellite_transponder_changed)
+        self.satellite_stop_button = QPushButton("Stop Tracking")
+        self.satellite_stop_button.setEnabled(False)
+        self.satellite_stop_button.clicked.connect(self._on_satellite_tracking_stop_clicked)
+
+        self.satellite_row = QHBoxLayout()
+        self.satellite_row.addWidget(self.satellite_label)
+        self.satellite_row.addWidget(self.satellite_transponder_combo, 1)
+        self.satellite_row.addWidget(self.satellite_stop_button)
+
+        self._active_satellite = None
+        self._next_satellite_crossing = None
+        self._satellite_tracking_timer = QTimer(self)
+        self._satellite_tracking_timer.timeout.connect(self._on_satellite_tracking_tick)
 
         self.wsjtx_button = QPushButton("Launch WSJT-X")
         self.wsjtx_button.setToolTip(
@@ -311,6 +363,7 @@ class RadioWindow(QWidget):
         layout.addLayout(self.meters_row)
         layout.addLayout(self.meters_row_2)
         layout.addLayout(self.band_buttons_row)
+        layout.addLayout(self.satellite_row)
         layout.addLayout(tuning_row)
         layout.addLayout(levels_row)
         layout.addWidget(self.status_label)
@@ -412,14 +465,115 @@ class RadioWindow(QWidget):
     def _on_hamclock_button_clicked(self):
         if self.hamclock_window is None:
             self.hamclock_window = HamClockWindow(
-                worker=self.worker,
                 observer_lat=self._details.get("observer_lat"),
                 observer_lon=self._details.get("observer_lon"),
                 observer_elevation_m=self._details.get("observer_elevation_m", 0.0),
             )
+            self.hamclock_window.satellite_selected.connect(self._on_satellite_selected)
         self.hamclock_window.show()
         self.hamclock_window.raise_()
         self.hamclock_window.activateWindow()
+
+    def _on_satellite_selected(self, satellite):
+        """A satellite was double-clicked on the Ham Dashboard map --
+        (re)start tracking it here, replacing whatever was active
+        before. Doesn't require the radio to be connected: elevation/
+        azimuth/AOS-LOS are still useful on their own, only the actual
+        VFO re-tuning is gated on that (checked every tick, not just
+        here, so it picks up automatically if the radio connects mid-
+        session)."""
+        self._active_satellite = satellite
+        self._next_satellite_crossing = None
+        self.satellite_label.setText(satellite.get("name", "?"))
+
+        self.satellite_transponder_combo.blockSignals(True)
+        self.satellite_transponder_combo.clear()
+        transponders = satellite.get("transponders", [])
+        if transponders:
+            for transponder in transponders:
+                downlink = transponder.get("downlink_mhz") or "?"
+                mode = transponder.get("mode") or "?"
+                description = transponder.get("description") or "Transponder"
+                self.satellite_transponder_combo.addItem(f"{description} -- {downlink} MHz {mode}", transponder)
+            self.satellite_transponder_combo.setEnabled(True)
+        else:
+            self.satellite_transponder_combo.addItem("No transponders stored -- Doppler correction unavailable", None)
+            self.satellite_transponder_combo.setEnabled(False)
+        self.satellite_transponder_combo.blockSignals(False)
+
+        self.satellite_stop_button.setEnabled(True)
+        self.satellite_overlay_label.setVisible(True)
+
+        if self.worker.is_connected():
+            # rigplane/CI-V's "set frequency" always targets whichever VFO
+            # is currently selected on the radio -- make sure that's A.
+            self.worker.set_control_value("vfo", "A")
+        self._on_satellite_tracking_tick()
+        self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
+
+    def _on_satellite_transponder_changed(self, _index):
+        if self._active_satellite is not None:
+            self._on_satellite_tracking_tick()  # reflect the new choice immediately, don't wait for the timer
+
+    def _on_satellite_tracking_stop_clicked(self):
+        self._satellite_tracking_timer.stop()
+        self._active_satellite = None
+        self._next_satellite_crossing = None
+        self.satellite_label.setText("No satellite selected")
+        self.satellite_transponder_combo.clear()
+        self.satellite_transponder_combo.setEnabled(False)
+        self.satellite_stop_button.setEnabled(False)
+        self.satellite_overlay_label.setVisible(False)
+
+    def _on_satellite_tracking_tick(self):
+        satellite = self._active_satellite
+        if satellite is None:
+            return
+        line1, line2 = satellite.get("line1", ""), satellite.get("line2", "")
+        observer_lat = self._details.get("observer_lat")
+        observer_lon = self._details.get("observer_lon")
+        observer_elevation_km = (self._details.get("observer_elevation_m") or 0.0) / 1000.0
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        look = satellite_look_angles(line1, line2, now, observer_lat, observer_lon, observer_elevation_km)
+        if look is None:
+            self.satellite_overlay_label.setText(f"{satellite.get('name', '?')}\nOrbit propagation failed (invalid TLE?)")
+            return
+
+        # The AOS/LOS search is a real (if cheap) computation -- only
+        # re-run it once the previously-found crossing has actually
+        # passed, not on every 2-second tick.
+        if self._next_satellite_crossing is None or now >= self._next_satellite_crossing["time_utc"]:
+            self._next_satellite_crossing = next_aos_los(
+                line1, line2, now, observer_lat, observer_lon, observer_elevation_km
+            )
+        crossing_text = "AOS/LOS: unknown"
+        if self._next_satellite_crossing:
+            remaining = (self._next_satellite_crossing["time_utc"] - now).total_seconds()
+            crossing_text = f"{self._next_satellite_crossing['event']} in {format_countdown(remaining)}"
+
+        doppler_text = ""
+        transponder = self.satellite_transponder_combo.currentData()
+        if transponder is not None:
+            try:
+                base_freq_hz = round(float(transponder.get("downlink_mhz")) * 1e6)
+            except (TypeError, ValueError):
+                base_freq_hz = None
+            if base_freq_hz is not None:
+                result = doppler_correction(
+                    base_freq_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km
+                )
+                if result is not None:
+                    if self.worker.is_connected():
+                        self.worker.set_frequency(round(result["frequency_hz"]))
+                    doppler_text = f"  Doppler {result['doppler_hz']:+.0f} Hz"
+
+        visibility = "up" if look["elevation_deg"] >= 0 else "down"
+        self.satellite_overlay_label.setText(
+            f"{satellite.get('name', '?')} ({visibility})\n"
+            f"El {look['elevation_deg']:.1f}°  Az {look['azimuth_deg']:.1f}°{doppler_text}\n"
+            f"{crossing_text}"
+        )
 
     def _on_wsjtx_button_clicked(self):
         settings = QSettings("IcomRadioApp", "RadioControl")
@@ -556,6 +710,7 @@ class RadioWindow(QWidget):
             )
 
     def closeEvent(self, event):
+        self._satellite_tracking_timer.stop()
         if self.hamclock_window is not None:
             self.hamclock_window.close()
         if self.rigctld_server is not None:

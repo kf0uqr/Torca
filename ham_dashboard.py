@@ -5,11 +5,18 @@ conditions, and satellite tracking into one window. Opened via the "Ham
 Dashboard" button in the main radio window -- doesn't need a radio
 connection. The operator's location (used for Doppler correction, and
 shown as a marker on the map) is set in ConnectionDialog, not here.
+
+Double-clicking a tracked satellite on the map doesn't drive the radio
+from here -- it just emits satellite_selected and leaves Doppler
+correction, transponder choice, and the live tracking overlay to
+RadioWindow (main_window.py) so tracking keeps running and stays
+switchable to another satellite without this window (or the whole app,
+since a QDialog's exec() used to block it) becoming unusable.
 """
 
 import datetime
 
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget,
@@ -28,7 +35,6 @@ from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
 from world_map import WorldMapWidget
 from satellite_tracking import (
     SatelliteConfigDialog,
-    DopplerCorrectionDialog,
     load_satellite_data,
     save_satellite_data,
     propagate_satellite,
@@ -38,17 +44,16 @@ from satellite_tracking import (
 
 class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
-    section for what's in scope and why. `worker` (a RadioWorker, or
-    None) is only needed for the Doppler correction dialog -- everything
-    else here still works without a radio connection. observer_lat/
-    observer_lon/observer_elevation_m come from ConnectionDialog."""
+    section for what's in scope and why. observer_lat/observer_lon/
+    observer_elevation_m come from ConnectionDialog."""
 
-    def __init__(self, worker=None, observer_lat=None, observer_lon=None,
+    satellite_selected = Signal(dict)  # emitted on a valid double-click; RadioWindow does the rest
+
+    def __init__(self, observer_lat=None, observer_lon=None,
                  observer_elevation_m=0.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ham Dashboard")
         self.resize(680, 520)
-        self._worker = worker
         self._observer_lat = observer_lat
         self._observer_lon = observer_lon
         self._observer_elevation_m = observer_elevation_m or 0.0
@@ -211,30 +216,26 @@ class HamClockWindow(QWidget):
         satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
         if satellite is None:
             return
-        if not satellite.get("transponders"):
-            QMessageBox.information(
-                self, "Doppler Correction",
-                f"No transponder data stored for {name} yet. Right-click "
-                "Satellites and use \"Fetch Transponder Data\" or "
-                "\"Edit Transponders...\" to add some first."
-            )
-            return
         # (0, 0) is what an unset lat/lon defaults to (nobody's actual
-        # station is at 0N 0E), so treat it the same as "not set".
+        # station is at 0N 0E), so treat it the same as "not set". Unlike
+        # transponder data (see main_window.py's tracking overlay, which
+        # handles "no transponders" gracefully -- elevation/azimuth/AOS-
+        # LOS don't need one), there's no useful degraded mode without a
+        # location at all.
         if not self._observer_lat and not self._observer_lon:
             QMessageBox.warning(
-                self, "Doppler Correction",
+                self, "Satellite Tracking",
                 "Set your location in the Connect dialog first (Latitude/"
-                "Longitude/Elevation) -- Doppler correction needs to know "
+                "Longitude/Elevation) -- satellite tracking needs to know "
                 "where you're observing from. You'll need to restart the "
                 "app to change it."
             )
             return
-        dialog = DopplerCorrectionDialog(
-            satellite, self._worker, self._observer_lat, self._observer_lon,
-            self._observer_elevation_m, self,
-        )
-        dialog.exec()
+        # RadioWindow already independently has observer_lat/lon/elevation
+        # (same source: ConnectionDialog's details) -- just the satellite
+        # itself goes over the signal, not a location that could in
+        # principle drift out of sync with RadioWindow's own copy.
+        self.satellite_selected.emit(satellite)
 
     @Slot(dict)
     def _on_solar_data(self, data):

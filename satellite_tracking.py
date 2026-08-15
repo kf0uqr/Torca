@@ -1,13 +1,13 @@
 """
-Satellite tracking for the Ham Dashboard: real orbital propagation via
-the sgp4 library (NORAD's standard SGP4/SDP4 algorithm -- not
-reimplemented here, same reasoning as not hand-rolling FT8 decoding),
-TLE data from CelesTrak, transponder data from SatNOGS DB, and the
-dialogs for managing tracked satellites (refresh TLEs, add/remove,
-store all known transponder data per satellite, pick which satellites
-display). Picking which transponder to actually use when tuning is a
-later feature -- for now this just stores everything SatNOGS knows
-about a satellite.
+Satellite tracking for the Ham Dashboard and main radio window: real
+orbital propagation via the sgp4 library (NORAD's standard SGP4/SDP4
+algorithm -- not reimplemented here, same reasoning as not hand-rolling
+FT8 decoding), TLE data from CelesTrak, transponder data from SatNOGS
+DB, Doppler correction / look-angle (elevation+azimuth) / AOS-LOS math
+(pure functions, no Qt dependency -- RadioWindow in main_window.py
+drives the radio and overlay display with these), and the dialogs for
+managing tracked satellites (refresh TLEs, add/remove, store all known
+transponder data per satellite, pick which satellites display).
 """
 
 import datetime
@@ -31,7 +31,7 @@ except ImportError:
     jday = None
     SGP4_AVAILABLE = False
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -45,7 +45,6 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
-    QComboBox,
 )
 
 # ==================== Satellite tracking ====================
@@ -198,61 +197,102 @@ EARTH_ROTATION_RATE_RAD_S = math.radians(360.98564736629) / 86400.0
 SPEED_OF_LIGHT_KM_S = 299792.458
 
 
+def _observer_teme_frame(observer_lat, observer_lon, observer_elevation_km, gmst_rad):
+    """The observer's position + velocity in the TEME inertial frame at
+    the instant gmst_rad corresponds to, plus the local Up/East/North
+    unit vectors at that same instant (used to turn a satellite's TEME
+    position into elevation/azimuth). Same spherical-Earth approximation
+    as propagate_satellite (observer_elevation_km is added straight onto
+    EARTH_RADIUS_KM rather than modeled against a WGS84 ellipsoid) --
+    Earth's oblateness affects this by well under the resolution a human
+    retunes a radio to or points an antenna with. The observer's TEME-
+    frame velocity isn't zero even though it's "standing still" on the
+    ground, because Earth's rotation is carrying it around the polar
+    axis -- needed for Doppler's range-rate calculation."""
+    obs_radius_km = EARTH_RADIUS_KM + observer_elevation_km
+    lat_rad = math.radians(observer_lat)
+    lon_rad = math.radians(observer_lon) + gmst_rad  # Earth-fixed longitude -> TEME longitude
+    cos_lat, sin_lat = math.cos(lat_rad), math.sin(lat_rad)
+    cos_lon, sin_lon = math.cos(lon_rad), math.sin(lon_rad)
+
+    position = (obs_radius_km * cos_lat * cos_lon, obs_radius_km * cos_lat * sin_lon, obs_radius_km * sin_lat)
+    # Earth's rotation vector (0, 0, omega) crossed with the observer's position.
+    velocity = (-EARTH_ROTATION_RATE_RAD_S * position[1], EARTH_ROTATION_RATE_RAD_S * position[0], 0.0)
+    # On a sphere, the local zenith ("Up") is just the observer's own
+    # radial direction -- East and North complete a standard topocentric
+    # ENU frame from there.
+    up = (cos_lat * cos_lon, cos_lat * sin_lon, sin_lat)
+    east = (-sin_lon, cos_lon, 0.0)
+    north = (-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat)
+    return position, velocity, up, east, north
+
+
+def satellite_look_angles(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0):
+    """Returns {"elevation_deg", "azimuth_deg", "range_km"} for the
+    satellite as seen from the observer at dt_utc -- azimuth is degrees
+    clockwise from true North. Position-only (no velocity/Doppler), so
+    it's cheap enough to call repeatedly for an AOS/LOS search. Returns
+    None if propagation fails (sgp4 missing/invalid TLE)."""
+    result = _propagate_teme(line1, line2, dt_utc)
+    if result is None:
+        return None
+    jd, fr, sat_pos, _sat_vel = result
+    gmst_rad = math.radians(_gmst_degrees(jd, fr))
+    obs_pos, _obs_vel, up, east, north = _observer_teme_frame(
+        observer_lat, observer_lon, observer_elevation_km, gmst_rad
+    )
+
+    range_vec = tuple(s - o for s, o in zip(sat_pos, obs_pos))
+    range_km = math.sqrt(sum(c * c for c in range_vec))
+    if range_km == 0:
+        return None
+    range_up = sum(c * u for c, u in zip(range_vec, up))
+    range_east = sum(c * u for c, u in zip(range_vec, east))
+    range_north = sum(c * u for c, u in zip(range_vec, north))
+
+    elevation_deg = math.degrees(math.asin(max(-1.0, min(1.0, range_up / range_km))))
+    azimuth_deg = math.degrees(math.atan2(range_east, range_north)) % 360.0
+    return {"elevation_deg": elevation_deg, "azimuth_deg": azimuth_deg, "range_km": range_km}
+
+
 def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observer_lon,
                         observer_elevation_km=0.0):
     """Corrects base_freq_hz (a transponder's downlink) for the
     satellite's Doppler shift at dt_utc, as seen from observer_lat/lon/
-    elevation. Same spherical-Earth approximation as propagate_satellite
-    (observer_elevation_km is added straight onto EARTH_RADIUS_KM rather
-    than modeled against a WGS84 ellipsoid) -- Earth's oblateness affects
-    this by well under the resolution a human retunes a radio to, nowhere
-    near worth a full ellipsoid conversion for. Elevation matters more
-    for LEO passes near the horizon, where slant range is smallest and
-    the observer's exact position has the most relative effect.
+    elevation.
 
     Standard non-relativistic Doppler: f_observed = f_transmitted *
     (1 - range_rate / c), where range_rate is how fast the slant range
     to the satellite is changing (negative while approaching -- range
     shrinking -- which is why that shows up as a HIGHER frequency).
     Both the satellite (from sgp4) and the observer are expressed in the
-    same TEME inertial frame; the observer's TEME-frame velocity isn't
-    zero even though it's "standing still" on the ground, because Earth's
-    rotation is carrying it around the polar axis.
+    same TEME inertial frame via _observer_teme_frame().
 
     Returns a dict with frequency_hz (the corrected downlink), doppler_hz
-    (how much correction was applied), range_km, range_rate_km_s, and
-    elevation_deg (how high above the observer's horizon the satellite
-    currently is -- negative means it hasn't risen yet/already set).
+    (how much correction was applied), range_km, range_rate_km_s,
+    elevation_deg, and azimuth_deg (degrees clockwise from true North).
     Returns None if propagation fails (sgp4 missing/invalid TLE)."""
     result = _propagate_teme(line1, line2, dt_utc)
     if result is None:
         return None
     jd, fr, sat_pos, sat_vel = result
     gmst_rad = math.radians(_gmst_degrees(jd, fr))
+    obs_pos, obs_vel, up, east, north = _observer_teme_frame(
+        observer_lat, observer_lon, observer_elevation_km, gmst_rad
+    )
 
-    obs_radius_km = EARTH_RADIUS_KM + observer_elevation_km
-    lat_rad = math.radians(observer_lat)
-    lon_rad = math.radians(observer_lon) + gmst_rad  # Earth-fixed longitude -> TEME longitude
-    obs_x = obs_radius_km * math.cos(lat_rad) * math.cos(lon_rad)
-    obs_y = obs_radius_km * math.cos(lat_rad) * math.sin(lon_rad)
-    obs_z = obs_radius_km * math.sin(lat_rad)
-    # Observer's TEME-frame velocity = Earth's rotation vector (0, 0, omega) crossed with its position.
-    obs_vx = -EARTH_ROTATION_RATE_RAD_S * obs_y
-    obs_vy = EARTH_ROTATION_RATE_RAD_S * obs_x
-
-    range_vec = (sat_pos[0] - obs_x, sat_pos[1] - obs_y, sat_pos[2] - obs_z)
+    range_vec = tuple(s - o for s, o in zip(sat_pos, obs_pos))
     range_km = math.sqrt(sum(c * c for c in range_vec))
     if range_km == 0:
         return None
-    rel_vel = (sat_vel[0] - obs_vx, sat_vel[1] - obs_vy, sat_vel[2])
+    rel_vel = tuple(s - o for s, o in zip(sat_vel, obs_vel))
     range_rate_km_s = sum(r * v for r, v in zip(range_vec, rel_vel)) / range_km
 
-    # Elevation: on a sphere, the local zenith at the observer points
-    # straight out from Earth's center through the observer, so the
-    # observer's own (unit) position vector doubles as that zenith
-    # direction -- no separate ENU frame needed.
-    zenith_component = sum(c * u for c, u in zip(range_vec, (obs_x, obs_y, obs_z))) / obs_radius_km
-    elevation_deg = math.degrees(math.asin(max(-1.0, min(1.0, zenith_component / range_km))))
+    range_up = sum(c * u for c, u in zip(range_vec, up))
+    range_east = sum(c * u for c, u in zip(range_vec, east))
+    range_north = sum(c * u for c, u in zip(range_vec, north))
+    elevation_deg = math.degrees(math.asin(max(-1.0, min(1.0, range_up / range_km))))
+    azimuth_deg = math.degrees(math.atan2(range_east, range_north)) % 360.0
 
     corrected_hz = base_freq_hz * (1.0 - range_rate_km_s / SPEED_OF_LIGHT_KM_S)
     return {
@@ -261,7 +301,69 @@ def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observe
         "range_km": range_km,
         "range_rate_km_s": range_rate_km_s,
         "elevation_deg": elevation_deg,
+        "azimuth_deg": azimuth_deg,
     }
+
+
+def next_aos_los(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0,
+                  search_horizon_hours=48, coarse_step_seconds=30):
+    """Finds this satellite's next horizon crossing (elevation 0
+    degrees) after dt_utc: AOS ("Acquisition of Signal", it's about to
+    rise) if it's currently below the horizon, LOS ("Loss of Signal",
+    it's about to set) if it's currently above. A coarse linear scan
+    (step size chosen well under a typical LEO pass's width, which is
+    several minutes, so a pass can't be stepped over entirely) brackets
+    the crossing, then 20 rounds of bisection refine it to sub-second
+    precision -- this is prediction, not live tracking, so it doesn't
+    need to be fast, just correct. 48h default because a given LEO
+    ground track can leave an observer's visible window for a day or
+    more at a time (confirmed live: ISS, a mid-latitude observer, no
+    pass for the next ~8 hours at the moment this was written) -- even
+    so, a full run only takes tens of milliseconds, and this only runs
+    once per crossing, not every tracking tick.
+
+    Returns {"event": "AOS" or "LOS", "time_utc": datetime,
+    "seconds_away": float}, or None if propagation fails or no crossing
+    is found within search_horizon_hours (e.g. a geometry where this
+    satellite never rises for this observer, or a decayed/invalid TLE)."""
+    current = satellite_look_angles(line1, line2, dt_utc, observer_lat, observer_lon, observer_elevation_km)
+    if current is None:
+        return None
+    event = "LOS" if current["elevation_deg"] >= 0 else "AOS"
+
+    max_steps = int(search_horizon_hours * 3600 / coarse_step_seconds)
+    prev_t, prev_elevation = dt_utc, current["elevation_deg"]
+    for step in range(1, max_steps + 1):
+        t = dt_utc + datetime.timedelta(seconds=step * coarse_step_seconds)
+        look = satellite_look_angles(line1, line2, t, observer_lat, observer_lon, observer_elevation_km)
+        if look is None:
+            return None
+        elevation = look["elevation_deg"]
+        if (elevation >= 0) != (prev_elevation >= 0):
+            lo, hi, lo_elevation = prev_t, t, prev_elevation
+            for _ in range(20):
+                mid = lo + (hi - lo) / 2
+                mid_look = satellite_look_angles(line1, line2, mid, observer_lat, observer_lon, observer_elevation_km)
+                if mid_look is None:
+                    break
+                if (mid_look["elevation_deg"] >= 0) == (lo_elevation >= 0):
+                    lo, lo_elevation = mid, mid_look["elevation_deg"]
+                else:
+                    hi = mid
+            return {"event": event, "time_utc": hi, "seconds_away": (hi - dt_utc).total_seconds()}
+        prev_t, prev_elevation = t, elevation
+    return None
+
+
+def format_countdown(seconds):
+    """Formats a duration in seconds as "MM:SS" or "H:MM:SS" for
+    display (AOS/LOS countdowns). Negative/None input clamps to 0."""
+    seconds = max(0, int(seconds or 0))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def footprint_points(lat, lon, altitude_km, num_points=72):
@@ -435,123 +537,6 @@ class TransponderEditDialog(QDialog):
                 "alive": self.table.item(row, 4).checkState() == Qt.Checked,
             })
         return transponders
-
-
-class DopplerCorrectionDialog(QDialog):
-    """Opened by double-clicking a satellite on the Ham Dashboard map.
-    Tunes the radio's VFO A to a chosen transponder's downlink, and while
-    "Start" is running, keeps re-tuning it every couple seconds to track
-    the satellite's Doppler shift. Uplink correction (for full-duplex
-    operating) and picking a transponder some other way than this
-    dropdown are both later features -- this is just the downlink."""
-
-    UPDATE_INTERVAL_MS = 2000
-
-    def __init__(self, satellite, worker, observer_lat, observer_lon,
-                 observer_elevation_m=0.0, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Doppler Correction -- {satellite.get('name', '?')}")
-        self.resize(440, 200)
-        self._satellite = satellite
-        self._worker = worker
-        self._observer_lat = observer_lat
-        self._observer_lon = observer_lon
-        self._observer_elevation_km = (observer_elevation_m or 0.0) / 1000.0
-
-        self.transponder_combo = QComboBox()
-        for transponder in satellite.get("transponders", []):
-            downlink = transponder.get("downlink_mhz") or "?"
-            mode = transponder.get("mode") or "?"
-            description = transponder.get("description") or "Transponder"
-            self.transponder_combo.addItem(f"{description} -- {downlink} MHz {mode}", transponder)
-
-        self.status_label = QLabel(
-            "Not started." if satellite.get("transponders")
-            else "No transponder data stored for this satellite -- fetch or add it "
-                 "from the Satellites config window first."
-        )
-        self.status_label.setWordWrap(True)
-
-        self.start_button = QPushButton("Start")
-        self.start_button.setCheckable(True)
-        self.start_button.setEnabled(bool(satellite.get("transponders")))
-        self.start_button.toggled.connect(self._on_start_toggled)
-
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.close)
-
-        form = QFormLayout()
-        form.addRow("Transponder:", self.transponder_combo)
-
-        button_row = QHBoxLayout()
-        button_row.addWidget(self.start_button)
-        button_row.addStretch(1)
-        button_row.addWidget(close_button)
-
-        layout = QVBoxLayout()
-        layout.addLayout(form)
-        layout.addWidget(self.status_label)
-        layout.addLayout(button_row)
-        self.setLayout(layout)
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._on_tick)
-
-    def _on_start_toggled(self, checked):
-        if not checked:
-            self._timer.stop()
-            self.transponder_combo.setEnabled(True)
-            self.start_button.setText("Start")
-            return
-
-        if self._worker is None or not self._worker.is_connected():
-            QMessageBox.warning(self, "Doppler Correction", "The radio isn't connected.")
-            self.start_button.setChecked(False)
-            return
-
-        self.transponder_combo.setEnabled(False)
-        self.start_button.setText("Stop")
-        # Make sure VFO A is actually the active VFO before driving
-        # set_frequency() at it -- rigplane/CI-V's "set frequency" always
-        # targets whichever VFO is currently selected on the radio.
-        self._worker.set_control_value("vfo", "A")
-        self._on_tick()
-        self._timer.start(self.UPDATE_INTERVAL_MS)
-
-    def _on_tick(self):
-        transponder = self.transponder_combo.currentData()
-        if transponder is None:
-            return
-        try:
-            base_freq_hz = round(float(transponder.get("downlink_mhz")) * 1e6)
-        except (TypeError, ValueError):
-            self.status_label.setText("This transponder has no usable downlink frequency.")
-            self.start_button.setChecked(False)
-            return
-
-        now = datetime.datetime.now(datetime.timezone.utc)
-        result = doppler_correction(
-            base_freq_hz,
-            self._satellite.get("line1", ""), self._satellite.get("line2", ""),
-            now, self._observer_lat, self._observer_lon, self._observer_elevation_km,
-        )
-        if result is None:
-            self.status_label.setText("Couldn't propagate this satellite's orbit (missing/invalid TLE?).")
-            self.start_button.setChecked(False)
-            return
-
-        freq_hz = round(result["frequency_hz"])
-        self._worker.set_frequency(freq_hz)
-        visibility = "above horizon" if result["elevation_deg"] >= 0 else "below horizon"
-        self.status_label.setText(
-            f"VFO A: {freq_hz / 1e6:.6f} MHz  (Doppler {result['doppler_hz']:+.0f} Hz, "
-            f"elevation {result['elevation_deg']:.1f}° -- {visibility}, "
-            f"range {result['range_km']:.0f} km)"
-        )
-
-    def closeEvent(self, event):
-        self._timer.stop()
-        event.accept()
 
 
 class ManualTleDialog(QDialog):

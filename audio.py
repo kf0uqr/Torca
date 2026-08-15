@@ -176,9 +176,8 @@ def move_source_output(source_output_id, source_name):
         pass
 
 
-def _downmix_stereo_to_mono(pcm: bytes) -> bytes:
-    """Collapses interleaved stereo s16le audio to mono by averaging each
-    L/R sample pair.
+def _downmix_stereo_to_mono(pcm: bytes, channel: str = "mix") -> bytes:
+    """Collapses interleaved stereo s16le audio to mono.
 
     Dual-receiver Icom radios (e.g. the 9700) negotiate a stereo RX codec
     by design -- confirmed in rigplane's own AudioCodec docs -- with
@@ -189,12 +188,25 @@ def _downmix_stereo_to_mono(pcm: bytes) -> bytes:
     computer even with its squelch open: it was still in the byte
     stream, just scrambled into a stream nothing was decoding as stereo.
 
+    ``channel`` picks how each L/R pair collapses to one mono sample:
+
+    - ``"mix"`` (default) -- the per-pair average. Correct for normal
+      listening (matches what the radio's own speaker already does by
+      mixing both receivers together).
+    - ``"main"`` -- L only, at full level. For feeding a decoder (e.g.
+      WSJT-X during satellite digital-mode work) that should only ever
+      hear Main, not have Sub's audio averaged into the same samples.
+    - ``"sub"`` -- R only, at full level. The mirror case -- the usual
+      choice for a satellite downlink decoder, so Main's audio (if its
+      squelch happens to be open at all) can't bleed into the decode.
+
     Mirrors rigplane's own dependency-free stdlib approach (audio/
-    backend.py's _downmix_stereo_to_mono_s16le, "mix" mode) rather than
-    pulling in numpy for this one conversion. Preserves timing (frames/
-    sec is unchanged -- only the interleaved redundancy per frame is
+    backend.py's _downmix_stereo_to_mono_s16le) rather than pulling in
+    numpy for this one conversion. Preserves timing (frames/sec is
+    unchanged -- only the interleaved redundancy per frame is
     collapsed), so the existing mono jitter-buffer/playback pipeline
-    downstream needs no other changes."""
+    downstream needs no other changes regardless of which mode is
+    selected."""
     usable = len(pcm) - (len(pcm) % 4)  # whole L/R pairs (2ch x 2 bytes)
     if usable <= 0:
         return b""
@@ -203,8 +215,15 @@ def _downmix_stereo_to_mono(pcm: bytes) -> bytes:
     if sys.byteorder != "little":
         samples.byteswap()
     mono = array("h", bytes(len(samples)))  # len(samples)//2 mono samples
-    for i in range(0, len(samples), 2):
-        mono[i // 2] = (samples[i] + samples[i + 1]) // 2
+    if channel == "main":
+        for i in range(0, len(samples), 2):
+            mono[i // 2] = samples[i]
+    elif channel == "sub":
+        for i in range(0, len(samples), 2):
+            mono[i // 2] = samples[i + 1]
+    else:  # "mix"
+        for i in range(0, len(samples), 2):
+            mono[i // 2] = (samples[i] + samples[i + 1]) // 2
     if sys.byteorder != "little":
         mono.byteswap()
     return mono.tobytes()
@@ -240,12 +259,19 @@ class AudioBridge:
     calling asyncio or Qt APIs directly from a PortAudio callback.
     """
 
-    def __init__(self, radio, loop, input_device, output_device, status_callback):
+    def __init__(self, radio, loop, input_device, output_device, status_callback, rx_downmix_channel="mix"):
         self.radio = radio
         self.loop = loop
         self._input_device = input_device
         self._output_device = output_device
         self._status = status_callback  # str -> None; must be safe to call from this thread
+        # "mix"/"main"/"sub" -- see _downmix_stereo_to_mono. Read fresh
+        # from _on_rx_audio on every chunk (not cached), so
+        # set_rx_downmix_channel() takes effect immediately on a
+        # running stream, e.g. switching the RX virtual cable between
+        # WSJT-X-decoding-Sub and normal-listening-mix without having
+        # to restart it.
+        self._rx_downmix_channel = rx_downmix_channel
 
         self.sample_rate = getattr(radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
         self._pcm_ok = self._check_pcm_codec()
@@ -253,9 +279,8 @@ class AudioBridge:
         if self._rx_stereo:
             self._status(
                 "RX audio: radio negotiated a stereo codec (dual-receiver "
-                "L=Main/R=Sub) -- downmixing to mono so both receivers' "
-                "audio reach the computer, matching what the radio's own "
-                "speaker already mixes together."
+                "L=Main/R=Sub) -- downmixing to mono "
+                f"({self._rx_downmix_channel!r}) for this output."
             )
 
         self._in_stream = None
@@ -484,7 +509,7 @@ class AudioBridge:
         audio arriving" from the outside."""
         data = self._extract_pcm_bytes(args, kwargs)
         if data is not None and self._rx_stereo:
-            data = _downmix_stereo_to_mono(data)
+            data = _downmix_stereo_to_mono(data, channel=self._rx_downmix_channel)
         if data is None:
             # A lone None argument (and possibly other shapes) shows up
             # periodically from rigplane -- most likely a benign
@@ -707,4 +732,12 @@ class AudioBridge:
         of silently keying with no TX audio and leaving that to be
         discovered by ear."""
         return self._in_stream is not None
+
+    def set_rx_downmix_channel(self, channel: str):
+        """Changes which receiver's audio this bridge's RX output
+        carries ("mix"/"main"/"sub", see _downmix_stereo_to_mono) --
+        takes effect on the very next chunk, no stream restart needed.
+        A no-op on a mono (single-receiver) connection, since
+        _on_rx_audio only ever consults this when _rx_stereo is True."""
+        self._rx_downmix_channel = channel
 

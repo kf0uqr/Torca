@@ -207,6 +207,17 @@ class RadioWorker(QThread):
         self._radio_cm = None
         self._stop_requested = False
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
+        # Which receiver's audio the RX virtual cable carries ("mix"/
+        # "main"/"sub", see audio._downmix_stereo_to_mono) -- a user
+        # preference for feeding an external decoder (e.g. WSJT-X on a
+        # satellite downlink) something other than the full Main+Sub
+        # mix, kept separate from this app's own listening audio, which
+        # always stays "mix" (see _setup_audio/_disable_virtual_cables,
+        # neither of which reads this). Persisted here rather than on
+        # the AudioBridge itself so the choice survives across
+        # enable/disable virtual-cables cycles, each of which replaces
+        # the AudioBridge instance entirely.
+        self._rx_downmix_channel = "mix"
         self._virtual_cable_modules = None  # (rx_module_id, tx_module_id) while virtual cables are active
         self._virtual_cable_previous_sink = None    # PulseAudio's default sink before enabling virtual cables
         self._virtual_cable_previous_source = None  # PulseAudio's default source before enabling virtual cables
@@ -299,6 +310,24 @@ class RadioWorker(QThread):
         )
         await self.audio_bridge.start()
 
+    def set_rx_downmix_channel(self, channel: str):
+        """Thread-safe: call from the GUI thread. channel is "mix"/
+        "main"/"sub" -- see audio._downmix_stereo_to_mono. Only
+        meaningful while Virtual Cables is active (this app's own
+        listening audio always stays "mix", see _setup_audio); applies
+        immediately to a running RX cable stream, no need to disable/
+        re-enable Virtual Cables to change it. Safe to call before
+        Virtual Cables has ever been enabled -- just remembers the
+        preference for whenever it is."""
+        if self.loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_rx_downmix_channel(channel), self.loop)
+
+    async def _set_rx_downmix_channel(self, channel: str):
+        self._rx_downmix_channel = channel
+        if self._virtual_cable_modules is not None and self.audio_bridge is not None:
+            self.audio_bridge.set_rx_downmix_channel(channel)
+
     def enable_virtual_cables(self):
         """Thread-safe: call from the GUI thread. Creates two PulseAudio/
         PipeWire null-sinks (see the module-level comment above
@@ -351,6 +380,7 @@ class RadioWorker(QThread):
             input_device=AUDIO_DEVICE_SYSTEM_DEFAULT,
             output_device=AUDIO_DEVICE_SYSTEM_DEFAULT,
             status_callback=self.audio_status.emit,
+            rx_downmix_channel=self._rx_downmix_channel,
         )
         await self.audio_bridge.start()
 

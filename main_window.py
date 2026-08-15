@@ -308,6 +308,37 @@ class RadioWindow(QWidget):
         )
         self.virtual_cable_button.toggled.connect(self._on_virtual_cable_toggled)
 
+        # Dual-receiver only: which receiver's audio goes to the RX
+        # virtual cable. Both Main and Sub get downmixed together by
+        # default (matching what the radio's own speaker does, for
+        # normal listening) -- but that's the wrong thing to feed a
+        # decoder like WSJT-X during satellite digital-mode work, since
+        # Main's audio (if its squelch is open at all) gets averaged
+        # straight into the same samples WSJT-X is trying to decode
+        # Sub's downlink out of. Hidden/disabled until a dual-receiver
+        # radio actually connects (see _on_connected) -- meaningless
+        # for a single-receiver radio, which never has a Sub channel to
+        # choose from. Takes effect immediately via
+        # worker.set_rx_downmix_channel(), including while Virtual
+        # Cables is already on -- no need to disable/re-enable to
+        # change it.
+        self.virtual_cable_channel_combo = QComboBox()
+        self.virtual_cable_channel_combo.addItem("RX Cable: Mixed (Main + Sub)", "mix")
+        self.virtual_cable_channel_combo.addItem("RX Cable: Main only", "main")
+        self.virtual_cable_channel_combo.addItem("RX Cable: Sub only", "sub")
+        self.virtual_cable_channel_combo.setVisible(False)
+        self.virtual_cable_channel_combo.setEnabled(False)
+        self.virtual_cable_channel_combo.setToolTip(
+            "Which receiver's audio goes to the RX virtual cable (e.g. for "
+            "WSJT-X digital-mode decoding on a satellite downlink) -- "
+            "'Sub only' keeps Main's audio from bleeding into the decode. "
+            "This app's own listening audio (when Virtual Cables is off) "
+            "always stays mixed, regardless of this setting."
+        )
+        self.virtual_cable_channel_combo.currentIndexChanged.connect(
+            self._on_virtual_cable_channel_changed
+        )
+
         self.status_label = QLabel("Connecting...")
 
         # AF Gain/Squelch/Monitor/TX Level/RF Level -- built generically
@@ -425,7 +456,10 @@ class RadioWindow(QWidget):
         self.extra_buttons_row.addWidget(self.hamclock_button)
         self.extra_buttons_row.addWidget(self.wsjtx_button)
         self.extra_buttons_row.addLayout(rigctld_column)
-        self.extra_buttons_row.addWidget(self.virtual_cable_button)
+        virtual_cable_column = QVBoxLayout()
+        virtual_cable_column.addWidget(self.virtual_cable_channel_combo)
+        virtual_cable_column.addWidget(self.virtual_cable_button)
+        self.extra_buttons_row.addLayout(virtual_cable_column)
         self.extra_buttons_row.addStretch()
 
         # controls_row (Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO) and
@@ -480,6 +514,8 @@ class RadioWindow(QWidget):
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
             self.active_receiver_button.setEnabled(True)
+            self.virtual_cable_channel_combo.setVisible(True)
+            self.virtual_cable_channel_combo.setEnabled(True)
         for button in self.band_buttons:
             button.setEnabled(True)
         for slider in self.level_sliders.values():
@@ -1046,6 +1082,9 @@ class RadioWindow(QWidget):
         else:
             self.virtual_cable_button.setText("Virtual Cables: OFF")
             self.worker.disable_virtual_cables()
+
+    def _on_virtual_cable_channel_changed(self, _index):
+        self.worker.set_rx_downmix_channel(self.virtual_cable_channel_combo.currentData())
 
     def _on_vfo_toggle_clicked(self, key):
         definition = CONTROL_DEFINITIONS[key]

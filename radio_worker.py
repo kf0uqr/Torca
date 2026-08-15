@@ -13,7 +13,7 @@ import os
 
 from PySide6.QtCore import QThread, Signal
 
-from rigplane import create_radio, LanBackendConfig, CommandError
+from rigplane import create_radio, LanBackendConfig, CommandError, AudioCodec
 try:
     # NOTE: rigplane's docs/PyPI page only show LanBackendConfig in examples --
     # a serial/USB config class isn't documented anywhere we could find. This
@@ -229,16 +229,41 @@ class RadioWorker(QThread):
         finally:
             self.loop.close()
 
-    def _build_config(self):
+    def _build_config(self, force_stereo=True):
+        """force_stereo (network connections only): request a stereo RX
+        codec explicitly instead of silently deferring to the radio
+        profile's own codec_preference. Confirmed by reading rigs/
+        ic9700.toml: rigplane pins the 9700 to mono ("no hardware has
+        been available to validate stereo rx_codec negotiation; default
+        to mono until proven") -- which is exactly why Sub's audio was
+        never in the LAN stream at all (not a bug in this app's
+        downmix, which never had anything to downmix).
+
+        Passing audio_codec_explicit=True is the only way to bypass
+        that profile default -- but doing so ALSO disarms rigplane's
+        own automatic mono-retry-on-rejection safety net in
+        _control_phase, which only fires for its own GLOBAL_DEFAULT/
+        PROFILE_DEFAULT codec sources, not an EXPLICIT one. A radio
+        that genuinely rejects a stereo conninfo request would then
+        fail the WHOLE CONNECTION instead of falling back to mono.
+        _main() re-implements that missing safety net at the app level
+        instead: it calls this once with the default force_stereo=True,
+        and if connecting with that config fails, retries once with
+        force_stereo=False (the radio profile's own proven-safe
+        default) before giving up for real. See the retry logic there."""
         d = self._details
         if d["connection_type"] == "network":
-            return LanBackendConfig(
+            kwargs = dict(
                 host=d["host"],
                 port=d["port"],
                 radio_addr=d["addr"],
                 username=d["username"],
                 password=d["password"],
             )
+            if force_stereo:
+                kwargs["audio_codec"] = AudioCodec.PCM_2CH_16BIT
+                kwargs["audio_codec_explicit"] = True
+            return LanBackendConfig(**kwargs)
         if SerialBackendConfig is None:
             raise RuntimeError(
                 "rigplane has no SerialBackendConfig in this install -- "
@@ -736,8 +761,28 @@ class RadioWorker(QThread):
     async def _main(self):
         try:
             config = self._build_config()
-            self._radio_cm = create_radio(config)
-            self.radio = await self._radio_cm.__aenter__()
+            try:
+                self._radio_cm = create_radio(config)
+                self.radio = await self._radio_cm.__aenter__()
+            except Exception as exc:
+                if getattr(config, "audio_codec_explicit", False):
+                    # See _build_config's docstring: an explicit stereo
+                    # request disarms rigplane's own automatic mono-
+                    # retry-on-rejection fallback, so re-implement it
+                    # here -- one retry with the radio profile's own
+                    # (proven-safe) codec default before actually giving
+                    # up. Whatever failure this produces (if any) is
+                    # what actually gets reported below, same as before
+                    # this stereo attempt existed.
+                    self.audio_status.emit(
+                        f"Connect: stereo audio request failed ({exc}) -- retrying "
+                        "with the radio profile's default (mono) codec."
+                    )
+                    config = self._build_config(force_stereo=False)
+                    self._radio_cm = create_radio(config)
+                    self.radio = await self._radio_cm.__aenter__()
+                else:
+                    raise
         except Exception as exc:
             self.connection_failed.emit(str(exc))
             return

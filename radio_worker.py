@@ -1231,6 +1231,23 @@ class RadioWorker(QThread):
                 return (label, low_hz, high_hz)
         return None
 
+    async def _get_receiver_frequency(self, receiver: int) -> int:
+        """Reads `receiver`'s (RECEIVER_MAIN/RECEIVER_SUB identity)
+        actual frequency, translated through rigplane's real GET
+        addressing -- see the comment above the frequency poll in
+        _poll_loop. get_frequency(receiver=...) is NOT a Main/Sub
+        identity selector: receiver=RECEIVER_MAIN(0) always means
+        "whichever receiver is currently selected" and
+        receiver=RECEIVER_SUB(1) always means "the unselected one",
+        regardless of which one that genuinely is. So which literal
+        value to pass depends on whether `receiver` IS the currently
+        active receiver, not on `receiver` itself -- passing it
+        straight through is wrong whenever Sub happens to be active
+        (which it always is during satellite receive, right up until
+        PTT switches to Main)."""
+        addressing = RECEIVER_MAIN if receiver == self._active_receiver else RECEIVER_SUB
+        return await self.radio.get_frequency(receiver=addressing)
+
     async def _resolve_receiver_band_conflict(self, receiver: int, freq_hz: int):
         """Dual-receiver only. Confirmed live on a real 9700: Main and
         Sub can't occupy the same band at the same time -- moving one
@@ -1267,7 +1284,7 @@ class RadioWorker(QThread):
             return
         other_receiver = RECEIVER_MAIN if receiver == RECEIVER_SUB else RECEIVER_SUB
         try:
-            other_freq_hz = await self.radio.get_frequency(receiver=other_receiver)
+            other_freq_hz = await self._get_receiver_frequency(other_receiver)
         except Exception as exc:
             self.error.emit(f"Band-conflict check (receiver {other_receiver}) failed: {exc}")
             return
@@ -1276,7 +1293,7 @@ class RadioWorker(QThread):
             return  # no conflict
         exclude_labels = {target_band[0], other_band[0]}
         try:
-            receiver_freq_hz = await self.radio.get_frequency(receiver=receiver)
+            receiver_freq_hz = await self._get_receiver_frequency(receiver)
             receiver_band = self._find_band(receiver_freq_hz)
             if receiver_band is not None:
                 exclude_labels.add(receiver_band[0])

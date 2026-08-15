@@ -8,6 +8,7 @@ only ever talks to the GUI thread by emitting signals.
 
 import asyncio
 import importlib
+import inspect
 import os
 
 from PySide6.QtCore import QThread, Signal
@@ -499,6 +500,32 @@ class RadioWorker(QThread):
             )
 
     @staticmethod
+    def _receiver_kwargs(method, receiver: int) -> dict:
+        """{"receiver": receiver} if method's signature actually accepts
+        a receiver kwarg, else {}. Confirmed via a full inspect.
+        signature() sweep of every getter/setter name referenced in
+        CONTROL_DEFINITIONS/LEVEL_DEFINITIONS that a lot more of them
+        take one than just "vfo"/frequency (af_level, agc, filter,
+        mode, preamp, rf_gain, squelch, vfo_slot, frequency -- all
+        default to receiver=0/Main when omitted) -- confirmed live on a
+        real 9700 that "mode" alone was enough to keep an
+        uplink/downlink flip-flop going even after frequency and vfo
+        were both already fixed individually. Rather than hand-listing
+        (and inevitably missing more of) them one at a time, every
+        getter/setter call in this file goes through this so whichever
+        receiver is actually in use (self._active_receiver) is passed
+        wherever the underlying method actually accepts it, and left
+        alone (its own default, Main) everywhere it doesn't. Only
+        meaningful for dual-receiver radios -- callers should only use
+        this when self.is_dual_receiver."""
+        try:
+            if "receiver" in inspect.signature(method).parameters:
+                return {"receiver": receiver}
+        except (TypeError, ValueError):
+            pass
+        return {}
+
+    @staticmethod
     def _normalize_level_value(raw):
         """Getter values might come back as a 0.0-1.0 float or, like the
         squelch setter turned out to want, a raw int on Icom's 0-255
@@ -517,15 +544,16 @@ class RadioWorker(QThread):
         elsewhere in this app (e.g. the S-meter). Whichever form works
         is cached per cache_key so later calls don't re-probe."""
         setter = getattr(self.radio, setter_name)
+        kwargs = self._receiver_kwargs(setter, self._active_receiver) if self.is_dual_receiver else {}
         mode = self._level_value_mode.get(cache_key, "float")
         if mode == "float":
             try:
-                await setter(value)
+                await setter(value, **kwargs)
                 self._level_value_mode[cache_key] = "float"
                 return
             except (TypeError, ValueError):
                 pass  # fall through and try the raw-int scale instead
-        await setter(int(round(value * 255)))
+        await setter(int(round(value * 255)), **kwargs)
         self._level_value_mode[cache_key] = "int255"
 
     def set_level_value(self, key: str, value: float):
@@ -766,7 +794,9 @@ class RadioWorker(QThread):
             except KeyError:
                 pass  # fall through and try the raw value anyway
         try:
-            await getattr(self.radio, set_name)(value)
+            setter = getattr(self.radio, set_name)
+            kwargs = self._receiver_kwargs(setter, self._active_receiver) if self.is_dual_receiver else {}
+            await setter(value, **kwargs)
         except Exception as exc:
             self.error.emit(f"{definition['label']}: {set_name}({value!r}) failed ({exc}).")
 
@@ -780,15 +810,14 @@ class RadioWorker(QThread):
         needing to track which widget wants which type."""
         while not self._stop_requested:
             try:
+                getter = self.radio.get_frequency
                 # Dual-receiver: read whichever receiver is actually in
                 # use right now (see _active_receiver's definition in
                 # __init__) rather than unconditionally defaulting to
                 # Main -- reading a receiver turned out, same as writing
                 # one, to also visibly focus/select it on a real 9700.
-                if self.is_dual_receiver:
-                    freq_hz = await self.radio.get_frequency(receiver=self._active_receiver)
-                else:
-                    freq_hz = await self.radio.get_frequency()
+                kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                freq_hz = await getter(**kwargs)
                 self.frequency_updated.emit(freq_hz)
             except Exception as exc:
                 self.error.emit(str(exc))
@@ -797,7 +826,8 @@ class RadioWorker(QThread):
                 definition = METER_DEFINITIONS[meter_type]
                 try:
                     getter = getattr(self.radio, getter_name)
-                    value = await getter()
+                    kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                    value = await getter(**kwargs)
                     self.meter_updated.emit(meter_type, value)
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
@@ -808,18 +838,12 @@ class RadioWorker(QThread):
                 definition = CONTROL_DEFINITIONS[key]
                 try:
                     getter = getattr(self.radio, get_name)
-                    # Same fix as the frequency read above, and for the
-                    # same reason -- confirmed live on a real 9700 that
-                    # this one keeps the flip-flop going all on its own
-                    # even with the frequency read fixed: "vfo" is backed
-                    # by get_vfo_slot(receiver=0), so polling it with no
-                    # argument every cycle unconditionally re-reads (and
-                    # refocuses to) Main regardless of which receiver
-                    # satellite tracking actually has in use.
-                    if self.is_dual_receiver and key == "vfo":
-                        value = await getter(receiver=self._active_receiver)
-                    else:
-                        value = await getter()
+                    # See _receiver_kwargs's docstring -- confirmed live
+                    # on a real 9700 that "vfo" alone wasn't the only
+                    # control causing the flip-flop; "mode" was too, and
+                    # there was no reason to expect it'd stop there.
+                    kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                    value = await getter(**kwargs)
                     if definition.get("tuple_result") and isinstance(value, tuple):
                         value = value[0]
                     # Generic enum unwrap: any Enum/IntEnum member has a
@@ -837,7 +861,8 @@ class RadioWorker(QThread):
                 definition = LEVEL_DEFINITIONS[key]
                 try:
                     getter = getattr(self.radio, get_name)
-                    raw_value = await getter()
+                    kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                    raw_value = await getter(**kwargs)
                     self.level_updated.emit(key, self._normalize_level_value(raw_value))
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")

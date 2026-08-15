@@ -847,6 +847,21 @@ class RadioWorker(QThread):
             for key, (get_name, _set_name) in self._control_methods.items():
                 if get_name is None:
                     continue  # write-only control (e.g. memory_mode) -- no GET variant exists, never poll
+                if key == "split" and self.is_dual_receiver and self._active_receiver == RECEIVER_SUB:
+                    # split is rig-global, not per-receiver (confirmed
+                    # via rigplane's own SplitCapable docstring) -- but
+                    # confirmed live on a real 9700 that get_split()
+                    # returns an unstable/flickering value while Sub is
+                    # the active receiver, making the split button
+                    # visibly flip on and off every poll cycle on its
+                    # own. Makes sense: Sub never transmits at all
+                    # (confirmed hardware limitation, PTT always
+                    # transmits from Main), so "is split on" isn't a
+                    # question with a stable answer for it. Skip polling
+                    # it entirely in that state -- the button just keeps
+                    # showing whatever it last correctly reflected from
+                    # when Main was active.
+                    continue
                 definition = CONTROL_DEFINITIONS[key]
                 try:
                     getter = getattr(self.radio, get_name)
@@ -1171,24 +1186,39 @@ class RadioWorker(QThread):
             self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
         self._active_receiver = receiver
 
-    def select_band(self, band_label: str, low_edge_hz: int):
+    def select_band(self, band_label: str, low_edge_hz: int, receiver: int = None):
         """Thread-safe. Tries Icom's confirmed get_bsr() band-stacking
         recall first -- reads whatever frequency was last used on that
         band and tunes to it, like pressing the real band button. Falls
         back to tuning to the band's low edge (low_edge_hz) for bands
         with no confirmed band-stacking code (currently VHF/UHF -- see
-        BAND_STACKING_CODES) or if the attempt fails for any reason."""
+        BAND_STACKING_CODES) or if the attempt fails for any reason.
+
+        receiver, when given (dual-receiver only, e.g. Sub while it's
+        the active receiver -- main_window.py's _on_band_selected),
+        targets the low-edge fallback at that receiver instead of
+        unconditionally defaulting to Main. Band-stacking recall itself
+        stays Main-only regardless -- confirmed via rigplane's own
+        get_bsr()/get_band_stack() signatures, neither takes a receiver
+        argument at all, so there's no way to ask for Sub's own
+        band-stack register; it's skipped straight to the low-edge
+        fallback whenever a non-Main receiver is targeted. Confirmed
+        live on a real 9700 that leaving this Main-only entirely (as an
+        earlier version of this did) actually changed Main's band while
+        Sub was the active/displayed receiver, silently changing the
+        wrong one -- the frequency readout would then show Main's
+        just-selected band instead of Sub's real, unchanged one."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._select_band(band_label, low_edge_hz), self.loop)
+        asyncio.run_coroutine_threadsafe(self._select_band(band_label, low_edge_hz, receiver), self.loop)
 
-    async def _select_band(self, band_label: str, low_edge_hz: int):
+    async def _select_band(self, band_label: str, low_edge_hz: int, receiver: int = None):
         radio_model = self._details["radio_model"]
         band_code = BAND_STACKING_CODES.get(band_label)
         if (radio_model, band_label) in BAND_STACKING_EXCLUDED:
             band_code = None  # confirmed to hang on this radio -- skip straight to the band edge
 
-        if band_code is not None:
+        if band_code is not None and receiver is None:
             freq_hz, reason = await _try_recall_band_stack(self.radio, band_code)
             if freq_hz is not None:
                 self.audio_status.emit(
@@ -1201,7 +1231,8 @@ class RadioWorker(QThread):
             )
 
         try:
-            await self.radio.set_frequency(low_edge_hz)
+            kwargs = self._receiver_kwargs(self.radio.set_frequency, receiver) if receiver is not None and self.is_dual_receiver else {}
+            await self.radio.set_frequency(low_edge_hz, **kwargs)
         except Exception as exc:
             self.error.emit(f"Band: setting frequency failed ({exc}).")
 

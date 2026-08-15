@@ -1100,7 +1100,17 @@ class RadioWindow(QWidget):
                 widget.blockSignals(False)
 
     def _on_band_selected(self, band_label, low_edge_hz):
-        self.worker.select_band(band_label, low_edge_hz)
+        # Dual-receiver: target whichever receiver is actually active
+        # right now (active_receiver_button's label -- there's no other
+        # tracked state for this in main_window.py) rather than always
+        # defaulting to Main -- confirmed live on a real 9700 that band
+        # selection silently changed Main while Sub was the active/
+        # displayed receiver, leaving Sub's real frequency untouched
+        # but showing Main's just-selected band instead.
+        receiver = None
+        if self.worker.is_dual_receiver and self.active_receiver_button.text() == "Active: SUB":
+            receiver = RECEIVER_SUB
+        self.worker.select_band(band_label, low_edge_hz, receiver)
         # Update optimistically using the band's low edge -- if the IC-7300
         # band-stacking register recalls a different frequency within the
         # band, the next poll cycle corrects this to the real value.

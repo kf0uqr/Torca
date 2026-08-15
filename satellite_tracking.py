@@ -626,8 +626,8 @@ class SatelliteConfigDialog(QDialog):
         self._satellites = [dict(sat) for sat in satellites]  # local working copy until OK is pressed
         self._on_change = on_change
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Show", "Name", "Transponders"])
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Show", "Name"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._rebuild_table()
 
@@ -635,9 +635,9 @@ class SatelliteConfigDialog(QDialog):
         self.refresh_button.clicked.connect(self._on_refresh_tles)
         self.fetch_transponder_button = QPushButton("Fetch Transponder Data (SatNOGS)")
         self.fetch_transponder_button.setToolTip(
-            "Looks up known transmitters for the selected satellite(s) in "
-            "SatNOGS DB (an open, community-maintained database) by NORAD "
-            "catalog number, and stores all of them."
+            "Looks up known transmitters in SatNOGS DB (an open, community-"
+            "maintained database) by NORAD catalog number, and stores all "
+            "of them -- for every tracked satellite, not just selected ones."
         )
         self.fetch_transponder_button.clicked.connect(self._on_fetch_transponders)
         self.edit_transponder_button = QPushButton("Edit Transponders...")
@@ -663,10 +663,10 @@ class SatelliteConfigDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel(
-            "Check satellites to display on the map. Select one or more rows "
-            "and click \"Fetch Transponder Data\" to pull all known "
-            "transponders from SatNOGS DB, or select one row and click "
-            "\"Edit Transponders...\" to view or hand-edit them."
+            "Check satellites to display on the map. \"Fetch Transponder "
+            "Data\" updates every tracked satellite from SatNOGS DB; select "
+            "one row and click \"Edit Transponders...\" to view or hand-edit "
+            "its list."
         ))
         layout.addWidget(self.table)
         layout.addLayout(button_row)
@@ -684,12 +684,6 @@ class SatelliteConfigDialog(QDialog):
             name_item = QTableWidgetItem(sat.get("name", ""))
             name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, 1, name_item)
-
-            count = len(sat.get("transponders", []))
-            summary = "None" if count == 0 else f"{count} transponder{'' if count == 1 else 's'}"
-            transponder_item = QTableWidgetItem(summary)
-            transponder_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.table.setItem(row, 2, transponder_item)
 
     def _on_refresh_tles(self):
         try:
@@ -733,40 +727,43 @@ class SatelliteConfigDialog(QDialog):
         self._rebuild_table()
 
     def _on_fetch_transponders(self):
-        rows = sorted({index.row() for index in self.table.selectedIndexes()})
-        if not rows:
-            QMessageBox.information(
-                self, "Fetch Transponder Data", "Select one or more satellites in the table first."
-            )
+        if not self._satellites:
+            QMessageBox.information(self, "Fetch Transponder Data", "No tracked satellites yet -- add some first.")
+            return
+        confirm = QMessageBox.question(
+            self, "Fetch Transponder Data",
+            f"This looks up transponder data from SatNOGS DB for all "
+            f"{len(self._satellites)} tracked satellite(s), one at a time -- "
+            "it may take a while and the window won't respond until it's "
+            "done. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
             return
         fetched = 0
-        for row in rows:
-            sat = self._satellites[row]
+        skipped = 0
+        for sat in self._satellites:
             norad_id = norad_id_from_tle_line1(sat.get("line1", ""))
             if norad_id is None:
-                QMessageBox.warning(
-                    self, "Fetch Transponder Data",
-                    f"Couldn't determine a NORAD catalog number for {sat.get('name', '?')} from its TLE."
-                )
+                skipped += 1
+                print(f"[ERROR] Ham Dashboard: couldn't determine a NORAD catalog number for {sat.get('name', '?')} from its TLE -- skipped.")
                 continue
             try:
-                transponders = fetch_transponders(norad_id)
+                sat["transponders"] = fetch_transponders(norad_id)
+                fetched += 1
             except Exception as exc:
-                QMessageBox.critical(
-                    self, "Fetch Transponder Data",
-                    f"Couldn't fetch data for {sat.get('name', '?')} (NORAD {norad_id}):\n{exc}"
-                )
-                continue
-            sat["transponders"] = transponders
-            fetched += 1
+                skipped += 1
+                print(f"[ERROR] Ham Dashboard: transponder fetch failed for {sat.get('name', '?')} (NORAD {norad_id}): {exc}")
         self._rebuild_table()
         if fetched:
             if self._on_change:
                 self._on_change(self._satellites)
-            QMessageBox.information(
-                self, "Fetch Transponder Data",
-                f"Updated stored transponder data for {fetched} satellite(s) from SatNOGS DB."
-            )
+        QMessageBox.information(
+            self, "Fetch Transponder Data",
+            f"Updated stored transponder data for {fetched} of {len(self._satellites)} "
+            f"tracked satellite(s) from SatNOGS DB."
+            + (f" {skipped} skipped due to errors -- see console for detail." if skipped else "")
+        )
 
     def _on_edit_transponders(self):
         rows = sorted({index.row() for index in self.table.selectedIndexes()})

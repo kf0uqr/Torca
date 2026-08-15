@@ -1070,11 +1070,25 @@ class RadioWorker(QThread):
         VFO A on that receiver first. Confirmed live (a real 9700):
         without this, the radio's own display never actually switches
         to the VFO context it labels "VFO A-2" for Sub -- receiver-only
-        writes weren't reaching the VFO slot. Sequential in one
-        coroutine (VFO select, then frequency), same reasoning as
-        select_vfo_and_set_frequency() above: two separately-dispatched
-        commands don't actually guarantee anything about their
-        real-world ordering on the radio's side."""
+        writes weren't reaching the VFO slot. Also selects `receiver`
+        as the active receiver FIRST, in this same coroutine, rather
+        than counting on a previously and separately dispatched
+        select_receiver() call to still be in effect -- confirmed live
+        on a real 9700 that it isn't reliable to assume that: bundling
+        just the VFO-slot-select with the frequency write (an earlier
+        version of this did, counting on active_receiver_button's own
+        select_receiver() call from whenever Sub was last switched to,
+        possibly long before) still didn't reliably reach Sub at all
+        when triggered much later by the tuning knob, even though the
+        exact same bundle IS confirmed reliable when it runs moments
+        after its own select_receiver() call, back to back, in the same
+        burst of activity (satellite mode's first tracking tick, right
+        after _start_satellite_tracking's own select_receiver()).
+        Sequential in one coroutine (active receiver, then VFO select,
+        then frequency), same reasoning as select_vfo_and_set_
+        frequency() above: separately-dispatched commands don't
+        actually guarantee anything about their real-world ordering --
+        or, it turns out, persistence -- on the radio's side."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(
@@ -1082,6 +1096,11 @@ class RadioWorker(QThread):
         )
 
     async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int):
+        try:
+            await self.radio.select_receiver(receiver)
+        except Exception as exc:
+            self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+        self._active_receiver = receiver
         try:
             await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
         except Exception as exc:

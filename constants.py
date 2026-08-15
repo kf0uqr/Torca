@@ -191,24 +191,23 @@ LEVEL_DEFINITIONS = {
 }
 
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on
-# a dual-receiver radio (their real getter/setter accepts a receiver=
-# kwarg -- confirmed via a full inspect.signature() sweep against
-# rigplane's IcomRadio, same discovery that found "vfo"/"mode" needed
-# it too -- see radio_worker.py's _receiver_kwargs). AF gain, squelch,
-# and RF gain are all controlled independently per receiver on a real
-# 9700, confirmed live -- so these get a second, Sub-targeted slider
-# alongside the existing Main-focused one. "monitor" (TX sidetone
-# level) and "tx_level" (TX power) aren't receiver RX settings at all
-# -- only Main ever transmits (confirmed live: PTT always transmits
-# from Main on a 9700/7610, a hardware limitation, not something these
-# settings could route around either).
+# a dual-receiver radio. Their real getter/setter DOES accept a
+# receiver= kwarg (confirmed via a full inspect.signature() sweep
+# against rigplane's IcomRadio, same discovery that found "vfo"/"mode"
+# needed it too -- see radio_worker.py's _receiver_kwargs) -- but
+# confirmed live on a real 9700 that these three specifically don't
+# actually respect it at all: AF gain/squelch/RF gain just follow
+# whichever receiver is active (rigplane's select_receiver(), CI-V
+# main_select/sub_select) regardless of what receiver= is passed. So
+# there's only one slider per key (main_window.py), not a separate
+# Main/Sub pair -- its label gets a live "(Sub)" suffix whenever the
+# active receiver isn't Main, via active_receiver_button, so it's clear
+# which receiver it's actually affecting at any given moment. "monitor"
+# (TX sidetone level) and "tx_level" (TX power) aren't receiver RX
+# settings at all -- only Main ever transmits (confirmed live: PTT
+# always transmits from Main on a 9700/7610, a hardware limitation, not
+# something these settings could route around either).
 DUAL_RECEIVER_LEVEL_KEYS = {"af_gain", "squelch", "rf_level"}
-
-# Synthetic suffix appended to a LEVEL_DEFINITIONS key in level_updated
-# signal payloads for a Sub-targeted reading, so main_window.py can tell
-# "af_gain" (Main) and "af_gain_sub" (Sub) apart and route each to its
-# own slider without LEVEL_DEFINITIONS itself needing separate entries.
-SUB_LEVEL_KEY_SUFFIX = "_sub"
 
 # get_s_meter() returns a raw 0-255 value over CI-V (confirmed against
 # Hamlib's IC-7300 backend, which reports RAWSTR range 0..255). The

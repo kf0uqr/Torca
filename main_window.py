@@ -469,6 +469,7 @@ class RadioWindow(QWidget):
         self.worker.audio_status.connect(self._on_audio_status)
         self.worker.level_updated.connect(self._on_level_updated)
         self.worker.control_updated.connect(self._on_control_updated)
+        self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
         self.worker.start()
 
     @Slot()
@@ -1055,6 +1056,20 @@ class RadioWindow(QWidget):
         receiver = RECEIVER_MAIN if self.active_receiver_button.text() == "Active: SUB" else RECEIVER_SUB
         self.worker.select_receiver(receiver)
         self.worker.set_scope_receiver(receiver)
+        self._update_active_receiver_ui(receiver)
+
+    def _on_active_receiver_changed(self, receiver):
+        """Connected to worker.active_receiver_changed -- real, polled
+        ground truth from get_active_receiver() (radio_worker.py's
+        _poll_loop), not something this app commanded. Only reflects it
+        in the UI (label/level-suffix) -- deliberately does NOT also
+        move the scope (set_scope_receiver), which stays under manual
+        control (active_receiver_button) only. Fixes a reported
+        startup mismatch: if the radio was already sitting on Sub when
+        the app connected (e.g. left there from a previous session),
+        the button used to keep showing "Active: MAIN" until manually
+        clicked, since nothing reflected the radio's actual starting
+        state."""
         self._update_active_receiver_ui(receiver)
 
     def _update_active_receiver_ui(self, receiver):

@@ -152,6 +152,7 @@ class RadioWorker(QThread):
     scope_frame_received = Signal(object)  # rigplane.scope.ScopeFrame
     audio_status = Signal(str)           # informational, not an error
     level_updated = Signal(str, float)   # (level key, value 0.0-1.0)
+    active_receiver_changed = Signal(int)  # dual-receiver only: 0=MAIN, 1=SUB, from get_active_receiver() polling
     error = Signal(str)
 
     def __init__(self, details, parent=None):
@@ -879,6 +880,16 @@ class RadioWorker(QThread):
                             f"Active receiver observed: {'SUB' if observed else 'MAIN'} (was {previous_label})"
                         )
                         self._last_observed_active_receiver = observed
+                        # Also drives the UI (main_window.py's active_
+                        # receiver_button etc) into sync -- confirmed
+                        # reported: on connect, if the radio was already
+                        # sitting on Sub (e.g. left there from a
+                        # previous session), the button still showed
+                        # "Active: MAIN" until manually clicked, since
+                        # nothing was reflecting the radio's real
+                        # starting state. This is real, polled ground
+                        # truth, so it's safe to just always reflect it.
+                        self.active_receiver_changed.emit(observed)
                 except Exception as exc:
                     self.error.emit(f"get_active_receiver: {exc}")
 
@@ -1087,12 +1098,35 @@ class RadioWorker(QThread):
         continuous downlink for full-duplex RX (main_window.py's
         _on_satellite_tracking_tick) -- Main's own VFO A/B, via
         select_vfo_and_set_frequency() instead, is what actually
-        matters for TX."""
+        matters for TX.
+
+        Also selects `receiver` as active FIRST, in the same atomic
+        coroutine -- confirmed live on a real 9700, via direct
+        get_active_receiver() polling, that skipping this (an earlier
+        version of this did) creates a genuinely SELF-PERPETUATING
+        oscillation on this radio/profile: rigplane's own no-cmd29
+        fallback (_run_with_receiver_vfo_fallback) for a bare
+        receiver=1 write checks whether Sub is already the selected
+        receiver, and if not, temporarily switches to it, writes, then
+        switches BACK to whatever was selected before -- which, since
+        every one of THESE calls always ends by switching back to Main,
+        guarantees Main is "current" at the start of the very next
+        call, triggering the exact same temporary-switch-and-revert
+        every single time, forever, every satellite-tracking tick.
+        Explicitly reselecting the receiver here first makes it already
+        match every time, so the write lands and STAYS -- exactly the
+        same reasoning already applied to select_receiver_vfo_and_set_
+        frequency()."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._set_receiver_frequency(receiver, freq_hz), self.loop)
 
     async def _set_receiver_frequency(self, receiver: int, freq_hz: int):
+        try:
+            await self.radio.select_receiver(receiver)
+        except Exception as exc:
+            self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+        self._active_receiver = receiver
         try:
             await self.radio.set_frequency(freq_hz, receiver=receiver)
         except Exception as exc:

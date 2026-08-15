@@ -808,7 +808,18 @@ class RadioWorker(QThread):
                 definition = CONTROL_DEFINITIONS[key]
                 try:
                     getter = getattr(self.radio, get_name)
-                    value = await getter()
+                    # Same fix as the frequency read above, and for the
+                    # same reason -- confirmed live on a real 9700 that
+                    # this one keeps the flip-flop going all on its own
+                    # even with the frequency read fixed: "vfo" is backed
+                    # by get_vfo_slot(receiver=0), so polling it with no
+                    # argument every cycle unconditionally re-reads (and
+                    # refocuses to) Main regardless of which receiver
+                    # satellite tracking actually has in use.
+                    if self.is_dual_receiver and key == "vfo":
+                        value = await getter(receiver=self._active_receiver)
+                    else:
+                        value = await getter()
                     if definition.get("tuple_result") and isinstance(value, tuple):
                         value = value[0]
                     # Generic enum unwrap: any Enum/IntEnum member has a

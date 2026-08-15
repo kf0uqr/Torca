@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
+from theme import position_on_screen_half
 from world_map import WorldMapWidget
 from satellite_tracking import (
     SatelliteConfigDialog,
@@ -53,7 +54,9 @@ class HamClockWindow(QWidget):
                  observer_elevation_m=0.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ham Dashboard")
-        self.resize(680, 520)
+        # Right half of the screen -- RadioWindow (main.py) takes the left
+        # half on launch, so the two sit side by side by default.
+        position_on_screen_half(self, "right")
         self._observer_lat = observer_lat
         self._observer_lon = observer_lon
         self._observer_elevation_m = observer_elevation_m or 0.0

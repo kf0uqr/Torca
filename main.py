@@ -31,7 +31,7 @@ Package layout (see each module's own docstring for details):
     satellite_tracking.py    -- SGP4 propagation, TLE/SatNOGS fetching, satellite dialogs
     ham_dashboard.py          -- HamClockWindow (ties the above three together)
     main_window.py            -- RadioWindow (the main application window)
-    theme.py                   -- dark theme applied to the whole app
+    theme.py                   -- dark theme + window placement helper
     main.py                     -- this file: the entry point
 """
 
@@ -41,7 +41,7 @@ from PySide6.QtWidgets import QApplication
 
 from connection_dialog import ConnectionDialog
 from main_window import RadioWindow
-from theme import apply_dark_theme
+from theme import apply_dark_theme, position_on_screen_half
 
 
 def main():
@@ -53,7 +53,7 @@ def main():
         sys.exit(0)  # user cancelled -- exit quietly, nothing to clean up yet
 
     window = RadioWindow(details)
-    window.resize(700, 620)
+    position_on_screen_half(window, "left")
     window.show()
     sys.exit(app.exec())
 

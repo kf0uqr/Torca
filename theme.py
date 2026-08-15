@@ -1,10 +1,12 @@
 """
 Applies an overall dark theme to the whole app -- the Fusion style plus
 a matching QPalette. Call apply_dark_theme(app) once, right after
-creating the QApplication and before showing any windows.
+creating the QApplication and before showing any windows. Also
+position_on_screen_half(), a small window-placement helper used to lay
+the main radio window and the Ham Dashboard out side by side.
 """
 
-from PySide6.QtGui import QPalette, QColor
+from PySide6.QtGui import QGuiApplication, QPalette, QColor
 
 def apply_dark_theme(app):
     """Applies an overall dark theme to the whole app -- the Fusion style
@@ -52,4 +54,20 @@ def apply_dark_theme(app):
         }
     """)
 
+
+def position_on_screen_half(window, side):
+    """Sizes and moves `window` to fill the left or right half of the
+    primary screen's available area (i.e. excluding taskbars/docks) --
+    call once, before window.show(), right after creating it. Used to
+    lay the main radio window and the Ham Dashboard out side by side on
+    launch. No-op if there's no primary screen to measure (e.g. running
+    fully headless) -- window keeps whatever size/position it already
+    had rather than erroring."""
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return
+    geometry = screen.availableGeometry()
+    half_width = geometry.width() // 2
+    x = geometry.x() if side == "left" else geometry.x() + half_width
+    window.setGeometry(x, geometry.y(), half_width, geometry.height())
 

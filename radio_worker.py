@@ -1062,6 +1062,7 @@ class RadioWorker(QThread):
     async def _select_receiver(self, receiver: int):
         try:
             await self.radio.select_receiver(receiver)
+            self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK")
         except Exception as exc:
             self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
         self._active_receiver = receiver
@@ -1114,10 +1115,12 @@ class RadioWorker(QThread):
     async def _set_dual_receiver_linking(self, on: bool):
         try:
             await self.radio.set_dual_watch(on)
+            self.audio_status.emit(f"[dual-rx] set_dual_watch({on}) OK")
         except Exception as exc:
             self.error.emit(f"Dual watch ({'on' if on else 'off'}) failed: {exc}")
         try:
             await self.radio.set_main_sub_tracking(on)
+            self.audio_status.emit(f"[dual-rx] set_main_sub_tracking({on}) OK")
         except Exception as exc:
             self.error.emit(f"Main/Sub tracking ({'on' if on else 'off'}) failed: {exc}")
 
@@ -1159,11 +1162,13 @@ class RadioWorker(QThread):
     async def _set_receiver_frequency(self, receiver: int, freq_hz: int):
         try:
             await self.radio.select_receiver(receiver)
+            self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK (bare freq write)")
         except Exception as exc:
             self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
         self._active_receiver = receiver
         try:
             await self.radio.set_frequency(freq_hz, receiver=receiver)
+            self.audio_status.emit(f"[dual-rx] set_frequency({freq_hz}, receiver={receiver}) OK")
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -1208,15 +1213,18 @@ class RadioWorker(QThread):
     async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int):
         try:
             await self.radio.select_receiver(receiver)
+            self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK (vfo+freq bundle)")
         except Exception as exc:
             self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
         self._active_receiver = receiver
         try:
             await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
+            self.audio_status.emit(f"[dual-rx] set_vfo_slot({vfo_slot!r}, receiver={receiver}) OK")
         except Exception as exc:
             self.error.emit(f"VFO slot select (receiver {receiver}): set_vfo_slot({vfo_slot!r}) failed ({exc}).")
         try:
             await self.radio.set_frequency(freq_hz, receiver=receiver)
+            self.audio_status.emit(f"[dual-rx] set_frequency({freq_hz}, receiver={receiver}) OK (vfo+freq bundle)")
         except Exception as exc:
             self.error.emit(str(exc))
 

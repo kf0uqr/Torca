@@ -73,6 +73,7 @@ except ImportError:
     RECEIVER_MAIN, RECEIVER_SUB = 0, 1
 
 from constants import (
+    RADIO_BANDS,
     BAND_STACKING_CODES,
     BAND_STACKING_REGISTER_LATEST,
     BAND_STACKING_EXCLUDED,
@@ -1210,7 +1211,100 @@ class RadioWorker(QThread):
             self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz), self.loop
         )
 
+    def _find_band(self, freq_hz: int):
+        """Returns (label, low_hz, high_hz) for whichever band in this
+        radio model's RADIO_BANDS freq_hz falls in, or None."""
+        radio_model = self._details.get("radio_model")
+        for label, low_hz, high_hz in RADIO_BANDS.get(radio_model, []):
+            if low_hz <= freq_hz <= high_hz:
+                return (label, low_hz, high_hz)
+        return None
+
+    def _find_safe_band(self, exclude_labels):
+        """Returns (label, low_hz, high_hz) for the first band in this
+        radio model's RADIO_BANDS whose label isn't in exclude_labels,
+        or None if every band is excluded (e.g. a radio with only two
+        bands total)."""
+        radio_model = self._details.get("radio_model")
+        for label, low_hz, high_hz in RADIO_BANDS.get(radio_model, []):
+            if label not in exclude_labels:
+                return (label, low_hz, high_hz)
+        return None
+
+    async def _resolve_receiver_band_conflict(self, receiver: int, freq_hz: int):
+        """Dual-receiver only. Confirmed live on a real 9700: Main and
+        Sub can't occupy the same band at the same time -- moving one
+        onto a band the other already holds is flatly refused, you have
+        to move one of them to a third, uninvolved band first to free
+        up the target. This bites hardest right when satellite tracking
+        starts: if Main and Sub happen to already be sitting on
+        (respectively) the uplink and downlink bands a *newly selected*
+        transponder needs -- reversed from what it actually wants (e.g.
+        Main on 2m/Sub on 70cm, but this transponder's uplink is 70cm
+        and downlink is 2m) -- neither can move to its target without
+        the other vacating first, and nothing here was doing that
+        automatically.
+
+        Checks whether moving `receiver` to freq_hz's band would land
+        on the band the OTHER receiver currently occupies (a fresh
+        get_frequency() read, not cached), and if so, moves the OTHER
+        receiver to any other available band first (VFO A, since it's
+        just a temporary parking spot, not meant to be used) before
+        returning -- callers should call this, then proceed with their
+        own intended receiver/VFO/frequency write as normal. The safe
+        band this picks also excludes `receiver`'s OWN current band,
+        not just the target and conflict bands -- `receiver` hasn't
+        moved off it yet at this point (that happens after this
+        returns), so parking the other receiver there would just swap
+        which pair is now colliding instead of resolving anything. No-
+        op if there's no conflict, freq_hz doesn't land in any known
+        band, or this radio model has fewer than 3 bands available
+        (nowhere uninvolved to park the other receiver)."""
+        if not self.is_dual_receiver:
+            return
+        target_band = self._find_band(freq_hz)
+        if target_band is None:
+            return
+        other_receiver = RECEIVER_MAIN if receiver == RECEIVER_SUB else RECEIVER_SUB
+        try:
+            other_freq_hz = await self.radio.get_frequency(receiver=other_receiver)
+        except Exception as exc:
+            self.error.emit(f"Band-conflict check (receiver {other_receiver}) failed: {exc}")
+            return
+        other_band = self._find_band(other_freq_hz)
+        if other_band is None or other_band[0] != target_band[0]:
+            return  # no conflict
+        exclude_labels = {target_band[0], other_band[0]}
+        try:
+            receiver_freq_hz = await self.radio.get_frequency(receiver=receiver)
+            receiver_band = self._find_band(receiver_freq_hz)
+            if receiver_band is not None:
+                exclude_labels.add(receiver_band[0])
+        except Exception as exc:
+            self.error.emit(f"Band-conflict check (receiver {receiver}) failed: {exc}")
+            return
+        safe_band = self._find_safe_band(exclude_labels)
+        if safe_band is None:
+            self.error.emit(
+                f"Band conflict: receiver {other_receiver} is on {other_band[0]}, the same "
+                f"band receiver {receiver} needs, and there's no third band available on this "
+                "radio to move it out of the way first."
+            )
+            return
+        safe_label, safe_low_hz, _safe_high_hz = safe_band
+        self.audio_status.emit(
+            f"[dual-rx] band conflict: receiver {other_receiver} is on {other_band[0]}, the "
+            f"same band receiver {receiver} needs -- moving it to {safe_label} first."
+        )
+        try:
+            await self.radio.select_receiver(other_receiver)
+            await self.radio.set_vfo_slot("A", receiver=other_receiver)
+            await self.radio.set_frequency(safe_low_hz, receiver=other_receiver)
+        except Exception as exc:
+            self.error.emit(f"Moving receiver {other_receiver} to {safe_label} failed: {exc}")
+
     async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int):
+        await self._resolve_receiver_band_conflict(receiver, freq_hz)
         try:
             await self.radio.select_receiver(receiver)
             self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK (vfo+freq bundle)")
@@ -1290,6 +1384,11 @@ class RadioWorker(QThread):
 
     async def _start_ptt_after_vfo(self, vfo_value, freq_hz: int, receiver: int = None):
         if receiver is not None:
+            # See _resolve_receiver_band_conflict's docstring -- Main
+            # can't switch to the uplink's band if Sub happens to
+            # already be sitting on it (moves Sub to a free third band
+            # first if so).
+            await self._resolve_receiver_band_conflict(receiver, freq_hz)
             try:
                 await self.radio.select_receiver(receiver)
             except Exception as exc:

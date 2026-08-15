@@ -157,7 +157,12 @@ class RadioWindow(QWidget):
             "QPushButton:disabled { background-color: #555; color: #999; }"
         )
         self.ptt_button.setEnabled(False)
-        self.ptt_button.setToolTip("Click to transmit, click again to release")
+        self.ptt_button.setToolTip(
+            "Click to transmit, click again to release. While satellite "
+            "tracking is running, this also swaps split VFO B (uplink, "
+            "Doppler-corrected) in for the transmission and back to VFO A "
+            "(downlink) on release."
+        )
         self.ptt_button.toggled.connect(self._on_ptt_toggled)
 
         self.hamclock_button = QPushButton("Ham Dashboard")
@@ -479,10 +484,22 @@ class RadioWindow(QWidget):
 
     def _on_ptt_toggled(self, checked):
         self.ptt_button.setText("TRANSMITTING" if checked else "PTT")
+        # While actively Doppler-tracking a satellite, PTT also drives the
+        # split VFO swap: B (uplink)/A (downlink) around the transmission,
+        # not just start/stop_ptt() on their own. Split itself was already
+        # turned on when tracking started (_start_satellite_tracking), so
+        # the radio's RX never leaves VFO A regardless of what VFO B does.
+        tracking_active = self._active_satellite is not None and self._satellite_tracking_timer.isActive()
         if checked:
+            if tracking_active and self.worker.is_connected():
+                self.worker.set_control_value("vfo", "B")
+                self._on_satellite_tracking_tick()  # Doppler-corrected uplink onto VFO B before keying up
             self.worker.start_ptt()
         else:
             self.worker.stop_ptt()
+            if tracking_active and self.worker.is_connected():
+                self.worker.set_control_value("vfo", "A")
+                self._on_satellite_tracking_tick()  # restore the Doppler-corrected downlink immediately
 
     def _on_hamclock_button_clicked(self):
         if self.hamclock_window is None:
@@ -554,16 +571,24 @@ class RadioWindow(QWidget):
     def _start_satellite_tracking(self):
         if self.worker.is_connected():
             # rigplane/CI-V's "set frequency" always targets whichever VFO
-            # is currently selected on the radio -- make sure that's A.
+            # is currently selected on the radio -- make sure that's A
+            # (RX/downlink). Split is enabled here too so PTT (see
+            # _on_ptt_toggled) can swap to VFO B/uplink for the duration
+            # of a transmission without the radio's own RX ever moving
+            # off VFO A/downlink.
             self.worker.set_control_value("vfo", "A")
+            self.worker.set_control_value("split", True)
         self._on_satellite_tracking_tick()
         self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
 
     def _stop_satellite_tracking(self):
         """Pauses re-tuning -- the satellite stays selected (name,
         transponder list, last-known overlay reading) until either
-        resumed or replaced by double-clicking another one."""
+        resumed or replaced by double-clicking another one. Also drops
+        split back off, since it was only turned on for this."""
         self._satellite_tracking_timer.stop()
+        if self.worker.is_connected():
+            self.worker.set_control_value("split", False)
 
     def _on_satellite_tracking_tick(self):
         satellite = self._active_satellite
@@ -596,26 +621,38 @@ class RadioWindow(QWidget):
         doppler_text = ""
         transponder = self.satellite_transponder_combo.currentData()
         if transponder is not None:
+            # While PTT is held, correct the uplink (on VFO B, which
+            # _on_ptt_toggled already switched to) instead of the
+            # downlink -- this tick keeps running every
+            # SATELLITE_TRACKING_INTERVAL_MS the whole time PTT is down,
+            # same as it does for the downlink at other times.
+            transmitting = self.ptt_button.isChecked()
+            freq_key = "uplink_mhz" if transmitting else "downlink_mhz"
             try:
-                base_freq_hz = round(float(transponder.get("downlink_mhz")) * 1e6)
+                base_freq_hz = round(float(transponder.get(freq_key)) * 1e6)
             except (TypeError, ValueError):
                 base_freq_hz = None
             if base_freq_hz is not None:
-                # The tuning knob adjusts this offset instead of the radio
-                # directly while tracking is active (_on_knob_steps) -- so
-                # manual tuning within a linear satellite's passband, or a
-                # nudge to line up with where it's actually transmitting,
-                # survives the next tick instead of being overwritten by
-                # a recompute from the transponder's bare nominal downlink.
-                base_freq_hz += self._satellite_freq_offset_hz
+                if not transmitting:
+                    # The tuning knob adjusts this offset instead of the
+                    # radio directly while tracking is active
+                    # (_on_knob_steps) -- so manual tuning within a linear
+                    # satellite's passband, or a nudge to line up with
+                    # where it's actually transmitting, survives the next
+                    # tick instead of being overwritten by a recompute
+                    # from the transponder's bare nominal downlink. Only
+                    # applies to RX -- there's no equivalent TX offset.
+                    base_freq_hz += self._satellite_freq_offset_hz
                 result = doppler_correction(
-                    base_freq_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km
+                    base_freq_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km,
+                    uplink=transmitting,
                 )
                 if result is not None:
                     if self.worker.is_connected():
                         self.worker.set_frequency(round(result["frequency_hz"]))
-                    doppler_text = f"  Doppler {result['doppler_hz']:+.0f} Hz"
-                    if self._satellite_freq_offset_hz:
+                    direction = "TX" if transmitting else "RX"
+                    doppler_text = f"  {direction} Doppler {result['doppler_hz']:+.0f} Hz"
+                    if not transmitting and self._satellite_freq_offset_hz:
                         doppler_text += f"  Offset {self._satellite_freq_offset_hz:+.0f} Hz"
 
         visibility = "up" if look["elevation_deg"] >= 0 else "down"

@@ -256,22 +256,39 @@ def satellite_look_angles(line1, line2, dt_utc, observer_lat, observer_lon, obse
 
 
 def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observer_lon,
-                        observer_elevation_km=0.0):
-    """Corrects base_freq_hz (a transponder's downlink) for the
-    satellite's Doppler shift at dt_utc, as seen from observer_lat/lon/
-    elevation.
+                        observer_elevation_km=0.0, uplink=False):
+    """Corrects base_freq_hz for the satellite's Doppler shift at
+    dt_utc, as seen from observer_lat/lon/elevation. base_freq_hz is a
+    transponder's nominal downlink by default; pass uplink=True to
+    correct its nominal uplink instead (see below for why that's not
+    just a sign flip).
 
-    Standard non-relativistic Doppler: f_observed = f_transmitted *
-    (1 - range_rate / c), where range_rate is how fast the slant range
-    to the satellite is changing (negative while approaching -- range
-    shrinking -- which is why that shows up as a HIGHER frequency).
-    Both the satellite (from sgp4) and the observer are expressed in the
-    same TEME inertial frame via _observer_teme_frame().
+    Standard non-relativistic Doppler, downlink: f_observed = f_emitted
+    * (1 - range_rate / c), where range_rate is how fast the slant
+    range to the satellite is changing (negative while approaching --
+    range shrinking -- which is why that shows up as a HIGHER
+    frequency). That's the frequency to tune the receiver to so a
+    signal actually emitted at base_freq_hz is heard correctly.
 
-    Returns a dict with frequency_hz (the corrected downlink), doppler_hz
-    (how much correction was applied), range_km, range_rate_km_s,
-    elevation_deg, and azimuth_deg (degrees clockwise from true North).
-    Returns None if propagation fails (sgp4 missing/invalid TLE)."""
+    Uplink is the same physics from the other direction: WE'RE the
+    emitter now, and we want the satellite's receiver to see exactly
+    base_freq_hz (its nominal uplink) after the same Doppler shift is
+    applied to our transmission during propagation. That means solving
+    the downlink formula for f_emitted given f_observed = base_freq_hz:
+    f_emitted = base_freq_hz / (1 - range_rate / c) -- the exact
+    inverse, not base_freq_hz * (1 + range_rate/c) (flipping the sign
+    on the multiply is only a first-order approximation of that
+    inverse; at LEO velocities the two agree to a small fraction of a
+    Hz, but the exact form costs nothing extra to compute).
+
+    Both the satellite (from sgp4) and the observer are expressed in
+    the same TEME inertial frame via _observer_teme_frame().
+
+    Returns a dict with frequency_hz (the corrected frequency),
+    doppler_hz (how much correction was applied), range_km,
+    range_rate_km_s, elevation_deg, and azimuth_deg (degrees clockwise
+    from true North). Returns None if propagation fails (sgp4 missing/
+    invalid TLE)."""
     result = _propagate_teme(line1, line2, dt_utc)
     if result is None:
         return None
@@ -294,7 +311,8 @@ def doppler_correction(base_freq_hz, line1, line2, dt_utc, observer_lat, observe
     elevation_deg = math.degrees(math.asin(max(-1.0, min(1.0, range_up / range_km))))
     azimuth_deg = math.degrees(math.atan2(range_east, range_north)) % 360.0
 
-    corrected_hz = base_freq_hz * (1.0 - range_rate_km_s / SPEED_OF_LIGHT_KM_S)
+    doppler_factor = 1.0 - range_rate_km_s / SPEED_OF_LIGHT_KM_S
+    corrected_hz = base_freq_hz / doppler_factor if uplink else base_freq_hz * doppler_factor
     return {
         "frequency_hz": corrected_hz,
         "doppler_hz": corrected_hz - base_freq_hz,

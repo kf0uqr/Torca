@@ -35,6 +35,8 @@ Package layout (see each module's own docstring for details):
     main.py                     -- this file: the entry point
 """
 
+import logging
+import os
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -42,6 +44,17 @@ from PySide6.QtWidgets import QApplication
 from connection_dialog import ConnectionDialog
 from main_window import RadioWindow
 from theme import apply_dark_theme, position_on_screen_half
+
+# Diagnostic only -- RADIONE_DEBUG_RIGPLANE=1 python3 main.py. Surfaces
+# rigplane's own internal DEBUG logging (logging.getLogger("rigplane")),
+# which includes lines like "civ-rx: active receiver -> SUB" whenever it
+# detects an active-receiver change -- useful for seeing, in real time,
+# whether something is flipping the active receiver back and forth
+# during dual-receiver (9700/7610) operation, independent of anything
+# this app's own code does. Off by default since it's fairly verbose.
+if os.environ.get("RADIONE_DEBUG_RIGPLANE"):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    logging.getLogger("rigplane").setLevel(logging.DEBUG)
 
 
 def main():

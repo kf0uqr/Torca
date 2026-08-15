@@ -165,26 +165,28 @@ class RadioWindow(QWidget):
         )
         self.ptt_button.toggled.connect(self._on_ptt_toggled)
 
-        # Dual-receiver (9700/7610) only -- rigplane's select_receiver()/
-        # get_active_receiver(), confirmed via their own docstrings to
-        # issue the real main_select/sub_select CI-V opcode (0x07 0xD0/
-        # 0xD1) and update RadioState.active. Genuinely different from
-        # addressing a specific receiver via receiver= on set_frequency
-        # etc (which writes into that receiver's own registers without
-        # necessarily making it "active") -- a manual way to test,
-        # button press by button press, whether PTT/TX actually follows
-        # THIS rather than Main's own VFO context regardless, before
-        # trying to automate whatever the answer turns out to be. Hidden
-        # for single-receiver radios (_on_connected).
+        # Dual-receiver (9700/7610) only -- rigplane's select_receiver(),
+        # confirmed via its own docstring to issue the real main_select/
+        # sub_select CI-V opcode (0x07 0xD0/0xD1) and update RadioState.
+        # active. Originally added to test whether this is what actually
+        # routes PTT/TX to Sub -- confirmed live (plus independently by
+        # Icom's own documented behavior) that it isn't: PTT always
+        # transmits from Main, full stop, a real hardware limitation.
+        # Kept as a manual control since it does drive something useful
+        # -- the scope/waterfall (set_scope_receiver, called alongside
+        # it) -- so you can look at Sub's downlink (e.g. to see your own
+        # signal) while Main handles TX. Hidden for single-receiver
+        # radios (_on_connected).
         self.active_receiver_button = QPushButton("Active: MAIN")
         self.active_receiver_button.setEnabled(False)
         self.active_receiver_button.setVisible(False)
         self.active_receiver_button.setToolTip(
             "Dual-receiver only: makes Main or Sub the radio's active "
-            "receiver (rigplane select_receiver() -- CI-V main_select/"
-            "sub_select), separate from which one has a given frequency "
-            "written to it. Manual diagnostic for finding out which of "
-            "these actually controls where PTT transmits."
+            "receiver and switches the scope/waterfall to match -- e.g. "
+            "switch to Sub to see your own signal on the downlink while "
+            "Main handles TX. PTT always transmits from Main regardless "
+            "of this (confirmed hardware behavior on the 9700/7610, not "
+            "something this switches)."
         )
         self.active_receiver_button.clicked.connect(self._on_active_receiver_toggle_clicked)
 
@@ -930,10 +932,19 @@ class RadioWindow(QWidget):
         # Optimistic label, same as the vfo_toggle buttons -- no polling
         # of get_active_receiver() wired up (yet); this is a manual
         # diagnostic first, not something depending on confirmed
-        # round-trip feedback.
-        going_to_sub = self.active_receiver_button.text() == "Active: MAIN"
-        self.worker.select_receiver(RECEIVER_SUB if going_to_sub else RECEIVER_MAIN)
-        self.active_receiver_button.setText("Active: SUB" if going_to_sub else "Active: MAIN")
+        # round-trip feedback. Confirmed live on a real 9700 (plus
+        # independently by Icom's own documented behavior): PTT always
+        # transmits from Main no matter which receiver is active -- a
+        # real hardware limitation, not a software gap -- so this no
+        # longer has anything to do with automating PTT/TX. Kept as a
+        # manual control, now also driving the scope/waterfall (set_
+        # scope_receiver -- confirmed live it doesn't follow
+        # select_receiver() on its own) so you can look at Sub's
+        # downlink (e.g. to see your own signal) while Main handles TX.
+        receiver = RECEIVER_MAIN if self.active_receiver_button.text() == "Active: SUB" else RECEIVER_SUB
+        self.worker.select_receiver(receiver)
+        self.worker.set_scope_receiver(receiver)
+        self.active_receiver_button.setText("Active: SUB" if receiver == RECEIVER_SUB else "Active: MAIN")
 
     @Slot(str, object)
     def _on_control_updated(self, key, value):

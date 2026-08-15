@@ -908,13 +908,14 @@ class RadioWorker(QThread):
         specific receiver via receiver= on set_frequency/set_vfo_slot/
         etc elsewhere in this file -- those write into that receiver's
         own registers without necessarily making it "active" for
-        anything else, which is exactly what every previous attempt to
-        route PTT/TX to Sub on a real 9700 ran into: the write always
-        landed, but had no effect on which receiver actually
-        transmitted. Manual diagnostic control (active_receiver_button,
-        main_window.py) for finding out whether THIS is what actually
-        determines that, before automating whatever the answer turns
-        out to be."""
+        anything else. Confirmed live on a real 9700 (manual toggle via
+        active_receiver_button, main_window.py, then testing PTT by
+        hand either way) plus independently confirmed by Icom's own
+        documented behavior: PTT always transmits from Main regardless
+        of which receiver is active -- a real hardware limitation, not
+        something addressable from software at all. Kept as a manual
+        control for whatever else "active receiver" turns out to affect
+        (e.g. the scope -- see set_scope_receiver below)."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._select_receiver(receiver), self.loop)
@@ -924,6 +925,26 @@ class RadioWorker(QThread):
             await self.radio.select_receiver(receiver)
         except Exception as exc:
             self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+
+    def set_scope_receiver(self, receiver: int):
+        """Thread-safe: call from the GUI thread. Dual-receiver only --
+        rigplane's set_scope_receiver(), confirmed via its own docstring
+        to select which receiver's spectrum/waterfall data the radio
+        streams (0=MAIN, 1=SUB) -- independent of select_receiver()
+        above; switching the active receiver doesn't also move the
+        scope. Called alongside select_receiver() (main_window.py's
+        _on_active_receiver_toggle_clicked) so the scope/waterfall
+        follows whichever receiver the toggle switches to, e.g. showing
+        Sub's downlink (to see your own signal) while Main handles TX."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_scope_receiver(receiver), self.loop)
+
+    async def _set_scope_receiver(self, receiver: int):
+        try:
+            await self.radio.set_scope_receiver(receiver)
+        except Exception as exc:
+            self.error.emit(f"Select scope receiver ({receiver}) failed: {exc}")
 
     def set_receiver_frequency(self, receiver: int, freq_hz: int):
         """Thread-safe: call from the GUI thread. Only meaningful on a

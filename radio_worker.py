@@ -13,7 +13,7 @@ import os
 
 from PySide6.QtCore import QThread, Signal
 
-from rigplane import create_radio, LanBackendConfig
+from rigplane import create_radio, LanBackendConfig, CommandError
 try:
     # NOTE: rigplane's docs/PyPI page only show LanBackendConfig in examples --
     # a serial/USB config class isn't documented anywhere we could find. This
@@ -162,18 +162,30 @@ class RadioWorker(QThread):
         self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
         # Dual-receiver only: which receiver every receiver-aware
         # getter/setter (see _receiver_kwargs) targets when none is
-        # explicitly given -- fixed at RECEIVER_MAIN and never changed.
-        # Confirmed live on a real 9700 (a controlled test giving each
-        # VFO a distinct mode to tell them apart) that PTT/split-driven
-        # transmission always follows Main's own VFO A/B context, never
-        # Sub, regardless of what's written to Sub -- so Main is the
-        # right target for every generic single-value control (mode,
-        # frequency readout, squelch, etc.) unconditionally. Sub is only
-        # ever touched directly, by receiver number, for its own
-        # continuous downlink tracking (main_window.py's
-        # _on_satellite_tracking_tick) -- that never needs to change
-        # what this defaults to.
+        # explicitly given. Starts at Main; kept in sync with the
+        # radio's real active receiver by _select_receiver() (called by
+        # both main_window.py's manual active_receiver_button and
+        # satellite mode's automatic PTT-driven switching) -- so the
+        # generic single-value controls (frequency readout, mode, etc.)
+        # correctly follow along too, e.g. showing Sub's live downlink
+        # while receiving and Main's live uplink while transmitting.
         self._active_receiver = RECEIVER_MAIN
+        # Dual-receiver only: keys (CONTROL_DEFINITIONS/LEVEL_DEFINITIONS)
+        # whose GETTER is confirmed, at runtime, to reject an explicit
+        # receiver= for this radio/profile -- confirmed live on a real
+        # 9700: AGC/Preamp/AF Gain/Squelch/RF Gain's own getters raise
+        # CommandError ("receiver=1 is unsupported for profile IC-9700:
+        # command 0x16/0x12 has no cmd29 route") for a non-Main
+        # receiver, even though their SETTERS silently accept (and,
+        # confirmed separately, functionally ignore) it -- only the read
+        # side is actually broken, and only for some commands, not
+        # others (frequency/vfo_slot's getters both confirmed working
+        # fine with an explicit receiver=). Populated as each one is
+        # actually hit (_poll_receiver_aware) rather than hand-listing
+        # them, since there's no way to predict which commands a given
+        # radio profile does or doesn't have this CI-V "cmd29" route for
+        # without just trying it.
+        self._receiver_unsupported_getters = set()
         self._radio_cm = None
         self._stop_requested = False
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
@@ -525,6 +537,33 @@ class RadioWorker(QThread):
             pass
         return {}
 
+    async def _poll_receiver_aware(self, key: str, getter):
+        """Calls getter(), passing receiver=self._active_receiver when
+        self.is_dual_receiver and the method's signature accepts it
+        (_receiver_kwargs) -- UNLESS key is already known
+        (_receiver_unsupported_getters) to reject that at runtime for
+        this radio/profile. On the first CommandError, remembers it
+        (so every later poll cycle goes straight to the safe bare call
+        instead of repeating -- and re-reporting -- the same failure
+        forever) and retries once without the receiver kwarg. Only
+        catches CommandError specifically -- anything else (a real
+        connection problem, say) still propagates to the caller's own
+        try/except, same as before this existed."""
+        kwargs = {}
+        if self.is_dual_receiver and key not in self._receiver_unsupported_getters:
+            kwargs = self._receiver_kwargs(getter, self._active_receiver)
+        if not kwargs:
+            return await getter()
+        try:
+            return await getter(**kwargs)
+        except CommandError as exc:
+            self._receiver_unsupported_getters.add(key)
+            self.error.emit(
+                f"{key}: reading with an explicit receiver isn't supported on this "
+                f"radio/profile ({exc}) -- reading the default receiver instead from now on."
+            )
+            return await getter()
+
     @staticmethod
     def _normalize_level_value(raw):
         """Getter values might come back as a 0.0-1.0 float or, like the
@@ -865,12 +904,13 @@ class RadioWorker(QThread):
                 definition = CONTROL_DEFINITIONS[key]
                 try:
                     getter = getattr(self.radio, get_name)
-                    # See _receiver_kwargs's docstring -- confirmed live
-                    # on a real 9700 that "vfo" alone wasn't the only
-                    # control causing the flip-flop; "mode" was too, and
-                    # there was no reason to expect it'd stop there.
-                    kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
-                    value = await getter(**kwargs)
+                    # See _receiver_kwargs's/_poll_receiver_aware's
+                    # docstrings -- confirmed live on a real 9700 that
+                    # "vfo" alone wasn't the only control causing the
+                    # flip-flop ("mode" was too), and that AGC/Preamp's
+                    # getters outright reject a non-Main receiver at
+                    # runtime rather than just ignoring it.
+                    value = await self._poll_receiver_aware(key, getter)
                     if definition.get("tuple_result") and isinstance(value, tuple):
                         value = value[0]
                     # Generic enum unwrap: any Enum/IntEnum member has a
@@ -888,18 +928,18 @@ class RadioWorker(QThread):
                 definition = LEVEL_DEFINITIONS[key]
                 getter = getattr(self.radio, get_name)
                 try:
-                    # AF gain/squelch/RF gain (DUAL_RECEIVER_LEVEL_KEYS)
-                    # don't actually respect receiver= at all -- confirmed
-                    # live on a real 9700 that this always reads/writes
-                    # whichever receiver is active (select_receiver()),
-                    # not self._active_receiver. Passed anyway (harmless,
-                    # ignored) for consistency with every other
-                    # receiver-aware getter here -- see main_window.py's
-                    # active_receiver_button/_level_receiver_suffix for
-                    # how the UI actually reflects which receiver this
-                    # ends up being.
-                    kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
-                    raw_value = await getter(**kwargs)
+                    # AF gain/squelch/RF gain's SETTERS don't actually
+                    # respect receiver= at all -- confirmed live on a
+                    # real 9700 that setting always affects whichever
+                    # receiver is active (select_receiver()), not
+                    # self._active_receiver -- but their GETTERS are
+                    # worse than just "ignored": confirmed live to raise
+                    # CommandError for a non-Main receiver outright.
+                    # _poll_receiver_aware handles that (see its
+                    # docstring); see main_window.py's active_receiver_
+                    # button/_level_receiver_suffix for how the UI
+                    # reflects which receiver these end up affecting.
+                    raw_value = await self._poll_receiver_aware(key, getter)
                     self.level_updated.emit(key, self._normalize_level_value(raw_value))
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")

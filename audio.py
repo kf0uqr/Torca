@@ -10,6 +10,8 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
+from array import array
 
 try:
     # pip install sounddevice (wraps PortAudio). Used both to list real
@@ -174,6 +176,40 @@ def move_source_output(source_output_id, source_name):
         pass
 
 
+def _downmix_stereo_to_mono(pcm: bytes) -> bytes:
+    """Collapses interleaved stereo s16le audio to mono by averaging each
+    L/R sample pair.
+
+    Dual-receiver Icom radios (e.g. the 9700) negotiate a stereo RX codec
+    by design -- confirmed in rigplane's own AudioCodec docs -- with
+    L=Main and R=Sub. Passing that straight through a mono output stream
+    (as this app previously did unconditionally) interleaves Main/Sub
+    samples as if they were sequential mono ones instead of simultaneous
+    channels, which is why Sub's audio never actually reached the
+    computer even with its squelch open: it was still in the byte
+    stream, just scrambled into a stream nothing was decoding as stereo.
+
+    Mirrors rigplane's own dependency-free stdlib approach (audio/
+    backend.py's _downmix_stereo_to_mono_s16le, "mix" mode) rather than
+    pulling in numpy for this one conversion. Preserves timing (frames/
+    sec is unchanged -- only the interleaved redundancy per frame is
+    collapsed), so the existing mono jitter-buffer/playback pipeline
+    downstream needs no other changes."""
+    usable = len(pcm) - (len(pcm) % 4)  # whole L/R pairs (2ch x 2 bytes)
+    if usable <= 0:
+        return b""
+    samples = array("h")
+    samples.frombytes(pcm[:usable])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    mono = array("h", bytes(len(samples)))  # len(samples)//2 mono samples
+    for i in range(0, len(samples), 2):
+        mono[i // 2] = (samples[i] + samples[i + 1]) // 2
+    if sys.byteorder != "little":
+        mono.byteswap()
+    return mono.tobytes()
+
+
 class AudioBridge:
     """Bridges a selected mic/speaker to rigplane's AudioTransport
     protocol. start_rx/stop_rx/start_tx/push_tx/stop_tx are confirmed
@@ -213,6 +249,14 @@ class AudioBridge:
 
         self.sample_rate = getattr(radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
         self._pcm_ok = self._check_pcm_codec()
+        self._rx_stereo = self._is_stereo_rx_codec()
+        if self._rx_stereo:
+            self._status(
+                "RX audio: radio negotiated a stereo codec (dual-receiver "
+                "L=Main/R=Sub) -- downmixing to mono so both receivers' "
+                "audio reach the computer, matching what the radio's own "
+                "speaker already mixes together."
+            )
 
         self._in_stream = None
         self._out_stream = None
@@ -292,6 +336,15 @@ class AudioBridge:
                 )
                 return False
         return True
+
+    def _is_stereo_rx_codec(self):
+        """True if the negotiated RX codec is a stereo PCM variant
+        (dual-receiver radios -- L=Main/R=Sub, see AudioCodec's own docs
+        in rigplane/core/types.py)."""
+        codec = getattr(self.radio, "audio_codec", None)
+        if codec is None:
+            return False
+        return "2CH" in self._codec_label(codec).upper()
 
     async def start(self):
         if not SOUNDDEVICE_AVAILABLE:
@@ -430,6 +483,8 @@ class AudioBridge:
         could easily be swallowed silently, which looks identical to "no
         audio arriving" from the outside."""
         data = self._extract_pcm_bytes(args, kwargs)
+        if data is not None and self._rx_stereo:
+            data = _downmix_stereo_to_mono(data)
         if data is None:
             # A lone None argument (and possibly other shapes) shows up
             # periodically from rigplane -- most likely a benign

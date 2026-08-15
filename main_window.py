@@ -612,8 +612,11 @@ class RadioWindow(QWidget):
             # (The radio's own split feature doesn't need to be on for
             # this at all -- see _start_satellite_tracking -- this
             # explicitly commands the VFO/frequency itself either way.)
-            # Sub is only ever used for continuous full-duplex downlink
-            # RX now -- see _on_satellite_tracking_tick.
+            # Sub carries the downlink, continuously re-tuned while
+            # receiving -- not touched at all during a transmission (the
+            # scope stays on it regardless, so it's still worth watching
+            # even though it's not being re-tuned) -- see
+            # _on_satellite_tracking_tick.
             target_vfo = "B" if checked else "A"
             # Satellite mode, dual-receiver only: PTT also switches the
             # active receiver -- Main for the transmission (so the
@@ -849,38 +852,51 @@ class RadioWindow(QWidget):
         bundled atomically with the PTT command itself, not dispatched
         here as a separate, independently-scheduled one.
 
-        Main's own VFO A(RX)/B(TX) split, on EVERY radio type now
-        (single-receiver 7300/705, and dual-receiver 9700/7610 alike):
-        confirmed live on a real 9700, with a controlled test giving
-        each VFO a distinct mode to tell them apart directly, that PTT-
-        driven transmission always follows Main's own current VFO A/B
-        context -- split or not -- and never Sub, no matter what's
-        written to Sub. Earlier attempts at a Main/Sub-based mechanism
-        (touch only whichever receiver is relevant to RX/TX, never
-        both) were solving a problem that didn't actually route TX
-        correctly in the first place. Which VFO to target is derived
-        fresh from ptt_button.isChecked() on EVERY call, not just
-        remembered from the last PTT edge, and reasserted via
-        select_vfo_and_set_frequency() (VFO select + frequency,
-        atomically) every single tick -- confirmed working correctly on
-        a real 705.
+        Single-receiver radios (7300/705): one shared VFO context, A for
+        RX / B for TX. Which VFO to target is derived fresh from
+        ptt_button.isChecked() on EVERY call, not just remembered from
+        the last PTT edge, and reasserted via select_vfo_and_set_
+        frequency() (VFO select + frequency, atomically) every single
+        tick -- confirmed working correctly on a real 705.
 
-        Dual-receiver radios (9700/7610) additionally get Sub locked to
-        the continuously Doppler-corrected downlink at all times,
-        regardless of PTT state -- true full-duplex listening while
-        Main handles the split-based TX, which is the actual point of
-        having a second receiver. Sub's own VFO slot only needs
-        selecting once (_satellite_sub_vfo_selected, reset whenever
-        tracking (re)starts) since its direction never changes;
-        subsequent ticks just update its frequency. Every tick still
-        writes a frequency to BOTH Main and Sub though, which (writing a
-        receiver's frequency also visibly focusing/activating it,
-        confirmed live on a real 9700) would otherwise flip-flop which
-        receiver is active every single cycle regardless of RX/TX state
-        -- so the tick ends by explicitly re-asserting which one
-        actually should be active (Main while transmitting, Sub
-        otherwise) after both writes, every time, not just at the PTT
-        edges that first set it."""
+        Dual-receiver radios (9700/7610): Sub is the downlink, Main is
+        the uplink (confirmed live on a real 9700: PTT-driven
+        transmission always follows Main's own VFO A/B context, never
+        Sub, so Main has to be what carries the uplink). Only whichever
+        receiver is actually ACTIVE right now gets Doppler-tuned this
+        tick -- Sub while receiving, Main while transmitting, never
+        both:
+
+        - Sub, while receiving: continuously re-tuned to the live
+          Doppler-corrected downlink, same as before. Its VFO slot only
+          needs selecting once per tracking session
+          (_satellite_sub_vfo_selected, reset in
+          _start_satellite_tracking) since its direction never changes;
+          subsequent ticks just update its frequency.
+        - Main, while transmitting: continuously re-tuned to the live
+          Doppler-corrected uplink, same select_vfo_and_set_frequency()
+          pattern as the single-receiver case above, just gated to only
+          run while transmitting.
+        - The receiver NOT currently active isn't touched at all by the
+          tick. Main sits wherever PTT last left it until the next
+          press (_on_ptt_toggled's bundled start_ptt_after_vfo() gives
+          it a fresh, correct value right when it's actually needed,
+          not continuously pre-tuned while nothing's watching it). Sub
+          isn't re-tuned during a transmission -- deliberately: Doppler
+          drift over the span of one transmission is small enough to
+          stay within the scope's visible bandwidth (which stays on Sub
+          throughout, see _start_satellite_tracking, specifically so
+          you can see yourself on the downlink while transmitting), so
+          there's nothing worth correcting for until PTT releases
+          anyway. This also sidesteps a real hardware quirk, confirmed
+          live on a real 9700 all the way back at the start of this
+          dual-receiver investigation: writing a receiver's frequency
+          also visibly focuses/activates it -- so writing both every
+          tick (an earlier version of this did) fought over focus and
+          made the active receiver flip-flop continuously regardless of
+          RX/TX state. Only ever touching one receiver per tick avoids
+          that entirely, without needing to explicitly reassert
+          anything afterward."""
         satellite = self._active_satellite
         if satellite is None:
             return
@@ -894,51 +910,41 @@ class RadioWindow(QWidget):
         warning_text = ""
         transmitting = self.ptt_button.isChecked()
         if self.worker.is_connected():
-            target_vfo = "B" if transmitting else "A"
-            freq_hz = uplink_hz if transmitting else downlink_hz
-            if not self.worker.control_available("vfo"):
-                warning_text = "  [VFO control unavailable -- can't switch bands]"
-            elif freq_hz is not None:
-                self.worker.select_vfo_and_set_frequency(target_vfo, freq_hz)
-            else:
-                self.worker.set_control_value("vfo", target_vfo)
-
-            if freq_hz is not None and not warning_text:
-                # Update optimistically, same as _on_knob_steps/
-                # _on_band_selected -- otherwise the main frequency
-                # readout and band-button highlight just sit still
-                # until the next 0.5s poll cycle confirms them.
-                self._current_freq_hz = freq_hz
-                self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
-                self._update_band_button_highlight()
-
             if self.worker.is_dual_receiver:
-                if downlink_hz is not None:
-                    if not self._satellite_sub_vfo_selected:
-                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, downlink_hz)
-                        self._satellite_sub_vfo_selected = True
-                    else:
-                        self.worker.set_receiver_frequency(RECEIVER_SUB, downlink_hz)
-                # This tick just wrote a frequency to BOTH Main (above)
-                # and Sub (just now) -- confirmed live on a real 9700,
-                # all the way back at the start of this whole dual-
-                # receiver investigation, that writing either receiver's
-                # frequency also visibly focuses/activates it. With true
-                # full-duplex sat mode needing BOTH written every tick
-                # (Sub for the continuous downlink, Main for whichever
-                # direction PTT has it in), that means every single tick
-                # was knocking focus onto Sub last, regardless of RX/TX
-                # state -- and then PTT's own bundled select_receiver()
-                # would only correct it until the NEXT tick immediately
-                # knocked it away again. Confirmed live as exactly the
-                # reported "active vfo constantly shifts back and forth
-                # ... during both transmit and receive." Explicitly
-                # re-asserting which receiver should actually be active
-                # here, every tick, after both writes, keeps it stable
-                # regardless of whatever focus side effect they just
-                # caused -- not touching the scope, which stays on Sub
-                # throughout (see _start_satellite_tracking).
-                self.worker.select_receiver(RECEIVER_MAIN if transmitting else RECEIVER_SUB)
+                if transmitting:
+                    freq_hz = uplink_hz
+                    if freq_hz is not None:
+                        self.worker.select_vfo_and_set_frequency("B", freq_hz)
+                else:
+                    freq_hz = downlink_hz
+                    if freq_hz is not None:
+                        if not self._satellite_sub_vfo_selected:
+                            self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, freq_hz)
+                            self._satellite_sub_vfo_selected = True
+                        else:
+                            self.worker.set_receiver_frequency(RECEIVER_SUB, freq_hz)
+                if freq_hz is not None:
+                    # Update optimistically, same as _on_knob_steps/
+                    # _on_band_selected -- otherwise the main frequency
+                    # readout and band-button highlight just sit still
+                    # until the next 0.5s poll cycle confirms them.
+                    self._current_freq_hz = freq_hz
+                    self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                    self._update_band_button_highlight()
+            else:
+                target_vfo = "B" if transmitting else "A"
+                freq_hz = uplink_hz if transmitting else downlink_hz
+                if not self.worker.control_available("vfo"):
+                    warning_text = "  [VFO control unavailable -- can't switch bands]"
+                elif freq_hz is not None:
+                    self.worker.select_vfo_and_set_frequency(target_vfo, freq_hz)
+                else:
+                    self.worker.set_control_value("vfo", target_vfo)
+
+                if freq_hz is not None and not warning_text:
+                    self._current_freq_hz = freq_hz
+                    self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                    self._update_band_button_highlight()
 
         self._update_satellite_overlay(satellite, look, crossing_text, downlink_doppler_hz, uplink_doppler_hz, warning_text)
 

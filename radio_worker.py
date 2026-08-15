@@ -937,7 +937,17 @@ class RadioWorker(QThread):
         of which receiver is active -- a real hardware limitation, not
         something addressable from software at all. Kept as a manual
         control for whatever else "active receiver" turns out to affect
-        (e.g. the scope -- see set_scope_receiver below)."""
+        (e.g. the scope -- see set_scope_receiver below).
+
+        Also updates self._active_receiver to match -- now that sat
+        mode only ever writes a frequency to whichever receiver is
+        genuinely active (main_window.py's _on_satellite_tracking_tick,
+        never both in the same tick any more), keeping this in sync
+        means every other receiver-aware getter/setter (_receiver_
+        kwargs) -- frequency, mode, etc -- correctly follows along too,
+        e.g. so the frequency readout reflects Sub's live downlink
+        while receiving and Main's live uplink while transmitting,
+        instead of a stale value from whichever it stopped matching."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._select_receiver(receiver), self.loop)
@@ -947,6 +957,7 @@ class RadioWorker(QThread):
             await self.radio.select_receiver(receiver)
         except Exception as exc:
             self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+        self._active_receiver = receiver
 
     def set_scope_receiver(self, receiver: int):
         """Thread-safe: call from the GUI thread. Dual-receiver only --

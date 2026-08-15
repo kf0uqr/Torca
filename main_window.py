@@ -1064,7 +1064,28 @@ class RadioWindow(QWidget):
         -- no polling of get_active_receiver() wired up (yet). Shared by
         the manual toggle above and satellite mode's automatic
         PTT-driven switching (_on_ptt_toggled, _start_satellite_
-        tracking, _stop_satellite_tracking)."""
+        tracking, _stop_satellite_tracking).
+
+        Also invalidates _current_freq_hz/freq_display (reasoned out
+        live on a real 9700, from the confirmed same-band constraint:
+        a number that appeared to keep changing within Main's own band
+        while Sub was supposedly active couldn't actually be Sub at
+        all, since Sub can never land on Main's band -- it had to be a
+        stale value). _current_freq_hz was left holding whichever
+        receiver was active BEFORE this switch until the next 0.5s poll
+        happened to refresh it -- ordinarily harmless, but the tuning
+        knob (_on_knob_steps) uses it as its baseline for the NEXT
+        relative step, and set_receiver_frequency() addresses Sub
+        explicitly regardless -- so a knob turn against a stale,
+        wrong-receiver baseline computes a target that's actually still
+        in the OLD receiver's band, gets silently rejected by the radio
+        for the same reason, and the optimistic display update shows
+        that never-applied value anyway, looking exactly like a phantom
+        VFO drifting inside the other receiver's band. Every caller of
+        this already supplies (or immediately follows up with) the
+        correct value for the new receiver except the manual toggle,
+        which now just shows "-- MHz" for up to one poll cycle instead
+        of a stale, misleading number the knob could act on."""
         self.active_receiver_button.setText("Active: SUB" if receiver == RECEIVER_SUB else "Active: MAIN")
         suffix = " (Sub)" if receiver == RECEIVER_SUB else ""
         for key in DUAL_RECEIVER_LEVEL_KEYS:
@@ -1072,6 +1093,9 @@ class RadioWindow(QWidget):
             label = self.level_labels[key]
             percent = self.level_sliders[key].value()
             label.setText(f"{LEVEL_DEFINITIONS[key]['label']}{suffix}: {percent}%")
+        self._current_freq_hz = None
+        self.freq_display.setText("-- MHz")
+        self._update_band_button_highlight()
 
     @Slot(str, object)
     def _on_control_updated(self, key, value):

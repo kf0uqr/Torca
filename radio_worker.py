@@ -993,11 +993,27 @@ class RadioWorker(QThread):
             except Exception as exc:
                 self.error.emit(f"Select receiver ({receiver}) for {key} failed: {exc}")
                 return
+            # Reported live on a real 9700: Main's mode still wasn't
+            # landing even with the correct receiver AND VFO slot
+            # selected first -- consistent with the recurring theme
+            # throughout this whole dual-receiver debugging effort, that
+            # rapid back-to-back CI-V writes to this radio don't
+            # reliably land in the order they're sent. A brief settle
+            # delay after actually switching receivers is a new
+            # mitigation, not yet tried for this specific call chain.
+            await asyncio.sleep(0.15)
         if vfo_slot is not None:
             try:
                 await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
             except Exception as exc:
                 self.error.emit(f"VFO slot select (receiver {receiver}) for {key} failed: {exc}")
+            else:
+                await asyncio.sleep(0.15)  # same settle-time reasoning as above, before the mode write itself
+        self.audio_status.emit(
+            f"[dual-rx] about to set {key}={value!r} on receiver {receiver} "
+            f"(active={self._active_receiver}, vfo_slot={vfo_slot!r}, "
+            f"receiver-unsupported-for-write={key in self._receiver_unsupported_setters})"
+        )
         await self._set_control_value(key, value)
         if restore and receiver != previously_active:
             try:

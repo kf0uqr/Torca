@@ -50,6 +50,14 @@ def _qrz_request(api_key: str, action: str, **params) -> dict:
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         text = response.read().decode("utf-8", errors="replace")
+    # Prints the RAW, unparsed wire response -- STATUS coming back
+    # RESULT=OK with a genuinely empty DATA (reported live) means
+    # something is off between what QRZ actually sends and what
+    # _parse_qrz_response/callers expect, and guessing further through
+    # that parsing layer without seeing ground truth risks another
+    # blind miss. Truncated defensively in case a FETCH response is
+    # large (a full-logbook ADIF dump).
+    print(f"[QRZ API] {action} raw response ({len(text)} bytes): {text[:2000]!r}")
     return _parse_qrz_response(text)
 
 

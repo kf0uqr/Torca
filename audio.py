@@ -296,6 +296,15 @@ class AudioBridge:
         self._rx_stereo_diag_l_peak = 0
         self._rx_stereo_diag_r_peak = 0
 
+        # Optional second consumer of this bridge's already-downmixed
+        # mono RX PCM -- e.g. RadioWorker.start_cw_decode() piggybacking
+        # on whatever RX stream this bridge already holds (normal
+        # listening audio or a Virtual Cable), instead of trying to
+        # register its own separate radio.start_rx() callback, which
+        # rigplane only allows one of at a time. See set_extra_rx_
+        # callback/has_rx_stream.
+        self._extra_rx_callback = None
+
         self.sample_rate = getattr(radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
         self._pcm_ok = self._check_pcm_codec()
         self._rx_stereo = self._is_stereo_rx_codec()
@@ -611,6 +620,8 @@ class AudioBridge:
                 )
             self._status(f"RX audio: first chunk received ({len(data)} bytes{detail}).")
         self._rx_chunk_count += 1
+        if self._extra_rx_callback is not None:
+            self._extra_rx_callback(data)
         try:
             self._rx_queue.put_nowait(data)
         except queue.Full:
@@ -813,6 +824,27 @@ class AudioBridge:
         of silently keying with no TX audio and leaving that to be
         discovered by ear."""
         return self._in_stream is not None
+
+    def has_rx_stream(self):
+        """Whether this bridge currently holds rigplane's start_rx()
+        registration (true once _start_rx has actually run -- only
+        happens if an output device was configured; see start()).
+        Lets a second consumer (RadioWorker.start_cw_decode) know
+        whether it can piggyback via set_extra_rx_callback(), or
+        whether it should fall back to registering its own direct
+        start_rx() tap instead, since a TX-only bridge (mic configured,
+        no speaker) never claims that registration at all."""
+        return self._rx_active
+
+    def set_extra_rx_callback(self, callback):
+        """Registers (callback is not None) or clears (callback is
+        None) a second consumer of this bridge's RX audio -- the same
+        already-downmixed mono PCM bytes queued for playback, handed
+        to `callback` right alongside that. Runs on this bridge's own
+        RX callback thread (same as _on_rx_audio itself), so `callback`
+        must follow the same cross-thread rules as everywhere else in
+        this app (no direct widget access)."""
+        self._extra_rx_callback = callback
 
     def set_rx_downmix_channel(self, channel: str):
         """Changes which receiver's audio this bridge's RX output

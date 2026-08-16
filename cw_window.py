@@ -9,12 +9,13 @@ same instance can be reopened freely without losing its transcript.
 Send: the radio's own built-in keyer over CI-V (RadioWorker.
 send_cw_text/stop_cw_text) -- no local audio/DSP involved at all.
 
-Decode: an auto-adaptive tone decoder (cw.CwDecoder) fed live PCM from
-a direct RadioWorker.start_cw_decode() audio tap. Can't run at the same
-time as an active Virtual Cable for the same radio (rigplane's
-start_rx() supports only one registered callback per radio) -- the
-toggle is disabled with an explanatory tooltip in that case rather than
-trying to arbitrate between the two.
+Decode: an auto-adaptive tone decoder (cw.CwDecoder) fed live PCM via
+RadioWorker.start_cw_decode(). Works alongside normal listening audio
+or an active Virtual Cable on the same radio -- RadioWorker shares
+whichever RX stream is already running (rigplane only allows one
+radio.start_rx() registration at a time) rather than requiring
+exclusive access, so this window never needs to gate the toggle on
+what else the radio's audio is doing.
 """
 
 from PySide6.QtCore import QTimer, Signal
@@ -152,8 +153,6 @@ class CwToolWindow(QWidget):
         self._status_timer.setInterval(500)
         self._status_timer.timeout.connect(self._update_decode_status)
 
-        self._update_decode_toggle_enabled()
-
     # ---- Send ----
 
     def _on_send_clicked(self):
@@ -185,23 +184,6 @@ class CwToolWindow(QWidget):
 
     # ---- Decode ----
 
-    def _update_decode_toggle_enabled(self):
-        audio_bridge_active = self._radio_window.worker.audio_bridge is not None
-        # Never disable it out from under an already-running decode
-        # session -- only gates STARTING a new one.
-        self.decode_toggle_button.setEnabled(
-            not audio_bridge_active or self.decode_toggle_button.isChecked()
-        )
-        if audio_bridge_active:
-            self.decode_toggle_button.setToolTip(
-                "Disabled: this radio's audio is already in use by an active "
-                "Virtual Cable. rigplane only supports one registered RX "
-                "audio callback per radio at a time -- stop the Virtual "
-                "Cable for this radio (Ham Dashboard) before decoding."
-            )
-        else:
-            self.decode_toggle_button.setToolTip("")
-
     def _on_decode_toggled(self, checked):
         worker = self._radio_window.worker
         if checked:
@@ -210,6 +192,14 @@ class CwToolWindow(QWidget):
             try:
                 worker.start_cw_decode(self._on_decode_audio_frame)
             except RuntimeError as exc:
+                # Defensive backstop only -- with cw_tool_button only
+                # ever enabled once the radio is connected (main_
+                # window.py's _on_connected), start_cw_decode() raising
+                # synchronously (not-connected-yet) shouldn't actually
+                # be reachable from here. A failure to actually attach
+                # (e.g. the radio doesn't support RX audio at all)
+                # happens asynchronously instead and is reported via
+                # worker.error, not this exception.
                 self._decoder = None
                 self.decode_status_label.setText(str(exc))
                 # Nothing was actually started (start_cw_decode raised
@@ -220,7 +210,6 @@ class CwToolWindow(QWidget):
                 self.decode_toggle_button.blockSignals(True)
                 self.decode_toggle_button.setChecked(False)
                 self.decode_toggle_button.blockSignals(False)
-                self._update_decode_toggle_enabled()
                 return
             self.decode_toggle_button.setText("Stop Decoding")
             self.decode_status_label.setText("Decoding -- listening for tone...")
@@ -235,7 +224,6 @@ class CwToolWindow(QWidget):
             self._decoder = None
             self.decode_toggle_button.setText("Start Decoding")
             self.decode_status_label.setText("Not decoding.")
-        self._update_decode_toggle_enabled()
 
     def _on_decode_audio_frame(self, pcm_bytes):
         # Runs on RadioWorker's asyncio-loop thread. cw.CwDecoder has
@@ -273,10 +261,6 @@ class CwToolWindow(QWidget):
         self.transcript.clear()
 
     # ---- Lifecycle ----
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._update_decode_toggle_enabled()
 
     def closing_for_real(self):
         """Called by RadioWindow.closeEvent when the OWNING radio

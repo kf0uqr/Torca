@@ -171,6 +171,11 @@ class RadioWorker(QThread):
         # caller-supplied function _on_cw_decode_frame hands raw PCM
         # bytes to once audio starts arriving.
         self._cw_decode_callback = None
+        # True while CW decode is attached via self.audio_bridge.set_
+        # extra_rx_callback() (piggybacking on an already-active RX
+        # stream) rather than its own direct radio.start_rx() tap --
+        # see _attach_cw_decode/_detach_cw_decode.
+        self._cw_decode_via_bridge = False
         # Dual-receiver only: which receiver every receiver-aware
         # getter/setter (see _receiver_kwargs) targets when none is
         # explicitly given. Starts at Main; kept in sync with the
@@ -391,6 +396,17 @@ class RadioWorker(QThread):
         asyncio.run_coroutine_threadsafe(self._set_virtual_cable_bridge(rx, tx), self.loop)
 
     async def _set_virtual_cable_bridge(self, rx: bool, tx: bool):
+        # If CW decode is active, detach it BEFORE the bridge instance
+        # it might currently be sharing (self._cw_decode_via_bridge) is
+        # stopped/discarded below -- and re-attach once the swap is
+        # done, so it picks up whatever the new situation actually is
+        # (a new bridge's RX stream, a direct tap, or -- if genuinely
+        # nothing to attach to -- start_rx() itself will fail and
+        # report why, same as any other attach failure).
+        cw_decode_was_active = self._cw_decode_callback is not None
+        if cw_decode_was_active:
+            await self._detach_cw_decode()
+
         if self.audio_bridge is not None:
             await self.audio_bridge.stop()
 
@@ -424,6 +440,9 @@ class RadioWorker(QThread):
             else:
                 self.audio_bridge = None
             self._virtual_cable_active = False
+
+        if cw_decode_was_active:
+            await self._attach_cw_decode()
 
     def start_ptt(self):
         """Thread-safe: call from the GUI thread on PTT button press.
@@ -526,41 +545,60 @@ class RadioWorker(QThread):
         to the GUI thread itself (e.g. via a Qt signal) before
         touching any widget.
 
-        Raises RuntimeError immediately (still on the calling/GUI
-        thread) if not connected yet, or if an AudioBridge is already
-        active for this radio -- rigplane's start_rx() only supports
-        one registered callback at a time (see _setup_audio's
-        docstring), so a CW decode tap can't coexist with an active
-        Virtual Cable on the same radio. Callers should check
-        self.audio_bridge is None themselves before ever offering
-        decode as an option (see cw_window.py), rather than relying on
-        this exception as the primary UX -- it's a backstop, not the
-        intended way this gets surfaced."""
+        Works alongside normal listening audio or a Virtual Cable --
+        see _attach_cw_decode -- by sharing that AudioBridge's already-
+        flowing RX stream instead of requiring exclusive access to
+        rigplane's single start_rx() registration. Raises RuntimeError
+        immediately (still on the calling/GUI thread) only if not
+        connected yet."""
         if self.loop is None or self.radio is None:
             raise RuntimeError("start_cw_decode: not connected yet.")
-        if self.audio_bridge is not None:
-            raise RuntimeError(
-                "start_cw_decode: an audio Virtual Cable is already active for "
-                "this radio -- rigplane only supports one registered RX audio "
-                "callback at a time. Stop the Virtual Cable for this radio first."
-            )
         self._cw_decode_callback = callback
         asyncio.run_coroutine_threadsafe(self._start_cw_decode(), self.loop)
 
     async def _start_cw_decode(self):
+        await self._attach_cw_decode()
+
+    async def _attach_cw_decode(self):
+        """Wires up wherever the current audio situation actually
+        lets CW decode receive PCM. rigplane only allows ONE
+        radio.start_rx() registration at a time -- if self.audio_bridge
+        already holds it (has_rx_stream(): normal listening audio from
+        the connection dialog, or an active Virtual Cable), CW decode
+        piggybacks on that SAME stream via AudioBridge.
+        set_extra_rx_callback() rather than stealing the registration
+        out from under it (which would silently break whatever that
+        bridge was already doing). Only registers CW decode's own
+        direct start_rx() tap when nothing else currently holds it --
+        e.g. no audio devices configured at all, or a TX-only bridge
+        (mic only, no speaker: has_rx_stream() is False since it never
+        calls start_rx in the first place)."""
+        if self.audio_bridge is not None and self.audio_bridge.has_rx_stream():
+            self._cw_decode_via_bridge = True
+            self.audio_bridge.set_extra_rx_callback(self._on_cw_decode_frame_from_bridge)
+            return
+        self._cw_decode_via_bridge = False
         try:
             await self.radio.start_rx(self._on_cw_decode_frame)
         except Exception as exc:
             self._cw_decode_callback = None
             self.error.emit(f"start_cw_decode: radio.start_rx() failed ({exc}).")
 
+    def _on_cw_decode_frame_from_bridge(self, pcm_bytes):
+        """AudioBridge's extra-RX-callback path -- it already extracted
+        and downmixed the PCM (the same bytes it queues for playback),
+        so unlike _on_cw_decode_frame below, no unwrapping is needed
+        here."""
+        if self._cw_decode_callback is not None:
+            self._cw_decode_callback(pcm_bytes)
+
     def _on_cw_decode_frame(self, packet=None):
-        """Called by rigplane on the asyncio-loop thread for each audio
-        frame while CW decoding is active -- same calling convention as
-        AudioBridge._on_rx_audio (always exactly one positional arg, an
-        AudioPacket or None; see its docstring). Reuses AudioBridge's
-        own _extract_pcm_bytes rather than duplicating that unwrapping
-        logic here."""
+        """Direct-tap path only (see _attach_cw_decode) -- called by
+        rigplane on the asyncio-loop thread for each audio frame, same
+        calling convention as AudioBridge._on_rx_audio (always exactly
+        one positional arg, an AudioPacket or None; see its
+        docstring). Reuses AudioBridge's own _extract_pcm_bytes rather
+        than duplicating that unwrapping logic here."""
         pcm_bytes = AudioBridge._extract_pcm_bytes(packet)
         if pcm_bytes is not None and self._cw_decode_callback is not None:
             self._cw_decode_callback(pcm_bytes)
@@ -573,6 +611,20 @@ class RadioWorker(QThread):
 
     async def _stop_cw_decode(self):
         self._cw_decode_callback = None
+        await self._detach_cw_decode()
+
+    async def _detach_cw_decode(self):
+        """Tears down whichever mode _attach_cw_decode last used --
+        clears the shared bridge's extra callback, or stops CW
+        decode's own direct tap. Safe to call even if self.audio_bridge
+        has since been replaced/stopped out from under a bridge-mode
+        attachment (e.g. by _set_virtual_cable_bridge, which detaches
+        before swapping the bridge instance)."""
+        if self._cw_decode_via_bridge:
+            if self.audio_bridge is not None:
+                self.audio_bridge.set_extra_rx_callback(None)
+            self._cw_decode_via_bridge = False
+            return
         try:
             await self.radio.stop_rx()
         except Exception as exc:

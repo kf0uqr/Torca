@@ -252,6 +252,31 @@ class RadioWindow(QWidget):
         # SatelliteSession (re)starts tracking (_on_tracking_changed) so
         # a fresh tracking session always reselects it.
         self._sub_vfo_a_selected = False
+        # Same idea, Main/TX side: whether Main's VFO B + active-
+        # receiver selection has already been done for the CURRENT
+        # transmission (via start_ptt_after_vfo, at the moment PTT was
+        # pressed -- _on_ptt_toggled). Reported live on a real 9700:
+        # apply_satellite_tick's mid-transmission Doppler-correction
+        # ticks were repeating the FULL select_receiver_vfo_and_set_
+        # frequency() call (which internally re-runs
+        # _resolve_receiver_band_conflict -- a live, over-the-wire read
+        # of Sub's OWN current frequency) every 2 seconds throughout an
+        # ongoing transmission, not just once. That repeated read
+        # appears to become unreliable while the radio is actively
+        # transmitting -- confirmed live that it eventually misreads
+        # Sub as sharing Main's band, which triggers the (otherwise
+        # legitimate) band-conflict "move the other receiver out of the
+        # way" logic and forcibly relocates Sub to a free band's raw
+        # low edge, corrupting a perfectly correct downlink frequency
+        # it was never supposed to touch mid-transmission at all. Main
+        # only genuinely needs that full, conflict-checked selection
+        # ONCE per transmission -- right when start_ptt_after_vfo
+        # already does it at PTT-press time -- so subsequent ticks use
+        # the cheap, bare set_receiver_frequency instead, same as
+        # _sub_vfo_a_selected's own established pattern. Set True in
+        # _on_ptt_toggled's press branch, reset False on release (each
+        # new transmission gets a fresh, real selection at press time).
+        self._main_vfo_b_selected = False
         self._satellite_session.tracking_changed.connect(self._on_tracking_changed)
 
 
@@ -606,6 +631,13 @@ class RadioWindow(QWidget):
                 receiver = RECEIVER_MAIN if checked else RECEIVER_SUB
             if checked:
                 self.worker.start_ptt_after_vfo(target_vfo, freq_hz, receiver)
+                if self.worker.is_dual_receiver:
+                    # Main's VFO B + active-receiver selection just
+                    # happened, atomically, as part of that call --
+                    # apply_satellite_tick's own mid-transmission ticks
+                    # can now use the cheap bare frequency write instead
+                    # of repeating the full (conflict-checked) select.
+                    self._main_vfo_b_selected = True
             elif self.worker.is_dual_receiver:
                 # Release, dual-receiver only: does NOT retune Main to
                 # VFO A/downlink_hz -- confirmed live on a real 9700,
@@ -618,6 +650,7 @@ class RadioWindow(QWidget):
                 # fresh -- nothing needs Main in between, since Sub is
                 # what's actually active/watched during RX.
                 self.worker.stop_ptt_and_select_receiver(receiver)
+                self._main_vfo_b_selected = False  # next transmission gets a fresh, real selection at press time
             else:
                 self.worker.stop_ptt_then_vfo(target_vfo, freq_hz)
             if receiver is not None:
@@ -666,24 +699,42 @@ class RadioWindow(QWidget):
             if transmitting:
                 freq_hz = uplink_hz
                 if freq_hz is not None:
-                    # Reported live on a real 9700: mode drifting and
-                    # both Main AND Sub ending up on VFO B, starting
-                    # right after the first transmission. Root cause --
-                    # select_vfo_and_set_frequency() has no receiver
-                    # targeting at all (unlike every other dual-receiver
-                    # operation in this codebase, including the Sub-side
-                    # branch a few lines below), so this periodic
-                    # (2s-tick) mid-transmission Doppler correction was
-                    # landing as a bare, unaddressed "select VFO B" CI-V
-                    # command -- fine at PTT-press time (start_ptt_
-                    # after_vfo bundles an explicit receiver=RECEIVER_
-                    # MAIN with it), but not safe to repeat unscoped
-                    # while already transmitting. select_receiver_vfo_
-                    # and_set_frequency explicitly re-selects Main as
-                    # the active receiver before touching its VFO/
-                    # frequency, in one atomic coroutine -- same
-                    # primitive Sub's own tick already relies on below.
-                    self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_MAIN, freq_hz, vfo_slot="B")
+                    # Reported live on a real 9700, two rounds: (1) mode
+                    # drifting and both Main AND Sub ending up on VFO B
+                    # -- root-caused to select_vfo_and_set_frequency()
+                    # having no receiver targeting at all, unlike every
+                    # other dual-receiver operation here (fixed by
+                    # switching to select_receiver_vfo_and_set_
+                    # frequency(), same primitive Sub's own tick uses
+                    # below); (2) that fix still corrupted Sub's
+                    # (correctly-tracking) downlink frequency down to a
+                    # band's raw low edge -- because that primitive
+                    # internally re-runs _resolve_receiver_band_conflict
+                    # on EVERY tick, which does a live over-the-wire
+                    # read of Sub's own current frequency to check for a
+                    # conflict, and that read appears to become
+                    # unreliable while the radio is actively
+                    # transmitting -- confirmed live it eventually
+                    # misreads Sub as sharing Main's band, which
+                    # triggers the (otherwise legitimate) "move the
+                    # other receiver out of the way" logic and forcibly
+                    # relocates Sub somewhere it was never supposed to
+                    # move at all mid-transmission.
+                    #
+                    # Main only genuinely needs that full, conflict-
+                    # checked selection ONCE per transmission -- right
+                    # when start_ptt_after_vfo already does it at PTT-
+                    # press time (_on_ptt_toggled sets
+                    # _main_vfo_b_selected=True right after). Subsequent
+                    # ticks use the cheap, bare set_receiver_frequency
+                    # instead -- same _sub_vfo_a_selected-style pattern
+                    # Sub's own tick already relies on, just applied to
+                    # Main/TX instead of Sub/RX.
+                    if not self._main_vfo_b_selected:
+                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_MAIN, freq_hz, vfo_slot="B")
+                        self._main_vfo_b_selected = True
+                    else:
+                        self.worker.set_receiver_frequency(RECEIVER_MAIN, freq_hz)
             else:
                 freq_hz = downlink_hz
                 if freq_hz is not None:

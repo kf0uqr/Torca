@@ -226,7 +226,25 @@ class LogBookWindow(QWidget):
 
     # ---- table rendering ----
 
+    @staticmethod
+    def _cell_text(qso, key):
+        if key == "_SYNCED":
+            return "Yes" if qso_log.is_synced(qso) else "No"
+        if key == "_CONFIRMED":
+            return "Yes" if qso_log.is_confirmed(qso) else "No"
+        return qso.get(key, "")
+
     def _rebuild_table(self):
+        # Newest QSOs first by default -- QSO_DATE (YYYYMMDD) and
+        # TIME_ON (HHMM/HHMMSS) both sort correctly as plain fixed-
+        # width numeric-ish strings, so combining them is enough for a
+        # real chronological order without parsing real datetimes.
+        # Reorders self._qsos itself (not just the view) -- fine since
+        # every lookup elsewhere in this class finds a QSO by UUID, not
+        # by list position, and this is the only place that assigns
+        # Qt.UserRole from the current position, right below.
+        self._qsos.sort(key=lambda qso: (qso.get("QSO_DATE", ""), qso.get("TIME_ON", "")), reverse=True)
+
         self.table.setSortingEnabled(False)
         self.table.setColumnCount(len(self._visible_columns))
         self.table.setHorizontalHeaderLabels(
@@ -235,13 +253,14 @@ class LogBookWindow(QWidget):
         self.table.setRowCount(len(self._qsos))
         for row, qso in enumerate(self._qsos):
             for col, key in enumerate(self._visible_columns):
-                text = ("Yes" if qso_log.is_synced(qso) else "No") if key == "_SYNCED" else qso.get(key, "")
-                item = QTableWidgetItem(text)
+                item = QTableWidgetItem(self._cell_text(qso, key))
                 # Remembers this row's position in self._qsos at the time
-                # of this rebuild -- the table view's own row order
-                # changes when the user sorts, but self._qsos itself
-                # never reorders, so this is a stable way to map a
-                # selected VIEW row back to the right list entry.
+                # of this rebuild -- the table VIEW's own row order
+                # changes when the user clicks a column header to sort,
+                # but self._qsos's position (as just set above) is
+                # exactly what row was inserted here, so this is a
+                # stable way to map a selected view row back to the
+                # right list entry.
                 item.setData(Qt.UserRole, row)
                 self.table.setItem(row, col, item)
         self.table.resizeColumnsToContents()

@@ -46,12 +46,14 @@ def ensure_uuid(qso: dict) -> dict:
     return updated
 
 # Ordered ADIF field -> {"label", "default_visible"} -- drives both the
-# Log Book table's columns and the Manage Columns dialog. "_SYNCED" is
-# a synthetic pseudo-field (not written to the ADIF file itself, and
-# not a real ADIF field name) derived from LOGID_FIELD's presence --
-# log_book_window.py special-cases it rather than reading it as a
-# plain stored value.
+# Log Book table's columns (in this order, left to right) and the
+# Manage Columns dialog. "_CONFIRMED"/"_SYNCED" are synthetic pseudo-
+# fields (not written to the ADIF file itself, not real ADIF field
+# names) -- log_book_window.py special-cases them rather than reading
+# them as plain stored values. "_CONFIRMED" is listed first so it
+# renders as the leftmost column.
 QSO_FIELD_DEFINITIONS = {
+    "_CONFIRMED": {"label": "Confirmed", "default_visible": True},
     "QSO_DATE": {"label": "Date", "default_visible": True},
     "TIME_ON": {"label": "Time On", "default_visible": True},
     "CALL": {"label": "Call", "default_visible": True},
@@ -73,8 +75,24 @@ QSO_FIELD_DEFINITIONS = {
     "QSO_DATE_OFF": {"label": "Date Off", "default_visible": False},
     "STATION_CALLSIGN": {"label": "Station Callsign", "default_visible": False},
     "MY_GRIDSQUARE": {"label": "My Grid Square", "default_visible": False},
+    "QSL_RCVD": {"label": "QSL Rcvd (paper)", "default_visible": False},
+    "LOTW_QSL_RCVD": {"label": "LoTW Rcvd", "default_visible": False},
+    "EQSL_QSL_RCVD": {"label": "eQSL Rcvd", "default_visible": False},
+    "APP_QRZLOG_STATUS": {"label": "QRZ Status (raw)", "default_visible": False},
     "_SYNCED": {"label": "Synced", "default_visible": True},
 }
+
+
+def is_confirmed(qso: dict) -> bool:
+    """A QSO counts as confirmed if any confirmation method says so --
+    standard ADIF QSL_RCVD (paper), or either electronic confirmation
+    service (LOTW_QSL_RCVD/EQSL_QSL_RCVD), each "Y" when confirmed
+    (ADIF's own Y/N/R/I enumeration for these fields). Deliberately
+    NOT based on QRZ's own APP_QRZLOG_STATUS -- its exact code meanings
+    ("C", others seen in the wild) aren't documented anywhere findable,
+    so it's kept as a raw, inspectable-but-unverified column instead of
+    being trusted for this derived Yes/No."""
+    return any(qso.get(field) == "Y" for field in ("QSL_RCVD", "LOTW_QSL_RCVD", "EQSL_QSL_RCVD"))
 
 
 def load_qso_log():

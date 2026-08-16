@@ -11,6 +11,7 @@ parameters. The response body is itself URL-encoded name=value pairs
 (NOT JSON) -- parsed with urllib.parse.parse_qsl.
 """
 
+import html
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -98,17 +99,25 @@ def qrz_delete(api_key: str, logids) -> dict:
 def qrz_fetch(api_key: str, option: str = "ALL") -> list:
     """Fetches QSO records matching `option` (QRZ's own filter syntax,
     e.g. "ALL", "AFTERLOGID:1000,MAX:250") as a list of ADIF field
-    dicts (via adif.parse_adif_records), each still carrying whatever
-    LOGID-identifying field QRZ includes per-record in its ADIF output
-    -- confirm the exact field name against a live response the first
-    time this runs for real, rather than assuming. Raises QrzApiError
-    on RESULT=FAIL."""
+    dicts (via adif.parse_adif_records), each carrying QRZ's own
+    per-record LOGID under APP_QRZLOG_LOGID -- confirmed live against
+    a real account. Raises QrzApiError on RESULT=FAIL."""
     parsed = _qrz_request(api_key, "FETCH", OPTION=option)
     result = parsed.get("RESULT")
     if result != "OK":
         raise QrzApiError(parsed.get("REASON") or f"QRZ FETCH failed (RESULT={result!r})")
     adif_text = parsed.get("ADIF", "")
-    return adif.parse_adif_records(adif_text) if adif_text else []
+    if not adif_text:
+        return []
+    # Confirmed live: QRZ HTML-entity-escapes the ADIF payload inside
+    # its response (&lt;/&gt; instead of literal </>), even though the
+    # whole response is already URL-encoded separately -- unescape
+    # first or every ADIF tag just looks like plain text and nothing
+    # parses (this was the actual cause of FETCH always returning 0
+    # records, not the ALL/MAX or AFTERLOGID:0 request-format guesses
+    # tried earlier).
+    adif_text = html.unescape(adif_text)
+    return adif.parse_adif_records(adif_text)
 
 
 def qrz_status(api_key: str) -> dict:

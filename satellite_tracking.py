@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QMenu,
 )
 
 # ==================== Satellite tracking ====================
@@ -695,6 +696,27 @@ def norad_id_from_tle_line1(line1):
         return None
 
 
+def tle_epoch_datetime(line1):
+    """Parses a TLE's epoch (standard TLE format, columns 19-32 of the
+    first line: 2-digit year + fractional day-of-year) into a
+    timezone-aware UTC datetime -- lets the Satellite Info dialog show
+    how stale a stored TLE is. Returns None if line1 isn't a valid/
+    parseable TLE line."""
+    try:
+        epoch_str = line1[18:32].strip()
+        year_2digit = int(epoch_str[:2])
+        day_of_year_frac = float(epoch_str[2:])
+        # Standard TLE convention (same pivot NORAD itself uses):
+        # 57-99 -> 1957-1999, 00-56 -> 2000-2056.
+        year = (1900 if year_2digit >= 57 else 2000) + year_2digit
+        return (
+            datetime.datetime(year, 1, 1, tzinfo=datetime.timezone.utc)
+            + datetime.timedelta(days=day_of_year_frac - 1)
+        )
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
 def fetch_transponders(norad_cat_id):
     """Fetches known transmitters/transponders for a satellite from
     SatNOGS DB. Returns a list of dicts: {"description", "uplink_mhz",
@@ -957,6 +979,8 @@ class SatelliteConfigDialog(QDialog):
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Show", "Name"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         self._rebuild_table()
 
         self.refresh_button = QPushButton("Refresh TLEs from CelesTrak")
@@ -1108,6 +1132,16 @@ class SatelliteConfigDialog(QDialog):
             if self._on_change:
                 self._on_change(self._satellites)
 
+    def _on_table_context_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0 or row >= len(self._satellites):
+            return
+        menu = QMenu(self)
+        info_action = menu.addAction("Satellite Info...")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is info_action:
+            SatelliteInfoDialog(self._satellites[row], self).exec()
+
     def _on_accept(self):
         for row, sat in enumerate(self._satellites):
             sat["selected"] = self.table.item(row, 0).checkState() == Qt.Checked
@@ -1115,3 +1149,69 @@ class SatelliteConfigDialog(QDialog):
 
     def result_satellites(self):
         return self._satellites
+
+
+class SatelliteInfoDialog(QDialog):
+    """Read-only view of everything this app has stored on one
+    satellite -- right-click it (on the map, in the upcoming-passes
+    table, or in the Satellite Tracking management dialog's list) to
+    open this. Purely informational, no OK/Cancel distinction -- just
+    Close."""
+
+    def __init__(self, satellite, parent=None):
+        super().__init__(parent)
+        name = satellite.get("name", "?")
+        self.setWindowTitle(f"Satellite Info -- {name}")
+        self.resize(560, 420)
+
+        line1 = satellite.get("line1", "")
+        line2 = satellite.get("line2", "")
+        norad_id = norad_id_from_tle_line1(line1)
+        epoch = tle_epoch_datetime(line1)
+
+        form = QFormLayout()
+        form.addRow("Name:", QLabel(name))
+        form.addRow("NORAD Catalog #:", QLabel(str(norad_id) if norad_id is not None else "Unknown"))
+        if epoch is not None:
+            age = datetime.datetime.now(datetime.timezone.utc) - epoch
+            age_text = f"{age.days}d {age.seconds // 3600}h old" if age.total_seconds() >= 0 else "in the future?"
+            form.addRow("TLE Epoch:", QLabel(f"{epoch.strftime('%Y-%m-%d %H:%M:%S')} UTC ({age_text})"))
+        else:
+            form.addRow("TLE Epoch:", QLabel("Unknown (unparseable TLE)"))
+        form.addRow("Shown on Map:", QLabel("Yes" if satellite.get("selected") else "No"))
+
+        line1_input = QLineEdit(line1)
+        line1_input.setReadOnly(True)
+        line2_input = QLineEdit(line2)
+        line2_input.setReadOnly(True)
+        form.addRow("TLE Line 1:", line1_input)
+        form.addRow("TLE Line 2:", line2_input)
+
+        transponders = satellite.get("transponders", [])
+        columns = ["Description", "Downlink (MHz)", "Uplink (MHz)", "Mode", "Uplink Mode", "Inverting", "Active"]
+        table = QTableWidget(len(transponders), len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for row, transponder in enumerate(transponders):
+            table.setItem(row, 0, QTableWidgetItem(transponder.get("description", "")))
+            table.setItem(row, 1, QTableWidgetItem(transponder.get("downlink_mhz", "")))
+            table.setItem(row, 2, QTableWidgetItem(transponder.get("uplink_mhz", "")))
+            table.setItem(row, 3, QTableWidgetItem(transponder.get("mode", "")))
+            table.setItem(row, 4, QTableWidgetItem(transponder.get("uplink_mode", "")))
+            table.setItem(row, 5, QTableWidgetItem("Yes" if transponder.get("invert") else "No"))
+            table.setItem(row, 6, QTableWidgetItem("Yes" if transponder.get("alive", True) else "No"))
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(QLabel(
+            "Transponders:" if transponders
+            else "No transponder data stored -- fetch from SatNOGS or add it in Edit Transponders."
+        ))
+        layout.addWidget(table)
+        layout.addWidget(button_box)
+        self.setLayout(layout)

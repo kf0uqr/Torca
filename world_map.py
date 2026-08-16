@@ -79,6 +79,7 @@ class WorldMapWidget(QWidget):
     own location if set, drawn on top."""
 
     satellite_double_clicked = Signal(str)  # satellite name, from the positions passed to set_satellite_positions
+    satellite_right_clicked = Signal(str)   # satellite name -- opens Satellite Info (ham_dashboard.py)
 
     # The background image (and the whole lat/lon grid it's drawn
     # against) is a standard equirectangular projection: 2:1 width:height.
@@ -253,16 +254,20 @@ class WorldMapWidget(QWidget):
     # areas of nearby satellites overlapping too much.
     _SATELLITE_HIT_RADIUS_PX = 10
 
-    def mouseDoubleClickEvent(self, event):
+    def _satellite_at(self, widget_pos):
+        """Returns the name of whichever satellite marker is under
+        widget_pos (within _SATELLITE_HIT_RADIUS_PX), or None -- shared
+        hit-test behind both the double-click (select/track) and
+        right-click (Satellite Info) handlers below."""
         if not self._satellite_mode or not self._satellite_positions:
-            return
+            return None
         # Markers are drawn in the letterboxed map rect's own (0,0)-origin
         # coordinate space (see paintEvent's painter.translate()) -- shift
         # the click position into that same space before comparing, or
         # every hit-test would be off by the letterbox's offset whenever
         # the widget's box isn't exactly MAP_ASPECT_RATIO.
         map_rect = self._map_rect()
-        pos = event.position() - map_rect.topLeft()
+        pos = widget_pos - map_rect.topLeft()
         w, h = map_rect.width(), map_rect.height()
         closest_name, closest_dist = None, None
         for sat in self._satellite_positions:
@@ -270,8 +275,19 @@ class WorldMapWidget(QWidget):
             dist = math.hypot(x - pos.x(), y - pos.y())
             if dist <= self._SATELLITE_HIT_RADIUS_PX and (closest_dist is None or dist < closest_dist):
                 closest_name, closest_dist = sat["name"], dist
+        return closest_name
+
+    def mouseDoubleClickEvent(self, event):
+        closest_name = self._satellite_at(event.position())
         if closest_name is not None:
             self.satellite_double_clicked.emit(closest_name)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.RightButton:
+            return
+        closest_name = self._satellite_at(event.position())
+        if closest_name is not None:
+            self.satellite_right_clicked.emit(closest_name)
 
     @staticmethod
     def _lonlat_to_xy(lat, lon, w, h):

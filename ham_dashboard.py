@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QFileDialog,
     QDialogButtonBox,
+    QMenu,
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
@@ -85,6 +86,7 @@ from constants import RADIO_ROLES
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 from satellite_tracking import (
     SatelliteConfigDialog,
+    SatelliteInfoDialog,
     load_satellite_data,
     save_satellite_data,
     propagate_satellite,
@@ -348,6 +350,7 @@ class HamClockWindow(QWidget):
 
         self.map_widget = WorldMapWidget()
         self.map_widget.satellite_double_clicked.connect(self._on_satellite_double_clicked)
+        self.map_widget.satellite_right_clicked.connect(self._on_satellite_right_clicked)
 
         self.utc_label = QLabel("--:--:-- UTC")
         self.utc_label.setStyleSheet("font-size: 20px; font-weight: bold;")
@@ -399,8 +402,13 @@ class HamClockWindow(QWidget):
             self.upcoming_passes_table.horizontalHeader().height()
             + self.PASSES_DISPLAY_COUNT * 24 + 4
         )
-        self.upcoming_passes_table.setToolTip("Double-click a row to select that satellite, same as double-clicking it on the map.")
+        self.upcoming_passes_table.setToolTip(
+            "Double-click a row to select that satellite, same as double-clicking it on the map. "
+            "Right-click for satellite info."
+        )
         self.upcoming_passes_table.cellDoubleClicked.connect(self._on_pass_row_double_clicked)
+        self.upcoming_passes_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.upcoming_passes_table.customContextMenuRequested.connect(self._on_passes_table_context_menu)
 
         self.satellites = load_satellite_data()
         self._upcoming_passes = []  # cached results from the last upcoming_passes() call
@@ -752,6 +760,26 @@ class HamClockWindow(QWidget):
         if row >= len(self._upcoming_passes):
             return
         self._on_satellite_double_clicked(self._upcoming_passes[row]["name"])
+
+    def _on_passes_table_context_menu(self, pos):
+        row = self.upcoming_passes_table.rowAt(pos.y())
+        if row < 0 or row >= len(self._upcoming_passes):
+            return
+        menu = QMenu(self)
+        info_action = menu.addAction("Satellite Info...")
+        chosen = menu.exec(self.upcoming_passes_table.viewport().mapToGlobal(pos))
+        if chosen is info_action:
+            self._on_satellite_right_clicked(self._upcoming_passes[row]["name"])
+
+    def _on_satellite_right_clicked(self, name):
+        """Right-clicked on the map marker, or via the upcoming-passes
+        table's context menu -- opens a read-only info dialog with
+        everything this app has stored on the satellite (TLE, NORAD ID,
+        transponders)."""
+        satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
+        if satellite is None:
+            return
+        SatelliteInfoDialog(satellite, self).exec()
 
     def _on_satellite_double_clicked(self, name):
         """(Re)starts tracking this satellite -- replaces whatever was

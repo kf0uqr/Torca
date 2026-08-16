@@ -7,6 +7,7 @@ account, or QRZ briefly unreachable, still gets a fully working log.
 """
 
 import pathlib
+import uuid
 
 from PySide6.QtCore import QThread, Signal
 
@@ -22,6 +23,27 @@ QSO_LOG_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "qsolog.adi"
 # with sync bookkeeping bolted on separately.
 LOGID_FIELD = "APP_RADIONE_LOGID"
 SYNCED_FIELD = "APP_RADIONE_SYNCED"
+# A permanent local identity, independent of QRZ's LOGID (which a
+# local-only, not-yet-synced QSO doesn't have yet) and independent of
+# list position (which shifts on sort/reload/sync-merge). Needed once
+# the Log Book window's New QSO/Edit dialogs became non-modal windows
+# rather than blocking dialogs -- an async edit or sync can now
+# legitimately complete while another window is still open, so any
+# code that needs to find "that one QSO again" later has to do it by a
+# stable ID, not a captured list index.
+UUID_FIELD = "APP_RADIONE_UUID"
+
+
+def ensure_uuid(qso: dict) -> dict:
+    """Returns qso unchanged if it already has UUID_FIELD, otherwise a
+    NEW dict with one assigned. Called on every local QSO the first
+    time it's created, and on every record pulled from QRZ (which has
+    no notion of this app's local UUID convention)."""
+    if qso.get(UUID_FIELD):
+        return qso
+    updated = dict(qso)
+    updated[UUID_FIELD] = uuid.uuid4().hex
+    return updated
 
 # Ordered ADIF field -> {"label", "default_visible"} -- drives both the
 # Log Book table's columns and the Manage Columns dialog. "_SYNCED" is
@@ -56,7 +78,11 @@ QSO_FIELD_DEFINITIONS = {
 
 
 def load_qso_log():
-    return adif.read_adif_log(QSO_LOG_PATH)
+    qsos = adif.read_adif_log(QSO_LOG_PATH)
+    migrated = [ensure_uuid(qso) for qso in qsos]
+    if migrated != qsos:  # dict equality -- catches whichever records actually got a fresh UUID
+        save_qso_log(migrated)
+    return migrated
 
 
 def save_qso_log(qsos):
@@ -155,7 +181,7 @@ def sync_with_qrz(api_key, qsos, cursor):
                         page_cursor = max(page_cursor, int(logid))
                 if logid and record[LOGID_FIELD] in existing_logids:
                     continue
-                qsos.append(record)
+                qsos.append(ensure_uuid(record))  # QRZ has no notion of this app's local UUID convention
                 if logid:
                     existing_logids.add(record[LOGID_FIELD])
                 pulled += 1

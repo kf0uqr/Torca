@@ -8,15 +8,20 @@ overridable widget. Also doubles as the "Edit Selected" form
 (log_book_window.py) when constructed with existing_qso: no radio
 picker/autofill in that mode, just a pre-filled form.
 
-Returns collected fields via self.result_fields (a plain ADIF-field
-dict) after a successful exec() -- persistence and any QRZ upload is
-the caller's job (log_book_window.py), same division of responsibility
-as ConnectionDialog.get_details().
+Shown non-modally (caller calls .show(), not .exec()) -- confirmed
+live that .exec()'s default application-modal blocking meant the
+operator couldn't touch a RadioWindow (e.g. retune) while this was
+open, defeating the point of its live radio autofill entirely. Emits
+submitted(dict) with the collected ADIF fields on a successful Log
+QSO/Save Changes click instead of returning a value from exec();
+persistence and any QRZ upload is the caller's job (log_book_window.py),
+same division of responsibility as ConnectionDialog.get_details() had
+for the (still modal, still a real one-shot picker) connection flow.
 """
 
 import datetime
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -42,6 +47,8 @@ _POLL_INTERVAL_MS = 1000
 
 
 class NewQsoDialog(QDialog):
+    submitted = Signal(dict)  # collected ADIF fields, emitted right before the window closes
+
     def __init__(self, dashboard, existing_qso=None, parent=None):
         super().__init__(parent)
         self._dashboard = dashboard
@@ -195,13 +202,17 @@ class NewQsoDialog(QDialog):
             "COMMENT": self.comment_input.text().strip(),
         }
         if self._existing_qso is not None:
-            # Preserve local-only QRZ sync metadata across an edit --
-            # log_book_window.py decides what to do with it (a synced
-            # record gets DELETE+re-INSERT'd; an unsynced one just
-            # stays that way until the next sync).
-            for key in (qso_log.LOGID_FIELD, qso_log.SYNCED_FIELD):
+            # Preserve local-only QRZ sync metadata AND identity across
+            # an edit -- log_book_window.py decides what to do with the
+            # sync fields (a synced record gets DELETE+re-INSERT'd; an
+            # unsynced one just stays that way until the next sync);
+            # UUID_FIELD is how it finds this exact record again
+            # afterward (not a list index, which can go stale now that
+            # this window is non-modal -- see the module docstring).
+            for key in (qso_log.LOGID_FIELD, qso_log.SYNCED_FIELD, qso_log.UUID_FIELD):
                 if key in self._existing_qso:
                     fields[key] = self._existing_qso[key]
 
         self.result_fields = fields
+        self.submitted.emit(fields)
         self.accept()

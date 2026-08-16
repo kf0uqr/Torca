@@ -132,6 +132,7 @@ class LogBookWindow(QWidget):
         self._sync_worker = None
         self._upload_worker = None
         self._reupload_worker = None
+        self._open_dialogs = []  # keeps non-modal New QSO/Edit windows alive -- see _track_dialog
 
         self.table = QTableWidget(0, 0)
         self.table.setSortingEnabled(True)
@@ -216,27 +217,58 @@ class LogBookWindow(QWidget):
         return selected[0].data(Qt.UserRole)
 
     # ---- New QSO / Edit ----
+    #
+    # Both open a NON-MODAL NewQsoDialog (.show(), not .exec()) --
+    # confirmed live that .exec()'s default application-modal blocking
+    # meant the operator couldn't touch a RadioWindow (e.g. retune)
+    # while New QSO was open, defeating the point of its live radio
+    # autofill. That makes every follow-up step here genuinely
+    # asynchronous relative to the rest of the app (a background sync
+    # can legitimately finish, reordering/replacing self._qsos, while
+    # one of these windows is still open) -- so every callback below
+    # re-finds its QSO by UUID_FIELD at the moment it actually runs,
+    # never by a list index captured earlier.
+
+    def _find_qso_index_by_uuid(self, qso_uuid):
+        for index, qso in enumerate(self._qsos):
+            if qso.get(qso_log.UUID_FIELD) == qso_uuid:
+                return index
+        return None
+
+    def _track_dialog(self, dialog):
+        # Keeps a Python-side reference alive for as long as a non-modal
+        # dialog might be open -- Qt's own parent-child ownership (we
+        # already pass parent=self) keeps the underlying widget alive,
+        # but a locally-scoped Python variable going out of scope right
+        # after .show() returns is still worth avoiding explicitly.
+        self._open_dialogs.append(dialog)
+        dialog.finished.connect(lambda _result, d=dialog: self._open_dialogs.remove(d) if d in self._open_dialogs else None)
 
     def _on_new_qso_clicked(self):
         dialog = NewQsoDialog(self._dashboard, parent=self)
-        if dialog.exec() != QDialog.Accepted or dialog.result_fields is None:
-            return
-        self._qsos.append(dialog.result_fields)
+        dialog.submitted.connect(self._on_new_qso_submitted)
+        self._track_dialog(dialog)
+        dialog.show()
+
+    def _on_new_qso_submitted(self, fields):
+        fields = qso_log.ensure_uuid(fields)
+        self._qsos.append(fields)
         qso_log.save_qso_log(self._qsos)
         self._rebuild_table()
 
         api_key = self._get_qrz_api_key()
         if not api_key:
             return
-        index = len(self._qsos) - 1
+        qso_uuid = fields[qso_log.UUID_FIELD]
         self.status_label.setText("Logged locally; uploading to QRZ...")
-        self._upload_worker = qso_log.QrzUploadWorker(api_key, self._qsos[index], self)
-        self._upload_worker.finished_upload.connect(lambda updated, i=index: self._on_quick_upload_finished(i, updated))
+        self._upload_worker = qso_log.QrzUploadWorker(api_key, fields, self)
+        self._upload_worker.finished_upload.connect(lambda updated, u=qso_uuid: self._on_quick_upload_finished(u, updated))
         self._upload_worker.failed.connect(self._on_quick_upload_failed)
         self._upload_worker.start()
 
-    def _on_quick_upload_finished(self, index, updated):
-        if index < len(self._qsos):
+    def _on_quick_upload_finished(self, qso_uuid, updated):
+        index = self._find_qso_index_by_uuid(qso_uuid)
+        if index is not None:
             self._qsos[index] = updated
             qso_log.save_qso_log(self._qsos)
             self._rebuild_table()
@@ -252,11 +284,20 @@ class LogBookWindow(QWidget):
         if index is None:
             QMessageBox.information(self, "Edit Selected", "Select a QSO in the table first.")
             return
-        original = self._qsos[index]
+        original = qso_log.ensure_uuid(self._qsos[index])
+        self._qsos[index] = original  # persists a freshly-assigned UUID, if this record didn't have one yet
+        qso_uuid = original[qso_log.UUID_FIELD]
+
         dialog = NewQsoDialog(self._dashboard, existing_qso=original, parent=self)
-        if dialog.exec() != QDialog.Accepted or dialog.result_fields is None:
+        dialog.submitted.connect(lambda fields, u=qso_uuid, orig=original: self._on_edit_submitted(u, orig, fields))
+        self._track_dialog(dialog)
+        dialog.show()
+
+    def _on_edit_submitted(self, qso_uuid, original, updated):
+        index = self._find_qso_index_by_uuid(qso_uuid)
+        if index is None:
+            self.status_label.setText("Couldn't save that edit -- the QSO no longer exists locally.")
             return
-        updated = dialog.result_fields
         self._qsos[index] = updated
         qso_log.save_qso_log(self._qsos)
         self._rebuild_table()
@@ -267,26 +308,28 @@ class LogBookWindow(QWidget):
             return
         self.status_label.setText("Re-uploading corrected QSO to QRZ...")
         self._reupload_worker = qso_log.QrzReuploadWorker(api_key, old_logid, updated, self)
-        self._reupload_worker.finished_reupload.connect(lambda result, i=index: self._on_reupload_finished(i, result))
-        self._reupload_worker.failed.connect(lambda message, i=index: self._on_reupload_failed(i, message))
+        self._reupload_worker.finished_reupload.connect(lambda result, u=qso_uuid: self._on_reupload_finished(u, result))
+        self._reupload_worker.failed.connect(lambda message, u=qso_uuid: self._on_reupload_failed(u, message))
         self._reupload_worker.start()
 
-    def _on_reupload_finished(self, index, updated):
-        if index < len(self._qsos):
+    def _on_reupload_finished(self, qso_uuid, updated):
+        index = self._find_qso_index_by_uuid(qso_uuid)
+        if index is not None:
             self._qsos[index] = updated
             qso_log.save_qso_log(self._qsos)
             self._rebuild_table()
         self.status_label.setText("QSO updated and re-uploaded to QRZ.")
         self._reupload_worker = None
 
-    def _on_reupload_failed(self, index, message):
+    def _on_reupload_failed(self, qso_uuid, message):
         # See qso_log.reupload_qso_to_qrz's docstring -- a failure here
         # might mean the old QRZ record is already gone (DELETE
         # succeeded, INSERT didn't). Clearing the local sync tags
         # either way is the safe, self-healing choice: the next sync
         # pushes it fresh as a new record rather than silently leaving
         # a QSO missing from QRZ.
-        if index < len(self._qsos):
+        index = self._find_qso_index_by_uuid(qso_uuid)
+        if index is not None:
             self._qsos[index].pop(qso_log.LOGID_FIELD, None)
             self._qsos[index].pop(qso_log.SYNCED_FIELD, None)
             qso_log.save_qso_log(self._qsos)
@@ -334,7 +377,21 @@ class LogBookWindow(QWidget):
         self._sync_worker.start()
 
     def _on_sync_finished(self, updated_qsos, new_cursor, summary):
-        self._qsos = updated_qsos
+        # Merges by UUID into the CURRENT self._qsos rather than
+        # replacing it outright -- the sync worker ran against a
+        # snapshot taken when it started, so a wholesale replace here
+        # would silently discard any QSO logged locally (New QSO/Edit,
+        # now both non-modal and therefore genuinely concurrent with a
+        # sync) while it was still in flight. Anything left in by_uuid
+        # after matching existing records is a QRZ-only pull, appended
+        # as new.
+        by_uuid = {qso[qso_log.UUID_FIELD]: qso for qso in updated_qsos if qso.get(qso_log.UUID_FIELD)}
+        for index, qso in enumerate(self._qsos):
+            qso_uuid = qso.get(qso_log.UUID_FIELD)
+            if qso_uuid in by_uuid:
+                self._qsos[index] = by_uuid.pop(qso_uuid)
+        self._qsos.extend(by_uuid.values())
+
         qso_log.save_qso_log(self._qsos)
         _settings().setValue(_QRZ_SYNC_CURSOR_SETTING, new_cursor)
         self._rebuild_table()

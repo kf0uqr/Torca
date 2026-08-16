@@ -63,6 +63,7 @@ from world_map import WorldMapWidget
 from connection_dialog import ConnectionDialog
 from main_window import RadioWindow
 from satellite_session import SatelliteSession
+from log_book_window import LogBookWindow
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from audio import (
     pactl_available,
@@ -448,6 +449,15 @@ class HamClockWindow(QWidget):
         )
         self.connect_radio_button.clicked.connect(self._on_connect_radio_clicked)
 
+        # Singleton, non-modal, tracked as self.log_book_window rather
+        # than a list (unlike RadioWindow, only one is ever open) --
+        # LogBookWindow.closeEvent hides rather than destroys it, so
+        # this same instance is always safe to show()/raise_() again.
+        self.log_book_window = None
+        self.log_book_button = QPushButton("Log Book...")
+        self.log_book_button.setToolTip("QSO log -- view/sort every contact, log a new one, edit and re-sync with QRZ.com.")
+        self.log_book_button.clicked.connect(self._on_log_book_clicked)
+
         self.connected_radios_list = QListWidget()
         self.connected_radios_list.setToolTip("Double-click to bring that radio's window to the front.")
         self.connected_radios_list.setFixedHeight(70)
@@ -456,6 +466,7 @@ class HamClockWindow(QWidget):
         connected_radios_header = QHBoxLayout()
         connected_radios_header.addWidget(QLabel("Connected Radios:"))
         connected_radios_header.addWidget(self.connect_radio_button)
+        connected_radios_header.addWidget(self.log_book_button)
         connected_radios_header.addStretch()
 
         connected_radios_column = QVBoxLayout()
@@ -1045,6 +1056,13 @@ class HamClockWindow(QWidget):
             window.show()
             window.raise_()
             window.activateWindow()
+
+    def _on_log_book_clicked(self):
+        if self.log_book_window is None:
+            self.log_book_window = LogBookWindow(self)
+        self.log_book_window.show()
+        self.log_book_window.raise_()
+        self.log_book_window.activateWindow()
 
     def _on_radio_window_closed(self, window):
         """Connected to RadioWindow.closed, emitted from closeEvent

@@ -1371,7 +1371,7 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(str(exc))
 
-    def select_receiver_vfo_and_set_frequency(self, receiver: int, freq_hz: int, vfo_slot: str = "A"):
+    def select_receiver_vfo_and_set_frequency(self, receiver: int, freq_hz: int, vfo_slot: str = "A", check_conflict: bool = True):
         """Thread-safe: call from the GUI thread. On a genuine dual-
         receiver radio, "which receiver" (Main/Sub) and "which VFO"
         (A/B) turned out to be two independent axes, not one -- each
@@ -1402,11 +1402,26 @@ class RadioWorker(QThread):
         then frequency), same reasoning as select_vfo_and_set_
         frequency() above: separately-dispatched commands don't
         actually guarantee anything about their real-world ordering --
-        or, it turns out, persistence -- on the radio's side."""
+        or, it turns out, persistence -- on the radio's side.
+
+        check_conflict=False skips _resolve_receiver_band_conflict --
+        confirmed live on a real 9700 that repeating THAT specific step
+        every 2-second tick throughout an ongoing transmission (Main's
+        own mid-transmission Doppler correction, main_window.py's
+        apply_satellite_tick) eventually misreads the other receiver's
+        frequency and forcibly relocates it, even though everything
+        else in this bundle (reselect receiver, reselect VFO slot, set
+        frequency) genuinely needs to run every single tick -- a bare
+        frequency-only write does NOT reliably keep VFO B selected on
+        its own (confirmed live: Main drifted back to VFO A). Conflict
+        checking is only genuinely needed once, at the moment of
+        actually switching bands (e.g. start_ptt_after_vfo, at PTT-
+        press time) -- every caller except that repeated-tick case
+        should leave this at its default (True)."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(
-            self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz), self.loop
+            self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz, check_conflict), self.loop
         )
 
     def _find_band(self, freq_hz: int):
@@ -1518,8 +1533,9 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Moving receiver {other_receiver} to {safe_label} failed: {exc}")
 
-    async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int):
-        await self._resolve_receiver_band_conflict(receiver, freq_hz)
+    async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int, check_conflict: bool = True):
+        if check_conflict:
+            await self._resolve_receiver_band_conflict(receiver, freq_hz)
         try:
             await self.radio.select_receiver(receiver)
             self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK (vfo+freq bundle)")

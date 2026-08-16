@@ -1608,18 +1608,31 @@ class RadioWorker(QThread):
         switching to Main for TX so the tuning knob/AF/RF/squelch
         controls follow it, same reasoning as everything else bundled
         here. Deliberately does NOT touch the scope receiver, so it can
-        keep showing Sub's downlink throughout the transmission."""
+        keep showing Sub's downlink throughout the transmission.
+
+        Deliberately does NOT run _resolve_receiver_band_conflict --
+        confirmed live on a real 9700 that this call's own pre-check
+        reads (get_frequency on both receivers, to look for a same-
+        band collision before deciding whether to move anything) cause
+        several rapid, visible receiver A/B oscillations right at the
+        moment PTT is pressed -- BEFORE the radio even keys up -- and
+        Sub can settle corrupted onto a free band's raw low edge by the
+        time that resolves, exactly the "moved a receiver that was
+        never supposed to move" failure the conflict check exists to
+        prevent, just triggered by the check's own reads instead of an
+        actual conflict. In practice Main's uplink band and Sub's
+        downlink band are never the same band for any real full-duplex
+        satellite transponder, and Sub is continuously verified to
+        already be on its correct (different) band by the RX tick
+        loop before any PTT press -- so this check has no genuine job
+        left to do here by the time an operator actually presses PTT,
+        only the demonstrated potential to corrupt Sub."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._start_ptt_after_vfo(vfo_value, freq_hz, receiver), self.loop)
 
     async def _start_ptt_after_vfo(self, vfo_value, freq_hz: int, receiver: int = None):
         if receiver is not None:
-            # See _resolve_receiver_band_conflict's docstring -- Main
-            # can't switch to the uplink's band if Sub happens to
-            # already be sitting on it (moves Sub to a free third band
-            # first if so).
-            await self._resolve_receiver_band_conflict(receiver, freq_hz)
             try:
                 await self.radio.select_receiver(receiver)
             except Exception as exc:

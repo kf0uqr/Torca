@@ -1153,12 +1153,12 @@ class RadioWorker(QThread):
         entries in constants.py)."""
         return key in self._control_methods
 
-    def set_frequency(self, freq_hz: int):
+    def set_frequency(self, freq_hz: int, check_conflict: bool = True):
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_frequency(freq_hz), self.loop)
+        asyncio.run_coroutine_threadsafe(self._set_frequency(freq_hz, check_conflict), self.loop)
 
-    async def _set_frequency(self, freq_hz: int):
+    async def _set_frequency(self, freq_hz: int, check_conflict: bool = True):
         # This method has no receiver parameter at all -- both of its
         # callers (the tuning knob's Main-active branch, and rigctld's
         # CAT frequency-set callback for external apps like WSJT-X) are
@@ -1169,7 +1169,17 @@ class RadioWorker(QThread):
         # a band Sub currently occupies was simply rejected outright by
         # the radio. No-op on a single-receiver radio
         # (_resolve_receiver_band_conflict's own guard).
-        await self._resolve_receiver_band_conflict(RECEIVER_MAIN, freq_hz)
+        #
+        # check_conflict=False (threaded through from select_vfo_and_
+        # set_frequency/start_ptt_after_vfo, satellite PTT specifically)
+        # skips it -- confirmed live this exact check, reached via THIS
+        # path (start_ptt_after_vfo -> _select_vfo_and_set_frequency ->
+        # here), was still corrupting Sub during satellite TX even after
+        # the OTHER two call sites (the tick loop, and start_ptt_after_
+        # vfo's own now-removed top-level call) were fixed -- this one
+        # was the one still actually firing every PTT press all along.
+        if check_conflict:
+            await self._resolve_receiver_band_conflict(RECEIVER_MAIN, freq_hz)
         try:
             await self.radio.set_frequency(freq_hz)
         except Exception as exc:
@@ -1553,7 +1563,7 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(str(exc))
 
-    def select_vfo_and_set_frequency(self, vfo_value, freq_hz: int):
+    def select_vfo_and_set_frequency(self, vfo_value, freq_hz: int, check_conflict: bool = True):
         """Thread-safe: call from the GUI thread. Selects VFO A/B and
         THEN sets its frequency, as one sequential coroutine rather than
         two independently-scheduled ones (set_control_value("vfo", ...)
@@ -1569,7 +1579,11 @@ class RadioWorker(QThread):
         yields control back to some OTHER task between those two awaits.
         Used for satellite split-mode PTT (main_window.py), where a
         frequency has to land on the VFO just switched to, not whichever
-        one happened to still be selected."""
+        one happened to still be selected.
+
+        check_conflict is threaded straight through to _set_frequency --
+        see its own docstring; start_ptt_after_vfo passes False here for
+        the satellite-PTT case."""
         if self.loop is None or self.radio is None:
             return
         if "vfo" not in self._control_methods:
@@ -1578,13 +1592,15 @@ class RadioWorker(QThread):
                 "(no working getter+setter was found on connect) -- frequency not changed."
             )
             return
-        asyncio.run_coroutine_threadsafe(self._select_vfo_and_set_frequency(vfo_value, freq_hz), self.loop)
+        asyncio.run_coroutine_threadsafe(
+            self._select_vfo_and_set_frequency(vfo_value, freq_hz, check_conflict), self.loop
+        )
 
-    async def _select_vfo_and_set_frequency(self, vfo_value, freq_hz: int):
+    async def _select_vfo_and_set_frequency(self, vfo_value, freq_hz: int, check_conflict: bool = True):
         await self._set_control_value("vfo", vfo_value)
-        await self._set_frequency(freq_hz)
+        await self._set_frequency(freq_hz, check_conflict)
 
-    def start_ptt_after_vfo(self, vfo_value, freq_hz: int, receiver: int = None):
+    def start_ptt_after_vfo(self, vfo_value, freq_hz: int, receiver: int = None, check_conflict: bool = True):
         """Thread-safe: call from the GUI thread. Single-receiver radios
         (7300/705): selects VFO A/B, sets its frequency, THEN keys PTT --
         all as ONE coroutine, not select_vfo_and_set_frequency() followed
@@ -1610,10 +1626,11 @@ class RadioWorker(QThread):
         here. Deliberately does NOT touch the scope receiver, so it can
         keep showing Sub's downlink throughout the transmission.
 
-        Deliberately does NOT run _resolve_receiver_band_conflict --
-        confirmed live on a real 9700 that this call's own pre-check
-        reads (get_frequency on both receivers, to look for a same-
-        band collision before deciding whether to move anything) cause
+        check_conflict=False (main_window.py's satellite PTT press
+        always passes this) skips _resolve_receiver_band_conflict --
+        confirmed live on a real 9700 that its own pre-check reads
+        (get_frequency on both receivers, to look for a same-band
+        collision before deciding whether to move anything) cause
         several rapid, visible receiver A/B oscillations right at the
         moment PTT is pressed -- BEFORE the radio even keys up -- and
         Sub can settle corrupted onto a free band's raw low edge by the
@@ -1626,19 +1643,28 @@ class RadioWorker(QThread):
         already be on its correct (different) band by the RX tick
         loop before any PTT press -- so this check has no genuine job
         left to do here by the time an operator actually presses PTT,
-        only the demonstrated potential to corrupt Sub."""
+        only the demonstrated potential to corrupt Sub. This has to be
+        threaded through explicitly (not just fixed at this method's
+        own top level) -- the VFO+frequency step below goes through
+        _select_vfo_and_set_frequency -> _set_frequency, which runs
+        this exact same check on its own unless told not to; confirmed
+        live that fixing only THIS method's own top-level call, while
+        that inner one still ran unconditionally, did not actually stop
+        the corruption at all."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._start_ptt_after_vfo(vfo_value, freq_hz, receiver), self.loop)
+        asyncio.run_coroutine_threadsafe(
+            self._start_ptt_after_vfo(vfo_value, freq_hz, receiver, check_conflict), self.loop
+        )
 
-    async def _start_ptt_after_vfo(self, vfo_value, freq_hz: int, receiver: int = None):
+    async def _start_ptt_after_vfo(self, vfo_value, freq_hz: int, receiver: int = None, check_conflict: bool = True):
         if receiver is not None:
             try:
                 await self.radio.select_receiver(receiver)
             except Exception as exc:
                 self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
         if "vfo" in self._control_methods:
-            await self._select_vfo_and_set_frequency(vfo_value, freq_hz)
+            await self._select_vfo_and_set_frequency(vfo_value, freq_hz, check_conflict)
         else:
             self.error.emit(
                 f"{CONTROL_DEFINITIONS['vfo']['label']}: not available on this radio/install "

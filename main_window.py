@@ -605,7 +605,7 @@ class RadioWindow(QWidget):
             if self.worker.is_dual_receiver:
                 receiver = RECEIVER_MAIN if checked else RECEIVER_SUB
             if checked:
-                self.worker.start_ptt_after_vfo(target_vfo, freq_hz, receiver)
+                self.worker.start_ptt_after_vfo(target_vfo, freq_hz, receiver, check_conflict=False)
             elif self.worker.is_dual_receiver:
                 # Release, dual-receiver only: does NOT retune Main to
                 # VFO A/downlink_hz -- confirmed live on a real 9700,

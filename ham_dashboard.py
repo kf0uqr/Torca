@@ -84,7 +84,7 @@ from audio import (
     VIRTUAL_CABLE_TX_NAME,
     VIRTUAL_CABLE_TX_DESC,
 )
-from constants import RADIO_ROLES
+from constants import RADIO_ROLES, HF_6M_BANDS, VHF_UHF_BANDS
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 from satellite_tracking import (
@@ -464,6 +464,25 @@ class HamClockWindow(QWidget):
         self.qso_map_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.qso_map_button.customContextMenuRequested.connect(self._on_qso_map_menu_requested)
 
+        # Filters which band's QSOs the map overlay shows -- every band
+        # this app knows about (same list/order as HF_6M_BANDS +
+        # VHF_UHF_BANDS, already ADIF's own lowercase BAND convention --
+        # see adif.band_for_freq_hz) plus "All Bands". Deliberately only
+        # affects QSO markers -- the operator location and satellite
+        # markers/footprints/paths are a different concept entirely (not
+        # tied to any one band) and stay shown regardless.
+        self.qso_band_filter_combo = QComboBox()
+        self.qso_band_filter_combo.addItem("All Bands", None)
+        for label, _low_hz, _high_hz in HF_6M_BANDS + VHF_UHF_BANDS:
+            self.qso_band_filter_combo.addItem(label, label)
+        self.qso_band_filter_combo.setToolTip("Only show QSOs on this band on the map.")
+        _stored_band_filter = settings.value("qso_map_band_filter", "") or None
+        if _stored_band_filter is not None:
+            index = self.qso_band_filter_combo.findData(_stored_band_filter)
+            if index != -1:
+                self.qso_band_filter_combo.setCurrentIndex(index)
+        self.qso_band_filter_combo.currentIndexChanged.connect(self._on_qso_band_filter_changed)
+
         # ---- Connected radios ----
         self.connect_radio_button = QPushButton("Connect New Radio...")
         self.connect_radio_button.setToolTip(
@@ -618,6 +637,7 @@ class HamClockWindow(QWidget):
         map_buttons_row = QHBoxLayout()
         map_buttons_row.addWidget(self.satellite_button)
         map_buttons_row.addWidget(self.qso_map_button)
+        map_buttons_row.addWidget(self.qso_band_filter_combo)
         map_buttons_row.addStretch()
 
         solar_row = QHBoxLayout()
@@ -773,13 +793,28 @@ class HamClockWindow(QWidget):
         if self.qso_map_button.isChecked():
             self.map_widget.set_qso_markers(self._build_qso_markers())
 
+    def _on_qso_band_filter_changed(self, _index):
+        band = self.qso_band_filter_combo.currentData()
+        QSettings("IcomRadioApp", "RadioControl").setValue("qso_map_band_filter", band or "")
+        if self.qso_map_button.isChecked():
+            self.map_widget.set_qso_markers(self._build_qso_markers())
+
     def _build_qso_markers(self):
         """Newest self._qso_map_count logged QSOs (None = all) that have
         a parseable Grid Square -- same newest-first sort key as
         log_book_window.py's default. QSOs with no/invalid grid square
         are silently skipped (nothing to plot them at) rather than
-        guessed."""
+        guessed.
+
+        Filtered to the band picked in qso_band_filter_combo (None =
+        "All Bands", no filtering) BEFORE slicing to _qso_map_count --
+        so e.g. picking "20m" and a count of 50 shows the 50 most
+        recent 20m QSOs specifically, not the 50 most recent QSOs
+        overall with only a handful happening to be 20m."""
+        band_filter = self.qso_band_filter_combo.currentData()
         qsos = qso_log.load_qso_log()
+        if band_filter is not None:
+            qsos = [qso for qso in qsos if qso.get("BAND") == band_filter]
         qsos.sort(key=lambda qso: (qso.get("QSO_DATE", ""), qso.get("TIME_ON", "")), reverse=True)
         if self._qso_map_count is not None:
             qsos = qsos[:self._qso_map_count]

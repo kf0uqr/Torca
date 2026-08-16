@@ -330,6 +330,8 @@ class RigctldDialog(QDialog):
 # every second by simple subtraction from the cached absolute times
 # (see _update_passes_countdowns), piggybacked on the existing clock
 # timer rather than a separate one.
+PASSES_REFRESH_INTERVAL_MS = 5 * 60 * 1000
+
 # (label, seconds) -- offered in PskReporterSettingsDialog's lookback
 # combo. Capped at pskreporter.MAX_LOOKBACK_SECONDS (24h), which is
 # PSKReporter's own documented hard limit on flowStartSeconds.
@@ -1035,10 +1037,17 @@ class HamClockWindow(QWidget):
         self._satellite_timer.timeout.connect(self._update_satellite_positions)
 
         # The actual pass search only reruns on this much coarser timer
-        # (also only while satellite mode is on) -- see the module
-        # comment on PASSES_REFRESH_INTERVAL_MS for why.
+        # -- see the module comment on PASSES_REFRESH_INTERVAL_MS for
+        # why. Per explicit instruction, independent of the Satellites
+        # map-overlay toggle -- loads immediately at startup and keeps
+        # itself fresh the whole session regardless of whether that
+        # button is ever turned on, rather than only starting once the
+        # operator clicks it (_on_satellite_toggled no longer touches
+        # this timer at all).
         self._passes_timer = QTimer(self)
         self._passes_timer.timeout.connect(self._refresh_upcoming_passes)
+        self._refresh_upcoming_passes()
+        self._passes_timer.start(PASSES_REFRESH_INTERVAL_MS)
 
         self.solar_worker = SolarDataWorker()
         self.solar_worker.data_updated.connect(self._on_solar_data)
@@ -1104,11 +1113,8 @@ class HamClockWindow(QWidget):
         if checked:
             self._update_satellite_positions()
             self._satellite_timer.start(5000)
-            self._refresh_upcoming_passes()
-            self._passes_timer.start(PASSES_REFRESH_INTERVAL_MS)
         else:
             self._satellite_timer.stop()
-            self._passes_timer.stop()
 
     def _on_satellite_config_requested(self, _pos):
         def persist(satellites):
@@ -1126,9 +1132,13 @@ class HamClockWindow(QWidget):
         )
         if dialog.exec() == QDialog.Accepted:
             persist(dialog.result_satellites())
+            # Upcoming Passes is independent of the Satellites map-
+            # overlay toggle now, so this always refreshes it -- only
+            # the map's own marker positions stay gated behind that
+            # button (no point updating them while the overlay is off).
+            self._refresh_upcoming_passes()
             if self.satellite_button.isChecked():
                 self._update_satellite_positions()
-                self._refresh_upcoming_passes()  # the selected/TLE list may have changed
 
     def _on_qso_map_toggled(self, checked):
         self.qso_map_button.setText("QSO Map: ON" if checked else "QSO Map: OFF")

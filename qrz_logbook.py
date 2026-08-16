@@ -112,12 +112,16 @@ def qrz_fetch(api_key: str, option: str = "ALL") -> list:
 
 
 def qrz_status(api_key: str) -> dict:
-    """Returns logbook metadata as a plain dict -- QRZ's own
-    DATA=name=value&... sub-string, itself further parsed the same
-    way as the outer response. Raises QrzApiError on RESULT=FAIL."""
+    """Returns logbook metadata as a plain dict. Confirmed live against
+    a real account that QRZ's actual STATUS response is flat --
+    COUNT/CONFIRMED/BOOK_NAME/OWNER/CALLSIGN/START_DATE/END_DATE/
+    BOOKID/DXCC_COUNT etc. sit directly at the top level alongside
+    RESULT/ACTION, not nested inside a separate DATA=name=value&...
+    sub-string as an earlier reading of QRZ's docs assumed (that
+    version always returned {} -- RESULT=OK, but no DATA key to dig
+    into at all). Raises QrzApiError on RESULT=FAIL."""
     parsed = _qrz_request(api_key, "STATUS")
     result = parsed.get("RESULT")
     if result != "OK":
         raise QrzApiError(parsed.get("REASON") or f"QRZ STATUS failed (RESULT={result!r})")
-    data_text = parsed.get("DATA", "")
-    return {key.upper(): value for key, value in urllib.parse.parse_qsl(data_text, keep_blank_values=True)}
+    return parsed

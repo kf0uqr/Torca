@@ -272,6 +272,14 @@ class AudioBridge:
         # WSJT-X-decoding-Sub and normal-listening-mix without having
         # to restart it.
         self._rx_downmix_channel = rx_downmix_channel
+        # Any trailing bytes from the last RX chunk that didn't form a
+        # complete L/R sample pair (2ch x 2 bytes = 4 bytes/pair) --
+        # carried over and prepended to the next chunk rather than
+        # dropped, so a chunk-size that isn't always a clean multiple of
+        # 4 doesn't silently lose/misalign samples on every single
+        # chunk boundary (which would show up as sustained
+        # garbling/distortion, not just an occasional click).
+        self._rx_stereo_remainder = b""
 
         self.sample_rate = getattr(radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
         self._pcm_ok = self._check_pcm_codec()
@@ -509,9 +517,13 @@ class AudioBridge:
         rigplane's own dispatch code -- a TypeError there could easily
         be swallowed silently, which looks identical to "no audio
         arriving" from the outside."""
-        data = self._extract_pcm_bytes(packet)
+        raw_data = self._extract_pcm_bytes(packet)
+        data = raw_data
         if data is not None and self._rx_stereo:
-            data = _downmix_stereo_to_mono(data, channel=self._rx_downmix_channel)
+            combined = self._rx_stereo_remainder + data
+            usable = len(combined) - (len(combined) % 4)
+            self._rx_stereo_remainder = combined[usable:]
+            data = _downmix_stereo_to_mono(combined[:usable], channel=self._rx_downmix_channel)
         if data is None:
             # packet=None is a genuine, expected case (a jitter-buffer
             # gap placeholder -- confirmed via AudioPacket's own docs),
@@ -529,7 +541,21 @@ class AudioBridge:
                 )
             return
         if self._rx_chunk_count == 0:
-            self._status(f"RX audio: first chunk received ({len(data)} bytes).")
+            detail = ""
+            if self._rx_stereo:
+                # Diagnostic for the muffled/garbled-Sub-audio
+                # investigation: a raw chunk length that ISN'T a clean
+                # multiple of 4 bytes (2ch x 2 bytes/sample) would mean
+                # an incomplete trailing L/R pair gets silently dropped
+                # every single chunk by _downmix_stereo_to_mono (it
+                # doesn't carry remainder bytes over to the next chunk)
+                # -- worth ruling in/out directly rather than guessing.
+                detail = (
+                    f", raw stereo chunk {len(raw_data)} bytes "
+                    f"({'clean' if len(raw_data) % 4 == 0 else 'NOT a multiple of 4 -- see comment'}), "
+                    f"downmix channel {self._rx_downmix_channel!r}, sample_rate {self.sample_rate}"
+                )
+            self._status(f"RX audio: first chunk received ({len(data)} bytes{detail}).")
         self._rx_chunk_count += 1
         try:
             self._rx_queue.put_nowait(data)

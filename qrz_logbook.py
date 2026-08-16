@@ -8,7 +8,11 @@ library dependency, raises on failure, callers catch and report.
 Every request is POST https://logbook.qrz.com/api with URL-encoded
 KEY=<api key>&ACTION=<INSERT|DELETE|FETCH|STATUS> plus action-specific
 parameters. The response body is itself URL-encoded name=value pairs
-(NOT JSON) -- parsed with urllib.parse.parse_qsl.
+(NOT JSON) -- parsed with urllib.parse.parse_qsl for every action
+EXCEPT FETCH, whose ADIF= value contains literal, non-percent-encoded
+'&' characters that break parse_qsl outright -- see
+_split_qrz_fetch_response's docstring, confirmed against a real
+account's response.
 """
 
 import html
@@ -42,7 +46,11 @@ def _parse_qrz_response(text: str) -> dict:
     return {key.upper(): value for key, value in urllib.parse.parse_qsl(text, keep_blank_values=True)}
 
 
-def _qrz_request(api_key: str, action: str, **params) -> dict:
+def _qrz_raw_request(api_key: str, action: str, **params) -> str:
+    """The raw response TEXT, before any &-delimited parsing -- FETCH
+    needs this directly (see _split_qrz_fetch_response) rather than
+    going through _parse_qrz_response, which corrupts a FETCH
+    response's ADIF value (see that function's docstring)."""
     data = {"KEY": api_key, "ACTION": action, **params}
     request = urllib.request.Request(
         QRZ_LOGBOOK_API_URL,
@@ -59,7 +67,38 @@ def _qrz_request(api_key: str, action: str, **params) -> dict:
     # blind miss. Truncated defensively in case a FETCH response is
     # large (a full-logbook ADIF dump).
     print(f"[QRZ API] {action} raw response ({len(text)} bytes): {text[:2000]!r}")
-    return _parse_qrz_response(text)
+    return text
+
+
+def _qrz_request(api_key: str, action: str, **params) -> dict:
+    return _parse_qrz_response(_qrz_raw_request(api_key, action, **params))
+
+
+def _split_qrz_fetch_response(text: str):
+    """Returns (parsed_head_dict, raw_adif_value) for a FETCH response.
+
+    Confirmed live against a real account: QRZ's FETCH response embeds
+    the ADIF payload with LITERAL, non-percent-encoded '&' characters
+    (from its own &lt;/&gt; HTML-escaping of every ADIF tag -- see
+    qrz_fetch), which breaks urllib.parse.parse_qsl's normal &-
+    delimited splitting completely -- parse_qsl("RESULT=OK&COUNT=2438
+    &ADIF=&lt;call:5&gt;N7PHY...") reads the ADIF value as EMPTY and
+    then produces several more bogus, meaningless key=value pairs from
+    the fragments after each stray '&' (confirmed: this, not the
+    later html.unescape gap, was the actual reason FETCH always
+    returned 0 records even after that fix landed).
+
+    ADIF is always the LAST field in every real response seen -- this
+    finds the literal "ADIF=" marker once and treats everything after
+    it as the raw ADIF value, completely unparsed/unsplit; only the
+    (short, safely &-delimited) portion before that marker goes
+    through the normal parser."""
+    marker = "ADIF="
+    index = text.find(marker)
+    if index == -1:
+        return _parse_qrz_response(text), ""
+    head = text[:index].rstrip("&")
+    return _parse_qrz_response(head), text[index + len(marker):]
 
 
 def qrz_insert(api_key: str, adif_record: str, replace: bool = False) -> dict:
@@ -102,20 +141,16 @@ def qrz_fetch(api_key: str, option: str = "ALL") -> list:
     dicts (via adif.parse_adif_records), each carrying QRZ's own
     per-record LOGID under APP_QRZLOG_LOGID -- confirmed live against
     a real account. Raises QrzApiError on RESULT=FAIL."""
-    parsed = _qrz_request(api_key, "FETCH", OPTION=option)
+    text = _qrz_raw_request(api_key, "FETCH", OPTION=option)
+    parsed, adif_text = _split_qrz_fetch_response(text)
     result = parsed.get("RESULT")
     if result != "OK":
         raise QrzApiError(parsed.get("REASON") or f"QRZ FETCH failed (RESULT={result!r})")
-    adif_text = parsed.get("ADIF", "")
     if not adif_text:
         return []
     # Confirmed live: QRZ HTML-entity-escapes the ADIF payload inside
-    # its response (&lt;/&gt; instead of literal </>), even though the
-    # whole response is already URL-encoded separately -- unescape
-    # first or every ADIF tag just looks like plain text and nothing
-    # parses (this was the actual cause of FETCH always returning 0
-    # records, not the ALL/MAX or AFTERLOGID:0 request-format guesses
-    # tried earlier).
+    # its response (&lt;/&gt; instead of literal </>) -- unescape
+    # before parsing or every ADIF tag just looks like plain text.
     adif_text = html.unescape(adif_text)
     return adif.parse_adif_records(adif_text)
 

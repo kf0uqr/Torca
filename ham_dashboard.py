@@ -64,6 +64,8 @@ from connection_dialog import ConnectionDialog
 from main_window import RadioWindow
 from satellite_session import SatelliteSession
 from log_book_window import LogBookWindow
+import adif
+import qso_log
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from audio import (
     pactl_available,
@@ -440,6 +442,28 @@ class HamClockWindow(QWidget):
         self.satellite_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.satellite_button.customContextMenuRequested.connect(self._on_satellite_config_requested)
 
+        # ---- QSO map overlay ----
+        # How many of the most recent logged QSOs to plot -- persisted
+        # across restarts (same QSettings group/key convention as every
+        # other saved preference in this app), same shape as the
+        # satellite button: click toggles the overlay on/off, right-
+        # click picks the count.
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        _stored_qso_map_count = settings.value("qso_map_count", 25, type=int)
+        self._qso_map_count = None if _stored_qso_map_count == -1 else _stored_qso_map_count
+        self.qso_map_button = QPushButton("QSO Map: OFF")
+        self.qso_map_button.setCheckable(True)
+        self.qso_map_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.qso_map_button.setToolTip(
+            "Toggle showing your most recent logged QSOs' locations on the "
+            "map (from each QSO's Grid Square). Right-click to choose how many."
+        )
+        self.qso_map_button.toggled.connect(self._on_qso_map_toggled)
+        self.qso_map_button.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.qso_map_button.customContextMenuRequested.connect(self._on_qso_map_menu_requested)
+
         # ---- Connected radios ----
         self.connect_radio_button = QPushButton("Connect New Radio...")
         self.connect_radio_button.setToolTip(
@@ -590,6 +614,7 @@ class HamClockWindow(QWidget):
         clocks_row.addWidget(self.utc_label)
         clocks_row.addWidget(self.local_label)
         clocks_row.addWidget(self.satellite_button)
+        clocks_row.addWidget(self.qso_map_button)
 
         solar_row = QHBoxLayout()
         solar_row.addWidget(self.sfi_label)
@@ -609,16 +634,17 @@ class HamClockWindow(QWidget):
         bottom_row.addLayout(upcoming_passes_column)
 
         layout = QVBoxLayout()
-        # No stretch factor -- the map claims only what its own
-        # (letterboxed, aspect-correct) heightForWidth calls for, rather
-        # than greedily taking all extra vertical space in the window
-        # (which is what a stretch factor of 1 here used to do, and the
-        # only thing keeping the map from severely distorting once
-        # HamClockWindow started occupying a tall/narrow half-screen
-        # region). Leaves more room below for the clocks/solar/band-
+        # clocks_row above the map (moved per explicit instruction), map
+        # itself still with no stretch factor -- it claims only what its
+        # own (letterboxed, aspect-correct) heightForWidth calls for,
+        # rather than greedily taking all extra vertical space in the
+        # window (which is what a stretch factor of 1 here used to do,
+        # and the only thing keeping the map from severely distorting
+        # once HamClockWindow started occupying a tall/narrow half-
+        # screen region). Leaves more room below for the solar/band-
         # conditions/passes rows -- and for whatever gets added there later.
-        layout.addWidget(self.map_widget)
         layout.addLayout(clocks_row)
+        layout.addWidget(self.map_widget)
         layout.addLayout(connected_radios_column)
         layout.addLayout(tracking_row)
         layout.addWidget(self.satellite_overlay_label)
@@ -718,6 +744,58 @@ class HamClockWindow(QWidget):
             if self.satellite_button.isChecked():
                 self._update_satellite_positions()
                 self._refresh_upcoming_passes()  # the selected/TLE list may have changed
+
+    def _on_qso_map_toggled(self, checked):
+        self.qso_map_button.setText("QSO Map: ON" if checked else "QSO Map: OFF")
+        self.map_widget.set_qso_markers(self._build_qso_markers() if checked else [])
+
+    def _on_qso_map_menu_requested(self, _pos):
+        menu = QMenu(self)
+        for count in (10, 25, 50, 100, None):  # None = "All"
+            label = "All" if count is None else str(count)
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(count == self._qso_map_count)
+            action.triggered.connect(lambda _checked=False, c=count: self._on_qso_map_count_selected(c))
+        menu.exec(self.qso_map_button.mapToGlobal(_pos))
+
+    def _on_qso_map_count_selected(self, count):
+        self._qso_map_count = count
+        QSettings("IcomRadioApp", "RadioControl").setValue(
+            "qso_map_count", -1 if count is None else count
+        )
+        if self.qso_map_button.isChecked():
+            self.map_widget.set_qso_markers(self._build_qso_markers())
+
+    def _build_qso_markers(self):
+        """Newest self._qso_map_count logged QSOs (None = all) that have
+        a parseable Grid Square -- same newest-first sort key as
+        log_book_window.py's default. QSOs with no/invalid grid square
+        are silently skipped (nothing to plot them at) rather than
+        guessed."""
+        qsos = qso_log.load_qso_log()
+        qsos.sort(key=lambda qso: (qso.get("QSO_DATE", ""), qso.get("TIME_ON", "")), reverse=True)
+        if self._qso_map_count is not None:
+            qsos = qsos[:self._qso_map_count]
+        markers = []
+        for qso in qsos:
+            latlon = adif.grid_square_to_latlon(qso.get("GRIDSQUARE"))
+            if latlon is None:
+                continue
+            lat, lon = latlon
+            date = qso.get("QSO_DATE", "")
+            time_on = qso.get("TIME_ON", "")
+            if len(date) == 8 and len(time_on) >= 4:
+                time_label = f"{date[0:4]}-{date[4:6]}-{date[6:8]} {time_on[0:2]}:{time_on[2:4]} UTC"
+            else:
+                time_label = time_on or date or "?"
+            markers.append({
+                "lat": lat, "lon": lon,
+                "band": qso.get("BAND") or "?",
+                "time": time_label,
+                "callsign": qso.get("CALL") or "?",
+            })
+        return markers
 
     def _update_satellite_positions(self):
         now = datetime.datetime.now(datetime.timezone.utc)

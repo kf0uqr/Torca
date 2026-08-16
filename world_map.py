@@ -15,7 +15,7 @@ import urllib.request
 
 from PySide6.QtCore import Qt, QRect, QRectF, QPointF, Signal, QThread, QTimer
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF, QImage, QFont
-from PySide6.QtWidgets import QWidget, QSizePolicy
+from PySide6.QtWidgets import QWidget, QSizePolicy, QToolTip
 
 from solar_data import _solar_subpoint, _solar_elevation
 
@@ -114,6 +114,10 @@ class WorldMapWidget(QWidget):
         self._background_image = None  # QImage, once loaded (or None -- falls back to a plain fill)
         self._satellite_mode = False
         self._satellite_positions = []  # list of {"name", "lat", "lon", "altitude_km", "footprint"}
+        self._qso_markers = []  # list of {"lat", "lon", "band", "time", "callsign"} -- see set_qso_markers
+        # Hover tooltip needs mouseMoveEvent to fire without a button
+        # held down -- off by default on a plain QWidget.
+        self.setMouseTracking(True)
 
         # Animated arrow along each shown ground track (sat["path"]),
         # indicating direction of travel -- a single shared progress
@@ -269,6 +273,13 @@ class WorldMapWidget(QWidget):
             for sat in self._satellite_positions:
                 self._draw_satellite_marker(painter, sat, w, h)
 
+        if self._qso_markers:
+            painter.setPen(QPen(QColor(15, 15, 20), 1))
+            painter.setBrush(QColor(80, 230, 130))
+            for qso in self._qso_markers:
+                x, y = self._lonlat_to_xy(qso["lat"], qso["lon"], w, h)
+                painter.drawEllipse(QPointF(x, y), 3.5, 3.5)
+
         painter.restore()
 
     def set_satellite_mode(self, enabled):
@@ -278,6 +289,50 @@ class WorldMapWidget(QWidget):
     def set_satellite_positions(self, positions):
         self._satellite_positions = positions
         self.update()
+
+    def set_qso_markers(self, markers):
+        """markers: list of {"lat", "lon", "band", "time", "callsign"}
+        -- ham_dashboard.py's QSO map button, converted from the log's
+        stored grid squares (adif.grid_square_to_latlon). Empty list
+        (the button's own OFF state) just stops drawing/hit-testing
+        them, same shape as set_satellite_positions([])."""
+        self._qso_markers = markers
+        self.update()
+
+    # Pixel radius around a QSO marker that still counts as a hover/
+    # click hit -- markers are drawn at a 3.5px radius (see paintEvent),
+    # matching the same slack-for-imprecision reasoning as satellite
+    # markers' own _SATELLITE_HIT_RADIUS_PX.
+    _QSO_HIT_RADIUS_PX = 8
+
+    def _qso_marker_at(self, widget_pos):
+        """Returns whichever QSO marker dict is under widget_pos
+        (within _QSO_HIT_RADIUS_PX), or None -- same shared hit-test
+        shape as _satellite_at, used by both the hover and click
+        tooltip paths below."""
+        if not self._qso_markers:
+            return None
+        map_rect = self._map_rect()
+        pos = widget_pos - map_rect.topLeft()
+        w, h = map_rect.width(), map_rect.height()
+        closest, closest_dist = None, None
+        for qso in self._qso_markers:
+            x, y = self._lonlat_to_xy(qso["lat"], qso["lon"], w, h)
+            dist = math.hypot(x - pos.x(), y - pos.y())
+            if dist <= self._QSO_HIT_RADIUS_PX and (closest_dist is None or dist < closest_dist):
+                closest, closest_dist = qso, dist
+        return closest
+
+    @staticmethod
+    def _qso_tooltip_text(qso):
+        return f"{qso.get('callsign', '?')}\n{qso.get('band', '?')}\n{qso.get('time', '?')}"
+
+    def mouseMoveEvent(self, event):
+        qso = self._qso_marker_at(event.position())
+        if qso is not None:
+            QToolTip.showText(event.globalPosition().toPoint(), self._qso_tooltip_text(qso), self)
+        else:
+            QToolTip.hideText()
 
     # Pixel radius around a satellite's marker that still counts as a hit
     # -- markers are drawn at a 4px radius (see _draw_satellite_marker),
@@ -314,6 +369,14 @@ class WorldMapWidget(QWidget):
             self.satellite_double_clicked.emit(closest_name)
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            qso = self._qso_marker_at(event.position())
+            if qso is not None:
+                # Click shows the same tooltip hovering already would --
+                # explicitly asked for as an alternative to hovering, not
+                # just a side effect of it.
+                QToolTip.showText(event.globalPosition().toPoint(), self._qso_tooltip_text(qso), self)
+                return
         closest_name = self._satellite_at(event.position())
         if closest_name is None:
             return

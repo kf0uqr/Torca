@@ -193,3 +193,39 @@ def band_for_freq_hz(freq_hz) -> str:
         if low_hz <= freq_hz <= high_hz:
             return label
     return None
+
+
+def grid_square_to_latlon(grid: str):
+    """Converts a Maidenhead grid locator (ADIF GRIDSQUARE, e.g. "EM12"
+    or "EM12ab") to (lat, lon) at the CENTER of the cell it identifies
+    -- the standard field/square/subsquare encoding (2 letters: 20deg
+    lon x 10deg lat field; +2 digits: 2deg lon x 1deg lat square; +2
+    more letters: 5min lon x 2.5min lat subsquare). Returns None for
+    anything shorter than 4 characters or that doesn't parse as a valid
+    locator -- callers should skip that QSO rather than guess/plot it
+    at 0,0. Used by ham_dashboard.py's QSO map overlay, the only
+    consumer of location data this log format actually has (no raw
+    lat/lon field is logged per-QSO)."""
+    if not grid:
+        return None
+    grid = grid.strip().upper()
+    if len(grid) < 4:
+        return None
+    try:
+        lon = (ord(grid[0]) - ord("A")) * 20 - 180
+        lat = (ord(grid[1]) - ord("A")) * 10 - 90
+        lon += int(grid[2]) * 2
+        lat += int(grid[3]) * 1
+        if len(grid) >= 6 and grid[4].isalpha() and grid[5].isalpha():
+            lon += (ord(grid[4]) - ord("A")) * (2 / 24)
+            lat += (ord(grid[5]) - ord("A")) * (1 / 24)
+            lon += (2 / 24) / 2
+            lat += (1 / 24) / 2
+        else:
+            lon += 1.0
+            lat += 0.5
+        if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+            return None
+        return lat, lon
+    except (ValueError, IndexError):
+        return None

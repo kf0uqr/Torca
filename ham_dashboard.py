@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QInputDialog,
     QLineEdit,
+    QTabWidget,
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
@@ -72,6 +73,8 @@ import adif
 import qso_log
 import pskreporter
 import pota
+import contests
+import dxcluster
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from wsjtx_udp import WsjtxUdpListener, WSJTX_DEFAULT_PORT
 from audio import (
@@ -386,6 +389,24 @@ class PotaWorker(QThread):
         self.spots_ready.emit(spots)
 
 
+class ContestsWorker(QThread):
+    """One-shot fetch off the GUI thread, same shape as PotaWorker --
+    the contest calendar feed is ~5MB (years of history, see
+    contests.py), so this genuinely matters for keeping the GUI thread
+    responsive, not just consistency with the other overlay workers."""
+
+    events_ready = Signal(list)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            events = contests.fetch_contests()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.events_ready.emit(events)
+
+
 class PskReporterSettingsDialog(QDialog):
     """Right-click the PSKReporter button to open this: your callsign
     (every PSKReporter query is scoped to just this one -- editable
@@ -510,15 +531,120 @@ class HamClockWindow(QWidget):
         self.band_conditions_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.band_conditions_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.band_conditions_table.setSelectionMode(QTableWidget.NoSelection)
-        self.band_conditions_table.setFixedHeight(
-            self.band_conditions_table.horizontalHeader().height()
-            + len(BAND_CONDITION_RANGES) * 28 + 4
-        )
+        # No setFixedHeight here any more -- this now lives inside
+        # band_data_tabs (below), which owns the overall fixed height
+        # for the whole tabbed area so every tab (this one, Contests,
+        # DX Spots, and whatever's added later) shares one consistent
+        # size regardless of which is active.
         for row in range(len(BAND_CONDITION_RANGES)):
             for col in range(2):
                 item = QTableWidgetItem("--")
                 item.setTextAlignment(Qt.AlignCenter)
                 self.band_conditions_table.setItem(row, col, item)
+
+        # ---- Contests tab ----
+        # Auto-fetched once at startup (see the end of __init__, same
+        # "just load it, no explicit opt-in toggle" treatment as Solar
+        # Data) -- this is read-only reference data, not a live overlay
+        # or a persistent connection sending anything to a third party,
+        # so it doesn't need the same explicit-action gating as the
+        # map's PSKReporter/POTA buttons or the DX Spots tab below.
+        self._contests_cache = []  # every event fetched (years of history) -- see _build_contest_rows
+        self._contests_worker = None
+        self.contests_table = QTableWidget(0, 3)
+        self.contests_table.setHorizontalHeaderLabels(["Contest", "Start (UTC)", "End (UTC)"])
+        self.contests_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.contests_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.contests_table.setSelectionMode(QTableWidget.NoSelection)
+        self.contests_table.verticalHeader().setVisible(False)
+        self.contests_status_label = QLabel("Loading contest calendar...")
+        self.contests_status_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.contests_refresh_button = QPushButton("Refresh")
+        self.contests_refresh_button.clicked.connect(self._start_contests_fetch)
+        contests_header_row = QHBoxLayout()
+        contests_header_row.addWidget(self.contests_status_label, 1)
+        contests_header_row.addWidget(self.contests_refresh_button)
+        contests_tab = QWidget()
+        contests_tab_layout = QVBoxLayout()
+        contests_tab_layout.setContentsMargins(4, 4, 4, 4)
+        contests_tab_layout.addLayout(contests_header_row)
+        contests_tab_layout.addWidget(self.contests_table)
+        contests_tab.setLayout(contests_tab_layout)
+
+        # ---- DX Spots tab ----
+        # Unlike Contests, this is a PERSISTENT connection that sends
+        # the operator's own callsign to a third-party server the
+        # moment it connects -- explicit opt-in (Connect button),
+        # never auto-started, same reasoning as every other network-
+        # connecting feature in this app (rigctld, Virtual Cables,
+        # WSJT-X Auto-Log, PSKReporter, POTA).
+        self._dx_cluster_client = None
+        # Local QSettings instance here rather than the shared
+        # `settings` variable used further down in __init__ (e.g. by
+        # the QSO map/PSKReporter setup) -- this block runs earlier in
+        # construction, before that variable exists yet.
+        _dx_settings = QSettings("IcomRadioApp", "RadioControl")
+        self.dx_host_input = QLineEdit(
+            _dx_settings.value("dx_cluster_host", dxcluster.DEFAULT_HOST)
+        )
+        self.dx_host_input.setToolTip(
+            "Any AK1A-compatible DX cluster server -- there's no single "
+            "\"correct\" one; different servers carry different mixes of "
+            "automated skimmer spots vs. human-submitted ones."
+        )
+        self.dx_port_input = QLineEdit(
+            str(_dx_settings.value("dx_cluster_port", dxcluster.DEFAULT_PORT))
+        )
+        self.dx_port_input.setFixedWidth(60)
+        self.dx_connect_button = QPushButton("Connect")
+        self.dx_connect_button.setCheckable(True)
+        self.dx_connect_button.toggled.connect(self._on_dx_connect_toggled)
+        self.dx_status_label = QLabel("Disconnected")
+        self.dx_status_label.setStyleSheet("color: #888; font-size: 11px;")
+        dx_controls_row = QHBoxLayout()
+        dx_controls_row.addWidget(QLabel("Host:"))
+        dx_controls_row.addWidget(self.dx_host_input, 1)
+        dx_controls_row.addWidget(QLabel("Port:"))
+        dx_controls_row.addWidget(self.dx_port_input)
+        dx_controls_row.addWidget(self.dx_connect_button)
+        self.dx_spots_table = QTableWidget(0, 6)
+        self.dx_spots_table.setHorizontalHeaderLabels(["Time", "Band", "Freq (MHz)", "DX Call", "Spotter", "Comment"])
+        self.dx_spots_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.dx_spots_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.dx_spots_table.setSelectionMode(QTableWidget.NoSelection)
+        self.dx_spots_table.verticalHeader().setVisible(False)
+        dx_spots_tab = QWidget()
+        dx_spots_tab_layout = QVBoxLayout()
+        dx_spots_tab_layout.setContentsMargins(4, 4, 4, 4)
+        dx_spots_tab_layout.addLayout(dx_controls_row)
+        dx_spots_tab_layout.addWidget(self.dx_status_label)
+        dx_spots_tab_layout.addWidget(self.dx_spots_table)
+        dx_spots_tab.setLayout(dx_spots_tab_layout)
+
+        # ---- Tabbed container -- per explicit instruction, replaces
+        # the old single-purpose "HF Band Conditions" area with a
+        # general one that can hold whatever other data sets get added
+        # later (Contests and DX Spots today, more later). Fixed height
+        # roughly matching upcoming_passes_table's own so the row this
+        # sits in (see bottom_row, below) stays visually balanced
+        # regardless of which tab is active.
+        self.band_data_tabs = QTabWidget()
+        self.band_data_tabs.addTab(self.band_conditions_table, "Band Conditions")
+        self.band_data_tabs.addTab(contests_tab, "Contests")
+        self.band_data_tabs.addTab(dx_spots_tab, "DX Spots")
+        # upcoming_passes_table (built further down in __init__, same
+        # row as this) isn't constructed yet at this point, so this
+        # doesn't reference it -- just uses the same row-count/height
+        # shape its own fixed-height calculation does (PASSES_
+        # DISPLAY_COUNT rows worth), plus room for the tab bar itself
+        # and the extra host/port/connect controls row the DX Spots
+        # tab has that the other two don't.
+        self.band_data_tabs.setFixedHeight(
+            self.band_conditions_table.horizontalHeader().height()
+            + self.PASSES_DISPLAY_COUNT * 24 + 4  # table content, matching upcoming_passes_table's own row count
+            + 34   # tab bar
+            + 44   # DX Spots tab's extra controls/status rows
+        )
 
         # Upcoming passes: the next PASSES_DISPLAY_COUNT AOS/LOS windows
         # across every satellite currently checked to display on the map
@@ -843,16 +969,12 @@ class HamClockWindow(QWidget):
         solar_row.addWidget(self.ssn_label)
         solar_row.addWidget(self.k_index_label)
 
-        band_conditions_column = QVBoxLayout()
-        band_conditions_column.addWidget(QLabel("HF Band Conditions:"))
-        band_conditions_column.addWidget(self.band_conditions_table)
-
         upcoming_passes_column = QVBoxLayout()
         upcoming_passes_column.addWidget(QLabel("Upcoming Satellite Passes:"))
         upcoming_passes_column.addWidget(self.upcoming_passes_table)
 
         bottom_row = QHBoxLayout()
-        bottom_row.addLayout(band_conditions_column)
+        bottom_row.addWidget(self.band_data_tabs)
         bottom_row.addLayout(upcoming_passes_column)
 
         layout = QVBoxLayout()
@@ -910,6 +1032,11 @@ class HamClockWindow(QWidget):
         self.solar_worker = SolarDataWorker()
         self.solar_worker.data_updated.connect(self._on_solar_data)
         self.solar_worker.start()
+
+        # Contests tab: loaded once at startup, same as Solar Data
+        # above -- read-only reference data, no explicit opt-in needed
+        # (unlike DX Spots' persistent connection).
+        self._start_contests_fetch()
 
     def _ensure_operator_callsign(self):
         """Prompts for the operator's own callsign immediately on first
@@ -1247,6 +1374,111 @@ class HamClockWindow(QWidget):
             lines.append(f"Comment: {spot['comments']}")
         lines.append(f"Spotted by: {spot.get('spotter', '?')}")
         return "\n".join(lines)
+
+    def _start_contests_fetch(self):
+        if self._contests_worker is not None and self._contests_worker.isRunning():
+            return  # a fetch is already in flight -- let it finish
+        self.contests_status_label.setText("Loading contest calendar...")
+        worker = ContestsWorker(self)
+        worker.events_ready.connect(self._on_contests_ready)
+        worker.failed.connect(self._on_contests_failed)
+        self._contests_worker = worker
+        worker.start()
+
+    def _on_contests_ready(self, events):
+        self._contests_cache = events
+        self._rebuild_contests_table()
+
+    def _on_contests_failed(self, message):
+        self.contests_status_label.setText(f"Couldn't load contest calendar: {message}")
+
+    def _rebuild_contests_table(self):
+        """Keeps only contests still in progress or yet to start
+        (end time in the future), soonest-starting first -- the fetched
+        feed itself spans years of history (see contests.py), which
+        isn't what "current and upcoming" means here."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        upcoming = sorted(
+            (event for event in self._contests_cache if event["end"] >= now),
+            key=lambda event: event["start"],
+        )
+        self.contests_table.setRowCount(len(upcoming))
+        for row, event in enumerate(upcoming):
+            self.contests_table.setItem(row, 0, QTableWidgetItem(event["name"]))
+            self.contests_table.setItem(row, 1, QTableWidgetItem(event["start"].strftime("%Y-%m-%d %H:%M")))
+            self.contests_table.setItem(row, 2, QTableWidgetItem(event["end"].strftime("%Y-%m-%d %H:%M")))
+        self.contests_status_label.setText(
+            f"{len(upcoming)} current/upcoming contest{'s' if len(upcoming) != 1 else ''}"
+        )
+
+    def _on_dx_connect_toggled(self, checked):
+        if checked:
+            if not self._operator_callsign:
+                self._ensure_operator_callsign()
+                if not self._operator_callsign:
+                    self.dx_connect_button.setChecked(False)
+                    return
+            host = self.dx_host_input.text().strip() or dxcluster.DEFAULT_HOST
+            try:
+                port = int(self.dx_port_input.text().strip())
+            except ValueError:
+                QMessageBox.warning(self, "DX Spots", "Port must be a number.")
+                self.dx_connect_button.setChecked(False)
+                return
+            settings = QSettings("IcomRadioApp", "RadioControl")
+            settings.setValue("dx_cluster_host", host)
+            settings.setValue("dx_cluster_port", port)
+
+            client = dxcluster.DxClusterClient(self._operator_callsign, host, port, self)
+            client.connected.connect(self._on_dx_connected)
+            client.disconnected.connect(self._on_dx_disconnected)
+            client.error.connect(self._on_dx_error)
+            client.spot_received.connect(self._on_dx_spot_received)
+            self._dx_cluster_client = client
+            self.dx_status_label.setText(f"Connecting to {host}:{port}...")
+            self.dx_connect_button.setText("Disconnect")
+            self.dx_host_input.setEnabled(False)
+            self.dx_port_input.setEnabled(False)
+            client.start()
+        else:
+            if self._dx_cluster_client is not None:
+                self._dx_cluster_client.stop()
+                self._dx_cluster_client = None
+            self.dx_status_label.setText("Disconnected")
+            self.dx_connect_button.setText("Connect")
+            self.dx_host_input.setEnabled(True)
+            self.dx_port_input.setEnabled(True)
+
+    def _on_dx_connected(self):
+        self.dx_status_label.setText(f"Connected as {self._operator_callsign}")
+
+    def _on_dx_disconnected(self):
+        # Also fires after an explicit Disconnect click (harmless,
+        # redundant with _on_dx_connect_toggled's own status update
+        # above) as well as an unexpected drop -- only the checked
+        # state actually distinguishes those, and setChecked(False)
+        # here is a no-op if it's already unchecked.
+        self.dx_connect_button.setChecked(False)
+
+    def _on_dx_error(self, message):
+        self.dx_status_label.setText(f"Connection error: {message}")
+
+    # Hard cap on the DX Spots table's row count -- this is a live,
+    # continuously-arriving feed (unlike the map overlays' one-shot
+    # fetches), so without a cap a long session would grow the table
+    # without bound.
+    _DX_SPOTS_MAX_ROWS = 200
+
+    def _on_dx_spot_received(self, spot):
+        self.dx_spots_table.insertRow(0)  # newest at the top
+        self.dx_spots_table.setItem(0, 0, QTableWidgetItem(spot["time"]))
+        self.dx_spots_table.setItem(0, 1, QTableWidgetItem(spot["band"]))
+        self.dx_spots_table.setItem(0, 2, QTableWidgetItem(f"{spot['frequency_hz'] / 1e6:.4f}"))
+        self.dx_spots_table.setItem(0, 3, QTableWidgetItem(spot["dx_call"]))
+        self.dx_spots_table.setItem(0, 4, QTableWidgetItem(spot["spotter"]))
+        self.dx_spots_table.setItem(0, 5, QTableWidgetItem(spot["comment"]))
+        while self.dx_spots_table.rowCount() > self._DX_SPOTS_MAX_ROWS:
+            self.dx_spots_table.removeRow(self.dx_spots_table.rowCount() - 1)
 
     def _update_satellite_positions(self):
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -1940,6 +2172,9 @@ class HamClockWindow(QWidget):
         if self._wsjtx_udp_listener is not None:
             self._wsjtx_udp_listener.stop()
             self._wsjtx_udp_listener = None
+        if self._dx_cluster_client is not None:
+            self._dx_cluster_client.stop()
+            self._dx_cluster_client = None
         for window in list(self._rigctld_servers):
             self._stop_rigctld_for_window(window)
         self._teardown_virtual_cables()  # best-effort; each affected window's own worker.stop() (below) may cut this off before it finishes

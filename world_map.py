@@ -236,6 +236,8 @@ class WorldMapWidget(QWidget):
             for sat in self._satellite_positions:
                 self._draw_satellite_footprint(painter, sat, w, h)
             for sat in self._satellite_positions:
+                self._draw_satellite_path(painter, sat, w, h)
+            for sat in self._satellite_positions:
                 self._draw_satellite_marker(painter, sat, w, h)
 
         painter.restore()
@@ -310,6 +312,37 @@ class WorldMapWidget(QWidget):
             prev_lon = lon
         painter.setPen(QPen(QColor(120, 200, 255, 180), 1, Qt.DashLine))
         painter.setBrush(QColor(120, 200, 255, 30))
+        for segment in segments:
+            if len(segment) < 2:
+                continue
+            path = QPainterPath()
+            x0, y0 = self._lonlat_to_xy(segment[0][0], segment[0][1], w, h)
+            path.moveTo(x0, y0)
+            for lat, lon in segment[1:]:
+                x, y = self._lonlat_to_xy(lat, lon, w, h)
+                path.lineTo(x, y)
+            painter.drawPath(path)
+
+    def _draw_satellite_path(self, painter, sat, w, h):
+        """Draws the satellite's orbit ground track -- opt-in per
+        satellite (see ham_dashboard.py's "Show Orbit Path" right-click
+        toggle), only present in sat["path"] when it's enabled."""
+        points = sat.get("path") or []
+        if len(points) < 2:
+            return
+        # Same antimeridian-crossing segment split as
+        # _draw_satellite_footprint, just for an open polyline instead
+        # of a closed/filled polygon -- otherwise the ground track would
+        # draw a spurious line straight across the map at each crossing.
+        segments = [[]]
+        prev_lon = None
+        for lat, lon in points:
+            if prev_lon is not None and abs(lon - prev_lon) > 180:
+                segments.append([])
+            segments[-1].append((lat, lon))
+            prev_lon = lon
+        painter.setPen(QPen(QColor(255, 140, 0, 160), 1.5, Qt.SolidLine))
+        painter.setBrush(Qt.NoBrush)
         for segment in segments:
             if len(segment) < 2:
                 continue

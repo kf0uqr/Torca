@@ -91,6 +91,7 @@ from satellite_tracking import (
     save_satellite_data,
     propagate_satellite,
     footprint_points,
+    ground_track_points,
     upcoming_passes,
     format_countdown,
     SGP4_AVAILABLE,
@@ -692,13 +693,16 @@ class HamClockWindow(QWidget):
             if result is None:
                 continue
             lat, lon, altitude_km = result
-            positions.append({
+            position = {
                 "name": sat.get("name", "?"),
                 "lat": lat,
                 "lon": lon,
                 "altitude_km": altitude_km,
                 "footprint": footprint_points(lat, lon, altitude_km),
-            })
+            }
+            if sat.get("show_path"):
+                position["path"] = ground_track_points(sat.get("line1", ""), sat.get("line2", ""), now)
+            positions.append(position)
         self.map_widget.set_satellite_positions(positions)
 
     def _refresh_upcoming_passes(self):
@@ -765,17 +769,32 @@ class HamClockWindow(QWidget):
         row = self.upcoming_passes_table.rowAt(pos.y())
         if row < 0 or row >= len(self._upcoming_passes):
             return
+        satellite = next(
+            (sat for sat in self.satellites if sat.get("name") == self._upcoming_passes[row]["name"]), None
+        )
+        if satellite is None:
+            return
         menu = QMenu(self)
         info_action = menu.addAction("Satellite Info...")
+        path_action = menu.addAction("Show Orbit Path")
+        path_action.setCheckable(True)
+        path_action.setChecked(bool(satellite.get("show_path")))
         chosen = menu.exec(self.upcoming_passes_table.viewport().mapToGlobal(pos))
         if chosen is info_action:
-            self._on_satellite_right_clicked(self._upcoming_passes[row]["name"])
+            SatelliteInfoDialog(satellite, self).exec()
+        elif chosen is path_action:
+            self._toggle_satellite_show_path(satellite, path_action.isChecked())
+
+    def _toggle_satellite_show_path(self, satellite, show):
+        satellite["show_path"] = show
+        save_satellite_data(self.satellites)
+        if self.satellite_button.isChecked():
+            self._update_satellite_positions()  # immediate feedback -- the 5s timer would also catch up on its own
 
     def _on_satellite_right_clicked(self, name):
-        """Right-clicked on the map marker, or via the upcoming-passes
-        table's context menu -- opens a read-only info dialog with
-        everything this app has stored on the satellite (TLE, NORAD ID,
-        transponders)."""
+        """Right-clicked on the map marker -- opens a read-only info
+        dialog with everything this app has stored on the satellite
+        (TLE, NORAD ID, transponders)."""
         satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
         if satellite is None:
             return

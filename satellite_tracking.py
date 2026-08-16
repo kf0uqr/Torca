@@ -673,6 +673,42 @@ def footprint_points(lat, lon, altitude_km, num_points=72):
     return points
 
 
+def orbital_period_minutes(line2):
+    """Parses a TLE's mean motion (line 2, standard columns 53-63:
+    revolutions per day) into an orbital period in minutes. Returns
+    None if line2 isn't a valid/parseable TLE line."""
+    try:
+        mean_motion_rev_per_day = float(line2[52:63].strip())
+        if mean_motion_rev_per_day <= 0:
+            return None
+        return 1440.0 / mean_motion_rev_per_day
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def ground_track_points(line1, line2, dt_utc, num_points=72):
+    """Computes the satellite's ground track (lat/lon points, no
+    altitude) over one full orbit centered on dt_utc -- half an orbit
+    before "now" and half an orbit after, the same visual convention
+    as other satellite tracking apps' orbit path line. Returns [] if
+    the orbital period can't be determined (invalid TLE) or sgp4
+    isn't installed."""
+    period_minutes = orbital_period_minutes(line2)
+    if period_minutes is None:
+        return []
+    half_period = period_minutes / 2.0
+    points = []
+    for i in range(num_points + 1):
+        offset_minutes = -half_period + (period_minutes * i / num_points)
+        t = dt_utc + datetime.timedelta(minutes=offset_minutes)
+        result = propagate_satellite(line1, line2, t)
+        if result is None:
+            continue
+        lat, lon, _altitude_km = result
+        points.append((lat, lon))
+    return points
+
+
 # SatNOGS DB (Libre Space Foundation) -- an open, community-maintained
 # database of satellite transmitters/transponders. Confirmed real
 # endpoint and field names from a live fetch of
@@ -1136,11 +1172,22 @@ class SatelliteConfigDialog(QDialog):
         row = self.table.rowAt(pos.y())
         if row < 0 or row >= len(self._satellites):
             return
+        sat = self._satellites[row]
         menu = QMenu(self)
         info_action = menu.addAction("Satellite Info...")
+        path_action = menu.addAction("Show Orbit Path")
+        path_action.setCheckable(True)
+        path_action.setChecked(bool(sat.get("show_path")))
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen is info_action:
-            SatelliteInfoDialog(self._satellites[row], self).exec()
+            SatelliteInfoDialog(sat, self).exec()
+        elif chosen is path_action:
+            # Applies immediately (same as fetch/edit transponders
+            # above) rather than waiting for OK -- it's a map display
+            # toggle with an instantly visible effect, not a form field.
+            sat["show_path"] = path_action.isChecked()
+            if self._on_change:
+                self._on_change(self._satellites)
 
     def _on_accept(self):
         for row, sat in enumerate(self._satellites):

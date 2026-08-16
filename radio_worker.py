@@ -921,13 +921,25 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"{definition['label']}: {set_name}({value!r}) failed ({exc}).")
 
-    def set_receiver_control_value(self, receiver: int, key: str, value):
+    def set_receiver_control_value(self, receiver: int, key: str, value, restore: bool = True):
         """Thread-safe: call from the GUI thread. Like set_control_value,
         but sets `key` on a SPECIFIC receiver regardless of which one is
         currently active -- e.g. setting Main's mode while Sub is the
         active/listening receiver during satellite tracking, which
         set_control_value can't do (it always targets self._active_receiver,
-        i.e. whichever one the operator is currently listening to/tuning)."""
+        i.e. whichever one the operator is currently listening to/tuning).
+
+        restore=False (main_window.py's apply_satellite_mode passes
+        this for Main's uplink mode) skips switching back to whichever
+        receiver was active before -- reported live on a real 9700 that
+        Main's mode change wasn't reliably landing at all with the
+        immediate switch-back in place, the same "temporarily switch to
+        Main, do a thing, switch right back to Sub" shape that turned
+        out to be unreliable for VFO/frequency writes too (see
+        start_ptt_after_vfo's docstring). Sub naturally becomes active
+        again on its own within a couple of seconds regardless, via the
+        RX tick loop's own continuous re-selection -- so there's nothing
+        left needing an explicit, immediate switch-back here."""
         if self.loop is None:
             return
         if key not in self._control_methods:
@@ -936,15 +948,15 @@ class RadioWorker(QThread):
                 "(no working getter+setter was found on connect)."
             )
             return
-        asyncio.run_coroutine_threadsafe(self._set_receiver_control_value(receiver, key, value), self.loop)
+        asyncio.run_coroutine_threadsafe(self._set_receiver_control_value(receiver, key, value, restore), self.loop)
 
-    async def _set_receiver_control_value(self, receiver: int, key: str, value):
+    async def _set_receiver_control_value(self, receiver: int, key: str, value, restore: bool = True):
         """Temporarily selects `receiver` (if it isn't already active),
         sets `key` on it via the same path _set_control_value uses, then
-        restores whichever receiver was active before -- a single bundled
-        coroutine, not three separately-dispatched calls, for the same
-        reason every other multi-step dual-receiver operation in this
-        file is bundled: two independently-scheduled
+        (if restore) restores whichever receiver was active before -- a
+        single bundled coroutine, not three separately-dispatched ones,
+        for the same reason every other multi-step dual-receiver
+        operation in this file is bundled: two independently-scheduled
         run_coroutine_threadsafe() calls don't guarantee real-world
         completion order (see _set_receiver_frequency's docstring for the
         self-perpetuating-oscillation bug this caused the one time it
@@ -963,7 +975,7 @@ class RadioWorker(QThread):
                 self.error.emit(f"Select receiver ({receiver}) for {key} failed: {exc}")
                 return
         await self._set_control_value(key, value)
-        if receiver != previously_active:
+        if restore and receiver != previously_active:
             try:
                 await self.radio.select_receiver(previously_active)
                 self._active_receiver = previously_active

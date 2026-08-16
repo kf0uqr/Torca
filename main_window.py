@@ -764,7 +764,7 @@ class RadioWindow(QWidget):
             if downlink_mode_value is not None:
                 self.worker.set_control_value("mode", downlink_mode_value)
             if uplink_mode_value is not None:
-                self.worker.set_receiver_control_value(RECEIVER_MAIN, "mode", uplink_mode_value)
+                self.worker.set_receiver_control_value(RECEIVER_MAIN, "mode", uplink_mode_value, restore=False)
         elif self._role == "downlink":
             if downlink_mode_value is not None:
                 self.worker.set_control_value("mode", downlink_mode_value)

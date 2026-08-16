@@ -72,6 +72,7 @@ import adif
 import qso_log
 import pskreporter
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
+from wsjtx_udp import WsjtxUdpListener, WSJTX_DEFAULT_PORT
 from audio import (
     pactl_available,
     create_null_sink,
@@ -755,10 +756,37 @@ class HamClockWindow(QWidget):
         )
         self.wsjtx_button.clicked.connect(self._on_wsjtx_button_clicked)
 
+        # ---- WSJT-X UDP auto-log ----
+        # Listens for WSJT-X's own "Logged ADIF" UDP broadcast (sent
+        # automatically the instant the operator clicks OK on WSJT-X's
+        # "Log QSO" dialog -- see wsjtx_udp.py) and logs it into the
+        # local QSO log the same way the New QSO dialog would, with no
+        # manual entry at all. Independent of "Launch WSJT-X"/Rigctld
+        # above -- works with ANY running WSJT-X instance (this app's
+        # own isolated profile or the operator's regular one) as long
+        # as its UDP Server port (Settings > Reporting) matches.
+        self._wsjtx_udp_port = settings.value("wsjtx_udp_port", WSJTX_DEFAULT_PORT, type=int)
+        self._wsjtx_udp_listener = None
+        self.wsjtx_autolog_button = QPushButton("WSJT-X Auto-Log: OFF")
+        self.wsjtx_autolog_button.setCheckable(True)
+        self.wsjtx_autolog_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.wsjtx_autolog_button.setToolTip(
+            "Automatically log every QSO the instant WSJT-X logs it (its "
+            "own \"Log QSO\" dialog -- OK). Make sure WSJT-X's UDP Server "
+            f"port (Settings > Reporting) matches this app's (default {WSJTX_DEFAULT_PORT}). "
+            "Right-click to change the port."
+        )
+        self.wsjtx_autolog_button.toggled.connect(self._on_wsjtx_autolog_toggled)
+        self.wsjtx_autolog_button.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.wsjtx_autolog_button.customContextMenuRequested.connect(self._on_wsjtx_autolog_menu_requested)
+
         external_apps_row = QHBoxLayout()
         external_apps_row.addWidget(self.wsjtx_button)
         external_apps_row.addWidget(self.rigctld_button)
         external_apps_row.addWidget(self.virtual_cable_button)
+        external_apps_row.addWidget(self.wsjtx_autolog_button)
         external_apps_row.addStretch()
 
         clocks_row = QHBoxLayout()
@@ -1745,8 +1773,66 @@ class HamClockWindow(QWidget):
         # (subprocess.Popen not raising means the OS accepted it).
         settings.setValue("wsjtx_executable_path", path)
 
+    def _on_wsjtx_autolog_toggled(self, checked):
+        if checked:
+            listener = WsjtxUdpListener(port=self._wsjtx_udp_port, parent=self)
+            try:
+                listener.start()
+            except RuntimeError as exc:
+                QMessageBox.critical(self, "WSJT-X Auto-Log", str(exc))
+                self.wsjtx_autolog_button.blockSignals(True)
+                self.wsjtx_autolog_button.setChecked(False)
+                self.wsjtx_autolog_button.blockSignals(False)
+                return
+            listener.qso_logged.connect(self._on_wsjtx_qso_logged)
+            listener.error.connect(self._on_wsjtx_udp_error)
+            self._wsjtx_udp_listener = listener
+            self.wsjtx_autolog_button.setText("WSJT-X Auto-Log: ON")
+        else:
+            if self._wsjtx_udp_listener is not None:
+                self._wsjtx_udp_listener.stop()
+                self._wsjtx_udp_listener = None
+            self.wsjtx_autolog_button.setText("WSJT-X Auto-Log: OFF")
+
+    def _on_wsjtx_autolog_menu_requested(self, _pos):
+        port, ok = QInputDialog.getInt(
+            self, "WSJT-X Auto-Log",
+            "UDP port to listen on (must match WSJT-X's own \"UDP Server "
+            "port\" in Settings > Reporting):",
+            self._wsjtx_udp_port, 1, 65535,
+        )
+        if not ok or port == self._wsjtx_udp_port:
+            return
+        self._wsjtx_udp_port = port
+        QSettings("IcomRadioApp", "RadioControl").setValue("wsjtx_udp_port", port)
+        if self.wsjtx_autolog_button.isChecked():
+            # Restart on the new port -- toggling off then back on reuses
+            # the exact same start/stop/error-handling path as a manual click.
+            self.wsjtx_autolog_button.setChecked(False)
+            self.wsjtx_autolog_button.setChecked(True)
+
+    def _on_wsjtx_qso_logged(self, fields):
+        """fields: one adif.parse_adif_records() result straight off
+        WSJT-X's own "Logged ADIF" UDP message -- already genuine ADIF,
+        no field-name translation needed. Reuses LogBookWindow's own
+        submit handler directly (append + save + refresh + best-effort
+        QRZ upload) rather than duplicating that logic -- same
+        established pattern as the dashboard's "New QSO..." button,
+        which already reaches into LogBookWindow the same way. Doesn't
+        show/raise the window -- this should never steal focus just
+        because a QSO came in in the background."""
+        if self.log_book_window is None:
+            self.log_book_window = LogBookWindow(self)
+        self.log_book_window._on_new_qso_submitted(fields)
+
+    def _on_wsjtx_udp_error(self, message):
+        print(f"[WSJT-X Auto-Log] {message}")
+
     def closeEvent(self, event):
         self.satellite_session.stop()
+        if self._wsjtx_udp_listener is not None:
+            self._wsjtx_udp_listener.stop()
+            self._wsjtx_udp_listener = None
         for window in list(self._rigctld_servers):
             self._stop_rigctld_for_window(window)
         self._teardown_virtual_cables()  # best-effort; each affected window's own worker.stop() (below) may cut this off before it finishes

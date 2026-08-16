@@ -98,6 +98,33 @@ def save_connection_profiles(profiles):
         print(f"[ERROR] Connection profiles: couldn't save profiles ({exc}).")
 
 
+def allowed_satellite_roles(active_roles):
+    """Given the set of roles already in use by connected radios,
+    returns the set of role VALUES (constants.RADIO_ROLES' second
+    tuple element) that make sense to offer for a NEW radio.
+
+    A satellite pass only makes sense driven one of two ways at a
+    time: one Full Duplex radio, or one Downlink + one Uplink pair --
+    never a mix, and never a duplicate of either half of the pair.
+    "Non-Sat" is always available regardless, since it doesn't
+    participate in satellite tracking at all.
+    """
+    if "full_duplex" in active_roles:
+        # A second Full Duplex radio is still fine (e.g. two
+        # independent full-duplex-capable radios each running their
+        # own pass) -- but Downlink/Uplink no longer make sense once
+        # a Full Duplex radio is already handling both directions.
+        return {"full_duplex", "non_sat"}
+    if "downlink" in active_roles and "uplink" in active_roles:
+        # The pair is already complete.
+        return {"non_sat"}
+    if "downlink" in active_roles:
+        return {"uplink", "non_sat"}
+    if "uplink" in active_roles:
+        return {"downlink", "non_sat"}
+    return {"full_duplex", "downlink", "uplink", "non_sat"}
+
+
 class ConnectionDialog(QDialog):
     """Collects radio connection details before the main window opens.
 
@@ -106,9 +133,10 @@ class ConnectionDialog(QDialog):
     either a details dict or None if the user cancelled.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, active_roles=None):
         super().__init__(parent)
         self.setWindowTitle("Connect to Radio")
+        self._allowed_roles = allowed_satellite_roles(active_roles or set())
 
         self._profiles = load_connection_profiles()
 
@@ -130,14 +158,19 @@ class ConnectionDialog(QDialog):
         # new radio with the shared satellite session.
         self.role_combo = QComboBox()
         for label, value in RADIO_ROLES:
-            self.role_combo.addItem(label, value)
+            if value in self._allowed_roles:
+                self.role_combo.addItem(label, value)
         self.role_combo.setToolTip(
             "Satellite Full Duplex: one dual-receiver radio (e.g. IC-9700) "
             "handles both uplink and downlink itself.\n"
             "Satellite Downlink / Satellite Uplink: a \"poor man's full "
             "duplex\" pair -- pick these for two separate radios working "
             "the same pass together.\n"
-            "Non-Sat: this radio isn't part of satellite tracking at all."
+            "Non-Sat: this radio isn't part of satellite tracking at all.\n"
+            "Options here are limited to what still makes sense given "
+            "already-connected radios -- e.g. once one radio is Satellite "
+            "Downlink, only Satellite Uplink (or Non-Sat) is offered for "
+            "the next one."
         )
 
         self.connection_combo = QComboBox()

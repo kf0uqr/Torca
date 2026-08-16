@@ -901,7 +901,12 @@ class HamClockWindow(QWidget):
     # ---- Connected radios ----
 
     def _on_connect_radio_clicked(self):
-        dialog = ConnectionDialog(self)
+        # Restricts the role combo to whatever still makes sense given
+        # already-connected radios (e.g. Downlink/Uplink hidden once a
+        # Full Duplex radio is connected) -- see
+        # connection_dialog.allowed_satellite_roles.
+        active_roles = {getattr(window, "_role", "non_sat") for window in self._connected_radios}
+        dialog = ConnectionDialog(self, active_roles=active_roles)
         if dialog.exec() != QDialog.Accepted:
             return
         details = dialog.details

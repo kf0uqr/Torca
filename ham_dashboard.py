@@ -1017,6 +1017,17 @@ class HamClockWindow(QWidget):
         self._map_timer.timeout.connect(self.map_widget.update)
         self._map_timer.start(60_000)
 
+        # Recomputes the Contests tab's row coloring/filtering (see
+        # _rebuild_contests_table) against the already-fetched cache --
+        # no new network fetch -- so a contest's color (and eventual
+        # drop-off the list once it ends) stays correct as time passes,
+        # not just at the moment it was last fetched. Same 60s cadence
+        # as the map terminator redraw above; contest start/end times
+        # don't need finer than that.
+        self._contests_recolor_timer = QTimer(self)
+        self._contests_recolor_timer.timeout.connect(self._rebuild_contests_table)
+        self._contests_recolor_timer.start(60_000)
+
         # Satellites move fast enough (LEO: ~7.8 km/s) that a much
         # shorter interval than the terminator's makes sense, without
         # being wasteful -- only actually runs while satellite mode is on.
@@ -1392,11 +1403,23 @@ class HamClockWindow(QWidget):
     def _on_contests_failed(self, message):
         self.contests_status_label.setText(f"Couldn't load contest calendar: {message}")
 
+    # Same green/yellow/red palette as _BAND_CONDITION_COLORS, reused
+    # here for visual consistency across the app's two "status at a
+    # glance" tables.
+    _CONTEST_NOW_COLOR = QColor(40, 130, 60)       # in progress
+    _CONTEST_SOON_COLOR = QColor(160, 140, 30)     # starts within 24h
+    _CONTEST_LATER_COLOR = QColor(140, 50, 50)     # starts more than 24h out
+
     def _rebuild_contests_table(self):
         """Keeps only contests still in progress or yet to start
         (end time in the future), soonest-starting first -- the fetched
         feed itself spans years of history (see contests.py), which
-        isn't what "current and upcoming" means here."""
+        isn't what "current and upcoming" means here. Each row is
+        color-coded by how soon it starts (or whether it's already
+        started), per explicit instruction -- recomputed fresh every
+        rebuild (not just when new data arrives) since a contest can
+        cross from "starts in >24h" to "starts within 24h" to "in
+        progress" without the underlying data ever changing."""
         now = datetime.datetime.now(datetime.timezone.utc)
         upcoming = sorted(
             (event for event in self._contests_cache if event["end"] >= now),
@@ -1404,9 +1427,21 @@ class HamClockWindow(QWidget):
         )
         self.contests_table.setRowCount(len(upcoming))
         for row, event in enumerate(upcoming):
-            self.contests_table.setItem(row, 0, QTableWidgetItem(event["name"]))
-            self.contests_table.setItem(row, 1, QTableWidgetItem(event["start"].strftime("%Y-%m-%d %H:%M")))
-            self.contests_table.setItem(row, 2, QTableWidgetItem(event["end"].strftime("%Y-%m-%d %H:%M")))
+            if event["start"] <= now:
+                color = self._CONTEST_NOW_COLOR
+            elif event["start"] - now <= datetime.timedelta(hours=24):
+                color = self._CONTEST_SOON_COLOR
+            else:
+                color = self._CONTEST_LATER_COLOR
+            name_item = QTableWidgetItem(event["name"])
+            start_item = QTableWidgetItem(event["start"].strftime("%Y-%m-%d %H:%M"))
+            end_item = QTableWidgetItem(event["end"].strftime("%Y-%m-%d %H:%M"))
+            for item in (name_item, start_item, end_item):
+                item.setBackground(color)
+                item.setForeground(QColor(255, 255, 255))
+            self.contests_table.setItem(row, 0, name_item)
+            self.contests_table.setItem(row, 1, start_item)
+            self.contests_table.setItem(row, 2, end_item)
         self.contests_status_label.setText(
             f"{len(upcoming)} current/upcoming contest{'s' if len(upcoming) != 1 else ''}"
         )

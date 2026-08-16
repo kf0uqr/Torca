@@ -666,7 +666,24 @@ class RadioWindow(QWidget):
             if transmitting:
                 freq_hz = uplink_hz
                 if freq_hz is not None:
-                    self.worker.select_vfo_and_set_frequency("B", freq_hz)
+                    # Reported live on a real 9700: mode drifting and
+                    # both Main AND Sub ending up on VFO B, starting
+                    # right after the first transmission. Root cause --
+                    # select_vfo_and_set_frequency() has no receiver
+                    # targeting at all (unlike every other dual-receiver
+                    # operation in this codebase, including the Sub-side
+                    # branch a few lines below), so this periodic
+                    # (2s-tick) mid-transmission Doppler correction was
+                    # landing as a bare, unaddressed "select VFO B" CI-V
+                    # command -- fine at PTT-press time (start_ptt_
+                    # after_vfo bundles an explicit receiver=RECEIVER_
+                    # MAIN with it), but not safe to repeat unscoped
+                    # while already transmitting. select_receiver_vfo_
+                    # and_set_frequency explicitly re-selects Main as
+                    # the active receiver before touching its VFO/
+                    # frequency, in one atomic coroutine -- same
+                    # primitive Sub's own tick already relies on below.
+                    self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_MAIN, freq_hz, vfo_slot="B")
             else:
                 freq_hz = downlink_hz
                 if freq_hz is not None:

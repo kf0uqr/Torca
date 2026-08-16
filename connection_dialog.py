@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from constants import (
     RADIO_PROFILES,
+    RADIO_ROLES,
     DEFAULT_HOST,
     DEFAULT_PORT,
     DEFAULT_USERNAME,
@@ -122,6 +123,23 @@ class ConnectionDialog(QDialog):
         self.radio_combo.addItems(RADIO_PROFILES.keys())
         self.radio_combo.currentTextChanged.connect(self._on_radio_changed)
 
+        # Which role this radio plays in satellite Doppler control --
+        # see RADIO_ROLES's own comment in constants.py. Chosen here,
+        # per-connection, rather than as a separate post-connect prompt,
+        # since the dashboard needs to know it before registering the
+        # new radio with the shared satellite session.
+        self.role_combo = QComboBox()
+        for label, value in RADIO_ROLES:
+            self.role_combo.addItem(label, value)
+        self.role_combo.setToolTip(
+            "Satellite Full Duplex: one dual-receiver radio (e.g. IC-9700) "
+            "handles both uplink and downlink itself.\n"
+            "Satellite Downlink / Satellite Uplink: a \"poor man's full "
+            "duplex\" pair -- pick these for two separate radios working "
+            "the same pass together.\n"
+            "Non-Sat: this radio isn't part of satellite tracking at all."
+        )
+
         self.connection_combo = QComboBox()
         self.connection_combo.addItem("Network (LAN)", "network")
         self.connection_combo.addItem("USB (Serial)", "usb")
@@ -193,6 +211,7 @@ class ConnectionDialog(QDialog):
         form.addRow("Profile:", profile_row)
 
         form.addRow("Radio:", self.radio_combo)
+        form.addRow("Satellite Role:", self.role_combo)
         form.addRow("Connection:", self.connection_combo)
         form.addRow("CI-V Address (hex):", self.addr_input)
 
@@ -295,6 +314,7 @@ class ConnectionDialog(QDialog):
         resolved against whatever's actually plugged in when loaded)."""
         return {
             "radio_model": self.radio_combo.currentText(),
+            "role": self.role_combo.currentData(),
             "connection_type": self.connection_combo.currentData(),
             "addr_hex": self.addr_input.text().strip(),
             "host": self.host_input.text().strip(),
@@ -314,6 +334,10 @@ class ConnectionDialog(QDialog):
         radio_model = profile.get("radio_model")
         if radio_model in RADIO_PROFILES:
             self.radio_combo.setCurrentText(radio_model)  # applies that radio's own addr/connection-type defaults first
+
+        role_index = self.role_combo.findData(profile.get("role"))
+        if role_index != -1:
+            self.role_combo.setCurrentIndex(role_index)
 
         connection_index = self.connection_combo.findData(profile.get("connection_type"))
         if connection_index != -1:
@@ -450,6 +474,7 @@ class ConnectionDialog(QDialog):
         connection_type = self.connection_combo.currentData()
         details = {
             "radio_model": self.radio_combo.currentText(),
+            "role": self.role_combo.currentData(),
             "connection_type": connection_type,
             "addr": addr,
             "audio_input_device": self.audio_input_combo.currentData(),

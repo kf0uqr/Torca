@@ -564,6 +564,87 @@ def format_countdown(seconds):
     return f"{minutes:02d}:{secs:02d}"
 
 
+def compute_satellite_state(satellite, transponder, observer_lat, observer_lon,
+                             observer_elevation_km, freq_offset_hz, cached_crossing=None):
+    """Pure computation, no radio I/O and no instance state -- look
+    angles, next AOS/LOS, and both directions' Doppler-corrected
+    frequencies for the given satellite/transponder right now.
+
+    Extracted from what used to be RadioWindow._compute_satellite_state
+    (a per-radio-window method) into a standalone function now that
+    satellite/transponder selection lives centrally in SatelliteSession
+    (satellite_session.py) instead of being duplicated per connected
+    radio -- multiple radios coordinating on one pass need everyone
+    computing against the exact same inputs, not each independently
+    reading its own local widgets.
+
+    cached_crossing is whatever this function last returned as
+    next_crossing (or None on the very first call) -- callers own that
+    caching themselves (this function has no state of its own) and
+    should pass the same value back in next time; the AOS/LOS search is
+    real, if cheap, work, only worth re-running once the previously-
+    found crossing has actually passed, not on every call.
+
+    Returns (look, crossing_text, downlink_hz, downlink_doppler_hz,
+    uplink_hz, uplink_doppler_hz, next_crossing), or None if propagation
+    fails (invalid/missing TLE)."""
+    line1, line2 = satellite.get("line1", ""), satellite.get("line2", "")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    look = satellite_look_angles(line1, line2, now, observer_lat, observer_lon, observer_elevation_km)
+    if look is None:
+        return None
+
+    next_crossing = cached_crossing
+    if next_crossing is None or now >= next_crossing["time_utc"]:
+        next_crossing = next_aos_los(
+            line1, line2, now, observer_lat, observer_lon, observer_elevation_km
+        )
+    crossing_text = "AOS/LOS: unknown"
+    if next_crossing:
+        remaining = (next_crossing["time_utc"] - now).total_seconds()
+        crossing_text = f"{next_crossing['event']} in {format_countdown(remaining)}"
+
+    downlink_hz, downlink_doppler_hz = None, None
+    uplink_hz, uplink_doppler_hz = None, None
+    if transponder is not None:
+        try:
+            base_downlink_hz = round(float(transponder.get("downlink_mhz")) * 1e6)
+        except (TypeError, ValueError):
+            base_downlink_hz = None
+        if base_downlink_hz is not None:
+            # The tuning knob adjusts this offset instead of the radio
+            # directly while tracking is active -- so manual tuning
+            # within a linear satellite's passband, or a nudge to line
+            # up with where it's actually transmitting, survives the
+            # next tick instead of being overwritten by a recompute from
+            # the transponder's bare nominal downlink. RX only -- there's
+            # no equivalent TX offset.
+            base_downlink_hz += freq_offset_hz
+            result = doppler_correction(
+                base_downlink_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km,
+                uplink=False,
+            )
+            if result is not None:
+                downlink_hz = round(result["frequency_hz"])
+                downlink_doppler_hz = result["doppler_hz"]
+
+        try:
+            base_uplink_hz = round(float(transponder.get("uplink_mhz")) * 1e6)
+        except (TypeError, ValueError):
+            base_uplink_hz = None
+        if base_uplink_hz is not None:
+            result = doppler_correction(
+                base_uplink_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km,
+                uplink=True,
+            )
+            if result is not None:
+                uplink_hz = round(result["frequency_hz"])
+                uplink_doppler_hz = result["doppler_hz"]
+
+    return look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz, next_crossing
+
+
 def footprint_points(lat, lon, altitude_km, num_points=72):
     """Computes the actual great-circle boundary of a satellite's
     footprint (the area from which it's above the horizon) as a list of

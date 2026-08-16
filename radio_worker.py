@@ -7,6 +7,7 @@ only ever talks to the GUI thread by emitting signals.
 """
 
 import asyncio
+import copy
 import importlib
 import inspect
 import os
@@ -866,9 +867,19 @@ class RadioWorker(QThread):
         AttributeError on every single poll cycle forever. Meter widgets
         set to a type with no working getter simply won't update; missing
         ones are reported once here instead of repeatedly."""
+        # Own, independent copy -- not the shared module-level
+        # METER_DEFINITIONS dict. This app now supports multiple
+        # simultaneously-connected radios (see satellite_session.py); two
+        # different radio models can genuinely have different
+        # native_power_unit scales, and mutating the shared dict in place
+        # (as this used to do, back when only one radio was ever
+        # connected at a time) would let whichever radio connected last
+        # silently overwrite the power-meter scaling for every other
+        # already-connected radio.
+        self._meter_definitions = copy.deepcopy(METER_DEFINITIONS)
         missing = []
         self._meter_getters = {}  # meter_type -> resolved method name
-        for meter_type, definition in METER_DEFINITIONS.items():
+        for meter_type, definition in self._meter_definitions.items():
             candidates = definition.get("getter_candidates", [definition["getter"]])
             resolved = find_method_name(self.radio, candidates)
             if resolved:
@@ -882,17 +893,14 @@ class RadioWorker(QThread):
 
         # native_power_unit is confirmed by rigplane's own docs to be a
         # Literal["raw_255", "watts"] attribute -- ask the radio which
-        # scale its power reading uses instead of guessing. Mutating
-        # METER_DEFINITIONS in place is deliberate: this app only ever
-        # connects to one radio at a time, so there's no risk of one
-        # radio's scale leaking into another connection.
+        # scale its power reading uses instead of guessing.
         if "power" in self._meter_getters:
             native_unit = getattr(self.radio, "native_power_unit", None)
             if native_unit == "watts":
-                METER_DEFINITIONS["power"]["kind"] = "direct"
+                self._meter_definitions["power"]["kind"] = "direct"
                 self.audio_status.emit("Power meter: radio reports native unit 'watts' -- reading directly.")
             elif native_unit == "raw_255":
-                METER_DEFINITIONS["power"]["kind"] = "linear"
+                self._meter_definitions["power"]["kind"] = "linear"
                 self.audio_status.emit("Power meter: radio reports native unit 'raw_255' -- scaling from raw.")
             else:
                 self.audio_status.emit(
@@ -1083,7 +1091,7 @@ class RadioWorker(QThread):
                 self.error.emit(str(exc))
 
             for meter_type, getter_name in self._meter_getters.items():
-                definition = METER_DEFINITIONS[meter_type]
+                definition = self._meter_definitions[meter_type]
                 try:
                     getter = getattr(self.radio, getter_name)
                     kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}

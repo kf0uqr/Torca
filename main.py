@@ -1,6 +1,6 @@
 """
-PySide6 GUI for controlling an Icom radio via rigplane, using a
-dedicated worker thread for all async radio I/O.
+PySide6 GUI for controlling Icom radios via rigplane, using a dedicated
+worker thread per radio connection for all async radio I/O.
 
 Install:
     pip install rigplane PySide6 sounddevice
@@ -18,21 +18,30 @@ Why a worker thread instead of qasync:
     asyncio.run_coroutine_threadsafe(), so calling worker.set_frequency(...)
     from a button click is safe and non-blocking.
 
+App structure: Ham Dashboard is the central/main window -- it opens
+directly (no radio connection required, no connection dialog at
+startup) and is where radios get added ("Connect New Radio..."), each
+assigned a satellite role (RADIO_ROLES in constants.py) in the
+connection dialog. Multiple radios can be connected at once and
+cooperate on one satellite pass via SatelliteSession, which
+HamClockWindow owns.
+
 Package layout (see each module's own docstring for details):
-    constants.py         -- pure data: bands, meter/control/level tables
+    constants.py         -- pure data: bands, roles, meter/control/level tables
     rig_discovery.py      -- shared "find the real method name" helper
     audio.py               -- AudioBridge + Linux virtual-audio-cable helpers
-    radio_worker.py        -- RadioWorker (QThread owning the radio connection)
-    connection_dialog.py   -- ConnectionDialog (shown before the main window)
+    radio_worker.py        -- RadioWorker (QThread owning one radio connection)
+    connection_dialog.py   -- ConnectionDialog (shown per radio, from the dashboard)
     widgets.py              -- SpectrumWidget/WaterfallWidget/MeterWidget/TuningKnobWidget
     wsjtx_rigctld.py        -- WSJT-X launcher + RigctldServer
     solar_data.py            -- NOAA/hamqsl fetching, SolarDataWorker, astronomy helpers
     world_map.py             -- WorldMapWidget (Ham Dashboard's day/night map)
     satellite_tracking.py    -- SGP4 propagation, TLE/SatNOGS fetching, satellite dialogs
-    ham_dashboard.py          -- HamClockWindow (ties the above three together)
-    main_window.py            -- RadioWindow (the main application window)
-    theme.py                   -- dark theme + window placement helper
-    main.py                     -- this file: the entry point
+    satellite_session.py     -- SatelliteSession (shared Doppler-tracking coordinator)
+    main_window.py            -- RadioWindow (one per connected radio)
+    ham_dashboard.py           -- HamClockWindow (the central/main window)
+    theme.py                    -- dark theme + window placement helper
+    main.py                      -- this file: the entry point
 """
 
 import logging
@@ -41,9 +50,8 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from connection_dialog import ConnectionDialog
-from main_window import RadioWindow
-from theme import apply_dark_theme, position_on_screen_half
+from ham_dashboard import HamClockWindow
+from theme import apply_dark_theme
 
 # Diagnostic only -- RADIONE_DEBUG_RIGPLANE=1 python3 main.py. Surfaces
 # rigplane's own internal DEBUG logging (logging.getLogger("rigplane")),
@@ -61,12 +69,7 @@ def main():
     app = QApplication(sys.argv)
     apply_dark_theme(app)
 
-    details = ConnectionDialog.get_details()
-    if details is None:
-        sys.exit(0)  # user cancelled -- exit quietly, nothing to clean up yet
-
-    window = RadioWindow(details)
-    position_on_screen_half(window, "left")
+    window = HamClockWindow()
     window.show()
     sys.exit(app.exec())
 

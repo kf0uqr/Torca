@@ -12,6 +12,23 @@ RADIO_PROFILES = {
     "IC-705": {"addr_hex": "A4", "default_connection": "network"},
 }
 
+# Which role a connected radio plays in satellite Doppler control, chosen
+# per-connection in ConnectionDialog. "full_duplex" is a single dual-
+# receiver radio (e.g. IC-9700) doing both uplink and downlink itself,
+# exactly like this app's original single-radio design. "downlink"/
+# "uplink" are for a "poor man's full duplex" pair of separate radios --
+# one continuously Doppler-tuned to the downlink (never transmits), one
+# PTT-driven onto the Doppler-tuned uplink (never continuously retuned
+# outside of a transmission). "non_sat" opts a radio out of satellite
+# tracking entirely -- a plain, standalone connection. See
+# satellite_session.py for how each role's tick/PTT behavior differs.
+RADIO_ROLES = [
+    ("Satellite Full Duplex", "full_duplex"),
+    ("Satellite Downlink", "downlink"),
+    ("Satellite Uplink", "uplink"),
+    ("Non-Sat", "non_sat"),
+]
+
 # Amateur band edges (US band plan) each radio actually covers, as
 # (label, low_hz, high_hz). IC-7300/IC-705 are HF+6m; IC-9700 is VHF/UHF
 # (its 23cm/1.2GHz entry requires the optional UX-9100 module -- included

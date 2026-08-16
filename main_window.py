@@ -1,38 +1,35 @@
 """
-RadioWindow: the main application window. Ties together the radio
+RadioWindow: a per-radio-connection window. Ties together the radio
 connection (via RadioWorker), all the live controls/meters/sliders, the
-spectrum scope and waterfall, band buttons, and the "extra" action
-buttons (Ham Dashboard, Launch WSJT-X, Rigctld, Virtual Cables). Also
-owns live satellite Doppler tracking -- double-clicking a satellite on
-the Ham Dashboard map selects it here (via HamClockWindow's
-satellite_selected signal) rather than opening a dialog of its own, so
-tracking keeps running in the background (VFO A retuned every couple
-seconds, elevation/azimuth/Doppler/AOS-LOS overlaid on the spectrum
-scope, like the frequency readout) and switching to another satellite
-is just another double-click away.
+spectrum scope and waterfall, band buttons, and PTT. Constructed by
+HamClockWindow (ham_dashboard.py) -- one per connected radio, each with
+a "satellite role" (RADIO_ROLES in constants.py) chosen in
+ConnectionDialog and passed in via `satellite_session`, which is the
+single shared source of truth for satellite/transponder selection and
+the periodic Doppler-tracking tick (satellite_session.py). This window
+has no satellite/transponder UI of its own -- role dispatch
+(apply_satellite_tick/apply_satellite_mode, called by SatelliteSession)
+is the only satellite-related logic that lives here, deciding what THIS
+radio does with the shared Doppler state depending on its role.
 """
 
-import datetime
-import os
-import platform
 import sys
 
-from PySide6.QtCore import Qt, QTimer, Slot, QSettings
+from PySide6.QtCore import Qt, Slot, Signal
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
-    QSpinBox,
     QSlider,
     QComboBox,
     QPushButton,
     QMessageBox,
-    QFileDialog,
 )
 
 from constants import (
     RADIO_BANDS,
+    RADIO_ROLES,
     LEVEL_DEFINITIONS,
     DUAL_RECEIVER_LEVEL_KEYS,
     CONTROL_DEFINITIONS,
@@ -41,19 +38,19 @@ from constants import (
 )
 from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
 from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
-from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
-from ham_dashboard import HamClockWindow
-from satellite_tracking import (
-    doppler_correction, satellite_look_angles, next_aos_los, format_countdown,
-    radio_mode_for_transponder,
-)
+from satellite_tracking import radio_mode_for_transponder
 
-SATELLITE_TRACKING_INTERVAL_MS = 2000
+_ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
+
 
 class RadioWindow(QWidget):
-    def __init__(self, details):
+    closed = Signal(object)  # emitted at the end of closeEvent, carrying self -- HamClockWindow listens
+
+    def __init__(self, details, satellite_session):
         super().__init__()
         self._details = details
+        self._role = details.get("role", "non_sat")
+        self._satellite_session = satellite_session
         if details["connection_type"] == "network":
             self._connection_label = f"{details['host']} (LAN)"
         else:
@@ -125,22 +122,6 @@ class RadioWindow(QWidget):
         self.spectrum_widget.set_overlay_widget(self.freq_display)
         self.waterfall_widget = WaterfallWidget()
 
-        # Live satellite tracking overlay -- populated by double-clicking
-        # a satellite on the Ham Dashboard map (see _on_satellite_selected
-        # below). Hidden until a satellite is actually selected. No fixed
-        # width, unlike freq_display -- satellite names and countdown
-        # digits both vary enough in length that a fixed box would either
-        # clip or float awkwardly; a little jitter on update is the
-        # tradeoff, and this is informational rather than something a
-        # user is reading a tuning offset off of.
-        self.satellite_overlay_label = QLabel("")
-        self.satellite_overlay_label.setStyleSheet(
-            "font-size: 13px; color: white; "
-            "background-color: rgb(10, 10, 20); padding: 4px 10px; border-radius: 4px;"
-        )
-        self.satellite_overlay_label.setVisible(False)
-        self.spectrum_widget.set_overlay_widget(self.satellite_overlay_label, corner="top-left")
-
         self.tuning_knob = TuningKnobWidget()
         self.tuning_knob.setEnabled(False)
         self.tuning_knob.steps_changed.connect(self._on_knob_steps)
@@ -168,6 +149,11 @@ class RadioWindow(QWidget):
             "(downlink) on release."
         )
         self.ptt_button.toggled.connect(self._on_ptt_toggled)
+        # "downlink" role radios never transmit as part of satellite
+        # tracking (they're the RX half of a "poor man's full duplex"
+        # pair) -- hidden entirely rather than just disabled, since
+        # there's no sensible manual PTT action for this role either.
+        self.ptt_button.setVisible(self._role != "downlink")
 
         # Dual-receiver (9700/7610) only -- rigplane's select_receiver(),
         # confirmed via its own docstring to issue the real main_select/
@@ -194,153 +180,34 @@ class RadioWindow(QWidget):
         )
         self.active_receiver_button.clicked.connect(self._on_active_receiver_toggle_clicked)
 
-        self.hamclock_button = QPushButton("Ham Dashboard")
-        self.hamclock_button.setToolTip(
-            "Opens a HamClock-inspired dashboard: day/night world map, UTC/"
-            "local clocks, live solar-terrestrial data (SFI/SSN/K-index) from "
-            "NOAA's public feeds, and satellite tracking. Double-click a "
-            "tracked satellite there to start live elevation/azimuth/AOS-LOS "
-            "and Doppler-corrected VFO A tracking here in the main window."
-        )
-        self.hamclock_button.clicked.connect(self._on_hamclock_button_clicked)
-        self.hamclock_window = None  # created lazily on first click
+        # Purely informational -- satellite tracking is now controlled
+        # centrally from the Ham Dashboard (satellite/transponder
+        # selection, Start/Stop Tracking), not per-radio-window, but the
+        # operator still needs to see at a glance what each connected
+        # radio is doing.
+        self.role_label = QLabel(f"Role: {_ROLE_LABELS.get(self._role, self._role)}")
+        self.role_label.setStyleSheet("color: #aaa; font-size: 11px;")
 
-        # Satellite tracking: populated by double-clicking a satellite on
-        # the Ham Dashboard map (see _on_satellite_selected). Disabled
-        # until then; "Stop Tracking" clears it back to this state.
-        self.satellite_label = QLabel("No satellite selected")
-        self.satellite_transponder_combo = QComboBox()
-        self.satellite_transponder_combo.setEnabled(False)
-        self.satellite_transponder_combo.setToolTip(
-            "Which of the selected satellite's stored transponders to Doppler-"
-            "correct VFO A against."
-        )
-        self.satellite_transponder_combo.currentIndexChanged.connect(self._on_satellite_transponder_changed)
-        # Toggle, not a one-way stop button -- pausing/resuming keeps the
-        # satellite selected (only double-clicking a different one on the
-        # map replaces it). Starts unchecked/disabled; _on_satellite_selected
-        # enables it and checks it (tracking starts immediately on select,
-        # same as before this was a toggle).
-        self.satellite_tracking_button = QPushButton("Start Tracking")
-        self.satellite_tracking_button.setCheckable(True)
-        self.satellite_tracking_button.setEnabled(False)
-        self.satellite_tracking_button.setStyleSheet(
-            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
-        )
-        self.satellite_tracking_button.setToolTip(
-            "Pause/resume Doppler re-tuning. The satellite stays selected "
-            "either way -- double-click a different one on the map to switch."
-        )
-        self.satellite_tracking_button.toggled.connect(self._on_satellite_tracking_toggled)
-
-        self.satellite_row = QHBoxLayout()
-        self.satellite_row.addWidget(self.satellite_label)
-        self.satellite_row.addWidget(self.satellite_transponder_combo, 1)
-        self.satellite_row.addWidget(self.satellite_tracking_button)
-
-        self._active_satellite = None
-        self._next_satellite_crossing = None
-        # Added to a transponder's nominal downlink before Doppler
-        # correction, via the tuning knob while tracking is active (see
-        # _on_knob_steps) -- lets the operator tune within a linear
-        # satellite's passband, or nudge to better match where it's
-        # actually transmitting, without the next tracking tick
-        # overwriting the adjustment. Reset whenever the satellite or
-        # transponder changes, since it's only meaningful relative to
-        # whichever nominal frequency it was dialed in against.
-        self._satellite_freq_offset_hz = 0
-        # Dual-receiver (9700/7610) only, satellite mode's periodic
+        # Dual-receiver (9700/7610) only, "full_duplex" role's periodic
         # tracking tick specifically: whether Sub's own VFO A has
         # already been explicitly selected for the current tracking
         # session (via select_receiver_vfo_and_set_frequency). Once
         # selected, Sub's direction never changes on its own (downlink
         # only, tracked continuously while receiving -- see
-        # _on_satellite_tracking_tick), so subsequent ticks can just use
-        # a bare set_receiver_frequency instead of reselecting every
-        # time -- confirmed working for this specific, tightly-looped
-        # (2-second) use. Manual Sub frequency adjustment (the tuning
-        # knob, band selection) does NOT reuse this flag -- confirmed
-        # live on a real 9700 that a one-time-select-then-bare-writes
-        # approach for those, mirroring this, did NOT reliably work
-        # (nothing on Sub moved at all); they instead bundle the VFO-A
-        # select into every single write, unconditionally. Reset to
-        # False in _start_satellite_tracking so a fresh tracking session
-        # always reselects it.
+        # apply_satellite_tick), so subsequent ticks can just use a bare
+        # set_receiver_frequency instead of reselecting every time --
+        # confirmed working for this specific, tightly-looped (2-second)
+        # use. Manual Sub frequency adjustment (the tuning knob, band
+        # selection) does NOT reuse this flag -- confirmed live on a
+        # real 9700 that a one-time-select-then-bare-writes approach for
+        # those, mirroring this, did NOT reliably work (nothing on Sub
+        # moved at all); they instead bundle the VFO-A select into every
+        # single write, unconditionally. Reset to False whenever
+        # SatelliteSession (re)starts tracking (_on_tracking_changed) so
+        # a fresh tracking session always reselects it.
         self._sub_vfo_a_selected = False
-        self._satellite_tracking_timer = QTimer(self)
-        self._satellite_tracking_timer.timeout.connect(self._on_satellite_tracking_tick)
+        self._satellite_session.tracking_changed.connect(self._on_tracking_changed)
 
-        self.wsjtx_button = QPushButton("Launch WSJT-X")
-        self.wsjtx_button.setToolTip(
-            f"Launches WSJT-X in its own isolated profile (--rig-name={WSJTX_RIG_NAME}), "
-            "separate from your main WSJT-X settings. Use the Rigctld button below to "
-            "let it control this radio."
-        )
-        self.wsjtx_button.clicked.connect(self._on_wsjtx_button_clicked)
-
-        self.rigctld_port_input = QSpinBox()
-        self.rigctld_port_input.setRange(1, 65535)
-        self.rigctld_port_input.setValue(RIGCTLD_DEFAULT_PORT)
-        self.rigctld_port_input.setToolTip("TCP port for the rigctld server to listen on.")
-
-        self.rigctld_button = QPushButton(f"Rigctld: OFF (port {RIGCTLD_DEFAULT_PORT})")
-        self.rigctld_button.setCheckable(True)
-        self.rigctld_button.setStyleSheet(
-            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
-        )
-        self.rigctld_button.setToolTip(
-            "Lets other CAT-aware apps (WSJT-X, JTDX, fldigi, ...) control this "
-            "radio through this app's connection -- select \"Hamlib NET rigctl\" "
-            "(rig model 2) and 127.0.0.1:<port above> in that app."
-        )
-        self.rigctld_button.toggled.connect(self._on_rigctld_toggled)
-        self.rigctld_server = None  # created lazily on first enable
-
-        self.virtual_cable_button = QPushButton("Virtual Cables: OFF")
-        self.virtual_cable_button.setCheckable(True)
-        self.virtual_cable_button.setStyleSheet(
-            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
-        )
-        self.virtual_cable_button.setEnabled(False)
-        self.virtual_cable_button.setToolTip(
-            "Creates two virtual audio devices (Linux/PulseAudio or PipeWire "
-            "only) so an external app (WSJT-X, etc.) can send/receive audio "
-            "through this app's radio connection, in place of the physical "
-            "devices chosen in the connection dialog. Click again to switch "
-            "back to those original devices."
-        )
-        self.virtual_cable_button.toggled.connect(self._on_virtual_cable_toggled)
-
-        # Dual-receiver only: which receiver's audio goes to the RX
-        # virtual cable. Both Main and Sub get downmixed together by
-        # default (matching what the radio's own speaker does, for
-        # normal listening) -- but that's the wrong thing to feed a
-        # decoder like WSJT-X during satellite digital-mode work, since
-        # Main's audio (if its squelch is open at all) gets averaged
-        # straight into the same samples WSJT-X is trying to decode
-        # Sub's downlink out of. Hidden/disabled until a dual-receiver
-        # radio actually connects (see _on_connected) -- meaningless
-        # for a single-receiver radio, which never has a Sub channel to
-        # choose from. Takes effect immediately via
-        # worker.set_rx_downmix_channel(), including while Virtual
-        # Cables is already on -- no need to disable/re-enable to
-        # change it.
-        self.virtual_cable_channel_combo = QComboBox()
-        self.virtual_cable_channel_combo.addItem("RX Cable: Mixed (Main + Sub)", "mix")
-        self.virtual_cable_channel_combo.addItem("RX Cable: Main only", "main")
-        self.virtual_cable_channel_combo.addItem("RX Cable: Sub only", "sub")
-        self.virtual_cable_channel_combo.setVisible(False)
-        self.virtual_cable_channel_combo.setEnabled(False)
-        self.virtual_cable_channel_combo.setToolTip(
-            "Which receiver's audio goes to the RX virtual cable (e.g. for "
-            "WSJT-X digital-mode decoding on a satellite downlink) -- "
-            "'Sub only' keeps Main's audio from bleeding into the decode. "
-            "This app's own listening audio (when Virtual Cables is off) "
-            "always stays mixed, regardless of this setting."
-        )
-        self.virtual_cable_channel_combo.currentIndexChanged.connect(
-            self._on_virtual_cable_channel_changed
-        )
 
         self.status_label = QLabel("Connecting...")
 
@@ -448,30 +315,15 @@ class RadioWindow(QWidget):
                 controls_row.setAlignment(widget, Qt.AlignTop)
             self.control_widgets[key] = widget
 
-        # Extra action buttons (WSJT-X, Rigctld, and whatever gets added
-        # later) -- a horizontal row of its own, kept as an attribute so
-        # future buttons can just be appended to it directly.
-        rigctld_column = QVBoxLayout()
-        rigctld_column.addWidget(self.rigctld_port_input)
-        rigctld_column.addWidget(self.rigctld_button)
-
-        self.extra_buttons_row = QHBoxLayout()
-        self.extra_buttons_row.addWidget(self.hamclock_button)
-        self.extra_buttons_row.addWidget(self.wsjtx_button)
-        self.extra_buttons_row.addLayout(rigctld_column)
-        virtual_cable_column = QVBoxLayout()
-        virtual_cable_column.addWidget(self.virtual_cable_channel_combo)
-        virtual_cable_column.addWidget(self.virtual_cable_button)
-        self.extra_buttons_row.addLayout(virtual_cable_column)
-        self.extra_buttons_row.addStretch()
-
-        # controls_row (Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO) and
-        # extra_buttons_row stack vertically together, to the left of the
-        # tuning knob -- not mixed into knob_row, which is the knob's own
-        # column on the right.
+        # controls_row (Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO) and the
+        # role label stack vertically together, to the left of the tuning
+        # knob -- not mixed into knob_row, which is the knob's own column
+        # on the right. WSJT-X/Rigctld/Virtual Cables all moved to the
+        # Ham Dashboard, which is the one place that makes sense once
+        # multiple radios can be connected at once.
         left_column = QVBoxLayout()
         left_column.addLayout(controls_row)
-        left_column.addLayout(self.extra_buttons_row)
+        left_column.addWidget(self.role_label)
 
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
@@ -490,7 +342,6 @@ class RadioWindow(QWidget):
         layout.addLayout(self.meters_row)
         layout.addLayout(self.meters_row_2)
         layout.addLayout(self.band_buttons_row)
-        layout.addLayout(self.satellite_row)
         layout.addLayout(tuning_row)
         layout.addLayout(levels_row)
         layout.addWidget(self.status_label)
@@ -509,6 +360,17 @@ class RadioWindow(QWidget):
         self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
         self.worker.start()
 
+        # Registers with the shared satellite session so this radio
+        # starts participating in Doppler tracking per its role -- see
+        # satellite_session.py. "non_sat" radios are never registered at
+        # all (SatelliteSession's dispatch never needs to know they
+        # exist). If a satellite/transponder is already selected
+        # (joining mid-session, e.g. connecting a second radio partway
+        # through a pass), register() applies the current mode
+        # immediately rather than waiting for the next transponder change.
+        if self._role != "non_sat":
+            self._satellite_session.register(self, self._role)
+
     @Slot()
     def _on_connected(self):
         self.status_label.setText(f"Connected to {self._connection_label}")
@@ -517,15 +379,12 @@ class RadioWindow(QWidget):
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
             self.active_receiver_button.setEnabled(True)
-            self.virtual_cable_channel_combo.setVisible(True)
-            self.virtual_cable_channel_combo.setEnabled(True)
         for button in self.band_buttons:
             button.setEnabled(True)
         for slider in self.level_sliders.values():
             slider.setEnabled(True)
         for widget in self.control_widgets.values():
             widget.setEnabled(True)
-        self.virtual_cable_button.setEnabled(True)
 
     @Slot(str)
     def _on_connection_failed(self, message):
@@ -598,13 +457,13 @@ class RadioWindow(QWidget):
         # the VFO/frequency itself rather than relying on the radio's
         # own split feature to do it, which turns out to not need to be
         # on at all (confirmed live on a real 705: identical behavior
-        # either way) -- see _start_satellite_tracking.
+        # either way).
         #
         # The retune and the PTT command are bundled into ONE atomic
         # worker call (start_ptt_after_vfo -- every radio type -- and
         # stop_ptt_then_vfo/stop_ptt_and_select_receiver depending on
         # the radio type, see below) instead of calling
-        # _on_satellite_tracking_tick() and then separately
+        # apply_satellite_tick() and then separately
         # self.worker.start_ptt()/stop_ptt() -- confirmed live on a real
         # 9700 that those two, dispatched as independently-scheduled
         # commands, don't actually guarantee the retune completes before
@@ -613,7 +472,14 @@ class RadioWindow(QWidget):
         # transmitting) would just ignore the retune, and the whole
         # transmission would hold the RX frequency instead of switching
         # to the uplink at all -- exactly what was reported.
-        tracking_active = self._active_satellite is not None and self._satellite_tracking_timer.isActive()
+        #
+        # current_state() (not the last periodic tick's cached numbers)
+        # is used deliberately -- same reasoning, the freshest possible
+        # Doppler-corrected uplink frequency right at the moment of
+        # keying. "downlink"-role radios never reach this at all (PTT
+        # button hidden); "non_sat" never has tracking_active True (not
+        # registered with the session).
+        tracking_active = self._role != "non_sat" and self._satellite_session.is_tracking()
         if not (tracking_active and self.worker.is_connected()):
             if checked:
                 self.worker.start_ptt()
@@ -621,8 +487,7 @@ class RadioWindow(QWidget):
                 self.worker.stop_ptt()
             return
 
-        satellite = self._active_satellite
-        state = self._compute_satellite_state(satellite)
+        state = self._satellite_session.current_state()
         if state is None:
             # Propagation failed -- nothing to retune to, but PTT should
             # still actually transmit/release rather than silently do
@@ -635,7 +500,6 @@ class RadioWindow(QWidget):
         look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz = state
 
         freq_hz = uplink_hz if checked else downlink_hz
-        warning_text = ""
         if freq_hz is None:
             # No usable frequency for this direction (e.g. no uplink
             # stored for this transponder) -- key/unkey without a
@@ -645,26 +509,30 @@ class RadioWindow(QWidget):
             else:
                 self.worker.stop_ptt()
         elif not self.worker.control_available("vfo"):
-            warning_text = "  [VFO control unavailable -- can't switch bands]"
             if checked:
                 self.worker.start_ptt()
             else:
                 self.worker.stop_ptt()
         else:
-            # Same VFO A(RX)/B(TX) swap on Main for BOTH radio types now
-            # -- confirmed live on a real 9700, with a controlled test
-            # that gave each VFO its own distinct mode to tell them
-            # apart directly, that PTT-driven transmission always
-            # follows Main's own current VFO A/B context and NEVER Sub,
-            # regardless of what's written to Sub's frequency/VFO slot.
-            # (The radio's own split feature doesn't need to be on for
-            # this at all -- see _start_satellite_tracking -- this
-            # explicitly commands the VFO/frequency itself either way.)
-            # Sub carries the downlink, continuously re-tuned while
-            # receiving -- not touched at all during a transmission (the
-            # scope stays on it regardless, so it's still worth watching
-            # even though it's not being re-tuned) -- see
-            # _on_satellite_tracking_tick.
+            # Same VFO A(RX)/B(TX) swap on Main for BOTH dual- and
+            # single-receiver radios -- confirmed live on a real 9700,
+            # with a controlled test that gave each VFO its own distinct
+            # mode to tell them apart directly, that PTT-driven
+            # transmission always follows Main's own current VFO A/B
+            # context and NEVER Sub, regardless of what's written to
+            # Sub's frequency/VFO slot. (The radio's own split feature
+            # doesn't need to be on for this at all -- this explicitly
+            # commands the VFO/frequency itself either way.) Sub carries
+            # the downlink, continuously re-tuned while receiving -- not
+            # touched at all during a transmission (the scope stays on
+            # it regardless, so it's still worth watching even though
+            # it's not being re-tuned) -- see apply_satellite_tick.
+            #
+            # A standalone "uplink"-role radio (is_dual_receiver False,
+            # receiver=None throughout) takes exactly this same single-
+            # receiver path -- it's already precisely what that role
+            # needs: VFO B on press, VFO A on release, no receiver
+            # concept at all.
             target_vfo = "B" if checked else "A"
             # Satellite mode, dual-receiver only: PTT also switches the
             # active receiver -- Main for the transmission (so the
@@ -675,9 +543,8 @@ class RadioWindow(QWidget):
             # param on start_ptt_after_vfo) rather than a separately-
             # dispatched select_receiver(), for the same ordering
             # reasons as everything else here. Never touches the scope
-            # -- that stays on Sub throughout a transmission
-            # (_start_satellite_tracking) so you can see yourself on the
-            # downlink while transmitting.
+            # -- that stays on Sub throughout a transmission so you can
+            # see yourself on the downlink while transmitting.
             receiver = None
             if self.worker.is_dual_receiver:
                 receiver = RECEIVER_MAIN if checked else RECEIVER_SUB
@@ -689,11 +556,11 @@ class RadioWindow(QWidget):
                 # Main can't switch to a band Sub currently occupies,
                 # and Sub is sitting on exactly that downlink band
                 # continuously throughout the transmission
-                # (_on_satellite_tracking_tick never touches it during
-                # TX). Main just stays wherever the transmission left it
-                # (the uplink band, VFO B) until the next PTT press
-                # retunes it fresh -- nothing needs Main in between,
-                # since Sub is what's actually active/watched during RX.
+                # (apply_satellite_tick never touches it during TX).
+                # Main just stays wherever the transmission left it (the
+                # uplink band, VFO B) until the next PTT press retunes it
+                # fresh -- nothing needs Main in between, since Sub is
+                # what's actually active/watched during RX.
                 self.worker.stop_ptt_and_select_receiver(receiver)
             else:
                 self.worker.stop_ptt_then_vfo(target_vfo, freq_hz)
@@ -703,459 +570,118 @@ class RadioWindow(QWidget):
             self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
             self._update_band_button_highlight()
 
-        self._update_satellite_overlay(satellite, look, crossing_text, downlink_doppler_hz, uplink_doppler_hz, warning_text)
-
-    def _on_hamclock_button_clicked(self):
-        if self.hamclock_window is None:
-            self.hamclock_window = HamClockWindow(
-                observer_lat=self._details.get("observer_lat"),
-                observer_lon=self._details.get("observer_lon"),
-                observer_elevation_m=self._details.get("observer_elevation_m", 0.0),
-            )
-            self.hamclock_window.satellite_selected.connect(self._on_satellite_selected)
-        self.hamclock_window.show()
-        self.hamclock_window.raise_()
-        self.hamclock_window.activateWindow()
-
-    def _on_satellite_selected(self, satellite):
-        """A satellite was double-clicked on the Ham Dashboard map --
-        (re)start tracking it here, replacing whatever was active
-        before (it stays selected/tracked until another double-click
-        replaces it -- pausing via the toggle button doesn't clear it).
-        Doesn't require the radio to be connected: elevation/azimuth/
-        AOS-LOS are still useful on their own, only the actual VFO
-        re-tuning is gated on that (checked every tick, not just here,
-        so it picks up automatically if the radio connects mid-
-        session)."""
-        self._active_satellite = satellite
-        self._next_satellite_crossing = None
-        self._satellite_freq_offset_hz = 0
-        self.satellite_label.setText(satellite.get("name", "?"))
-
-        self.satellite_transponder_combo.blockSignals(True)
-        self.satellite_transponder_combo.clear()
-        transponders = satellite.get("transponders", [])
-        if transponders:
-            for transponder in transponders:
-                downlink = transponder.get("downlink_mhz") or "?"
-                mode = transponder.get("mode") or "?"
-                uplink_mode = transponder.get("uplink_mode") or ""
-                # Only show a "mode/uplink_mode" split when they actually
-                # differ (an inverting linear transponder) -- redundant
-                # otherwise (FM transponders, or entries with no
-                # uplink_mode recorded at all).
-                mode_label = f"{uplink_mode}/{mode}" if uplink_mode and uplink_mode != mode else mode
-                description = transponder.get("description") or "Transponder"
-                self.satellite_transponder_combo.addItem(f"{description} -- {downlink} MHz {mode_label}", transponder)
-            self.satellite_transponder_combo.setEnabled(True)
-        else:
-            self.satellite_transponder_combo.addItem("No transponders stored -- Doppler correction unavailable", None)
-            self.satellite_transponder_combo.setEnabled(False)
-        self.satellite_transponder_combo.blockSignals(False)
-
-        self.satellite_tracking_button.setEnabled(True)
-        self.satellite_overlay_label.setVisible(True)
-
-        # Tracking always (re)starts on selection, same as before this
-        # button became a toggle -- if it's already checked (switching
-        # straight from one satellite to another), setChecked(True) won't
-        # re-emit toggled, so start explicitly rather than relying on it.
-        self.satellite_tracking_button.blockSignals(True)
-        self.satellite_tracking_button.setChecked(True)
-        self.satellite_tracking_button.blockSignals(False)
-        self.satellite_tracking_button.setText("Stop Tracking")
-        self._start_satellite_tracking()
-
-    def _on_satellite_transponder_changed(self, _index):
-        self._satellite_freq_offset_hz = 0  # only meaningful relative to the transponder it was dialed in against
-        if self._active_satellite is not None:
-            self._apply_transponder_mode(self.satellite_transponder_combo.currentData())
-            self._on_satellite_tracking_tick()  # reflect the new choice immediately, don't wait for the timer
-
-    def _on_satellite_tracking_toggled(self, checked):
-        self.satellite_tracking_button.setText("Stop Tracking" if checked else "Start Tracking")
-        if checked:
-            self._start_satellite_tracking()
-        else:
-            self._stop_satellite_tracking()
-
-    def _start_satellite_tracking(self):
-        # Split doesn't need to be turned on for this -- confirmed live
-        # on a real 705 that PTT switches to the Doppler-corrected
-        # uplink and back the same way whether split is on or off,
-        # since select_vfo_and_set_frequency()/start_ptt_after_vfo()
-        # already explicitly command the VFO A/B swap themselves rather
-        # than relying on split to do it. (An earlier version of this
-        # enabled split here, on the theory a 9700 needed it for PTT to
-        # follow Main's VFO B at all -- that turned out to be wrong too;
-        # PTT already follows Main's VFO A/B regardless of split state.)
+    def _on_tracking_changed(self, tracking):
         self._sub_vfo_a_selected = False
 
-        # Satellite mode, dual-receiver only: Sub is the active receiver
-        # (tuning knob/AF/RF/squelch controls) and the scope both default
-        # to Sub -- receiving, that's the Doppler-corrected downlink
-        # Sub continuously tracks (_on_satellite_tracking_tick), so
-        # that's what's worth looking at/listening to and adjusting.
-        # PTT itself switches the active receiver to Main for the
-        # duration of each transmission (_on_ptt_toggled) but
-        # deliberately leaves the scope on Sub throughout, to see
-        # yourself on the downlink while transmitting.
-        if self.worker.is_connected() and self.worker.is_dual_receiver:
-            # Radio-side dual watch / Main-Sub tracking (real Icom
-            # features -- alternating-listen and linked-tuning,
-            # respectively) directly fight this app's own from-scratch
-            # Main=uplink/Sub=downlink management -- confirmed live on
-            # a real 9700 that the active receiver kept oscillating
-            # between Main and Sub no matter how the software-side
-            # select_receiver() calls were adjusted (redundant every
-            # tick, or only once), strongly suggesting the radio itself
-            # was doing the switching regardless of what this app
-            # commanded. Explicitly disabled here so satellite mode
-            # starts from a clean, from-scratch state.
-            self.worker.set_dual_receiver_linking(False)
-            self.worker.select_receiver(RECEIVER_SUB)
-            self.worker.set_scope_receiver(RECEIVER_SUB)
-            self._update_active_receiver_ui(RECEIVER_SUB)
+    def apply_satellite_tick(self, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz):
+        """Called by SatelliteSession every tracking tick (2s) and
+        immediately on transponder/offset change. Role dispatch -- what
+        THIS radio does with the shared Doppler state depends entirely
+        on self._role; mechanics themselves are unchanged from the
+        original single-radio implementation, just relocated from what
+        used to be _on_satellite_tracking_tick. Returns a warning string
+        (possibly empty) for SatelliteSession to aggregate and surface.
 
-        self._apply_transponder_mode(self.satellite_transponder_combo.currentData())
-        self._on_satellite_tracking_tick()
-        self._satellite_tracking_timer.start(SATELLITE_TRACKING_INTERVAL_MS)
+        "full_duplex": today's original dual-receiver logic, verbatim --
+        Sub continuously re-tuned to the downlink while receiving, Main
+        re-tuned to the uplink only while transmitting (never both the
+        same tick -- confirmed live on a real 9700 that writing both
+        every tick fights over receiver focus and makes the active
+        receiver flip-flop continuously). Main sits wherever PTT last
+        left it between transmissions -- see _on_ptt_toggled.
 
-    def _apply_transponder_mode(self, transponder):
-        """Sets the radio's mode(s) from the transponder's stored mode
-        data, if they map unambiguously to this app's confirmed-valid
-        radio modes (see satellite_tracking.radio_mode_for_transponder)
-        -- called on tracking start and whenever the transponder
-        selection changes, so switching from an FM bird to a linear one
-        mid-session re-applies the right mode too, not just on first
-        start. Does nothing for either side (leaves mode alone) when it
-        can't be mapped confidently -- see that function's docstring for
-        why guessing further would be worse than doing nothing.
+        "downlink": always re-tuned to the downlink, VFO A, every tick,
+        unconditionally -- this role never transmits, so there's no
+        "while receiving" gate needed at all.
 
-        Downlink (Sub, or the single receiver on a single-receiver
-        radio) is set from the transponder's "mode" field whenever it
-        maps. Uplink (Main, dual-receiver only) is set two ways:
-          - If the transponder has its own "uplink_mode" recorded
-            (SatNOGS DB tracks this separately from "mode" specifically
-            because some linear transponders invert sidebands between
-            uplink and downlink -- confirmed via a live fetch of AO-7's
-            entry, mode=USB/uplink_mode=LSB/invert=true -- see
-            fetch_transponders' docstring) and it maps too, that's used,
-            correctly handling inverting transponders.
-          - Otherwise, only when the downlink mode is FM/WFM: mirrors
-            the downlink mode onto Main, since FM transponders don't
-            invert sidebands, so uplink==downlink is a safe default even
-            without explicit uplink_mode data (most FM entries don't
-            bother recording one, since it'd always just repeat "mode").
-          - Any other case (no uplink_mode AND downlink isn't FM/WFM)
-            leaves Main's mode alone for the operator to set/verify
-            manually, rather than risk transmitting on the wrong
-            sideband from an unconfirmed guess.
+        "uplink": does nothing on the periodic tick at all -- mirrors
+        how full_duplex's Main is left alone between transmissions;
+        PTT press (_on_ptt_toggled) computes a fresh uplink frequency
+        and retunes right then instead.
 
-        set_control_value (not set_receiver_control_value) is used for
-        the downlink half deliberately: it targets whichever receiver is
-        CURRENTLY active, which is correct here because every call site
-        of this method (tracking start, transponder change) only calls
-        it once Sub is already the intended active receiver -- using
-        set_receiver_control_value's explicit select-then-restore
-        machinery for Sub too would race against _start_satellite_
-        tracking's own already-in-flight select_receiver(RECEIVER_SUB)
-        dispatch (two independently-scheduled coroutines with no
-        guaranteed completion order -- the exact class of bug documented
-        at length elsewhere in this file). Main genuinely needs the
-        explicit version, since it's never the active receiver at this
-        point."""
+        Not called for "non_sat" radios (never registered with the
+        session)."""
+        if not self.worker.is_connected():
+            return ""
+        warning_text = ""
+        if self._role == "full_duplex":
+            transmitting = self.ptt_button.isChecked()
+            freq_hz = None
+            if transmitting:
+                freq_hz = uplink_hz
+                if freq_hz is not None:
+                    self.worker.select_vfo_and_set_frequency("B", freq_hz)
+            else:
+                freq_hz = downlink_hz
+                if freq_hz is not None:
+                    if not self._sub_vfo_a_selected:
+                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, freq_hz)
+                        self._sub_vfo_a_selected = True
+                    else:
+                        self.worker.set_receiver_frequency(RECEIVER_SUB, freq_hz)
+            if freq_hz is not None:
+                self._current_freq_hz = freq_hz
+                self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                self._update_band_button_highlight()
+        elif self._role == "downlink":
+            freq_hz = downlink_hz
+            if not self.worker.control_available("vfo"):
+                warning_text = "VFO control unavailable -- can't switch bands"
+            elif freq_hz is not None:
+                self.worker.select_vfo_and_set_frequency("A", freq_hz)
+                self._current_freq_hz = freq_hz
+                self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                self._update_band_button_highlight()
+        # "uplink": deliberately nothing here -- see docstring.
+        return warning_text
+
+    def apply_satellite_mode(self, transponder):
+        """Called by SatelliteSession whenever the transponder selection
+        changes (and once immediately on register(), if a transponder is
+        already selected -- e.g. connecting a second radio mid-pass).
+        Role dispatch, reusing radio_mode_for_transponder's confirmed-
+        unambiguous mapping (see satellite_tracking.py) -- relocated
+        near-verbatim from the original single-radio _apply_transponder_
+        mode.
+
+        "full_duplex": downlink mode applied via set_control_value
+        (targets whichever receiver is currently active -- Sub, since
+        that's who's listening). Uplink mode applied to Main
+        specifically via set_receiver_control_value, preferring the
+        transponder's own recorded uplink_mode (correctly handles
+        inverting linear transponders, e.g. AO-7's LSB-up/USB-down) and
+        falling back to mirroring the downlink mode only when it's FM/
+        WFM (safe -- FM transponders don't invert) and no uplink_mode
+        was recorded. Any other case leaves Main's mode alone rather
+        than guess.
+
+        "downlink": downlink mode only, via set_control_value (this
+        radio has no Main to speak of).
+
+        "uplink": same uplink-mode preference logic as full_duplex's
+        Main half, applied via the plain (non-receiver-specific)
+        set_control_value -- this radio has no Sub/downlink concept, so
+        there's no separate "which receiver" question here at all."""
         if transponder is None or not self.worker.is_connected():
             return
         if "mode" not in self.control_widgets:
             return
         downlink_mode_value = radio_mode_for_transponder(transponder.get("mode"))
-        if downlink_mode_value is not None:
-            self.worker.set_control_value("mode", downlink_mode_value)
-
-        if not self.worker.is_dual_receiver:
-            return
         uplink_mode_value = radio_mode_for_transponder(transponder.get("uplink_mode"))
         if uplink_mode_value is None and downlink_mode_value in ("FM", "WFM"):
             uplink_mode_value = downlink_mode_value
-        if uplink_mode_value is not None:
-            self.worker.set_receiver_control_value(RECEIVER_MAIN, "mode", uplink_mode_value)
 
-    def _stop_satellite_tracking(self):
-        """Pauses re-tuning -- the satellite stays selected (name,
-        transponder list, last-known overlay reading) until either
-        resumed or replaced by double-clicking another one. Also
-        restores Main as the active receiver/scope (dual-receiver only),
-        undoing _start_satellite_tracking's switch to Sub -- otherwise
-        normal (non-satellite) operation would silently be left
-        controlling/watching Sub instead of Main. Deliberately does NOT
-        re-enable dual watch/Main-Sub tracking (disabled on start) --
-        this app never reads their original state before disabling
-        them, so there's nothing to correctly restore; if wanted for
-        normal (non-satellite) operation, they can be turned back on
-        directly on the radio itself."""
-        self._satellite_tracking_timer.stop()
-        if self.worker.is_connected() and self.worker.is_dual_receiver:
-            self.worker.select_receiver(RECEIVER_MAIN)
-            self.worker.set_scope_receiver(RECEIVER_MAIN)
-            self._update_active_receiver_ui(RECEIVER_MAIN)
-
-    def _compute_satellite_state(self, satellite):
-        """Pure computation, no radio I/O -- look angles, next AOS/LOS,
-        and both directions' Doppler-corrected frequencies for the given
-        satellite right now. Shared between the periodic tracking tick
-        (which dispatches per-tick, unbundled with anything else) and
-        PTT press/release (which needs the exact same numbers but has to
-        bundle sending them to the radio together with the PTT command
-        itself -- see _on_ptt_toggled). Returns None if propagation
-        fails (invalid/missing TLE)."""
-        line1, line2 = satellite.get("line1", ""), satellite.get("line2", "")
-        observer_lat = self._details.get("observer_lat")
-        observer_lon = self._details.get("observer_lon")
-        observer_elevation_km = (self._details.get("observer_elevation_m") or 0.0) / 1000.0
-        now = datetime.datetime.now(datetime.timezone.utc)
-
-        look = satellite_look_angles(line1, line2, now, observer_lat, observer_lon, observer_elevation_km)
-        if look is None:
-            return None
-
-        # The AOS/LOS search is a real (if cheap) computation -- only
-        # re-run it once the previously-found crossing has actually
-        # passed, not on every 2-second tick.
-        if self._next_satellite_crossing is None or now >= self._next_satellite_crossing["time_utc"]:
-            self._next_satellite_crossing = next_aos_los(
-                line1, line2, now, observer_lat, observer_lon, observer_elevation_km
-            )
-        crossing_text = "AOS/LOS: unknown"
-        if self._next_satellite_crossing:
-            remaining = (self._next_satellite_crossing["time_utc"] - now).total_seconds()
-            crossing_text = f"{self._next_satellite_crossing['event']} in {format_countdown(remaining)}"
-
-        transponder = self.satellite_transponder_combo.currentData()
-        downlink_hz, downlink_doppler_hz = None, None
-        uplink_hz, uplink_doppler_hz = None, None
-        if transponder is not None:
-            try:
-                base_downlink_hz = round(float(transponder.get("downlink_mhz")) * 1e6)
-            except (TypeError, ValueError):
-                base_downlink_hz = None
-            if base_downlink_hz is not None:
-                # The tuning knob adjusts this offset instead of the
-                # radio directly while tracking is active (_on_knob_
-                # steps) -- so manual tuning within a linear satellite's
-                # passband, or a nudge to line up with where it's
-                # actually transmitting, survives the next tick instead
-                # of being overwritten by a recompute from the
-                # transponder's bare nominal downlink. RX only -- there's
-                # no equivalent TX offset.
-                base_downlink_hz += self._satellite_freq_offset_hz
-                result = doppler_correction(
-                    base_downlink_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km,
-                    uplink=False,
-                )
-                if result is not None:
-                    downlink_hz = round(result["frequency_hz"])
-                    downlink_doppler_hz = result["doppler_hz"]
-
-            try:
-                base_uplink_hz = round(float(transponder.get("uplink_mhz")) * 1e6)
-            except (TypeError, ValueError):
-                base_uplink_hz = None
-            if base_uplink_hz is not None:
-                result = doppler_correction(
-                    base_uplink_hz, line1, line2, now, observer_lat, observer_lon, observer_elevation_km,
-                    uplink=True,
-                )
-                if result is not None:
-                    uplink_hz = round(result["frequency_hz"])
-                    uplink_doppler_hz = result["doppler_hz"]
-
-        return look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz
-
-    def _update_satellite_overlay(self, satellite, look, crossing_text,
-                                   downlink_doppler_hz, uplink_doppler_hz, warning_text=""):
-        doppler_text = ""
-        if downlink_doppler_hz is not None:
-            doppler_text += f"  RX Doppler {downlink_doppler_hz:+.0f} Hz"
-            if self._satellite_freq_offset_hz:
-                doppler_text += f"  Offset {self._satellite_freq_offset_hz:+.0f} Hz"
-        if uplink_doppler_hz is not None:
-            doppler_text += f"  TX Doppler {uplink_doppler_hz:+.0f} Hz"
-        visibility = "up" if look["elevation_deg"] >= 0 else "down"
-        self.satellite_overlay_label.setText(
-            f"{satellite.get('name', '?')} ({visibility})\n"
-            f"El {look['elevation_deg']:.1f}°  Az {look['azimuth_deg']:.1f}°{doppler_text}{warning_text}\n"
-            f"{crossing_text}"
-        )
-        self.spectrum_widget.reposition_overlays()
-
-    def _on_satellite_tracking_tick(self):
-        """Called every SATELLITE_TRACKING_INTERVAL_MS by the tracking
-        timer, and also immediately (for responsiveness) on satellite/
-        transponder selection and knob input. NOT called for PTT press/
-        release any more -- see _on_ptt_toggled, which needs the retune
-        bundled atomically with the PTT command itself, not dispatched
-        here as a separate, independently-scheduled one.
-
-        Single-receiver radios (7300/705): one shared VFO context, A for
-        RX / B for TX. Which VFO to target is derived fresh from
-        ptt_button.isChecked() on EVERY call, not just remembered from
-        the last PTT edge, and reasserted via select_vfo_and_set_
-        frequency() (VFO select + frequency, atomically) every single
-        tick -- confirmed working correctly on a real 705.
-
-        Dual-receiver radios (9700/7610): Sub is the downlink, Main is
-        the uplink (confirmed live on a real 9700: PTT-driven
-        transmission always follows Main's own VFO A/B context, never
-        Sub, so Main has to be what carries the uplink). Only whichever
-        receiver is actually ACTIVE right now gets Doppler-tuned this
-        tick -- Sub while receiving, Main while transmitting, never
-        both:
-
-        - Sub, while receiving: continuously re-tuned to the live
-          Doppler-corrected downlink, same as before. Its VFO slot only
-          needs selecting once per tracking session (_sub_vfo_a_selected,
-          reset in _start_satellite_tracking) since its direction never
-          changes; subsequent ticks just update its frequency.
-        - Main, while transmitting: continuously re-tuned to the live
-          Doppler-corrected uplink, same select_vfo_and_set_frequency()
-          pattern as the single-receiver case above, just gated to only
-          run while transmitting.
-        - The receiver NOT currently active isn't touched at all by the
-          tick. Main sits wherever PTT last left it until the next
-          press (_on_ptt_toggled's bundled start_ptt_after_vfo() gives
-          it a fresh, correct value right when it's actually needed,
-          not continuously pre-tuned while nothing's watching it). Sub
-          isn't re-tuned during a transmission -- deliberately: Doppler
-          drift over the span of one transmission is small enough to
-          stay within the scope's visible bandwidth (which stays on Sub
-          throughout, see _start_satellite_tracking, specifically so
-          you can see yourself on the downlink while transmitting), so
-          there's nothing worth correcting for until PTT releases
-          anyway. This also sidesteps a real hardware quirk, confirmed
-          live on a real 9700 all the way back at the start of this
-          dual-receiver investigation: writing a receiver's frequency
-          also visibly focuses/activates it -- so writing both every
-          tick (an earlier version of this did) fought over focus and
-          made the active receiver flip-flop continuously regardless of
-          RX/TX state. Only ever touching one receiver per tick avoids
-          that entirely, without needing to explicitly reassert
-          anything afterward."""
-        satellite = self._active_satellite
-        if satellite is None:
-            return
-        state = self._compute_satellite_state(satellite)
-        if state is None:
-            self.satellite_overlay_label.setText(f"{satellite.get('name', '?')}\nOrbit propagation failed (invalid TLE?)")
-            self.spectrum_widget.reposition_overlays()
-            return
-        look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz = state
-
-        warning_text = ""
-        transmitting = self.ptt_button.isChecked()
-        if self.worker.is_connected():
-            if self.worker.is_dual_receiver:
-                if transmitting:
-                    freq_hz = uplink_hz
-                    if freq_hz is not None:
-                        self.worker.select_vfo_and_set_frequency("B", freq_hz)
-                else:
-                    freq_hz = downlink_hz
-                    if freq_hz is not None:
-                        if not self._sub_vfo_a_selected:
-                            self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, freq_hz)
-                            self._sub_vfo_a_selected = True
-                        else:
-                            self.worker.set_receiver_frequency(RECEIVER_SUB, freq_hz)
-                if freq_hz is not None:
-                    # Update optimistically, same as _on_knob_steps/
-                    # _on_band_selected -- otherwise the main frequency
-                    # readout and band-button highlight just sit still
-                    # until the next 0.5s poll cycle confirms them.
-                    self._current_freq_hz = freq_hz
-                    self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
-                    self._update_band_button_highlight()
-            else:
-                target_vfo = "B" if transmitting else "A"
-                freq_hz = uplink_hz if transmitting else downlink_hz
-                if not self.worker.control_available("vfo"):
-                    warning_text = "  [VFO control unavailable -- can't switch bands]"
-                elif freq_hz is not None:
-                    self.worker.select_vfo_and_set_frequency(target_vfo, freq_hz)
-                else:
-                    self.worker.set_control_value("vfo", target_vfo)
-
-                if freq_hz is not None and not warning_text:
-                    self._current_freq_hz = freq_hz
-                    self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
-                    self._update_band_button_highlight()
-
-        self._update_satellite_overlay(satellite, look, crossing_text, downlink_doppler_hz, uplink_doppler_hz, warning_text)
-
-    def _on_wsjtx_button_clicked(self):
-        settings = QSettings("IcomRadioApp", "RadioControl")
-        path = settings.value("wsjtx_executable_path", "")
-
-        if not path or not os.path.isfile(path):
-            path = find_wsjtx_executable()
-
-        if not path:
-            path, _filter = QFileDialog.getOpenFileName(
-                self, "Locate the WSJT-X executable",
-                "", "Executable (*.exe);;All files (*)" if platform.system() == "Windows" else "All files (*)",
-            )
-            if not path:
-                return  # user cancelled the browse dialog
-
-        try:
-            launch_wsjtx(path)
-        except OSError as exc:
-            QMessageBox.critical(self, "WSJT-X", f"Couldn't launch WSJT-X at:\n{path}\n\n{exc}")
-            return
-
-        # Only remember the path once it's actually confirmed to work
-        # (subprocess.Popen not raising means the OS accepted it).
-        settings.setValue("wsjtx_executable_path", path)
-
-    def _on_rigctld_toggled(self, checked):
-        if checked:
-            port = self.rigctld_port_input.value()
-            self.rigctld_server = RigctldServer(
-                get_freq=lambda: self._current_freq_hz or 0,
-                set_freq=lambda hz: self.worker.set_frequency(int(hz)),
-                get_mode=lambda: (self.control_widgets["mode"].currentData() or "USB", 0),
-                set_mode=lambda mode: self.worker.set_control_value("mode", mode),
-                get_ptt=lambda: self.ptt_button.isChecked(),
-                set_ptt=lambda on: self.ptt_button.setChecked(on),  # reuses the normal PTT path via its toggled signal
-                port=port,
-            )
-            try:
-                self.rigctld_server.start()
-            except RuntimeError as exc:
-                QMessageBox.critical(self, "Rigctld", str(exc))
-                self.rigctld_server = None
-                self.rigctld_button.setChecked(False)
-                return
-            self.rigctld_button.setText(f"Rigctld: ON (port {port})")
-            self.rigctld_port_input.setEnabled(False)  # changing port on a live server needs a stop/restart first
-        else:
-            port = self.rigctld_port_input.value()
-            if self.rigctld_server is not None:
-                self.rigctld_server.stop()
-                self.rigctld_server = None
-            self.rigctld_button.setText(f"Rigctld: OFF (port {port})")
-            self.rigctld_port_input.setEnabled(True)
-
-    def _on_virtual_cable_toggled(self, checked):
-        if checked:
-            self.virtual_cable_button.setText("Virtual Cables: ON")
-            self.worker.enable_virtual_cables()
-        else:
-            self.virtual_cable_button.setText("Virtual Cables: OFF")
-            self.worker.disable_virtual_cables()
-
-    def _on_virtual_cable_channel_changed(self, _index):
-        self.worker.set_rx_downmix_channel(self.virtual_cable_channel_combo.currentData())
+        if self._role == "full_duplex":
+            if downlink_mode_value is not None:
+                self.worker.set_control_value("mode", downlink_mode_value)
+            if uplink_mode_value is not None:
+                self.worker.set_receiver_control_value(RECEIVER_MAIN, "mode", uplink_mode_value)
+        elif self._role == "downlink":
+            if downlink_mode_value is not None:
+                self.worker.set_control_value("mode", downlink_mode_value)
+        elif self._role == "uplink":
+            if uplink_mode_value is not None:
+                self.worker.set_control_value("mode", uplink_mode_value)
 
     def _on_vfo_toggle_clicked(self, key):
         definition = CONTROL_DEFINITIONS[key]
@@ -1293,16 +819,19 @@ class RadioWindow(QWidget):
     def _on_knob_steps(self, steps):
         step_hz = self.step_combo.currentData()
         # While actively Doppler-tracking a transponder, the knob adjusts
-        # the offset applied to that transponder's nominal downlink
-        # instead of commanding the radio directly -- otherwise the next
-        # tracking tick (up to 2s later) would just overwrite any manual
-        # adjustment with a fresh nominal+Doppler computation. This is
-        # how an operator tunes within a linear satellite's passband, or
-        # nudges to better match where it's actually transmitting.
-        if (self._active_satellite is not None and self._satellite_tracking_timer.isActive()
-                and self.satellite_transponder_combo.currentData() is not None):
-            self._satellite_freq_offset_hz += steps * step_hz
-            self._on_satellite_tracking_tick()  # apply immediately, don't wait for the next timer tick
+        # the SHARED offset (SatelliteSession) applied to the
+        # transponder's nominal downlink instead of commanding the radio
+        # directly -- otherwise the next tracking tick (up to 2s later)
+        # would just overwrite any manual adjustment with a fresh
+        # nominal+Doppler computation. This is how an operator tunes
+        # within a linear satellite's passband, or nudges to better
+        # match where it's actually transmitting. Only meaningful for
+        # roles that actually watch the downlink continuously
+        # (full_duplex/downlink) -- "uplink" has no receive duty as part
+        # of satellite tracking at all (see apply_satellite_tick), and
+        # "non_sat" never has tracking active in the first place.
+        if self._role in ("full_duplex", "downlink") and self._satellite_session.is_tracking():
+            self._satellite_session.adjust_offset(steps * step_hz)
             return
 
         if self._current_freq_hz is None:
@@ -1351,13 +880,16 @@ class RadioWindow(QWidget):
             )
 
     def closeEvent(self, event):
-        self._satellite_tracking_timer.stop()
-        if self.hamclock_window is not None:
-            self.hamclock_window.close()
-        if self.rigctld_server is not None:
-            self.rigctld_server.stop()
-        if self.virtual_cable_button.isChecked():
-            self.worker.disable_virtual_cables()  # best-effort; worker.stop() below may cut this off before it finishes
+        self._satellite_session.unregister(self)
+        # Emitted BEFORE worker.stop() -- HamClockWindow's handler may
+        # still need to call something on this worker (e.g.
+        # disable_virtual_cables(), if this radio was its target), which
+        # needs the worker's asyncio loop still alive to have any chance
+        # of actually running (best-effort either way -- worker.stop()
+        # right after this may still cut it off before it finishes,
+        # exactly as disable_virtual_cables() itself already
+        # acknowledges elsewhere).
+        self.closed.emit(self)
         self.worker.stop()
         self.worker.wait(2000)  # give the polling loop a moment to exit cleanly
         event.accept()

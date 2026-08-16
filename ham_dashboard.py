@@ -1,22 +1,37 @@
 """
-HamClockWindow: the Ham Dashboard window itself, tying together the
-day/night world map, live clocks, solar-terrestrial data, HF band
-conditions, and satellite tracking into one window. Opened via the "Ham
-Dashboard" button in the main radio window -- doesn't need a radio
-connection. The operator's location (used for Doppler correction, and
-shown as a marker on the map) is set in ConnectionDialog, not here.
+HamClockWindow: the app's central/main window -- the one thing that
+exists independently of any radio connection, tying together the day/
+night world map, live clocks, solar-terrestrial data, HF band
+conditions, satellite tracking, and now (see below) radio connection
+management, satellite Doppler control, Virtual Cables, rigctld, and
+WSJT-X launching. Constructed directly by main.py; no radio connects at
+startup any more -- radios are added from here ("Connect New Radio..."),
+each assigned a satellite role (RADIO_ROLES in constants.py) in
+ConnectionDialog, and get their own RadioWindow (main_window.py).
 
-Double-clicking a tracked satellite on the map doesn't drive the radio
-from here -- it just emits satellite_selected and leaves Doppler
-correction, transponder choice, and the live tracking overlay to
-RadioWindow (main_window.py) so tracking keeps running and stays
-switchable to another satellite without this window (or the whole app,
-since a QDialog's exec() used to block it) becoming unusable.
+Satellite/transponder selection, the Doppler-tracking clock, and per-
+role dispatch to however many radios are currently connected all live
+in SatelliteSession (satellite_session.py), owned by this window --
+the single shared source of truth multiple radios need to cooperate on
+one pass. This window owns the UI for it (transponder combo, Start/
+Stop Tracking, the tracking overlay); RadioWindow has none of that any
+more, only role-dispatch logic that reacts to what SatelliteSession
+tells it. Double-clicking a satellite on the map (or a row in the
+upcoming-passes table) starts a session here directly -- no signal
+hop out to some other window needed, since this DOES own tracking now.
+
+Virtual Cables and rigctld are also both here, each with their own
+"which connected radio" target picker, rather than living on whichever
+RadioWindow happened to have the button -- makes sense once more than
+one radio can be connected. WSJT-X launching has no radio dependency
+at all and moved here too, for the same "one central place" reasoning.
 """
 
 import datetime
+import os
+import platform
 
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import Qt, QTimer, Slot, QSettings
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget,
@@ -29,11 +44,23 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QListWidget,
+    QListWidgetItem,
+    QComboBox,
+    QSpinBox,
+    QFileDialog,
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
 from theme import position_on_screen_half
 from world_map import WorldMapWidget
+from connection_dialog import ConnectionDialog
+from main_window import RadioWindow
+from satellite_session import SatelliteSession
+from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
+from constants import RADIO_ROLES
+
+_ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 from satellite_tracking import (
     SatelliteConfigDialog,
     load_satellite_data,
@@ -60,22 +87,33 @@ PASSES_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
 class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
-    section for what's in scope and why. observer_lat/observer_lon/
-    observer_elevation_m come from ConnectionDialog."""
+    section for what's in scope and why."""
 
-    satellite_selected = Signal(dict)  # emitted on a valid double-click; RadioWindow does the rest
     PASSES_DISPLAY_COUNT = 10
 
-    def __init__(self, observer_lat=None, observer_lon=None,
-                 observer_elevation_m=0.0, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ham Dashboard")
-        # Right half of the screen -- RadioWindow (main.py) takes the left
-        # half on launch, so the two sit side by side by default.
         position_on_screen_half(self, "right")
-        self._observer_lat = observer_lat
-        self._observer_lon = observer_lon
-        self._observer_elevation_m = observer_elevation_m or 0.0
+
+        # No radio connects at startup any more -- this window is the
+        # first thing that opens, so observer location (for Doppler
+        # correction and the map marker) comes straight from QSettings
+        # (the same keys ConnectionDialog itself reads/writes) instead
+        # of from a RadioWindow's connection details. Re-read after each
+        # successful new-radio connection too (_on_connect_radio_clicked),
+        # in case that dialog updated it.
+        self._load_observer_location()
+
+        self.satellite_session = SatelliteSession(self)
+        self.satellite_session.set_observer_location(
+            self._observer_lat, self._observer_lon, self._observer_elevation_m
+        )
+        self.satellite_session.state_updated.connect(self._on_satellite_state_updated)
+        self.satellite_session.tracking_changed.connect(self._on_session_tracking_changed)
+
+        self._connected_radios = []  # RadioWindow instances, in connection order
+        self._active_satellite = None  # for populating the transponder combo -- SatelliteSession keeps its own copy for computation
 
         self.map_widget = WorldMapWidget()
         self.map_widget.satellite_double_clicked.connect(self._on_satellite_double_clicked)
@@ -149,6 +187,158 @@ class HamClockWindow(QWidget):
         self.satellite_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.satellite_button.customContextMenuRequested.connect(self._on_satellite_config_requested)
 
+        # ---- Connected radios ----
+        self.connect_radio_button = QPushButton("Connect New Radio...")
+        self.connect_radio_button.setToolTip(
+            "Opens the connection dialog for another radio -- pick its "
+            "satellite role there (Full Duplex / Downlink / Uplink / "
+            "Non-Sat). Each connected radio gets its own window."
+        )
+        self.connect_radio_button.clicked.connect(self._on_connect_radio_clicked)
+
+        self.connected_radios_list = QListWidget()
+        self.connected_radios_list.setToolTip("Double-click to bring that radio's window to the front.")
+        self.connected_radios_list.setFixedHeight(70)
+        self.connected_radios_list.itemDoubleClicked.connect(self._on_connected_radio_item_double_clicked)
+
+        connected_radios_header = QHBoxLayout()
+        connected_radios_header.addWidget(QLabel("Connected Radios:"))
+        connected_radios_header.addWidget(self.connect_radio_button)
+        connected_radios_header.addStretch()
+
+        connected_radios_column = QVBoxLayout()
+        connected_radios_column.addLayout(connected_radios_header)
+        connected_radios_column.addWidget(self.connected_radios_list)
+
+        # ---- Satellite tracking controls (moved from RadioWindow --
+        # now the single shared control point for however many radios
+        # are cooperating on one pass, driving SatelliteSession) ----
+        self.satellite_name_label = QLabel("No satellite selected")
+        self.transponder_combo = QComboBox()
+        self.transponder_combo.setEnabled(False)
+        self.transponder_combo.setToolTip(
+            "Which of the selected satellite's stored transponders to "
+            "Doppler-correct against."
+        )
+        self.transponder_combo.currentIndexChanged.connect(self._on_transponder_changed)
+        # Toggle, not a one-way stop button -- pausing/resuming keeps the
+        # satellite selected (only double-clicking a different one on
+        # the map, or a different upcoming-pass row, replaces it).
+        # Starts unchecked/disabled; _on_satellite_double_clicked enables
+        # it and checks it (tracking starts immediately on select, same
+        # as the pre-refactor per-radio-window behavior).
+        self.tracking_button = QPushButton("Start Tracking")
+        self.tracking_button.setCheckable(True)
+        self.tracking_button.setEnabled(False)
+        self.tracking_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.tracking_button.setToolTip(
+            "Pause/resume Doppler re-tuning on every connected satellite-role "
+            "radio. The satellite stays selected either way -- double-click a "
+            "different one on the map (or an upcoming-pass row) to switch."
+        )
+        self.tracking_button.toggled.connect(self._on_tracking_toggled)
+
+        tracking_row = QHBoxLayout()
+        tracking_row.addWidget(self.satellite_name_label)
+        tracking_row.addWidget(self.transponder_combo, 1)
+        tracking_row.addWidget(self.tracking_button)
+
+        # Live El/Az/Doppler/AOS-LOS text -- replaces what used to be
+        # RadioWindow's own per-window overlay (one shared readout now,
+        # not one per connected radio).
+        self.satellite_overlay_label = QLabel("")
+        self.satellite_overlay_label.setWordWrap(True)
+        self.satellite_overlay_label.setStyleSheet("color: #ccc; font-size: 12px;")
+
+        # ---- Virtual Cables (moved from RadioWindow -- now targets
+        # whichever connected radio is picked, since more than one can
+        # be connected at once) ----
+        self.virtual_cable_target_combo = QComboBox()
+        self.virtual_cable_target_combo.setToolTip("Which connected radio's audio to route through the virtual cables.")
+
+        self.virtual_cable_channel_combo = QComboBox()
+        self.virtual_cable_channel_combo.addItem("RX Cable: Mixed (Main + Sub)", "mix")
+        self.virtual_cable_channel_combo.addItem("RX Cable: Main only", "main")
+        self.virtual_cable_channel_combo.addItem("RX Cable: Sub only", "sub")
+        self.virtual_cable_channel_combo.setToolTip(
+            "Which receiver's audio goes to the RX virtual cable (e.g. for "
+            "WSJT-X digital-mode decoding on a satellite downlink) -- 'Sub "
+            "only' keeps Main's audio from bleeding into the decode. Only "
+            "meaningful for a dual-receiver target radio; harmless no-op "
+            "otherwise. Takes effect immediately, including while Virtual "
+            "Cables is already on."
+        )
+        self.virtual_cable_channel_combo.currentIndexChanged.connect(self._on_virtual_cable_channel_changed)
+
+        self.virtual_cable_button = QPushButton("Virtual Cables: OFF")
+        self.virtual_cable_button.setCheckable(True)
+        self.virtual_cable_button.setEnabled(False)
+        self.virtual_cable_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.virtual_cable_button.setToolTip(
+            "Creates two virtual audio devices (Linux/PulseAudio or PipeWire "
+            "only) so an external app (WSJT-X, etc.) can send/receive audio "
+            "through the target radio's connection, in place of the physical "
+            "devices chosen for it in the connection dialog. Click again to "
+            "switch back to those original devices."
+        )
+        self.virtual_cable_button.toggled.connect(self._on_virtual_cable_toggled)
+
+        # ---- Rigctld (moved from RadioWindow -- own target picker,
+        # independent of Virtual Cables', since a real setup might want
+        # rigctld bound to one radio (e.g. the uplink) while Virtual
+        # Cables feeds a different one (e.g. the downlink)) ----
+        self.rigctld_target_combo = QComboBox()
+        self.rigctld_target_combo.setToolTip("Which connected radio external CAT-aware apps control through rigctld.")
+
+        self.rigctld_port_input = QSpinBox()
+        self.rigctld_port_input.setRange(1, 65535)
+        self.rigctld_port_input.setValue(RIGCTLD_DEFAULT_PORT)
+        self.rigctld_port_input.setToolTip("TCP port for the rigctld server to listen on.")
+
+        self.rigctld_button = QPushButton(f"Rigctld: OFF (port {RIGCTLD_DEFAULT_PORT})")
+        self.rigctld_button.setCheckable(True)
+        self.rigctld_button.setEnabled(False)
+        self.rigctld_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.rigctld_button.setToolTip(
+            "Lets other CAT-aware apps (WSJT-X, JTDX, fldigi, ...) control the "
+            "target radio through this app's connection -- select \"Hamlib NET "
+            "rigctl\" (rig model 2) and 127.0.0.1:<port above> in that app."
+        )
+        self.rigctld_button.toggled.connect(self._on_rigctld_toggled)
+        self.rigctld_server = None  # created lazily on first enable
+
+        # ---- WSJT-X launch (moved from RadioWindow -- no radio
+        # dependency at all, so this is just a relocation) ----
+        self.wsjtx_button = QPushButton("Launch WSJT-X")
+        self.wsjtx_button.setToolTip(
+            f"Launches WSJT-X in its own isolated profile (--rig-name={WSJTX_RIG_NAME}), "
+            "separate from your main WSJT-X settings. Use the Rigctld button below to "
+            "let it control a radio."
+        )
+        self.wsjtx_button.clicked.connect(self._on_wsjtx_button_clicked)
+
+        rigctld_column = QVBoxLayout()
+        rigctld_column.addWidget(self.rigctld_target_combo)
+        rigctld_column.addWidget(self.rigctld_port_input)
+        rigctld_column.addWidget(self.rigctld_button)
+
+        virtual_cable_column = QVBoxLayout()
+        virtual_cable_column.addWidget(self.virtual_cable_target_combo)
+        virtual_cable_column.addWidget(self.virtual_cable_channel_combo)
+        virtual_cable_column.addWidget(self.virtual_cable_button)
+
+        external_apps_row = QHBoxLayout()
+        external_apps_row.addWidget(self.wsjtx_button)
+        external_apps_row.addLayout(rigctld_column)
+        external_apps_row.addLayout(virtual_cable_column)
+        external_apps_row.addStretch()
+
         clocks_row = QHBoxLayout()
         clocks_row.addWidget(self.utc_label)
         clocks_row.addWidget(self.local_label)
@@ -182,6 +372,10 @@ class HamClockWindow(QWidget):
         # conditions/passes rows -- and for whatever gets added there later.
         layout.addWidget(self.map_widget)
         layout.addLayout(clocks_row)
+        layout.addLayout(connected_radios_column)
+        layout.addLayout(tracking_row)
+        layout.addWidget(self.satellite_overlay_label)
+        layout.addLayout(external_apps_row)
         layout.addLayout(solar_row)
         layout.addWidget(self.solar_updated_label)
         layout.addLayout(bottom_row)
@@ -219,6 +413,18 @@ class HamClockWindow(QWidget):
         self.solar_worker = SolarDataWorker()
         self.solar_worker.data_updated.connect(self._on_solar_data)
         self.solar_worker.start()
+
+    def _load_observer_location(self):
+        """Reads observer_lat/lon/elevation from QSettings -- the same
+        keys ConnectionDialog itself reads/writes on every accept -- so
+        the map marker and Doppler correction have a location without
+        needing a radio connected first. Called once at startup and
+        again after each successful new-radio connection, in case that
+        dialog just updated it."""
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        self._observer_lat = float(settings.value("operator_lat", 0.0)) or None
+        self._observer_lon = float(settings.value("operator_lon", 0.0)) or None
+        self._observer_elevation_m = float(settings.value("operator_elevation_m", 0.0))
 
     def _update_clocks(self):
         self.utc_label.setText(datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC"))
@@ -342,29 +548,104 @@ class HamClockWindow(QWidget):
         self._on_satellite_double_clicked(self._upcoming_passes[row]["name"])
 
     def _on_satellite_double_clicked(self, name):
+        """(Re)starts tracking this satellite -- replaces whatever was
+        active before (it stays selected/tracked until another double-
+        click, or upcoming-pass row double-click, replaces it; pausing
+        via Stop Tracking doesn't clear it). Drives SatelliteSession
+        directly now -- this window owns tracking control, not just a
+        signal source for some other window to react to."""
         satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
         if satellite is None:
             return
         # (0, 0) is what an unset lat/lon defaults to (nobody's actual
         # station is at 0N 0E), so treat it the same as "not set". Unlike
-        # transponder data (see main_window.py's tracking overlay, which
-        # handles "no transponders" gracefully -- elevation/azimuth/AOS-
-        # LOS don't need one), there's no useful degraded mode without a
-        # location at all.
+        # transponder data (handled gracefully below -- elevation/
+        # azimuth/AOS-LOS don't need one), there's no useful degraded
+        # mode without a location at all.
         if not self._observer_lat and not self._observer_lon:
             QMessageBox.warning(
                 self, "Satellite Tracking",
-                "Set your location in the Connect dialog first (Latitude/"
-                "Longitude/Elevation) -- satellite tracking needs to know "
-                "where you're observing from. You'll need to restart the "
-                "app to change it."
+                "Set your location in the Connect New Radio dialog first "
+                "(Latitude/Longitude/Elevation) -- satellite tracking needs "
+                "to know where you're observing from."
             )
             return
-        # RadioWindow already independently has observer_lat/lon/elevation
-        # (same source: ConnectionDialog's details) -- just the satellite
-        # itself goes over the signal, not a location that could in
-        # principle drift out of sync with RadioWindow's own copy.
-        self.satellite_selected.emit(satellite)
+
+        self._active_satellite = satellite
+        self.satellite_name_label.setText(satellite.get("name", "?"))
+
+        self.transponder_combo.blockSignals(True)
+        self.transponder_combo.clear()
+        transponders = satellite.get("transponders", [])
+        if transponders:
+            for transponder in transponders:
+                downlink = transponder.get("downlink_mhz") or "?"
+                mode = transponder.get("mode") or "?"
+                uplink_mode = transponder.get("uplink_mode") or ""
+                # Only show a "uplink/downlink" mode split when they
+                # actually differ (an inverting linear transponder) --
+                # redundant otherwise (FM transponders, or entries with
+                # no uplink_mode recorded at all).
+                mode_label = f"{uplink_mode}/{mode}" if uplink_mode and uplink_mode != mode else mode
+                description = transponder.get("description") or "Transponder"
+                self.transponder_combo.addItem(f"{description} -- {downlink} MHz {mode_label}", transponder)
+            self.transponder_combo.setEnabled(True)
+        else:
+            self.transponder_combo.addItem("No transponders stored -- Doppler correction unavailable", None)
+            self.transponder_combo.setEnabled(False)
+        self.transponder_combo.blockSignals(False)
+
+        # Tracking always (re)starts on selection -- if it's already
+        # checked (switching straight from one satellite to another),
+        # setChecked(True) won't re-emit toggled, so start explicitly
+        # rather than relying on it.
+        self.tracking_button.setEnabled(True)
+        self.tracking_button.blockSignals(True)
+        self.tracking_button.setChecked(True)
+        self.tracking_button.blockSignals(False)
+        self.tracking_button.setText("Stop Tracking")
+
+        self.satellite_session.start(satellite)
+        self.satellite_session.set_transponder(self.transponder_combo.currentData())
+
+    def _on_transponder_changed(self, _index):
+        if self._active_satellite is not None:
+            self.satellite_session.set_transponder(self.transponder_combo.currentData())
+
+    def _on_tracking_toggled(self, checked):
+        self.tracking_button.setText("Stop Tracking" if checked else "Start Tracking")
+        if checked:
+            if self._active_satellite is not None:
+                self.satellite_session.start(self._active_satellite)
+        else:
+            self.satellite_session.stop()
+
+    def _on_session_tracking_changed(self, tracking):
+        # Keeps the button in sync if SatelliteSession's state changes
+        # from somewhere other than this button itself (there's no such
+        # path today, but this is cheap insurance against the button and
+        # the session silently disagreeing).
+        if self.tracking_button.isChecked() != tracking:
+            self.tracking_button.blockSignals(True)
+            self.tracking_button.setChecked(tracking)
+            self.tracking_button.blockSignals(False)
+            self.tracking_button.setText("Stop Tracking" if tracking else "Start Tracking")
+
+    def _on_satellite_state_updated(self, satellite, look, crossing_text, downlink_doppler_hz, uplink_doppler_hz, warning_text):
+        if look is None:
+            self.satellite_overlay_label.setText(f"{satellite.get('name', '?')}\nOrbit propagation failed (invalid TLE?)")
+            return
+        doppler_text = ""
+        if downlink_doppler_hz is not None:
+            doppler_text += f"  RX Doppler {downlink_doppler_hz:+.0f} Hz"
+        if uplink_doppler_hz is not None:
+            doppler_text += f"  TX Doppler {uplink_doppler_hz:+.0f} Hz"
+        visibility = "up" if look["elevation_deg"] >= 0 else "down"
+        self.satellite_overlay_label.setText(
+            f"{satellite.get('name', '?')} ({visibility})  "
+            f"El {look['elevation_deg']:.1f}°  Az {look['azimuth_deg']:.1f}°{doppler_text}{warning_text}\n"
+            f"{crossing_text}"
+        )
 
     @Slot(dict)
     def _on_solar_data(self, data):
@@ -411,7 +692,184 @@ class HamClockWindow(QWidget):
                     item.setBackground(color)
                     item.setForeground(QColor(255, 255, 255))
 
+    # ---- Connected radios ----
+
+    def _on_connect_radio_clicked(self):
+        dialog = ConnectionDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        details = dialog.details
+
+        # ConnectionDialog may have just updated the saved location --
+        # re-read and push it to the map/session so it's not stuck on
+        # whatever was there (or nothing) at startup.
+        self._load_observer_location()
+        self.satellite_session.set_observer_location(
+            self._observer_lat, self._observer_lon, self._observer_elevation_m
+        )
+        if self._observer_lat is not None and self._observer_lon is not None:
+            self.map_widget.set_operator_location(
+                self._observer_lat, self._observer_lon,
+                f"{self._observer_lat:.3f}, {self._observer_lon:.3f}",
+            )
+
+        window = RadioWindow(details, self.satellite_session)
+        window.closed.connect(self._on_radio_window_closed)
+        self._connected_radios.append(window)
+
+        role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
+        connection_label = details.get("host") or details.get("serial_port") or "?"
+        item = QListWidgetItem(f"{details['radio_model']} ({role_label}) -- {connection_label}")
+        item.setData(Qt.UserRole, window)
+        self.connected_radios_list.addItem(item)
+
+        self._refresh_target_combos()
+        window.show()
+
+    def _on_connected_radio_item_double_clicked(self, item):
+        window = item.data(Qt.UserRole)
+        if window is not None:
+            window.show()
+            window.raise_()
+            window.activateWindow()
+
+    def _on_radio_window_closed(self, window):
+        """Connected to RadioWindow.closed, emitted from closeEvent
+        BEFORE that window's worker actually stops -- so it's still
+        safe here to call something on it one last time (disabling
+        Virtual Cables/rigctld if this was their target), same best-
+        effort guarantee those calls already carry on their own."""
+        if window in self._connected_radios:
+            self._connected_radios.remove(window)
+        for row in range(self.connected_radios_list.count()):
+            item = self.connected_radios_list.item(row)
+            if item.data(Qt.UserRole) is window:
+                self.connected_radios_list.takeItem(row)
+                break
+        if self.virtual_cable_button.isChecked() and self.virtual_cable_target_combo.currentData() is window:
+            self.virtual_cable_button.setChecked(False)  # triggers _on_virtual_cable_toggled(False) on this still-alive window
+        if self.rigctld_button.isChecked() and self.rigctld_target_combo.currentData() is window:
+            self.rigctld_button.setChecked(False)
+        self._refresh_target_combos()
+
+    def _refresh_target_combos(self):
+        for combo in (self.virtual_cable_target_combo, self.rigctld_target_combo):
+            previous = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for window in self._connected_radios:
+                details = window._details
+                role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
+                connection_label = details.get("host") or details.get("serial_port") or "?"
+                combo.addItem(f"{details['radio_model']} ({role_label}) -- {connection_label}", window)
+            if previous is not None:
+                index = combo.findData(previous)
+                if index != -1:
+                    combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+        has_radios = bool(self._connected_radios)
+        self.virtual_cable_button.setEnabled(has_radios)
+        self.rigctld_button.setEnabled(has_radios)
+
+    # ---- Virtual Cables ----
+
+    def _on_virtual_cable_toggled(self, checked):
+        window = self.virtual_cable_target_combo.currentData()
+        if window is None:
+            if checked:
+                self.virtual_cable_button.blockSignals(True)
+                self.virtual_cable_button.setChecked(False)
+                self.virtual_cable_button.blockSignals(False)
+            return
+        if checked:
+            self.virtual_cable_button.setText("Virtual Cables: ON")
+            window.worker.enable_virtual_cables()
+        else:
+            self.virtual_cable_button.setText("Virtual Cables: OFF")
+            window.worker.disable_virtual_cables()
+        self.virtual_cable_target_combo.setEnabled(not checked)
+
+    def _on_virtual_cable_channel_changed(self, _index):
+        window = self.virtual_cable_target_combo.currentData()
+        if window is not None:
+            window.worker.set_rx_downmix_channel(self.virtual_cable_channel_combo.currentData())
+
+    # ---- Rigctld ----
+
+    def _on_rigctld_toggled(self, checked):
+        if checked:
+            window = self.rigctld_target_combo.currentData()
+            if window is None:
+                self.rigctld_button.blockSignals(True)
+                self.rigctld_button.setChecked(False)
+                self.rigctld_button.blockSignals(False)
+                return
+            port = self.rigctld_port_input.value()
+            self.rigctld_server = RigctldServer(
+                get_freq=lambda: window._current_freq_hz or 0,
+                set_freq=lambda hz: window.worker.set_frequency(int(hz)),
+                get_mode=lambda: (window.control_widgets["mode"].currentData() or "USB", 0),
+                set_mode=lambda mode: window.worker.set_control_value("mode", mode),
+                get_ptt=lambda: window.ptt_button.isChecked(),
+                set_ptt=lambda on: window.ptt_button.setChecked(on),  # reuses the normal PTT path via its toggled signal
+                port=port,
+            )
+            try:
+                self.rigctld_server.start()
+            except RuntimeError as exc:
+                QMessageBox.critical(self, "Rigctld", str(exc))
+                self.rigctld_server = None
+                self.rigctld_button.setChecked(False)
+                return
+            self.rigctld_button.setText(f"Rigctld: ON (port {port})")
+            self.rigctld_port_input.setEnabled(False)  # changing port on a live server needs a stop/restart first
+            self.rigctld_target_combo.setEnabled(False)
+        else:
+            port = self.rigctld_port_input.value()
+            if self.rigctld_server is not None:
+                self.rigctld_server.stop()
+                self.rigctld_server = None
+            self.rigctld_button.setText(f"Rigctld: OFF (port {port})")
+            self.rigctld_port_input.setEnabled(True)
+            self.rigctld_target_combo.setEnabled(True)
+
+    # ---- WSJT-X ----
+
+    def _on_wsjtx_button_clicked(self):
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        path = settings.value("wsjtx_executable_path", "")
+
+        if not path or not os.path.isfile(path):
+            path = find_wsjtx_executable()
+
+        if not path:
+            path, _filter = QFileDialog.getOpenFileName(
+                self, "Locate the WSJT-X executable",
+                "", "Executable (*.exe);;All files (*)" if platform.system() == "Windows" else "All files (*)",
+            )
+            if not path:
+                return  # user cancelled the browse dialog
+
+        try:
+            launch_wsjtx(path)
+        except OSError as exc:
+            QMessageBox.critical(self, "WSJT-X", f"Couldn't launch WSJT-X at:\n{path}\n\n{exc}")
+            return
+
+        # Only remember the path once it's actually confirmed to work
+        # (subprocess.Popen not raising means the OS accepted it).
+        settings.setValue("wsjtx_executable_path", path)
+
     def closeEvent(self, event):
+        self.satellite_session.stop()
+        if self.rigctld_server is not None:
+            self.rigctld_server.stop()
+        if self.virtual_cable_button.isChecked():
+            window = self.virtual_cable_target_combo.currentData()
+            if window is not None:
+                window.worker.disable_virtual_cables()  # best-effort; that window's own worker.stop() (below) may cut this off before it finishes
+        for window in list(self._connected_radios):
+            window.close()
         self._satellite_timer.stop()
         self._passes_timer.stop()
         self.solar_worker.requestInterruption()

@@ -408,6 +408,7 @@ class RadioWindow(QWidget):
         self.worker.scope_span_changed.connect(self._on_scope_span_changed)
         self.worker.scope_ref_changed.connect(self._on_scope_ref_changed)
         self.worker.scope_speed_changed.connect(self._on_scope_speed_changed)
+        self.worker.scope_ready.connect(self._on_scope_ready)
         self.worker.start()
 
         # Registers with the shared satellite session so this radio
@@ -429,10 +430,10 @@ class RadioWindow(QWidget):
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
             self.active_receiver_button.setEnabled(True)
-        if self.worker.is_scope_capable:
-            self.scope_span_combo.setEnabled(True)
-            self.scope_ref_spin.setEnabled(True)
-            self.scope_speed_combo.setEnabled(True)
+        # Scope controls are NOT enabled here -- is_scope_capable isn't
+        # known true yet at this point (see RadioWorker._main's
+        # scope_ready docstring); _on_scope_ready handles it once the
+        # worker confirms enable_scope() actually succeeded.
         for button in self.band_buttons:
             button.setEnabled(True)
         for slider in self.level_sliders.values():
@@ -779,6 +780,17 @@ class RadioWindow(QWidget):
         clicked, since nothing reflected the radio's actual starting
         state."""
         self._update_active_receiver_ui(receiver)
+
+    @Slot()
+    def _on_scope_ready(self):
+        # Fired once (RadioWorker.scope_ready), only if enable_scope()
+        # genuinely succeeded -- see its docstring for why this can't just
+        # be checked in _on_connected. If the radio isn't scope-capable at
+        # all, this never fires and the controls stay greyed out, which is
+        # correct.
+        self.scope_span_combo.setEnabled(True)
+        self.scope_ref_spin.setEnabled(True)
+        self.scope_speed_combo.setEnabled(True)
 
     def _on_scope_span_combo_changed(self, index):
         self.worker.set_scope_span(index)

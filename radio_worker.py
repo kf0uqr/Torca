@@ -145,6 +145,7 @@ class RadioWorker(QThread):
     scope_span_changed = Signal(int)     # preset index 0-7, from get_scope_span() polling
     scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
     scope_speed_changed = Signal(int)    # 0=fast, 1=mid, 2=slow, from get_scope_speed() polling
+    scope_ready = Signal()               # emitted once enable_scope() actually succeeds -- see is_scope_capable
     error = Signal(str)
 
     def __init__(self, details, parent=None):
@@ -760,6 +761,16 @@ class RadioWorker(QThread):
             self.radio.on_scope_data(self._handle_scope_frame)
             await self.radio.enable_scope()
             self.is_scope_capable = True
+            # is_scope_capable becomes true here, well AFTER connected.emit()
+            # above -- main_window.py's _on_connected (which runs off that
+            # signal) would almost always see it still False, since this
+            # await completes on its own schedule long after the GUI thread
+            # gets queued to enable other controls. Confirmed live: on a
+            # real 9700, the scope itself loaded fine but the span/ref/
+            # speed controls stayed greyed out forever, exactly this race.
+            # A dedicated signal, fired only once this really is known true,
+            # is what main_window.py's scope controls listen for instead.
+            self.scope_ready.emit()
         except Exception as exc:
             self.error.emit(f"Scope unavailable: {exc}")
 

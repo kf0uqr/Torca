@@ -202,6 +202,19 @@ class WorldMapWidget(QWidget):
         self._image_fetcher.failed.connect(self._on_image_failed)
         self._image_fetcher.start()
 
+    def wait_for_pending_image_fetch(self, timeout_ms=21000):
+        """Call from the owning window's closeEvent before it returns
+        -- _image_fetcher is a one-shot QThread with no interruption
+        support at all (nothing to check between steps: it's cache-hit-
+        instant, or one single blocking urllib call up to its own 20s
+        timeout, never a loop), so unlike SolarDataWorker there's no
+        cooperative flag to set here, only waiting it out. Only matters
+        on a fresh install/cache miss -- once WORLD_MAP_CACHE_PATH
+        exists (true after the very first successful run), this
+        returns instantly every time after. Default timeout covers
+        that one urllib call's own 20s bound with a small margin."""
+        self._image_fetcher.wait(timeout_ms)
+
         # ---- +/- zoom buttons ----
         # Plain child QWidgets positioned by hand (not a layout -- they
         # need to float in the map's own top-left corner, tracking

@@ -75,6 +75,7 @@ import pskreporter
 import pota
 import contests
 import dxcluster
+import updater
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from wsjtx_udp import WsjtxUdpListener, WSJTX_DEFAULT_PORT
 from audio import (
@@ -407,6 +408,42 @@ class ContestsWorker(QThread):
             self.failed.emit(str(exc))
             return
         self.events_ready.emit(events)
+
+
+class UpdateCheckWorker(QThread):
+    """One-shot check off the GUI thread -- updater.check_for_update()
+    does real network I/O (git ls-remote against GitHub)."""
+
+    result_ready = Signal(object)  # updater.UpdateCheckResult
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            result = updater.check_for_update()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.result_ready.emit(result)
+
+
+class UpdatePerformWorker(QThread):
+    """Runs updater.perform_update() off the GUI thread -- it shells
+    out to git/pip/install.sh, which can take up to a minute or two.
+    status_callback=self.status.emit is safe to call from this
+    thread -- Qt signal emission is thread-safe, same as every other
+    worker in this app reporting back to the GUI thread."""
+
+    status = Signal(str)
+    succeeded = Signal()
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            updater.perform_update(status_callback=self.status.emit)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit()
 
 
 class PskReporterSettingsDialog(QDialog):
@@ -806,6 +843,15 @@ class HamClockWindow(QWidget):
         self.new_qso_button.setToolTip("Log a new QSO -- auto-fills from a connected radio's live state if one is picked.")
         self.new_qso_button.clicked.connect(self._on_new_qso_clicked)
 
+        # See updater.py's own docstring for the two ways this can
+        # actually update things (a dev git checkout vs. an install.sh
+        # install) and why neither needs a root/sudo prompt from here.
+        self._update_check_worker = None
+        self._update_perform_worker = None
+        self.update_button = QPushButton("Check for Updates...")
+        self.update_button.setToolTip("Checks GitHub for a newer version of Radione, and can update in place.")
+        self.update_button.clicked.connect(self._on_update_button_clicked)
+
         self.connected_radios_list = QListWidget()
         self.connected_radios_list.setToolTip("Double-click to bring that radio's window to the front.")
         self.connected_radios_list.setFixedHeight(70)
@@ -816,6 +862,7 @@ class HamClockWindow(QWidget):
         connected_radios_header.addWidget(self.connect_radio_button)
         connected_radios_header.addWidget(self.log_book_button)
         connected_radios_header.addWidget(self.new_qso_button)
+        connected_radios_header.addWidget(self.update_button)
         connected_radios_header.addStretch()
 
         connected_radios_column = QVBoxLayout()
@@ -1895,6 +1942,90 @@ class HamClockWindow(QWidget):
             self.log_book_window = LogBookWindow(self)
         self.log_book_window._on_new_qso_clicked()
 
+    def _on_update_button_clicked(self):
+        if self._update_check_worker is not None and self._update_check_worker.isRunning():
+            return
+        if self._update_perform_worker is not None and self._update_perform_worker.isRunning():
+            return
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Checking...")
+        worker = UpdateCheckWorker(self)
+        worker.result_ready.connect(self._on_update_check_ready)
+        worker.failed.connect(self._on_update_check_failed)
+        self._update_check_worker = worker
+        worker.start()
+
+    def _on_update_check_ready(self, result):
+        self.update_button.setEnabled(True)
+        self.update_button.setText("Check for Updates...")
+
+        if result.mode == updater.MODE_UNSUPPORTED:
+            QMessageBox.information(
+                self, "Check for Updates",
+                "This installation can't be self-updated: its folder has no git checkout "
+                "and isn't writable by the current user -- likely an install from before "
+                "this feature existed, or one still owned by root.\n\n"
+                "Reinstall with install.sh to enable in-app updates."
+            )
+            return
+
+        if result.version_unknown:
+            proceed = QMessageBox.question(
+                self, "Check for Updates",
+                "Couldn't determine the currently installed version (no .install_commit "
+                f"marker found). Latest available: {result.latest_commit[:12]}.\n\n"
+                "Update anyway?"
+            )
+            if proceed != QMessageBox.Yes:
+                return
+        elif not result.update_available:
+            QMessageBox.information(
+                self, "Check for Updates",
+                f"You're already running the latest version ({result.current_commit[:12]})."
+            )
+            return
+        else:
+            proceed = QMessageBox.question(
+                self, "Check for Updates",
+                f"Update available: {result.current_commit[:12]} -> {result.latest_commit[:12]}.\n\n"
+                "Update now?"
+            )
+            if proceed != QMessageBox.Yes:
+                return
+
+        self._start_update()
+
+    def _on_update_check_failed(self, message):
+        self.update_button.setEnabled(True)
+        self.update_button.setText("Check for Updates...")
+        QMessageBox.warning(self, "Check for Updates", f"Couldn't check for updates:\n{message}")
+
+    def _start_update(self):
+        self.update_button.setEnabled(False)
+        self.update_button.setText("Updating...")
+        worker = UpdatePerformWorker(self)
+        worker.status.connect(self._on_update_status)
+        worker.succeeded.connect(self._on_update_succeeded)
+        worker.failed.connect(self._on_update_failed)
+        self._update_perform_worker = worker
+        worker.start()
+
+    def _on_update_status(self, message):
+        self.update_button.setText(f"Updating: {message}")
+
+    def _on_update_succeeded(self):
+        self.update_button.setEnabled(True)
+        self.update_button.setText("Check for Updates...")
+        QMessageBox.information(
+            self, "Update Complete",
+            "Radione has been updated. Restart the app to use the new version."
+        )
+
+    def _on_update_failed(self, message):
+        self.update_button.setEnabled(True)
+        self.update_button.setText("Check for Updates...")
+        QMessageBox.critical(self, "Update Failed", f"Couldn't complete the update:\n{message}")
+
     def _on_radio_window_closed(self, window):
         """Connected to RadioWindow.closed, emitted from closeEvent
         BEFORE that window's worker actually stops -- so it's still
@@ -2234,5 +2365,51 @@ class HamClockWindow(QWidget):
         self._satellite_timer.stop()
         self._passes_timer.stop()
         self.solar_worker.requestInterruption()
-        self.solar_worker.wait(2000)
+        # requestInterruption() only takes effect between fetch cycles
+        # (checked in SolarDataWorker.run()'s own loop) -- it can't
+        # interrupt an in-flight urllib call, and fetch_solar_data()
+        # makes up to 4 SEQUENTIAL requests, each with its own 10s
+        # timeout (solar_data.py). The old 2000ms wait() here was too
+        # short to cover even ONE of those timing out, let alone
+        # several -- confirmed live: closing during a fetch reliably
+        # hit the same "QThread: Destroyed while thread is still
+        # running" abort just fixed for RadioWorker (radio_worker.py's
+        # stop(), which cancels its asyncio task directly rather than
+        # relying on a cooperative flag). SolarDataWorker's fetches are
+        # plain synchronous urllib calls, not asyncio, so that same
+        # cancellation approach doesn't apply here -- 15s comfortably
+        # covers the common case (one fetch stage hitting its 10s
+        # timeout) without making every quit wait a full worst-case 40s
+        # (all four hanging their full timeout, an unlikely combination
+        # in practice since most real network failures fail fast rather
+        # than hanging silently for the full duration).
+        self.solar_worker.wait(15000)
+        # Only ever actually waits on a fresh install/cache miss -- see
+        # its own docstring. Discovered the same way as the solar_
+        # worker fix above: this fetcher had NO shutdown handling at
+        # all (not even a too-short wait like solar_worker's old one),
+        # so closing during the one-time map image download reliably
+        # hit the same QThread-destroyed-while-running abort.
+        self.map_widget.wait_for_pending_image_fetch()
+        # Same class of bug again, found via the same headless-testing
+        # process: every other one-shot fetch this window can have in
+        # flight needs waiting out too, not just solar data and the map
+        # image. ContestsWorker in particular is started unconditionally
+        # at startup (like solar/map) but had NO wait at all -- confirmed
+        # via gc.get_objects() showing it isRunning() well after close()
+        # returned. The others only ever run if the operator triggered
+        # them (PSKReporter/POTA refresh, an update check or an update
+        # actually installing) -- same risk if closed while one's still
+        # in flight. UpdatePerformWorker gets a much longer allowance:
+        # killing the app mid-install could leave a broken /opt/radione,
+        # worse than a slow quit.
+        for worker, timeout_ms in (
+            (self._pskreporter_worker, 15000),
+            (self._pota_worker, 15000),
+            (self._contests_worker, 20000),
+            (self._update_check_worker, 15000),
+            (self._update_perform_worker, 300000),
+        ):
+            if worker is not None:
+                worker.wait(timeout_ms)
         event.accept()

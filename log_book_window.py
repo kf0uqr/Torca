@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 import qso_log
+import qrz_logbook
 from new_qso_dialog import NewQsoDialog
 
 _SETTINGS_ORG = "IcomRadioApp"
@@ -99,6 +100,16 @@ class QrzSettingsDialog(QDialog):
             "optional. Leave blank to use the Log Book without QRZ sync."
         )
 
+        self.test_button = QPushButton("Test Connection")
+        self.test_button.setToolTip(
+            "Calls QRZ's STATUS action with the key currently typed above "
+            "-- confirms the key works and shows how many QSOs QRZ has on "
+            "file, independent of a full sync."
+        )
+        self.test_button.clicked.connect(self._on_test_clicked)
+        self.test_result_label = QLabel("")
+        self.test_result_label.setWordWrap(True)
+
         form = QFormLayout()
         form.addRow(QLabel(
             "QRZ sync is optional -- the Log Book works fully offline/\n"
@@ -106,6 +117,8 @@ class QrzSettingsDialog(QDialog):
             "with your QRZ.com Logbook."
         ))
         form.addRow("API Key:", self.key_input)
+        form.addRow("", self.test_button)
+        form.addRow("", self.test_result_label)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
@@ -115,6 +128,23 @@ class QrzSettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(button_box)
         self.setLayout(layout)
+
+    def _on_test_clicked(self):
+        key = self.key_input.text().strip()
+        if not key:
+            self.test_result_label.setText("Enter a key first.")
+            return
+        self.test_result_label.setText("Testing...")
+        self.test_button.setEnabled(False)
+        # A single, explicit, user-initiated STATUS call -- brief enough
+        # to block for, same as ConnectionDialog's "Get GPS Coordinates".
+        try:
+            status = qrz_logbook.qrz_status(key)
+        except Exception as exc:
+            self.test_result_label.setText(f"Failed: {exc}")
+        else:
+            self.test_result_label.setText(f"OK -- QRZ says: {status}")
+        self.test_button.setEnabled(True)
 
     def result_api_key(self):
         return self.key_input.text().strip()

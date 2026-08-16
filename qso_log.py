@@ -158,10 +158,25 @@ def sync_with_qrz(api_key, qsos, cursor):
     new_cursor = cursor
     try:
         page_cursor = cursor
+        first_page = True
         while True:
-            fetched = qrz_logbook.qrz_fetch(
-                api_key, option=f"AFTERLOGID:{page_cursor},MAX:{_QRZ_FETCH_PAGE_SIZE}"
-            )
+            # QRZ's docs describe "ALL" as the default filter and
+            # AFTERLOGID:n as an alternative one, not necessarily
+            # interchangeable at n=0 -- AFTERLOGID:0 returning nothing
+            # (instead of "everything", which ALL unambiguously means)
+            # was the leading suspect for "QSOs don't pull down at all"
+            # on a first-ever sync, reported live. Use ALL for the very
+            # first page of a from-scratch sync; AFTERLOGID naturally
+            # takes over from the second page onward once page_cursor
+            # has advanced past 0 from real LOGID values seen in page 1,
+            # and for every subsequent (already-synced-before) sync.
+            if first_page and page_cursor == 0:
+                option = f"ALL,MAX:{_QRZ_FETCH_PAGE_SIZE}"
+            else:
+                option = f"AFTERLOGID:{page_cursor},MAX:{_QRZ_FETCH_PAGE_SIZE}"
+            first_page = False
+            fetched = qrz_logbook.qrz_fetch(api_key, option=option)
+            print(f"[QSO Log] QRZ FETCH (option={option!r}) returned {len(fetched)} record(s).")
             if not fetched:
                 break
             for record in fetched:
@@ -179,6 +194,8 @@ def sync_with_qrz(api_key, qsos, cursor):
                     record[SYNCED_FIELD] = "Y"
                     if str(logid).isdigit():
                         page_cursor = max(page_cursor, int(logid))
+                else:
+                    print(f"[QSO Log] Pulled record has no recognized LOGID field -- raw keys: {sorted(record.keys())}")
                 if logid and record[LOGID_FIELD] in existing_logids:
                     continue
                 qsos.append(ensure_uuid(record))  # QRZ has no notion of this app's local UUID convention

@@ -613,8 +613,12 @@ class HamClockWindow(QWidget):
         clocks_row = QHBoxLayout()
         clocks_row.addWidget(self.utc_label)
         clocks_row.addWidget(self.local_label)
-        clocks_row.addWidget(self.satellite_button)
-        clocks_row.addWidget(self.qso_map_button)
+        clocks_row.addStretch()
+
+        map_buttons_row = QHBoxLayout()
+        map_buttons_row.addWidget(self.satellite_button)
+        map_buttons_row.addWidget(self.qso_map_button)
+        map_buttons_row.addStretch()
 
         solar_row = QHBoxLayout()
         solar_row.addWidget(self.sfi_label)
@@ -634,9 +638,10 @@ class HamClockWindow(QWidget):
         bottom_row.addLayout(upcoming_passes_column)
 
         layout = QVBoxLayout()
-        # clocks_row above the map (moved per explicit instruction), map
-        # itself still with no stretch factor -- it claims only what its
-        # own (letterboxed, aspect-correct) heightForWidth calls for,
+        # clocks_row and map_buttons_row (satellite/QSO Map toggles, in
+        # their own row per explicit instruction) both above the map.
+        # Map itself still with no stretch factor -- it claims only what
+        # its own (letterboxed, aspect-correct) heightForWidth calls for,
         # rather than greedily taking all extra vertical space in the
         # window (which is what a stretch factor of 1 here used to do,
         # and the only thing keeping the map from severely distorting
@@ -644,6 +649,7 @@ class HamClockWindow(QWidget):
         # screen region). Leaves more room below for the solar/band-
         # conditions/passes rows -- and for whatever gets added there later.
         layout.addLayout(clocks_row)
+        layout.addLayout(map_buttons_row)
         layout.addWidget(self.map_widget)
         layout.addLayout(connected_radios_column)
         layout.addLayout(tracking_row)

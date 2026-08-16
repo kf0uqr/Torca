@@ -15,7 +15,7 @@ import urllib.request
 
 from PySide6.QtCore import Qt, QRect, QRectF, QPointF, Signal, QThread, QTimer
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF, QImage, QFont
-from PySide6.QtWidgets import QWidget, QSizePolicy, QToolTip
+from PySide6.QtWidgets import QWidget, QSizePolicy, QToolTip, QPushButton
 
 from solar_data import _solar_subpoint, _solar_elevation
 
@@ -165,6 +165,54 @@ class WorldMapWidget(QWidget):
         self._image_fetcher.image_ready.connect(self._on_image_ready)
         self._image_fetcher.failed.connect(self._on_image_failed)
         self._image_fetcher.start()
+
+        # ---- +/- zoom buttons ----
+        # Plain child QWidgets positioned by hand (not a layout -- they
+        # need to float in the map's own top-left corner, tracking
+        # _map_rect() rather than the widget's own rect, since letterbox
+        # bars mean those aren't the same point whenever the widget's
+        # box isn't exactly MAP_ASPECT_RATIO) -- repositioned in
+        # resizeEvent below. A semi-opaque dark background keeps them
+        # legible over either the day or night hemisphere.
+        button_style = (
+            "QPushButton { background-color: rgba(30, 30, 34, 200); color: white; "
+            "border: 1px solid rgba(200, 200, 200, 120); border-radius: 4px; "
+            "font-weight: bold; font-size: 14px; }"
+            "QPushButton:hover { background-color: rgba(60, 60, 66, 220); }"
+            "QPushButton:pressed { background-color: rgba(90, 90, 98, 230); }"
+        )
+        self._ZOOM_BUTTON_SIZE = 26
+        self._ZOOM_BUTTON_MARGIN = 8
+        self.zoom_in_button = QPushButton("+", self)
+        self.zoom_in_button.setFixedSize(self._ZOOM_BUTTON_SIZE, self._ZOOM_BUTTON_SIZE)
+        self.zoom_in_button.setStyleSheet(button_style)
+        self.zoom_in_button.setToolTip("Zoom in")
+        self.zoom_in_button.clicked.connect(self._on_zoom_in_clicked)
+        self.zoom_out_button = QPushButton("−", self)  # proper minus sign, not a hyphen
+        self.zoom_out_button.setFixedSize(self._ZOOM_BUTTON_SIZE, self._ZOOM_BUTTON_SIZE)
+        self.zoom_out_button.setStyleSheet(button_style)
+        self.zoom_out_button.setToolTip("Zoom out")
+        self.zoom_out_button.clicked.connect(self._on_zoom_out_clicked)
+        self._position_zoom_buttons()
+
+    _ZOOM_BUTTON_FACTOR = 1.4  # per-click step -- a bigger jump than one wheel notch (_ZOOM_STEP), since a click is discrete
+
+    def _on_zoom_in_clicked(self):
+        self._zoom_at(self._map_rect().center(), self._ZOOM_BUTTON_FACTOR)
+
+    def _on_zoom_out_clicked(self):
+        self._zoom_at(self._map_rect().center(), 1.0 / self._ZOOM_BUTTON_FACTOR)
+
+    def _position_zoom_buttons(self):
+        map_rect = self._map_rect()
+        x = int(map_rect.x()) + self._ZOOM_BUTTON_MARGIN
+        y = int(map_rect.y()) + self._ZOOM_BUTTON_MARGIN
+        self.zoom_in_button.move(x, y)
+        self.zoom_out_button.move(x, y + self._ZOOM_BUTTON_SIZE + 4)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_zoom_buttons()
 
     def _advance_path_animation(self):
         # Only worth repainting (a full paintEvent -- background image

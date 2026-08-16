@@ -296,10 +296,29 @@ class ConnectionDialog(QDialog):
     def _populate_audio_devices(self):
         """Fill the audio combos by querying sounddevice/PortAudio
         directly -- the same library AudioBridge uses to actually open
-        the streams, so whatever's picked here is guaranteed openable.
-        Stores each device's numeric PortAudio index as the combo's
-        item data (not a name string), since numeric indices don't have
-        the cross-library name-mismatch problem a name string would."""
+        the streams. Stores each device's numeric PortAudio index as
+        the combo's item data (not a name string), since numeric
+        indices don't have the cross-library name-mismatch problem a
+        name string would.
+
+        Excludes ALSA "virtual"/plugin devices (default, pulse,
+        sysdefault, dmix, plug, samplerate, ...) when at least one real
+        hardware device is also present -- confirmed live that opening
+        one of these (specifically "default", 32in/32out -- clearly an
+        aggregate, not real hardware) as the audio input can hit a real
+        bug in PortAudio's ALSA-via-PulseAudio compatibility shim: the
+        capture stream's prepare call can time out and leave PortAudio's
+        own internal state corrupted, aborting the WHOLE PROCESS with a
+        native "PaUnixMutex_Terminate: Assertion ... failed" crash that
+        no amount of Python-level try/except can catch, let alone
+        recover from. Real ALSA hardware devices are reliably named
+        "... (hw:X,Y)" (e.g. "USB Audio CODEC: - (hw:1,0)"); everything
+        else in the list is one of these risky virtual/plugin entries.
+        Only filters when at least one hw: device actually exists --
+        i.e. we're clearly on an ALSA-based system where a genuinely
+        safer choice is available -- so this never makes device
+        selection impossible on a platform where sounddevice's naming
+        doesn't follow this convention at all."""
         self.audio_input_combo.addItem("None (no RX audio)", None)
         self.audio_output_combo.addItem("None (no TX audio)", None)
 
@@ -319,11 +338,16 @@ class ConnectionDialog(QDialog):
             self.audio_output_combo.setEnabled(False)
             return
 
+        has_hw_devices = any("(hw:" in device.get("name", "") for device in devices)
+
         for index, device in enumerate(devices):
+            name = device.get("name", "")
+            if has_hw_devices and "(hw:" not in name:
+                continue
             if device.get("max_input_channels", 0) > 0:
-                self.audio_input_combo.addItem(device["name"], index)
+                self.audio_input_combo.addItem(name, index)
             if device.get("max_output_channels", 0) > 0:
-                self.audio_output_combo.addItem(device["name"], index)
+                self.audio_output_combo.addItem(name, index)
 
     def _refresh_profile_combo(self, select_name=None):
         self.profile_combo.blockSignals(True)

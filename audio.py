@@ -280,6 +280,21 @@ class AudioBridge:
         # chunk boundary (which would show up as sustained
         # garbling/distortion, not just an occasional click).
         self._rx_stereo_remainder = b""
+        # Diagnostic for the muffled/garbled-Sub-audio investigation:
+        # accumulates separate L (Main) vs R (Sub) amplitude stats over
+        # the first ~100 chunks, then reports a one-time comparison --
+        # see _report_stereo_channel_diagnostic. A single chunk's worth
+        # of samples is too small/noisy a sample to draw a conclusion
+        # from (normal speech/audio varies a lot sample to sample); a
+        # ~1-2 second running comparison is much more telling, e.g.
+        # "R is consistently near-silent" vs "R has real but
+        # differently-shaped signal than L".
+        self._rx_stereo_diag_chunks = 0
+        self._rx_stereo_diag_pairs = 0
+        self._rx_stereo_diag_l_abs_sum = 0
+        self._rx_stereo_diag_r_abs_sum = 0
+        self._rx_stereo_diag_l_peak = 0
+        self._rx_stereo_diag_r_peak = 0
 
         self.sample_rate = getattr(radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
         self._pcm_ok = self._check_pcm_codec()
@@ -500,6 +515,43 @@ class AudioBridge:
         if self._out_stream:
             self._out_stream.stop()
 
+    def _accumulate_stereo_channel_diagnostic(self, aligned_stereo_bytes):
+        """Diagnostic for the muffled/garbled-Sub-audio investigation --
+        see the _rx_stereo_diag_* fields' comment in __init__. Decodes
+        raw, still-interleaved stereo bytes (before downmixing) and
+        accumulates separate L (Main) vs R (Sub) amplitude stats, then
+        reports a one-time comparison once ~100 chunks have been
+        collected (a single chunk is too small/noisy a sample to draw a
+        conclusion from). No-op once that report has already fired, or
+        on empty input."""
+        if self._rx_stereo_diag_chunks >= 100 or not aligned_stereo_bytes:
+            return
+        samples = array("h")
+        samples.frombytes(aligned_stereo_bytes)
+        if sys.byteorder != "little":
+            samples.byteswap()
+        for i in range(0, len(samples), 2):
+            l_sample, r_sample = samples[i], samples[i + 1]
+            self._rx_stereo_diag_l_abs_sum += abs(l_sample)
+            self._rx_stereo_diag_r_abs_sum += abs(r_sample)
+            self._rx_stereo_diag_l_peak = max(self._rx_stereo_diag_l_peak, abs(l_sample))
+            self._rx_stereo_diag_r_peak = max(self._rx_stereo_diag_r_peak, abs(r_sample))
+            self._rx_stereo_diag_pairs += 1
+        self._rx_stereo_diag_chunks += 1
+        if self._rx_stereo_diag_chunks >= 100 and self._rx_stereo_diag_pairs:
+            l_avg = self._rx_stereo_diag_l_abs_sum / self._rx_stereo_diag_pairs
+            r_avg = self._rx_stereo_diag_r_abs_sum / self._rx_stereo_diag_pairs
+            self._status(
+                "RX audio stereo channel comparison (first "
+                f"{self._rx_stereo_diag_pairs} sample pairs): "
+                f"L(Main) avg|sample|={l_avg:.0f} peak={self._rx_stereo_diag_l_peak}, "
+                f"R(Sub) avg|sample|={r_avg:.0f} peak={self._rx_stereo_diag_r_peak} "
+                "(int16 scale, 0-32767). If R is near-zero while L isn't, Sub's "
+                "audio isn't reaching this channel at all; if both have "
+                "comparable levels but Sub still sounds wrong, the issue is "
+                "more likely alignment/content than silence."
+            )
+
     def _on_rx_audio(self, packet=None):
         """Called by rigplane when audio arrives from the radio -- runs
         on the asyncio loop thread. Only touches the thread-safe
@@ -523,7 +575,9 @@ class AudioBridge:
             combined = self._rx_stereo_remainder + data
             usable = len(combined) - (len(combined) % 4)
             self._rx_stereo_remainder = combined[usable:]
-            data = _downmix_stereo_to_mono(combined[:usable], channel=self._rx_downmix_channel)
+            aligned = combined[:usable]
+            self._accumulate_stereo_channel_diagnostic(aligned)
+            data = _downmix_stereo_to_mono(aligned, channel=self._rx_downmix_channel)
         if data is None:
             # packet=None is a genuine, expected case (a jitter-buffer
             # gap placeholder -- confirmed via AudioPacket's own docs),

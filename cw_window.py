@@ -19,13 +19,31 @@ whichever RX stream is already running (rigplane only allows one
 radio.start_rx() registration at a time) rather than requiring
 exclusive access, so this window never needs to gate the toggle on
 what else the radio's audio is doing.
+
+Macros: a bank of one-click common CW phrases across the top (CQ,
+signal report, TU 73, etc, plus a few blank slots for the operator's
+own) -- left-click sends it through the exact same PTT-sequenced path
+as the Send button (a blank one opens the edit dialog instead, since
+there's nothing useful to send); right-click always opens the edit
+dialog. {MYCALL}/{CALL} tokens are substituted before sending --
+{MYCALL} from the operator_callsign QSettings value used elsewhere in
+this app, {CALL} from this window's own Contact field. Persisted to a
+shared cw_macros.json (same ~/.icom_radio_app_cache directory
+connection_dialog.py already uses for structured, non-QSettings data)
+so edits carry over across radios and app restarts.
 """
 
-from PySide6.QtCore import QTimer, Signal
+import json
+import pathlib
+
+from PySide6.QtCore import Qt, QSettings, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget,
+    QDialog,
+    QDialogButtonBox,
     QVBoxLayout,
     QHBoxLayout,
+    QFormLayout,
     QLabel,
     QLineEdit,
     QPushButton,
@@ -35,6 +53,77 @@ from PySide6.QtWidgets import (
 
 from constants import AUDIO_DEFAULT_SAMPLE_RATE
 from cw import CwDecoder, estimate_cw_send_duration_ms
+
+_MACROS_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "cw_macros.json"
+
+# 8 preset phrases covering the common shape of a CW QSO (calling CQ,
+# answering a call, exchanging a signal report, requesting a repeat,
+# asking who's there, breaking in, acknowledging, and signing off) plus
+# 2 blank slots per row for the operator's own. {MYCALL}/{CALL} are
+# substituted at send time (see _resolve_macro_text) -- deliberately no
+# other placeholder text (e.g. a literal "NAME"/"QTH" reminder) since a
+# macro click sends immediately, and literal placeholder text would be
+# sent as CW exactly as typed.
+_DEFAULT_MACROS = [
+    {"label": "CQ", "text": "CQ CQ CQ DE {MYCALL} {MYCALL} {MYCALL} K"},
+    {"label": "Answer", "text": "{CALL} DE {MYCALL} {MYCALL} K"},
+    {"label": "Report", "text": "UR RST 599 599 BT"},
+    {"label": "TU 73", "text": "TU 73 GL DE {MYCALL} SK"},
+    {"label": "", "text": ""},
+    {"label": "", "text": ""},
+    {"label": "QRZ?", "text": "QRZ? DE {MYCALL}"},
+    {"label": "AGN", "text": "PSE AGN AGN"},
+    {"label": "BK", "text": "BK"},
+    {"label": "R R", "text": "R R"},
+    {"label": "", "text": ""},
+    {"label": "", "text": ""},
+]
+
+
+def _load_macros():
+    if _MACROS_PATH.exists():
+        try:
+            data = json.loads(_MACROS_PATH.read_text())
+            if isinstance(data, list) and len(data) == len(_DEFAULT_MACROS):
+                return data
+        except (OSError, ValueError):
+            pass
+    return [dict(macro) for macro in _DEFAULT_MACROS]
+
+
+def _save_macros(macros):
+    _MACROS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _MACROS_PATH.write_text(json.dumps(macros, indent=2))
+
+
+class MacroEditDialog(QDialog):
+    """Edit one macro's button label and message template. {MYCALL}
+    and {CALL} are the only recognized substitution tokens -- see
+    CwToolWindow._resolve_macro_text."""
+
+    def __init__(self, label, text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit CW Macro")
+        self.label_edit = QLineEdit(label)
+        self.label_edit.setPlaceholderText("Button label")
+        self.text_edit = QLineEdit(text)
+        self.text_edit.setPlaceholderText("Message -- {MYCALL} and {CALL} are substituted before sending")
+        form = QFormLayout()
+        form.addRow("Button label:", self.label_edit)
+        form.addRow("Message:", self.text_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def result_label(self):
+        return self.label_edit.text().strip()
+
+    def result_text(self):
+        return self.text_edit.text().strip()
 
 # Delay between keying PTT and actually starting to send code, and
 # between the estimated end of sending and releasing PTT -- lets
@@ -62,7 +151,7 @@ class CwToolWindow(QWidget):
         super().__init__()
         self._radio_window = radio_window
         self.setWindowTitle(f"CW Tool -- {radio_window._connection_label}")
-        self.resize(480, 440)
+        self.resize(560, 480)
 
         self._decoder = None  # cw.CwDecoder, constructed fresh each time decoding starts
 
@@ -74,6 +163,37 @@ class CwToolWindow(QWidget):
         # it. See _on_send_clicked's docstring for the full sequence.
         self._send_sequence_active = False
         self._send_pending_text = None
+
+        # ---- Macros ----
+
+        self._macros = _load_macros()  # list of {"label", "text"} dicts, see _load_macros/_save_macros
+        self.macro_buttons = []
+
+        self.contact_call_edit = QLineEdit()
+        self.contact_call_edit.setPlaceholderText("Other station's callsign (for {CALL} in macros)")
+        contact_row = QHBoxLayout()
+        contact_row.addWidget(QLabel("Contact:"))
+        contact_row.addWidget(self.contact_call_edit)
+
+        macro_row_1 = QHBoxLayout()
+        macro_row_2 = QHBoxLayout()
+        half = len(self._macros) // 2
+        for index, macro in enumerate(self._macros):
+            button = QPushButton(macro["label"] or "(empty)")
+            button.setMinimumWidth(70)
+            button.setContextMenuPolicy(Qt.CustomContextMenu)
+            button.clicked.connect(lambda checked=False, i=index: self._on_macro_clicked(i))
+            button.customContextMenuRequested.connect(
+                lambda pos, i=index: self._on_macro_right_clicked(i)
+            )
+            self.macro_buttons.append(button)
+            (macro_row_1 if index < half else macro_row_2).addWidget(button)
+        self._refresh_macro_tooltips()
+
+        macro_group = QVBoxLayout()
+        macro_group.addWidget(QLabel("<b>Macros</b> (left-click: send, right-click: edit)"))
+        macro_group.addLayout(macro_row_1)
+        macro_group.addLayout(macro_row_2)
 
         # ---- Send ----
 
@@ -152,6 +272,8 @@ class CwToolWindow(QWidget):
         decode_group.addWidget(self.transcript)
 
         layout = QVBoxLayout()
+        layout.addLayout(macro_group)
+        layout.addLayout(contact_row)
         layout.addLayout(send_group)
         layout.addLayout(decode_group)
         self.setLayout(layout)
@@ -202,11 +324,15 @@ class CwToolWindow(QWidget):
         not a guess. Ignored while a previous send is still in flight
         (guarded by _send_sequence_active, not just the disabled Send
         button -- returnPressed on the text field can still fire while
-        the button itself is disabled)."""
-        if self._send_sequence_active:
-            return
+        the button itself is disabled). Macro clicks (_on_macro_clicked)
+        go through the same _start_send_sequence path."""
         text = self.send_text_edit.text().strip()
         if not text:
+            return
+        self._start_send_sequence(text)
+
+    def _start_send_sequence(self, text):
+        if self._send_sequence_active:
             return
         self._send_sequence_active = True
         self.send_button.setEnabled(False)
@@ -246,6 +372,45 @@ class CwToolWindow(QWidget):
         self._send_ptt_lead_timer.stop()
         self._send_ptt_trail_timer.stop()
         self._send_pending_text = None
+
+    # ---- Macros ----
+
+    def _resolve_macro_text(self, text):
+        """Substitutes {MYCALL} (this app's shared operator_callsign
+        QSettings value, same one PSKReporter/QSO logging already use)
+        and {CALL} (this window's own Contact field) into a macro's
+        stored template. Read fresh each call rather than cached, in
+        case the operator's callsign is changed in settings, or the
+        Contact field is edited, while this window stays open."""
+        mycall = QSettings("IcomRadioApp", "RadioControl").value("operator_callsign", "") or ""
+        contact_call = self.contact_call_edit.text().strip().upper()
+        return text.replace("{MYCALL}", mycall).replace("{CALL}", contact_call)
+
+    def _on_macro_clicked(self, index):
+        macro = self._macros[index]
+        if not macro["text"]:
+            # Nothing configured yet -- editing it is more useful than
+            # silently sending nothing.
+            self._on_macro_right_clicked(index)
+            return
+        resolved = self._resolve_macro_text(macro["text"])
+        self.send_text_edit.setText(resolved)
+        self._start_send_sequence(resolved)
+
+    def _on_macro_right_clicked(self, index):
+        macro = self._macros[index]
+        dialog = MacroEditDialog(macro["label"], macro["text"], self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        macro["label"] = dialog.result_label()
+        macro["text"] = dialog.result_text()
+        self.macro_buttons[index].setText(macro["label"] or "(empty)")
+        self._refresh_macro_tooltips()
+        _save_macros(self._macros)
+
+    def _refresh_macro_tooltips(self):
+        for button, macro in zip(self.macro_buttons, self._macros):
+            button.setToolTip(macro["text"] or "Click to configure this macro")
 
     def _on_wpm_spin_changed(self, value):
         self._radio_window.worker.set_key_speed(value)

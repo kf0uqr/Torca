@@ -242,6 +242,28 @@ class RadioWorker(QThread):
         """Thread entry point: create and own the asyncio loop here."""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        # Dual-receiver only: serializes every coroutine that switches
+        # which receiver is selected on the radio and then acts on it
+        # (retune, mode write, PTT). Each such coroutine is already
+        # internally atomic (see e.g. select_receiver_vfo_and_set_
+        # frequency's docstring), but that guarantee only holds WITHIN
+        # one coroutine -- it says nothing about two independently-
+        # scheduled ones (e.g. the satellite tick's Sub retune, which
+        # fires every 2s continuously for the whole tracking session,
+        # and apply_satellite_mode's one-off Main mode write) racing
+        # each other on the shared event loop. Mode in particular has
+        # no receiver-specific CI-V write at all (confirmed by reading
+        # rigplane's own runtime/radio.py: set_mode(receiver=0) is just
+        # the bare "set mode on whichever receiver is CURRENTLY
+        # selected" command, same "selected/unselected" semantics as
+        # frequency) -- so if the Sub tick's own select_receiver(SUB)
+        # lands on the radio in between this coroutine's own
+        # select_receiver(MAIN) and its mode write, the write silently
+        # lands on Sub instead, with Main's mode never actually
+        # changing -- exactly what was reported live even after
+        # removing all VFO-slot switching. This lock closes that
+        # window.
+        self._receiver_switch_lock = asyncio.Lock()
         try:
             self.loop.run_until_complete(self._main())
         finally:
@@ -985,42 +1007,56 @@ class RadioWorker(QThread):
                 await self._set_control_value("vfo", vfo_slot)
             await self._set_control_value(key, value)
             return
-        previously_active = self._active_receiver
-        if receiver != previously_active:
-            try:
-                await self.radio.select_receiver(receiver)
-                self._active_receiver = receiver
-            except Exception as exc:
-                self.error.emit(f"Select receiver ({receiver}) for {key} failed: {exc}")
-                return
-            # Reported live on a real 9700: Main's mode still wasn't
-            # landing even with the correct receiver AND VFO slot
-            # selected first -- consistent with the recurring theme
-            # throughout this whole dual-receiver debugging effort, that
-            # rapid back-to-back CI-V writes to this radio don't
-            # reliably land in the order they're sent. A brief settle
-            # delay after actually switching receivers is a new
-            # mitigation, not yet tried for this specific call chain.
-            await asyncio.sleep(0.15)
-        if vfo_slot is not None:
-            try:
-                await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
-            except Exception as exc:
-                self.error.emit(f"VFO slot select (receiver {receiver}) for {key} failed: {exc}")
-            else:
-                await asyncio.sleep(0.15)  # same settle-time reasoning as above, before the mode write itself
-        self.audio_status.emit(
-            f"[dual-rx] about to set {key}={value!r} on receiver {receiver} "
-            f"(active={self._active_receiver}, vfo_slot={vfo_slot!r}, "
-            f"receiver-unsupported-for-write={key in self._receiver_unsupported_setters})"
-        )
-        await self._set_control_value(key, value)
-        if restore and receiver != previously_active:
-            try:
-                await self.radio.select_receiver(previously_active)
-                self._active_receiver = previously_active
-            except Exception as exc:
-                self.error.emit(f"Restoring active receiver ({previously_active}) after {key} failed: {exc}")
+        # Holds the lock for the ENTIRE select-then-write sequence,
+        # including the final _set_control_value() call -- that call
+        # reads self._active_receiver (via _call_receiver_aware) to
+        # decide which receiver= kwarg to pass, and mode in particular
+        # has no receiver-specific CI-V write at all on this radio (the
+        # bare command just targets whichever receiver the radio
+        # CURRENTLY has selected) -- so without the lock, an interleaved
+        # coroutine (e.g. the satellite tick's continuous Sub retune)
+        # could both reselect Sub on the actual hardware AND overwrite
+        # self._active_receiver back to Sub in between this method's own
+        # select_receiver(Main) and its mode write, silently landing the
+        # write on Sub instead. Confirmed live: this was still happening
+        # even after removing all VFO-slot switching.
+        async with self._receiver_switch_lock:
+            previously_active = self._active_receiver
+            if receiver != previously_active:
+                try:
+                    await self.radio.select_receiver(receiver)
+                    self._active_receiver = receiver
+                except Exception as exc:
+                    self.error.emit(f"Select receiver ({receiver}) for {key} failed: {exc}")
+                    return
+                # Reported live on a real 9700: Main's mode still wasn't
+                # landing even with the correct receiver AND VFO slot
+                # selected first -- consistent with the recurring theme
+                # throughout this whole dual-receiver debugging effort, that
+                # rapid back-to-back CI-V writes to this radio don't
+                # reliably land in the order they're sent. A brief settle
+                # delay after actually switching receivers is a new
+                # mitigation, not yet tried for this specific call chain.
+                await asyncio.sleep(0.15)
+            if vfo_slot is not None:
+                try:
+                    await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
+                except Exception as exc:
+                    self.error.emit(f"VFO slot select (receiver {receiver}) for {key} failed: {exc}")
+                else:
+                    await asyncio.sleep(0.15)  # same settle-time reasoning as above, before the mode write itself
+            self.audio_status.emit(
+                f"[dual-rx] about to set {key}={value!r} on receiver {receiver} "
+                f"(active={self._active_receiver}, vfo_slot={vfo_slot!r}, "
+                f"receiver-unsupported-for-write={key in self._receiver_unsupported_setters})"
+            )
+            await self._set_control_value(key, value)
+            if restore and receiver != previously_active:
+                try:
+                    await self.radio.select_receiver(previously_active)
+                    self._active_receiver = previously_active
+                except Exception as exc:
+                    self.error.emit(f"Restoring active receiver ({previously_active}) after {key} failed: {exc}")
 
     async def _poll_loop(self):
         """Periodically reads live values: frequency, plus every
@@ -1421,17 +1457,18 @@ class RadioWorker(QThread):
         asyncio.run_coroutine_threadsafe(self._set_receiver_frequency(receiver, freq_hz), self.loop)
 
     async def _set_receiver_frequency(self, receiver: int, freq_hz: int):
-        try:
-            await self.radio.select_receiver(receiver)
-            self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK (bare freq write)")
-        except Exception as exc:
-            self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
-        self._active_receiver = receiver
-        try:
-            await self.radio.set_frequency(freq_hz, receiver=receiver)
-            self.audio_status.emit(f"[dual-rx] set_frequency({freq_hz}, receiver={receiver}) OK")
-        except Exception as exc:
-            self.error.emit(str(exc))
+        async with self._receiver_switch_lock:
+            try:
+                await self.radio.select_receiver(receiver)
+                self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK (bare freq write)")
+            except Exception as exc:
+                self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+            self._active_receiver = receiver
+            try:
+                await self.radio.set_frequency(freq_hz, receiver=receiver)
+                self.audio_status.emit(f"[dual-rx] set_frequency({freq_hz}, receiver={receiver}) OK")
+            except Exception as exc:
+                self.error.emit(str(exc))
 
     def select_receiver_vfo_and_set_frequency(self, receiver: int, freq_hz: int, vfo_slot: str = "A", check_conflict: bool = True):
         """Thread-safe: call from the GUI thread. On a genuine dual-
@@ -1598,22 +1635,23 @@ class RadioWorker(QThread):
     async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int, check_conflict: bool = True):
         if check_conflict:
             await self._resolve_receiver_band_conflict(receiver, freq_hz)
-        try:
-            await self.radio.select_receiver(receiver)
-            self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK (vfo+freq bundle)")
-        except Exception as exc:
-            self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
-        self._active_receiver = receiver
-        try:
-            await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
-            self.audio_status.emit(f"[dual-rx] set_vfo_slot({vfo_slot!r}, receiver={receiver}) OK")
-        except Exception as exc:
-            self.error.emit(f"VFO slot select (receiver {receiver}): set_vfo_slot({vfo_slot!r}) failed ({exc}).")
-        try:
-            await self.radio.set_frequency(freq_hz, receiver=receiver)
-            self.audio_status.emit(f"[dual-rx] set_frequency({freq_hz}, receiver={receiver}) OK (vfo+freq bundle)")
-        except Exception as exc:
-            self.error.emit(str(exc))
+        async with self._receiver_switch_lock:
+            try:
+                await self.radio.select_receiver(receiver)
+                self.audio_status.emit(f"[dual-rx] select_receiver({receiver}) OK (vfo+freq bundle)")
+            except Exception as exc:
+                self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+            self._active_receiver = receiver
+            try:
+                await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
+                self.audio_status.emit(f"[dual-rx] set_vfo_slot({vfo_slot!r}, receiver={receiver}) OK")
+            except Exception as exc:
+                self.error.emit(f"VFO slot select (receiver {receiver}): set_vfo_slot({vfo_slot!r}) failed ({exc}).")
+            try:
+                await self.radio.set_frequency(freq_hz, receiver=receiver)
+                self.audio_status.emit(f"[dual-rx] set_frequency({freq_hz}, receiver={receiver}) OK (vfo+freq bundle)")
+            except Exception as exc:
+                self.error.emit(str(exc))
 
     def select_vfo_and_set_frequency(self, vfo_value, freq_hz: int, check_conflict: bool = True):
         """Thread-safe: call from the GUI thread. Selects VFO A/B and
@@ -1710,19 +1748,20 @@ class RadioWorker(QThread):
         )
 
     async def _start_ptt_after_vfo(self, vfo_value, freq_hz: int, receiver: int = None, check_conflict: bool = True):
-        if receiver is not None:
-            try:
-                await self.radio.select_receiver(receiver)
-            except Exception as exc:
-                self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
-        if "vfo" in self._control_methods:
-            await self._select_vfo_and_set_frequency(vfo_value, freq_hz, check_conflict)
-        else:
-            self.error.emit(
-                f"{CONTROL_DEFINITIONS['vfo']['label']}: not available on this radio/install "
-                "-- transmitting without switching to the uplink."
-            )
-        await self._start_ptt()
+        async with self._receiver_switch_lock:
+            if receiver is not None:
+                try:
+                    await self.radio.select_receiver(receiver)
+                except Exception as exc:
+                    self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+            if "vfo" in self._control_methods:
+                await self._select_vfo_and_set_frequency(vfo_value, freq_hz, check_conflict)
+            else:
+                self.error.emit(
+                    f"{CONTROL_DEFINITIONS['vfo']['label']}: not available on this radio/install "
+                    "-- transmitting without switching to the uplink."
+                )
+            await self._start_ptt()
 
     def start_ptt_with_frequency(self, freq_hz: int, receiver: int = None):
         """Thread-safe: call from the GUI thread. Selects `receiver`
@@ -1749,14 +1788,15 @@ class RadioWorker(QThread):
         asyncio.run_coroutine_threadsafe(self._start_ptt_with_frequency(freq_hz, receiver), self.loop)
 
     async def _start_ptt_with_frequency(self, freq_hz: int, receiver: int = None):
-        if receiver is not None:
-            try:
-                await self.radio.select_receiver(receiver)
-                self._active_receiver = receiver
-            except Exception as exc:
-                self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
-        await self._set_frequency(freq_hz, check_conflict=False)
-        await self._start_ptt()
+        async with self._receiver_switch_lock:
+            if receiver is not None:
+                try:
+                    await self.radio.select_receiver(receiver)
+                    self._active_receiver = receiver
+                except Exception as exc:
+                    self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+            await self._set_frequency(freq_hz, check_conflict=False)
+            await self._start_ptt()
 
     def stop_ptt_then_vfo(self, vfo_value, freq_hz: int):
         """Thread-safe: call from the GUI thread. The release-side
@@ -1812,11 +1852,12 @@ class RadioWorker(QThread):
 
     async def _stop_ptt_and_select_receiver(self, receiver: int):
         await self._stop_ptt()
-        try:
-            await self.radio.select_receiver(receiver)
-        except Exception as exc:
-            self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
-        self._active_receiver = receiver
+        async with self._receiver_switch_lock:
+            try:
+                await self.radio.select_receiver(receiver)
+            except Exception as exc:
+                self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+            self._active_receiver = receiver
 
     def select_band(self, band_label: str, low_edge_hz: int, receiver: int = None):
         """Thread-safe. Tries Icom's confirmed get_bsr() band-stacking

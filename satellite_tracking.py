@@ -851,7 +851,7 @@ class TransponderEditDialog(QDialog):
     which one to actually use when tuning is a later feature; this
     dialog is just for storing and correcting the data."""
 
-    COLUMNS = ["Description", "Uplink (MHz)", "Downlink (MHz)", "Mode", "Uplink Mode", "Active"]
+    COLUMNS = ["Description", "Uplink (MHz)", "Downlink (MHz)", "Mode", "Uplink Mode", "Invert", "Active"]
 
     def __init__(self, satellite_name, transponders, parent=None):
         super().__init__(parent)
@@ -903,10 +903,20 @@ class TransponderEditDialog(QDialog):
         # docstring. Left blank for e.g. FM transponders, where uplink
         # and downlink mode are the same anyway.
         self.table.setItem(row, 4, QTableWidgetItem(transponder.get("uplink_mode", "")))
+        # Whether this transponder swaps sideband between uplink and
+        # downlink (e.g. AO-7's Mode U/V, RS-44's Mode V/u) -- see
+        # apply_satellite_mode in main_window.py, which flips Main's
+        # USB/LSB uplink mode based on this flag. Populated automatically
+        # by fetch_transponders() for SatNOGS-sourced entries; editable
+        # here for hand-entered ones or to correct SatNOGS data.
+        invert_item = QTableWidgetItem()
+        invert_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        invert_item.setCheckState(Qt.Checked if transponder.get("invert") else Qt.Unchecked)
+        self.table.setItem(row, 5, invert_item)
         active_item = QTableWidgetItem()
         active_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
         active_item.setCheckState(Qt.Checked if transponder.get("alive", True) else Qt.Unchecked)
-        self.table.setItem(row, 5, active_item)
+        self.table.setItem(row, 6, active_item)
 
     def _on_add_row(self):
         row = self.table.rowCount()
@@ -935,7 +945,8 @@ class TransponderEditDialog(QDialog):
                 "downlink_mhz": downlink,
                 "mode": mode,
                 "uplink_mode": uplink_mode,
-                "alive": self.table.item(row, 5).checkState() == Qt.Checked,
+                "invert": self.table.item(row, 5).checkState() == Qt.Checked,
+                "alive": self.table.item(row, 6).checkState() == Qt.Checked,
             })
         return transponders
 

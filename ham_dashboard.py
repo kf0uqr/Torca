@@ -210,6 +210,99 @@ class VirtualCableDialog(QDialog):
         self._set_status(False, None, None)
 
 
+class RigctldDialog(QDialog):
+    """One row per connected radio -- rigctld is inherently one-radio-
+    per-port, so a real multi-radio setup (e.g. WSJT-X reaching both an
+    uplink and a downlink radio) needs a separate server, on a separate
+    port, per radio, started/stopped independently. Rows for radios
+    with no remembered port yet default to sequential free ports
+    starting at RIGCTLD_DEFAULT_PORT (skipping any already claimed by a
+    remembered or just-assigned port in this same dialog), so two newly
+    -connected radios don't default to the same port -- the user can
+    still freely retype either one, though; an actual collision (with
+    another of our own servers or anything else) surfaces as a normal
+    QTcpServer bind failure via on_start's return value. Never touches
+    RigctldServer directly -- on_start(window, port) -> bool and
+    on_stop(window) do the real work in HamClockWindow."""
+
+    def __init__(self, connected_radios, running_servers, ports, on_start, on_stop, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Rigctld")
+        self._on_start = on_start
+        self._on_stop = on_stop
+        self._rows = {}  # RadioWindow -> (port_spinbox, toggle_button)
+
+        form = QFormLayout()
+        used_ports = set(ports.values())
+        next_free_port = RIGCTLD_DEFAULT_PORT
+        for window in connected_radios:
+            details = window._details
+            role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
+            connection_label = details.get("host") or details.get("serial_port") or "?"
+            label = f"{details['radio_model']} ({role_label}) -- {connection_label}"
+
+            if window in ports:
+                default_port = ports[window]
+            else:
+                while next_free_port in used_ports:
+                    next_free_port += 1
+                default_port = next_free_port
+                used_ports.add(default_port)
+
+            port_spinbox = QSpinBox()
+            port_spinbox.setRange(1, 65535)
+            port_spinbox.setValue(default_port)
+            port_spinbox.setToolTip("TCP port for this radio's rigctld server -- must differ from any other radio's.")
+
+            is_running = window in running_servers
+            toggle_button = QPushButton("Stop" if is_running else "Start")
+            toggle_button.setCheckable(True)
+            toggle_button.setChecked(is_running)
+            toggle_button.setStyleSheet(
+                "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+            )
+            port_spinbox.setEnabled(not is_running)
+            toggle_button.toggled.connect(lambda checked, w=window: self._on_row_toggled(w, checked))
+
+            row = QHBoxLayout()
+            row.addWidget(port_spinbox)
+            row.addWidget(toggle_button)
+            form.addRow(label, row)
+            self._rows[window] = (port_spinbox, toggle_button)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+
+        layout = QVBoxLayout()
+        message = QLabel(
+            "Each radio gets its own rigctld server (select \"Hamlib NET "
+            "rigctl\", rig model 2, and 127.0.0.1:<port> in the external "
+            "app) -- radios need different ports."
+            if connected_radios else "No radios connected."
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+        layout.addLayout(form)
+        layout.addWidget(close_button)
+        self.setLayout(layout)
+
+    def _on_row_toggled(self, window, checked):
+        port_spinbox, toggle_button = self._rows[window]
+        if checked:
+            success = self._on_start(window, port_spinbox.value())
+            if not success:
+                toggle_button.blockSignals(True)
+                toggle_button.setChecked(False)
+                toggle_button.blockSignals(False)
+                return
+            toggle_button.setText("Stop")
+            port_spinbox.setEnabled(False)
+        else:
+            self._on_stop(window)
+            toggle_button.setText("Start")
+            port_spinbox.setEnabled(True)
+
+
 # Recomputing pass predictions (upcoming_passes) is real work -- SGP4
 # propagation across a multi-day search window for every selected
 # satellite -- unlike the map position update, which is one propagation
@@ -417,31 +510,24 @@ class HamClockWindow(QWidget):
         )
         self.virtual_cable_button.clicked.connect(self._on_virtual_cable_button_clicked)
 
-        # ---- Rigctld (moved from RadioWindow -- own target picker,
-        # independent of Virtual Cables', since a real setup might want
-        # rigctld bound to one radio (e.g. the uplink) while Virtual
-        # Cables feeds a different one (e.g. the downlink)) ----
-        self.rigctld_target_combo = QComboBox()
-        self.rigctld_target_combo.setToolTip("Which connected radio external CAT-aware apps control through rigctld.")
+        # ---- Rigctld (moved from RadioWindow -- opens a dialog with
+        # one row per connected radio, each independently started/
+        # stopped on its own port, since rigctld is inherently one-
+        # radio-per-port and a real setup might want e.g. WSJT-X
+        # reaching both an uplink and a downlink radio at once, which
+        # needs two separate servers on two separate ports) ----
+        self._rigctld_servers = {}  # RadioWindow -> running RigctldServer
+        self._rigctld_ports = {}    # RadioWindow -> remembered port (kept even while stopped)
 
-        self.rigctld_port_input = QSpinBox()
-        self.rigctld_port_input.setRange(1, 65535)
-        self.rigctld_port_input.setValue(RIGCTLD_DEFAULT_PORT)
-        self.rigctld_port_input.setToolTip("TCP port for the rigctld server to listen on.")
-
-        self.rigctld_button = QPushButton(f"Rigctld: OFF (port {RIGCTLD_DEFAULT_PORT})")
-        self.rigctld_button.setCheckable(True)
+        self.rigctld_button = QPushButton("Rigctld: OFF")
         self.rigctld_button.setEnabled(False)
-        self.rigctld_button.setStyleSheet(
-            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
-        )
         self.rigctld_button.setToolTip(
-            "Lets other CAT-aware apps (WSJT-X, JTDX, fldigi, ...) control the "
-            "target radio through this app's connection -- select \"Hamlib NET "
-            "rigctl\" (rig model 2) and 127.0.0.1:<port above> in that app."
+            "Configure per-radio rigctld servers so other CAT-aware apps "
+            "(WSJT-X, JTDX, fldigi, ...) can control them -- select \"Hamlib "
+            "NET rigctl\" (rig model 2) and 127.0.0.1:<port> in that app. "
+            "Each radio needs its own port."
         )
-        self.rigctld_button.toggled.connect(self._on_rigctld_toggled)
-        self.rigctld_server = None  # created lazily on first enable
+        self.rigctld_button.clicked.connect(self._on_rigctld_button_clicked)
 
         # ---- WSJT-X launch (moved from RadioWindow -- no radio
         # dependency at all, so this is just a relocation) ----
@@ -453,14 +539,9 @@ class HamClockWindow(QWidget):
         )
         self.wsjtx_button.clicked.connect(self._on_wsjtx_button_clicked)
 
-        rigctld_column = QVBoxLayout()
-        rigctld_column.addWidget(self.rigctld_target_combo)
-        rigctld_column.addWidget(self.rigctld_port_input)
-        rigctld_column.addWidget(self.rigctld_button)
-
         external_apps_row = QHBoxLayout()
         external_apps_row.addWidget(self.wsjtx_button)
-        external_apps_row.addLayout(rigctld_column)
+        external_apps_row.addWidget(self.rigctld_button)
         external_apps_row.addWidget(self.virtual_cable_button)
         external_apps_row.addStretch()
 
@@ -848,7 +929,7 @@ class HamClockWindow(QWidget):
         item.setData(Qt.UserRole, window)
         self.connected_radios_list.addItem(item)
 
-        self._refresh_target_combos()
+        self._update_external_app_buttons_enabled()
         window.show()
 
     def _on_connected_radio_item_double_clicked(self, item):
@@ -878,24 +959,11 @@ class HamClockWindow(QWidget):
             new_rx = None if window is self._virtual_cable_rx_window else self._virtual_cable_rx_window
             new_tx = None if window is self._virtual_cable_tx_window else self._virtual_cable_tx_window
             self._apply_virtual_cable_config(new_rx, new_tx, self._virtual_cable_channel)
-        if self.rigctld_button.isChecked() and self.rigctld_target_combo.currentData() is window:
-            self.rigctld_button.setChecked(False)
-        self._refresh_target_combos()
+        self._stop_rigctld_for_window(window)
+        self._rigctld_ports.pop(window, None)
+        self._update_external_app_buttons_enabled()
 
-    def _refresh_target_combos(self):
-        previous = self.rigctld_target_combo.currentData()
-        self.rigctld_target_combo.blockSignals(True)
-        self.rigctld_target_combo.clear()
-        for window in self._connected_radios:
-            details = window._details
-            role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
-            connection_label = details.get("host") or details.get("serial_port") or "?"
-            self.rigctld_target_combo.addItem(f"{details['radio_model']} ({role_label}) -- {connection_label}", window)
-        if previous is not None:
-            index = self.rigctld_target_combo.findData(previous)
-            if index != -1:
-                self.rigctld_target_combo.setCurrentIndex(index)
-        self.rigctld_target_combo.blockSignals(False)
+    def _update_external_app_buttons_enabled(self):
         has_radios = bool(self._connected_radios)
         self.virtual_cable_button.setEnabled(has_radios)
         self.rigctld_button.setEnabled(has_radios)
@@ -1065,42 +1133,52 @@ class HamClockWindow(QWidget):
 
     # ---- Rigctld ----
 
-    def _on_rigctld_toggled(self, checked):
-        if checked:
-            window = self.rigctld_target_combo.currentData()
-            if window is None:
-                self.rigctld_button.blockSignals(True)
-                self.rigctld_button.setChecked(False)
-                self.rigctld_button.blockSignals(False)
-                return
-            port = self.rigctld_port_input.value()
-            self.rigctld_server = RigctldServer(
-                get_freq=lambda: window._current_freq_hz or 0,
-                set_freq=lambda hz: window.worker.set_frequency(int(hz)),
-                get_mode=lambda: (window.control_widgets["mode"].currentData() or "USB", 0),
-                set_mode=lambda mode: window.worker.set_control_value("mode", mode),
-                get_ptt=lambda: window.ptt_button.isChecked(),
-                set_ptt=lambda on: window.ptt_button.setChecked(on),  # reuses the normal PTT path via its toggled signal
-                port=port,
-            )
-            try:
-                self.rigctld_server.start()
-            except RuntimeError as exc:
-                QMessageBox.critical(self, "Rigctld", str(exc))
-                self.rigctld_server = None
-                self.rigctld_button.setChecked(False)
-                return
-            self.rigctld_button.setText(f"Rigctld: ON (port {port})")
-            self.rigctld_port_input.setEnabled(False)  # changing port on a live server needs a stop/restart first
-            self.rigctld_target_combo.setEnabled(False)
-        else:
-            port = self.rigctld_port_input.value()
-            if self.rigctld_server is not None:
-                self.rigctld_server.stop()
-                self.rigctld_server = None
-            self.rigctld_button.setText(f"Rigctld: OFF (port {port})")
-            self.rigctld_port_input.setEnabled(True)
-            self.rigctld_target_combo.setEnabled(True)
+    def _on_rigctld_button_clicked(self):
+        dialog = RigctldDialog(
+            self._connected_radios, self._rigctld_servers, self._rigctld_ports,
+            on_start=self._on_rigctld_dialog_start,
+            on_stop=self._on_rigctld_dialog_stop,
+            parent=self,
+        )
+        dialog.exec()  # each row already started/stopped its own server directly -- Close just dismisses
+
+    def _on_rigctld_dialog_start(self, window, port):
+        """Returns True/False so the dialog's row can reflect whether
+        the server actually started -- a port collision (with another
+        of our own radios' servers, or anything else already using that
+        port) surfaces as a normal QTcpServer bind failure here, same
+        as the original single-target implementation's own handling."""
+        server = RigctldServer(
+            get_freq=lambda: window._current_freq_hz or 0,
+            set_freq=lambda hz: window.worker.set_frequency(int(hz)),
+            get_mode=lambda: (window.control_widgets["mode"].currentData() or "USB", 0),
+            set_mode=lambda mode: window.worker.set_control_value("mode", mode),
+            get_ptt=lambda: window.ptt_button.isChecked(),
+            set_ptt=lambda on: window.ptt_button.setChecked(on),  # reuses the normal PTT path via its toggled signal
+            port=port,
+        )
+        try:
+            server.start()
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Rigctld", str(exc))
+            return False
+        self._rigctld_servers[window] = server
+        self._rigctld_ports[window] = port
+        self._update_rigctld_button_label()
+        return True
+
+    def _on_rigctld_dialog_stop(self, window):
+        self._stop_rigctld_for_window(window)
+        self._update_rigctld_button_label()
+
+    def _stop_rigctld_for_window(self, window):
+        server = self._rigctld_servers.pop(window, None)
+        if server is not None:
+            server.stop()
+
+    def _update_rigctld_button_label(self):
+        count = len(self._rigctld_servers)
+        self.rigctld_button.setText(f"Rigctld: {count} running" if count else "Rigctld: OFF")
 
     # ---- WSJT-X ----
 
@@ -1131,8 +1209,8 @@ class HamClockWindow(QWidget):
 
     def closeEvent(self, event):
         self.satellite_session.stop()
-        if self.rigctld_server is not None:
-            self.rigctld_server.stop()
+        for window in list(self._rigctld_servers):
+            self._stop_rigctld_for_window(window)
         self._teardown_virtual_cables()  # best-effort; each affected window's own worker.stop() (below) may cut this off before it finishes
         for window in list(self._connected_radios):
             window.close()

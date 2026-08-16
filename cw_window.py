@@ -7,7 +7,10 @@ effects, unlike Log Book) before hiding rather than destroying, so the
 same instance can be reopened freely without losing its transcript.
 
 Send: the radio's own built-in keyer over CI-V (RadioWorker.
-send_cw_text/stop_cw_text) -- no local audio/DSP involved at all.
+send_cw_text/stop_cw_text) -- no local audio/DSP involved at all. PTT
+is keyed explicitly around the send (half a second before it starts,
+half a second after it ends) rather than left to the radio's own
+keyer alone -- see _on_send_clicked's docstring for why.
 
 Decode: an auto-adaptive tone decoder (cw.CwDecoder) fed live PCM via
 RadioWorker.start_cw_decode(). Works alongside normal listening audio
@@ -31,7 +34,20 @@ from PySide6.QtWidgets import (
 )
 
 from constants import AUDIO_DEFAULT_SAMPLE_RATE
-from cw import CwDecoder
+from cw import CwDecoder, estimate_cw_send_duration_ms
+
+# Delay between keying PTT and actually starting to send code, and
+# between the estimated end of sending and releasing PTT -- lets
+# external relays/an amplifier settle before/after the CW keying
+# itself, avoiding hot-switching and a clipped first or last
+# character. Per explicit instruction, not (yet) user-configurable.
+_PTT_LEAD_MS = 500
+_PTT_TRAIL_MS = 500
+# There's no live "done" signal for a CW send (see cw.
+# estimate_cw_send_duration_ms's docstring) -- this pads the estimate
+# a little so PTT doesn't release a moment before the radio actually
+# finishes keying the last character.
+_DURATION_SAFETY_MARGIN = 1.08
 
 
 class CwToolWindow(QWidget):
@@ -49,6 +65,15 @@ class CwToolWindow(QWidget):
         self.resize(480, 440)
 
         self._decoder = None  # cw.CwDecoder, constructed fresh each time decoding starts
+
+        # True from the moment Send keys PTT until PTT is released
+        # again (the trail timer firing, Stop being clicked, or this
+        # window closing) -- guards against a second Send while one is
+        # already in flight, and tells closeEvent whether IT (not some
+        # unrelated manual PTT use) is holding PTT and needs to release
+        # it. See _on_send_clicked's docstring for the full sequence.
+        self._send_sequence_active = False
+        self._send_pending_text = None
 
         # ---- Send ----
 
@@ -89,6 +114,16 @@ class CwToolWindow(QWidget):
         send_group.addWidget(self.send_text_edit)
         send_group.addLayout(send_buttons_row)
         send_group.addLayout(speed_row)
+
+        # See _on_send_clicked's docstring for the PTT-around-the-send
+        # sequence these two drive.
+        self._send_ptt_lead_timer = QTimer(self)
+        self._send_ptt_lead_timer.setSingleShot(True)
+        self._send_ptt_lead_timer.timeout.connect(self._on_send_ptt_lead_elapsed)
+
+        self._send_ptt_trail_timer = QTimer(self)
+        self._send_ptt_trail_timer.setSingleShot(True)
+        self._send_ptt_trail_timer.timeout.connect(self._on_send_ptt_trail_elapsed)
 
         # ---- Decode ----
 
@@ -156,13 +191,61 @@ class CwToolWindow(QWidget):
     # ---- Send ----
 
     def _on_send_clicked(self):
+        """Keys PTT, waits _PTT_LEAD_MS, sends the CW text, waits for
+        it to (an estimated) finish plus _PTT_TRAIL_MS, then releases
+        PTT -- rather than relying on the radio's own keyer to key
+        PTT/TX itself for exactly the duration of the code (which it
+        does do on its own, but with no lead-in/lead-out margin). The
+        lead/trail delays give external relays or an amplifier time to
+        settle before/after the actual keying, avoiding hot-switching
+        and a clipped first or last character -- explicit instruction,
+        not a guess. Ignored while a previous send is still in flight
+        (guarded by _send_sequence_active, not just the disabled Send
+        button -- returnPressed on the text field can still fire while
+        the button itself is disabled)."""
+        if self._send_sequence_active:
+            return
         text = self.send_text_edit.text().strip()
         if not text:
             return
+        self._send_sequence_active = True
+        self.send_button.setEnabled(False)
+        self._send_pending_text = text
+        self._radio_window.worker.start_ptt()
+        self._send_ptt_lead_timer.start(_PTT_LEAD_MS)
+
+    def _on_send_ptt_lead_elapsed(self):
+        text = self._send_pending_text
+        self._send_pending_text = None
+        if text is None:
+            return
         self._radio_window.worker.send_cw_text(text)
+        duration_ms = estimate_cw_send_duration_ms(text, self.wpm_spin.value())
+        self._send_ptt_trail_timer.start(int(duration_ms * _DURATION_SAFETY_MARGIN) + _PTT_TRAIL_MS)
+
+    def _on_send_ptt_trail_elapsed(self):
+        self._radio_window.worker.stop_ptt()
+        self._send_sequence_active = False
+        self.send_button.setEnabled(True)
 
     def _on_stop_send_clicked(self):
-        self._radio_window.worker.stop_cw_text()
+        # Immediate, regardless of which phase of the send sequence
+        # (still in the pre-send PTT lead delay, actively sending, or
+        # waiting out the post-send trail delay) this interrupts --
+        # cancelling the timers prevents a pending send_cw_text() or
+        # stop_ptt() call from firing later on top of this.
+        self._cancel_send_sequence_timers()
+        worker = self._radio_window.worker
+        worker.stop_cw_text()
+        if self._send_sequence_active:
+            worker.stop_ptt()
+            self._send_sequence_active = False
+        self.send_button.setEnabled(True)
+
+    def _cancel_send_sequence_timers(self):
+        self._send_ptt_lead_timer.stop()
+        self._send_ptt_trail_timer.stop()
+        self._send_pending_text = None
 
     def _on_wpm_spin_changed(self, value):
         self._radio_window.worker.set_key_speed(value)
@@ -284,7 +367,17 @@ class CwToolWindow(QWidget):
         # _stop_ptt).
         if self.decode_toggle_button.isChecked():
             self.decode_toggle_button.setChecked(False)  # synchronously runs _on_decode_toggled(False)
-        self._radio_window.worker.stop_cw_text()
+        self._cancel_send_sequence_timers()
+        worker = self._radio_window.worker
+        worker.stop_cw_text()
+        if self._send_sequence_active:
+            # Only release PTT if THIS window's own Send sequence is
+            # what's holding it -- an unrelated manual PTT press (the
+            # radio window's own PTT button) must not be cut off just
+            # because this window happened to close at the same time.
+            worker.stop_ptt()
+            self._send_sequence_active = False
+        self.send_button.setEnabled(True)
         if getattr(self, "_closing_for_real", False):
             event.accept()
             return

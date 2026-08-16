@@ -78,6 +78,53 @@ _UNIT_ADAPT_RATE = 0.3
 UNKNOWN_CHAR_PLACEHOLDER = "*"
 
 
+def estimate_cw_send_duration_ms(text: str, wpm: int) -> float:
+    """Estimates how long the radio's own keyer will take to key out
+    `text` at `wpm`, in milliseconds -- standard PARIS-word timing
+    (dot=1 unit, dash=3, intra-character gap=1, inter-character gap=3,
+    inter-word gap=7; unit_ms = 1200/wpm, same constants as CwDecoder's
+    classification thresholds above).
+
+    There's no live "done" signal from the radio for a CW send --
+    rigplane's send_cw_text() coroutine only confirms the CI-V command
+    was accepted, not that keying has actually finished; the radio
+    paces the real Morse timing itself, independently, after that
+    returns. This estimate is what lets calling code (cw_window.py's
+    PTT-around-the-CW-send sequencing) know roughly when to expect it
+    to be over, the same way an external contest keyer/sequencer
+    without any read-back from the rig would.
+
+    Characters with no MORSE_CODE_TABLE entry (unsupported
+    punctuation, stray whitespace) are skipped -- contribute no time --
+    on the assumption that the radio's own keyer does the same rather
+    than erroring outright on them."""
+    if wpm <= 0:
+        return 0.0
+    unit_ms = 1200.0 / wpm
+    total_units = 0.0
+    words = text.strip().split(" ")
+    first_word = True
+    for word in words:
+        if not word:
+            continue  # collapses accidental repeated spaces
+        if not first_word:
+            total_units += 7.0
+        first_word = False
+        first_char = True
+        for char in word.upper():
+            pattern = MORSE_CODE_TABLE.get(char)
+            if pattern is None:
+                continue
+            if not first_char:
+                total_units += 3.0
+            first_char = False
+            for i, symbol in enumerate(pattern):
+                if i > 0:
+                    total_units += 1.0
+                total_units += 1.0 if symbol == "." else 3.0
+    return total_units * unit_ms
+
+
 class GoertzelDetector:
     """Computes the signal energy at `target_hz` for a block of int16
     samples. Doesn't need the block size in advance -- the Goertzel

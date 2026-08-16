@@ -158,58 +158,73 @@ def sync_with_qrz(api_key, qsos, cursor):
     new_cursor = cursor
     try:
         page_cursor = cursor
-        first_page = True
-        while True:
-            # QRZ's docs describe "ALL" as the default filter and
-            # AFTERLOGID:n as an alternative one, not necessarily
-            # interchangeable at n=0 -- AFTERLOGID:0 returning nothing
-            # (instead of "everything", which ALL unambiguously means)
-            # was the leading suspect for "QSOs don't pull down at all"
-            # on a first-ever sync, reported live. Use ALL for the very
-            # first page of a from-scratch sync; AFTERLOGID naturally
-            # takes over from the second page onward once page_cursor
-            # has advanced past 0 from real LOGID values seen in page 1,
-            # and for every subsequent (already-synced-before) sync.
-            if first_page and page_cursor == 0:
-                option = f"ALL,MAX:{_QRZ_FETCH_PAGE_SIZE}"
-            else:
+        if page_cursor == 0:
+            # Confirmed directly against QRZ's own docs: "When the
+            # option ALL is given, only the options TYPE and STATUS may
+            # also be specified" -- MAX (or anything else) CANNOT be
+            # combined with ALL. An earlier attempt sent
+            # "ALL,MAX:250" for a from-scratch sync, which QRZ evidently
+            # rejects/ignores outright (confirmed live: RESULT=OK,
+            # COUNT=0, no error) -- that combination is invalid per
+            # their own documented constraint, not a fluke. ALL alone
+            # has no MAX-based pagination available, so a from-scratch
+            # sync fetches the entire logbook in one request/response;
+            # every later, already-synced sync uses AFTERLOGID (which
+            # CAN combine with MAX) and paginates normally.
+            fetched = qrz_logbook.qrz_fetch(api_key, option="ALL")
+            print(f"[QSO Log] QRZ FETCH (option='ALL') returned {len(fetched)} record(s).")
+            batch_pulled, page_cursor = _apply_pulled_records(fetched, qsos, existing_logids, page_cursor)
+            pulled += batch_pulled
+        else:
+            while True:
                 option = f"AFTERLOGID:{page_cursor},MAX:{_QRZ_FETCH_PAGE_SIZE}"
-            first_page = False
-            fetched = qrz_logbook.qrz_fetch(api_key, option=option)
-            print(f"[QSO Log] QRZ FETCH (option={option!r}) returned {len(fetched)} record(s).")
-            if not fetched:
-                break
-            for record in fetched:
-                # QRZ's own docs don't spell out the exact per-record
-                # field name their FETCH ADIF output uses for a
-                # record's LOGID -- APP_QRZLOG_LOGID is the commonly-
-                # used convention, with a bare LOGID fallback. NOT yet
-                # confirmed against a live response -- worth double-
-                # checking the first time this runs against a real
-                # account, and adjusting here if QRZ actually uses a
-                # different field name.
-                logid = record.get("APP_QRZLOG_LOGID") or record.get("LOGID")
-                if logid:
-                    record[LOGID_FIELD] = str(logid)
-                    record[SYNCED_FIELD] = "Y"
-                    if str(logid).isdigit():
-                        page_cursor = max(page_cursor, int(logid))
-                else:
-                    print(f"[QSO Log] Pulled record has no recognized LOGID field -- raw keys: {sorted(record.keys())}")
-                if logid and record[LOGID_FIELD] in existing_logids:
-                    continue
-                qsos.append(ensure_uuid(record))  # QRZ has no notion of this app's local UUID convention
-                if logid:
-                    existing_logids.add(record[LOGID_FIELD])
-                pulled += 1
-            if len(fetched) < _QRZ_FETCH_PAGE_SIZE:
-                break
+                fetched = qrz_logbook.qrz_fetch(api_key, option=option)
+                print(f"[QSO Log] QRZ FETCH (option={option!r}) returned {len(fetched)} record(s).")
+                if not fetched:
+                    break
+                batch_pulled, page_cursor = _apply_pulled_records(fetched, qsos, existing_logids, page_cursor)
+                pulled += batch_pulled
+                if len(fetched) < _QRZ_FETCH_PAGE_SIZE:
+                    break
         new_cursor = page_cursor
     except Exception as exc:
         print(f"[ERROR] QSO Log: QRZ fetch failed ({exc}); local log unaffected, will retry next sync.")
 
     summary = {"uploaded": uploaded, "upload_failures": upload_failures, "pulled": pulled}
     return qsos, new_cursor, summary
+
+
+def _apply_pulled_records(fetched, qsos, existing_logids, page_cursor):
+    """Tags each freshly-fetched record with LOGID_FIELD/SYNCED_FIELD
+    (when QRZ's own per-record LOGID field is recognized), assigns a
+    local UUID, skips anything already present locally, and appends
+    the rest to qsos in place. Returns (pulled_count,
+    updated_page_cursor) -- shared between sync_with_qrz's ALL (single
+    request) and AFTERLOGID (paginated) branches."""
+    pulled = 0
+    for record in fetched:
+        # QRZ's own docs don't spell out the exact per-record field
+        # name their FETCH ADIF output uses for a record's LOGID --
+        # APP_QRZLOG_LOGID is the commonly-used convention, with a bare
+        # LOGID fallback. NOT yet confirmed against a live response --
+        # worth double-checking the first time this runs against a real
+        # account, and adjusting here if QRZ actually uses a different
+        # field name.
+        logid = record.get("APP_QRZLOG_LOGID") or record.get("LOGID")
+        if logid:
+            record[LOGID_FIELD] = str(logid)
+            record[SYNCED_FIELD] = "Y"
+            if str(logid).isdigit():
+                page_cursor = max(page_cursor, int(logid))
+        else:
+            print(f"[QSO Log] Pulled record has no recognized LOGID field -- raw keys: {sorted(record.keys())}")
+        if logid and record[LOGID_FIELD] in existing_logids:
+            continue
+        qsos.append(ensure_uuid(record))  # QRZ has no notion of this app's local UUID convention
+        if logid:
+            existing_logids.add(record[LOGID_FIELD])
+        pulled += 1
+    return pulled, page_cursor
 
 
 class QrzSyncWorker(QThread):

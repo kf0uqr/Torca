@@ -80,6 +80,7 @@ class WorldMapWidget(QWidget):
 
     satellite_double_clicked = Signal(str)  # satellite name, from the positions passed to set_satellite_positions
     satellite_right_clicked = Signal(str)   # satellite name -- opens Satellite Info (ham_dashboard.py)
+    satellite_left_clicked = Signal(str)    # satellite name -- sets the "active" map-highlighted satellite
 
     # The background image (and the whole lat/lon grid it's drawn
     # against) is a standard equirectangular projection: 2:1 width:height.
@@ -285,11 +286,17 @@ class WorldMapWidget(QWidget):
             self.satellite_double_clicked.emit(closest_name)
 
     def mousePressEvent(self, event):
-        if event.button() != Qt.RightButton:
-            return
         closest_name = self._satellite_at(event.position())
-        if closest_name is not None:
+        if closest_name is None:
+            return
+        if event.button() == Qt.RightButton:
             self.satellite_right_clicked.emit(closest_name)
+        elif event.button() == Qt.LeftButton:
+            # Also fires as the first press of a double-click (Qt sends
+            # press/release/press/doubleClick/release for one) -- that's
+            # fine, ham_dashboard.py's double-click handler sets the same
+            # "active" state itself, so this is just redundant, not wrong.
+            self.satellite_left_clicked.emit(closest_name)
 
     @staticmethod
     def _lonlat_to_xy(lat, lon, w, h):
@@ -310,8 +317,12 @@ class WorldMapWidget(QWidget):
                 segments.append([])
             segments[-1].append((lat, lon))
             prev_lon = lon
-        painter.setPen(QPen(QColor(120, 200, 255, 180), 1, Qt.DashLine))
-        painter.setBrush(QColor(120, 200, 255, 30))
+        if sat.get("active"):
+            painter.setPen(QPen(QColor(255, 230, 0, 220), 1.5, Qt.DashLine))
+            painter.setBrush(QColor(255, 230, 0, 45))
+        else:
+            painter.setPen(QPen(QColor(120, 200, 255, 180), 1, Qt.DashLine))
+            painter.setBrush(QColor(120, 200, 255, 30))
         for segment in segments:
             if len(segment) < 2:
                 continue
@@ -324,9 +335,12 @@ class WorldMapWidget(QWidget):
             painter.drawPath(path)
 
     def _draw_satellite_path(self, painter, sat, w, h):
-        """Draws the satellite's orbit ground track -- opt-in per
-        satellite (see ham_dashboard.py's "Show Orbit Path" right-click
-        toggle), only present in sat["path"] when it's enabled."""
+        """Draws the satellite's orbit ground track -- present in
+        sat["path"] either because it's opt-in per satellite (see
+        ham_dashboard.py's "Show Orbit Path" right-click toggle) or
+        because this is the currently map-"active" satellite (always
+        shown while active, regardless of its own Show Orbit Path
+        setting -- see ham_dashboard.py's _update_satellite_positions)."""
         points = sat.get("path") or []
         if len(points) < 2:
             return
@@ -341,7 +355,10 @@ class WorldMapWidget(QWidget):
                 segments.append([])
             segments[-1].append((lat, lon))
             prev_lon = lon
-        painter.setPen(QPen(QColor(255, 140, 0, 160), 1.5, Qt.SolidLine))
+        if sat.get("active"):
+            painter.setPen(QPen(QColor(255, 230, 0, 220), 2.5, Qt.SolidLine))
+        else:
+            painter.setPen(QPen(QColor(255, 140, 0, 160), 1.5, Qt.SolidLine))
         painter.setBrush(Qt.NoBrush)
         for segment in segments:
             if len(segment) < 2:
@@ -356,9 +373,14 @@ class WorldMapWidget(QWidget):
 
     def _draw_satellite_marker(self, painter, sat, w, h):
         x, y = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 140, 0))
-        painter.drawEllipse(QPointF(x, y), 4, 4)
+        if sat.get("active"):
+            painter.setPen(QPen(QColor(255, 255, 255, 220), 1))
+            painter.setBrush(QColor(255, 230, 0))
+            painter.drawEllipse(QPointF(x, y), 6, 6)
+        else:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 140, 0))
+            painter.drawEllipse(QPointF(x, y), 4, 4)
 
         # Outlined (dark halo + light fill) rather than a flat light
         # color -- a flat color only reads well over the night-shaded

@@ -352,6 +352,7 @@ class HamClockWindow(QWidget):
         self.map_widget = WorldMapWidget()
         self.map_widget.satellite_double_clicked.connect(self._on_satellite_double_clicked)
         self.map_widget.satellite_right_clicked.connect(self._on_satellite_right_clicked)
+        self.map_widget.satellite_left_clicked.connect(self._on_satellite_left_clicked)
 
         self.utc_label = QLabel("--:--:-- UTC")
         self.utc_label.setStyleSheet("font-size: 20px; font-weight: bold;")
@@ -404,15 +405,26 @@ class HamClockWindow(QWidget):
             + self.PASSES_DISPLAY_COUNT * 24 + 4
         )
         self.upcoming_passes_table.setToolTip(
-            "Double-click a row to select that satellite, same as double-clicking it on the map. "
+            "Click a row to make it the active (highlighted) satellite on the map. "
+            "Double-click to select it for tracking, same as double-clicking it on the map. "
             "Right-click for satellite info."
         )
+        self.upcoming_passes_table.cellClicked.connect(self._on_pass_row_clicked)
         self.upcoming_passes_table.cellDoubleClicked.connect(self._on_pass_row_double_clicked)
         self.upcoming_passes_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.upcoming_passes_table.customContextMenuRequested.connect(self._on_passes_table_context_menu)
 
         self.satellites = load_satellite_data()
         self._upcoming_passes = []  # cached results from the last upcoming_passes() call
+        # Which satellite is currently highlighted on the map (brighter
+        # marker/footprint/path colors, and its ground track always shown
+        # regardless of its own "Show Orbit Path" setting) -- purely
+        # visual, set by left-clicking a satellite (map marker or a
+        # passes-table row) or double-clicking one (which also starts
+        # tracking, see _on_satellite_double_clicked). Distinct from
+        # _active_satellite (the Doppler-tracked satellite) -- the two are
+        # usually the same bird in practice but aren't the same concept.
+        self._map_highlighted_satellite_name = None
 
         self.satellite_button = QPushButton("Satellites: OFF")
         self.satellite_button.setCheckable(True)
@@ -693,14 +705,20 @@ class HamClockWindow(QWidget):
             if result is None:
                 continue
             lat, lon, altitude_km = result
+            is_active = sat.get("name") == self._map_highlighted_satellite_name
             position = {
                 "name": sat.get("name", "?"),
                 "lat": lat,
                 "lon": lon,
                 "altitude_km": altitude_km,
                 "footprint": footprint_points(lat, lon, altitude_km),
+                "active": is_active,
             }
-            if sat.get("show_path"):
+            # The active satellite's ground track always shows, on top of
+            # (not instead of) its own persisted "Show Orbit Path" setting
+            # -- and disappears the instant a different satellite becomes
+            # active, per the satellite's own show_path value only.
+            if sat.get("show_path") or is_active:
                 position["path"] = ground_track_points(sat.get("line1", ""), sat.get("line2", ""), now)
             positions.append(position)
         self.map_widget.set_satellite_positions(positions)
@@ -758,6 +776,14 @@ class HamClockWindow(QWidget):
             if item is not None:
                 item.setText(text)
 
+    def _on_pass_row_clicked(self, row, _column):
+        """Single-click a row here is the same as left-clicking that
+        satellite's marker on the map -- makes it the active
+        (highlighted) satellite. Purely visual, no tracking change."""
+        if row >= len(self._upcoming_passes):
+            return
+        self._on_satellite_left_clicked(self._upcoming_passes[row]["name"])
+
     def _on_pass_row_double_clicked(self, row, _column):
         """Double-clicking a row here is the same as double-clicking
         that satellite's marker on the map."""
@@ -800,13 +826,31 @@ class HamClockWindow(QWidget):
             return
         SatelliteInfoDialog(satellite, self).exec()
 
+    def _on_satellite_left_clicked(self, name):
+        """Left-clicked on the map marker, or a passes-table row --
+        makes this the "active" satellite on the map: brighter marker/
+        footprint/path colors, and its ground track always shown
+        (regardless of its own Show Orbit Path setting) until a
+        different satellite becomes active. Purely visual -- does NOT
+        start Doppler tracking (see _on_satellite_double_clicked for
+        that)."""
+        if self._map_highlighted_satellite_name == name:
+            return
+        self._map_highlighted_satellite_name = name
+        if self.satellite_button.isChecked():
+            self._update_satellite_positions()  # immediate feedback -- the 5s timer would also catch up on its own
+
     def _on_satellite_double_clicked(self, name):
         """(Re)starts tracking this satellite -- replaces whatever was
         active before (it stays selected/tracked until another double-
         click, or upcoming-pass row double-click, replaces it; pausing
         via Stop Tracking doesn't clear it). Drives SatelliteSession
         directly now -- this window owns tracking control, not just a
-        signal source for some other window to react to."""
+        signal source for some other window to react to. Also makes it
+        the map-active satellite (same as a single left-click) -- doesn't
+        need a location configured, so this happens before that check
+        below, unlike the tracking behavior it gates."""
+        self._on_satellite_left_clicked(name)
         satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
         if satellite is None:
             return

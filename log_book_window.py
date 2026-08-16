@@ -174,8 +174,12 @@ class LogBookWindow(QWidget):
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
 
-        self.new_qso_button = QPushButton("New QSO...")
-        self.new_qso_button.clicked.connect(self._on_new_qso_clicked)
+        # New QSO's own button lives on the Ham Dashboard now, next to
+        # "Log Book..." -- but the actual logic stays here (this window
+        # owns self._qsos/persistence/table refresh); the dashboard's
+        # button just calls this window's _on_new_qso_clicked()
+        # directly, lazily constructing this window first if needed
+        # (see ham_dashboard.py's _on_new_qso_clicked).
         self.edit_button = QPushButton("Edit Selected")
         self.edit_button.clicked.connect(self._on_edit_clicked)
         self.delete_button = QPushButton("Delete Selected")
@@ -191,7 +195,6 @@ class LogBookWindow(QWidget):
         self.status_label.setStyleSheet("color: #aaa; font-size: 11px;")
 
         toolbar = QHBoxLayout()
-        toolbar.addWidget(self.new_qso_button)
         toolbar.addWidget(self.edit_button)
         toolbar.addWidget(self.delete_button)
         toolbar.addWidget(self.columns_button)

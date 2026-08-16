@@ -458,6 +458,14 @@ class HamClockWindow(QWidget):
         self.log_book_button.setToolTip("QSO log -- view/sort every contact, log a new one, edit and re-sync with QRZ.com.")
         self.log_book_button.clicked.connect(self._on_log_book_clicked)
 
+        # Opens the same New QSO window LogBookWindow itself uses --
+        # lazily builds that window (without showing it) if it doesn't
+        # exist yet, so a QSO can be logged quickly without opening the
+        # full log table first. See _on_new_qso_clicked.
+        self.new_qso_button = QPushButton("New QSO...")
+        self.new_qso_button.setToolTip("Log a new QSO -- auto-fills from a connected radio's live state if one is picked.")
+        self.new_qso_button.clicked.connect(self._on_new_qso_clicked)
+
         self.connected_radios_list = QListWidget()
         self.connected_radios_list.setToolTip("Double-click to bring that radio's window to the front.")
         self.connected_radios_list.setFixedHeight(70)
@@ -467,6 +475,7 @@ class HamClockWindow(QWidget):
         connected_radios_header.addWidget(QLabel("Connected Radios:"))
         connected_radios_header.addWidget(self.connect_radio_button)
         connected_radios_header.addWidget(self.log_book_button)
+        connected_radios_header.addWidget(self.new_qso_button)
         connected_radios_header.addStretch()
 
         connected_radios_column = QVBoxLayout()
@@ -1063,6 +1072,16 @@ class HamClockWindow(QWidget):
         self.log_book_window.show()
         self.log_book_window.raise_()
         self.log_book_window.activateWindow()
+
+    def _on_new_qso_clicked(self):
+        # Deliberately does NOT show()/raise_() the Log Book window --
+        # logging a QSO shouldn't force that table open too, just needs
+        # the (possibly not-yet-created, and left hidden either way)
+        # LogBookWindow instance around to own persistence/QRZ upload,
+        # same as _on_log_book_clicked's lazy construction.
+        if self.log_book_window is None:
+            self.log_book_window = LogBookWindow(self)
+        self.log_book_window._on_new_qso_clicked()
 
     def _on_radio_window_closed(self, window):
         """Connected to RadioWindow.closed, emitted from closeEvent

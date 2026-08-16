@@ -26,6 +26,18 @@ Also included:
 
 ## Installation
 
+### System-wide (Linux)
+
+```bash
+git clone https://github.com/kf0uqr/irc.git
+cd irc
+sudo ./install.sh
+```
+
+Installs the app and its own Python virtual environment to `/opt/radione`, and adds a `radione` command to `/usr/local/bin`. Re-run `sudo ./install.sh` any time to reinstall/upgrade, or `sudo ./install.sh --uninstall` to remove everything it installed.
+
+### Manual (any platform)
+
 ```bash
 # 1. Clone the repository
 git clone https://github.com/kf0uqr/irc.git
@@ -42,7 +54,8 @@ pip install -r requirements.txt
 ## Running
 
 ```bash
-python main.py
+radione          # if installed via install.sh
+python main.py   # manual install
 ```
 
 You'll be prompted for connection details (serial or LAN), plus your location (lat/lon/elevation, used for satellite Doppler correction), before the main window opens. Click **Save Profile...** in that dialog to save the whole setup under a name for next time -- the last-used profile (or a fresh one you pick from the dropdown) loads automatically.

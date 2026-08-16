@@ -146,6 +146,8 @@ class RadioWorker(QThread):
     scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
     scope_speed_changed = Signal(int)    # 0=fast, 1=mid, 2=slow, from get_scope_speed() polling
     scope_ready = Signal()               # emitted once enable_scope() actually succeeds -- see is_scope_capable
+    key_speed_changed = Signal(int)      # WPM, 6-48, from get_key_speed() polling
+    cw_pitch_changed = Signal(int)       # Hz, 300-900, from get_cw_pitch() polling
     error = Signal(str)
 
     def __init__(self, details, parent=None):
@@ -161,6 +163,14 @@ class RadioWorker(QThread):
         self._last_observed_scope_span = None
         self._last_observed_scope_ref = None
         self._last_observed_scope_speed = None
+        # Same change-filtered-polling idea, for the CW keyer's speed/
+        # pitch settings (see set_key_speed/set_cw_pitch below).
+        self._last_observed_key_speed = None
+        self._last_observed_cw_pitch = None
+        # Set by start_cw_decode(), cleared by stop_cw_decode() -- the
+        # caller-supplied function _on_cw_decode_frame hands raw PCM
+        # bytes to once audio starts arriving.
+        self._cw_decode_callback = None
         # Dual-receiver only: which receiver every receiver-aware
         # getter/setter (see _receiver_kwargs) targets when none is
         # explicitly given. Starts at Main; kept in sync with the
@@ -474,6 +484,99 @@ class RadioWorker(QThread):
                 f"PTT: radio.set_ptt(False) FAILED ({exc}) -- radio may still be keyed! "
                 "Check the radio directly."
             )
+
+    def send_cw_text(self, text: str):
+        """Thread-safe: call from the GUI thread. Sends `text` via the
+        radio's own built-in keyer (rigplane's send_cw_text() --
+        splits into 30-char chunks, the radio converts it to real CW
+        and keys the transmitter itself). No local audio/DSP on the
+        send side at all -- unlike PTT/mic audio, this doesn't touch
+        self.audio_bridge, so it works regardless of whether a CW
+        decode tap or a Virtual Cable is active."""
+        if self.loop is None or self.radio is None:
+            self.error.emit("Send CW: not connected yet -- send_cw_text() ignored.")
+            return
+        asyncio.run_coroutine_threadsafe(self._send_cw_text(text), self.loop)
+
+    async def _send_cw_text(self, text: str):
+        try:
+            await self.radio.send_cw_text(text)
+        except Exception as exc:
+            self.error.emit(f"Send CW text failed: {exc}")
+
+    def stop_cw_text(self):
+        """Thread-safe: call from the GUI thread -- aborts an in-
+        progress CW send (rigplane's stop_cw_text())."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._stop_cw_text(), self.loop)
+
+    async def _stop_cw_text(self):
+        try:
+            await self.radio.stop_cw_text()
+        except Exception as exc:
+            self.error.emit(f"Stop CW text failed: {exc}")
+
+    def start_cw_decode(self, callback):
+        """Thread-safe: call from the GUI thread. `callback` is
+        invoked with raw PCM bytes (int16, mono) each time audio
+        arrives -- on RadioWorker's own asyncio-loop thread, NOT the
+        GUI thread, same cross-thread requirement as every other
+        callback-driven signal in this app; the caller must hop back
+        to the GUI thread itself (e.g. via a Qt signal) before
+        touching any widget.
+
+        Raises RuntimeError immediately (still on the calling/GUI
+        thread) if not connected yet, or if an AudioBridge is already
+        active for this radio -- rigplane's start_rx() only supports
+        one registered callback at a time (see _setup_audio's
+        docstring), so a CW decode tap can't coexist with an active
+        Virtual Cable on the same radio. Callers should check
+        self.audio_bridge is None themselves before ever offering
+        decode as an option (see cw_window.py), rather than relying on
+        this exception as the primary UX -- it's a backstop, not the
+        intended way this gets surfaced."""
+        if self.loop is None or self.radio is None:
+            raise RuntimeError("start_cw_decode: not connected yet.")
+        if self.audio_bridge is not None:
+            raise RuntimeError(
+                "start_cw_decode: an audio Virtual Cable is already active for "
+                "this radio -- rigplane only supports one registered RX audio "
+                "callback at a time. Stop the Virtual Cable for this radio first."
+            )
+        self._cw_decode_callback = callback
+        asyncio.run_coroutine_threadsafe(self._start_cw_decode(), self.loop)
+
+    async def _start_cw_decode(self):
+        try:
+            await self.radio.start_rx(self._on_cw_decode_frame)
+        except Exception as exc:
+            self._cw_decode_callback = None
+            self.error.emit(f"start_cw_decode: radio.start_rx() failed ({exc}).")
+
+    def _on_cw_decode_frame(self, packet=None):
+        """Called by rigplane on the asyncio-loop thread for each audio
+        frame while CW decoding is active -- same calling convention as
+        AudioBridge._on_rx_audio (always exactly one positional arg, an
+        AudioPacket or None; see its docstring). Reuses AudioBridge's
+        own _extract_pcm_bytes rather than duplicating that unwrapping
+        logic here."""
+        pcm_bytes = AudioBridge._extract_pcm_bytes(packet)
+        if pcm_bytes is not None and self._cw_decode_callback is not None:
+            self._cw_decode_callback(pcm_bytes)
+
+    def stop_cw_decode(self):
+        """Thread-safe: call from the GUI thread."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._stop_cw_decode(), self.loop)
+
+    async def _stop_cw_decode(self):
+        self._cw_decode_callback = None
+        try:
+            await self.radio.stop_rx()
+        except Exception as exc:
+            self.error.emit(f"stop_cw_decode: radio.stop_rx() failed ({exc}).")
 
     async def _setup_levels(self):
         """Checks whether this radio supports rigplane's LevelsCapable
@@ -1117,6 +1220,27 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"get_scope_speed: {exc}")
 
+            # CW keyer speed/pitch -- same change-filtered polling as
+            # scope span/ref/speed above, but unconditional (no
+            # capability flag: get_key_speed/get_cw_pitch are plain
+            # Radio methods, not gated behind a Capable protocol like
+            # scope/audio are, and confirmed present for every radio
+            # profile this app targets).
+            try:
+                key_speed = await self.radio.get_key_speed()
+                if key_speed != self._last_observed_key_speed:
+                    self._last_observed_key_speed = key_speed
+                    self.key_speed_changed.emit(key_speed)
+            except Exception as exc:
+                self.error.emit(f"get_key_speed: {exc}")
+            try:
+                cw_pitch = await self.radio.get_cw_pitch()
+                if cw_pitch != self._last_observed_cw_pitch:
+                    self._last_observed_cw_pitch = cw_pitch
+                    self.cw_pitch_changed.emit(cw_pitch)
+            except Exception as exc:
+                self.error.emit(f"get_cw_pitch: {exc}")
+
             try:
                 # get_frequency's receiver param is NOT a Main/Sub
                 # identity selector -- confirmed by reading rigplane's
@@ -1353,6 +1477,40 @@ class RadioWorker(QThread):
             self._last_observed_scope_span = span_index
         except Exception as exc:
             self.error.emit(f"Set scope span ({span_index}) failed: {exc}")
+
+    def set_key_speed(self, wpm: int):
+        """Thread-safe: call from the GUI thread. CW keyer speed in
+        WPM -- confirmed range 6-48 (rigplane's own get_key_speed()/
+        set_key_speed() BCD encoding, commands/levels.py)."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_key_speed(wpm), self.loop)
+
+    async def _set_key_speed(self, wpm: int):
+        try:
+            await self.radio.set_key_speed(wpm)
+            self._last_observed_key_speed = wpm
+        except Exception as exc:
+            self.error.emit(f"Set key speed ({wpm}) failed: {exc}")
+
+    def set_cw_pitch(self, pitch_hz: int):
+        """Thread-safe: call from the GUI thread. CW sidetone pitch in
+        Hz -- confirmed range 300-900 (rigplane's own get_cw_pitch()/
+        set_cw_pitch() BCD encoding, commands/levels.py). Also the
+        frequency a CW decode session should listen at: it's both the
+        operator's own sidetone AND, assuming the far station is
+        roughly zero-beat, the frequency their signal appears at in
+        the receiver's passband."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_cw_pitch(pitch_hz), self.loop)
+
+    async def _set_cw_pitch(self, pitch_hz: int):
+        try:
+            await self.radio.set_cw_pitch(pitch_hz)
+            self._last_observed_cw_pitch = pitch_hz
+        except Exception as exc:
+            self.error.emit(f"Set CW pitch ({pitch_hz}) failed: {exc}")
 
     def set_scope_ref(self, ref_db: float):
         """Thread-safe: call from the GUI thread. rigplane's

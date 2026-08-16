@@ -142,6 +142,9 @@ class RadioWorker(QThread):
     audio_status = Signal(str)           # informational, not an error
     level_updated = Signal(str, float)   # (level key, value 0.0-1.0)
     active_receiver_changed = Signal(int)  # dual-receiver only: 0=MAIN, 1=SUB, from get_active_receiver() polling
+    scope_span_changed = Signal(int)     # preset index 0-7, from get_scope_span() polling
+    scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
+    scope_speed_changed = Signal(int)    # 0=fast, 1=mid, 2=slow, from get_scope_speed() polling
     error = Signal(str)
 
     def __init__(self, details, parent=None):
@@ -150,6 +153,13 @@ class RadioWorker(QThread):
         self.loop = None       # asyncio event loop, created inside run()
         self.radio = None      # rigplane Radio, set once connected
         self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
+        self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
+        # Last-observed span/ref/speed, so _poll_loop only emits
+        # scope_*_changed when the value genuinely changes -- same
+        # change-filtering as _last_observed_active_receiver above.
+        self._last_observed_scope_span = None
+        self._last_observed_scope_ref = None
+        self._last_observed_scope_speed = None
         # Dual-receiver only: which receiver every receiver-aware
         # getter/setter (see _receiver_kwargs) targets when none is
         # explicitly given. Starts at Main; kept in sync with the
@@ -749,6 +759,7 @@ class RadioWorker(QThread):
         try:
             self.radio.on_scope_data(self._handle_scope_frame)
             await self.radio.enable_scope()
+            self.is_scope_capable = True
         except Exception as exc:
             self.error.emit(f"Scope unavailable: {exc}")
 
@@ -980,6 +991,33 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"get_active_receiver: {exc}")
 
+            if self.is_scope_capable:
+                # Reflects the scope's real settings -- e.g. hand-adjusted
+                # from the radio's own front panel -- same change-filtered
+                # polling approach as active_receiver above. Cheap: three
+                # more instant CI-V reads per cycle.
+                try:
+                    span = await self.radio.get_scope_span()
+                    if span != self._last_observed_scope_span:
+                        self._last_observed_scope_span = span
+                        self.scope_span_changed.emit(span)
+                except Exception as exc:
+                    self.error.emit(f"get_scope_span: {exc}")
+                try:
+                    ref_db = await self.radio.get_scope_ref()
+                    if ref_db != self._last_observed_scope_ref:
+                        self._last_observed_scope_ref = ref_db
+                        self.scope_ref_changed.emit(ref_db)
+                except Exception as exc:
+                    self.error.emit(f"get_scope_ref: {exc}")
+                try:
+                    speed = await self.radio.get_scope_speed()
+                    if speed != self._last_observed_scope_speed:
+                        self._last_observed_scope_speed = speed
+                        self.scope_speed_changed.emit(speed)
+                except Exception as exc:
+                    self.error.emit(f"get_scope_speed: {exc}")
+
             try:
                 # get_frequency's receiver param is NOT a Main/Sub
                 # identity selector -- confirmed by reading rigplane's
@@ -1184,6 +1222,58 @@ class RadioWorker(QThread):
             await self.radio.set_scope_receiver(receiver)
         except Exception as exc:
             self.error.emit(f"Select scope receiver ({receiver}) failed: {exc}")
+
+    def set_scope_span(self, span_index: int):
+        """Thread-safe: call from the GUI thread. rigplane's
+        set_scope_span() takes a PRESET INDEX, not a raw Hz value --
+        confirmed via rigplane's own commands/scope.py:
+        _SCOPE_SPAN_PRESETS_HZ = (2500, 5000, 10000, 25000, 50000,
+        100000, 250000, 500000), i.e. index 0-7. Applies to whichever
+        receiver is currently the scope receiver (set_scope_receiver),
+        not something this call addresses separately -- confirmed via
+        rigplane's runtime source, span/ref/speed all read
+        self._scope_controls().receiver internally rather than taking
+        their own receiver= kwarg."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_scope_span(span_index), self.loop)
+
+    async def _set_scope_span(self, span_index: int):
+        try:
+            await self.radio.set_scope_span(span_index)
+            self._last_observed_scope_span = span_index
+        except Exception as exc:
+            self.error.emit(f"Set scope span ({span_index}) failed: {exc}")
+
+    def set_scope_ref(self, ref_db: float):
+        """Thread-safe: call from the GUI thread. rigplane's
+        set_scope_ref() -- confirmed via commands/scope.py's
+        _scope_ref_encode(): -30.0 to +10.0 dB in 0.5 dB steps."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_scope_ref(ref_db), self.loop)
+
+    async def _set_scope_ref(self, ref_db: float):
+        try:
+            await self.radio.set_scope_ref(ref_db)
+            self._last_observed_scope_ref = ref_db
+        except Exception as exc:
+            self.error.emit(f"Set scope ref ({ref_db}) failed: {exc}")
+
+    def set_scope_speed(self, speed_index: int):
+        """Thread-safe: call from the GUI thread. rigplane's
+        set_scope_speed() -- confirmed via commands/scope.py's
+        scope_set_speed(): 0=fast, 1=mid, 2=slow."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_scope_speed(speed_index), self.loop)
+
+    async def _set_scope_speed(self, speed_index: int):
+        try:
+            await self.radio.set_scope_speed(speed_index)
+            self._last_observed_scope_speed = speed_index
+        except Exception as exc:
+            self.error.emit(f"Set scope speed ({speed_index}) failed: {exc}")
 
     def set_dual_receiver_linking(self, on: bool):
         """Thread-safe: call from the GUI thread. Dual-receiver only --

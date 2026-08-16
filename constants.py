@@ -114,6 +114,19 @@ WATERFALL_ROWS = 200     # how many past scope frames the waterfall keeps on scr
 TUNING_STEPS = [("10 Hz", 10), ("100 Hz", 100), ("1 kHz", 1_000), ("10 kHz", 10_000)]
 DEGREES_PER_KNOB_STEP = 15
 
+# Scope span preset labels, index-matched to rigplane's own
+# commands/scope.py:_SCOPE_SPAN_PRESETS_HZ = (2500, 5000, 10000, 25000,
+# 50000, 100000, 250000, 500000) -- set_scope_span() takes this index (0-7),
+# not a raw Hz value, confirmed via that table and its
+# _validate_scope_range("scope span", span, 0, 7).
+SCOPE_SPAN_LABELS = [
+    "2.5 kHz", "5 kHz", "10 kHz", "25 kHz", "50 kHz", "100 kHz", "250 kHz", "500 kHz",
+]
+
+# Scope speed preset labels, index-matched to rigplane's own
+# commands/scope.py:scope_set_speed() -- 0=fast, 1=mid, 2=slow.
+SCOPE_SPEED_LABELS = [("Fast", 0), ("Mid", 1), ("Slow", 2)]
+
 # Approximate occupied-bandwidth passband for the scope's mode overlay
 # (widgets.py's SpectrumWidget) -- (hz_below_tuned_freq, hz_above_tuned_freq)
 # per mode, matching the confirmed CONTROL_DEFINITIONS["mode"]["options"]

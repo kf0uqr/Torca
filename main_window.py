@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QSlider,
     QComboBox,
+    QDoubleSpinBox,
     QPushButton,
     QMessageBox,
 )
@@ -35,6 +36,8 @@ from constants import (
     CONTROL_DEFINITIONS,
     CONTROL_OPTION_EXCLUDED,
     TUNING_STEPS,
+    SCOPE_SPAN_LABELS,
+    SCOPE_SPEED_LABELS,
 )
 from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
 from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
@@ -179,6 +182,49 @@ class RadioWindow(QWidget):
             "something this switches)."
         )
         self.active_receiver_button.clicked.connect(self._on_active_receiver_toggle_clicked)
+
+        # Scope span/reference level/sweep speed -- rigplane's
+        # set_scope_span/set_scope_ref/set_scope_speed (radio_worker.py),
+        # confirmed real via rigplane's own runtime/_scope_runtime.py and
+        # commands/scope.py despite the ic9700.toml profile only listing
+        # GET variants (a red herring -- these are hardcoded Python
+        # methods, not gated by that profile's declarative CI-V command
+        # table). Disabled until _on_connected() confirms the radio
+        # actually supports the scope at all (worker.is_scope_capable) --
+        # not every radio does. Each one's currentIndexChanged also fires
+        # while _on_scope_span_changed/etc are reflecting a just-polled
+        # live value below, but that just re-sends the same value the
+        # radio already has -- harmless, same as the existing combo
+        # controls (_on_control_combo_changed).
+        self.scope_span_combo = QComboBox()
+        for label in SCOPE_SPAN_LABELS:
+            self.scope_span_combo.addItem(label)
+        self.scope_span_combo.setEnabled(False)
+        self.scope_span_combo.currentIndexChanged.connect(self._on_scope_span_combo_changed)
+
+        self.scope_ref_spin = QDoubleSpinBox()
+        self.scope_ref_spin.setRange(-30.0, 10.0)
+        self.scope_ref_spin.setSingleStep(0.5)
+        self.scope_ref_spin.setDecimals(1)
+        self.scope_ref_spin.setSuffix(" dB")
+        self.scope_ref_spin.setEnabled(False)
+        self.scope_ref_spin.valueChanged.connect(self._on_scope_ref_spin_changed)
+
+        self.scope_speed_combo = QComboBox()
+        for label, value in SCOPE_SPEED_LABELS:
+            self.scope_speed_combo.addItem(label, value)
+        self.scope_speed_combo.setEnabled(False)
+        self.scope_speed_combo.currentIndexChanged.connect(self._on_scope_speed_combo_changed)
+
+        scope_controls_row = QHBoxLayout()
+        for label_text, widget in (
+            ("Span:", self.scope_span_combo),
+            ("Ref:", self.scope_ref_spin),
+            ("Speed:", self.scope_speed_combo),
+        ):
+            scope_controls_row.addWidget(QLabel(label_text))
+            scope_controls_row.addWidget(widget)
+        scope_controls_row.addStretch()
 
         # Purely informational -- satellite tracking is now controlled
         # centrally from the Ham Dashboard (satellite/transponder
@@ -337,6 +383,7 @@ class RadioWindow(QWidget):
         tuning_row.addLayout(knob_row)
 
         layout = QVBoxLayout()
+        layout.addLayout(scope_controls_row)
         layout.addWidget(self.spectrum_widget)
         layout.addWidget(self.waterfall_widget)
         layout.addLayout(self.meters_row)
@@ -358,6 +405,9 @@ class RadioWindow(QWidget):
         self.worker.level_updated.connect(self._on_level_updated)
         self.worker.control_updated.connect(self._on_control_updated)
         self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
+        self.worker.scope_span_changed.connect(self._on_scope_span_changed)
+        self.worker.scope_ref_changed.connect(self._on_scope_ref_changed)
+        self.worker.scope_speed_changed.connect(self._on_scope_speed_changed)
         self.worker.start()
 
         # Registers with the shared satellite session so this radio
@@ -379,6 +429,10 @@ class RadioWindow(QWidget):
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
             self.active_receiver_button.setEnabled(True)
+        if self.worker.is_scope_capable:
+            self.scope_span_combo.setEnabled(True)
+            self.scope_ref_spin.setEnabled(True)
+            self.scope_speed_combo.setEnabled(True)
         for button in self.band_buttons:
             button.setEnabled(True)
         for slider in self.level_sliders.values():
@@ -725,6 +779,41 @@ class RadioWindow(QWidget):
         clicked, since nothing reflected the radio's actual starting
         state."""
         self._update_active_receiver_ui(receiver)
+
+    def _on_scope_span_combo_changed(self, index):
+        self.worker.set_scope_span(index)
+
+    def _on_scope_ref_spin_changed(self, value):
+        self.worker.set_scope_ref(value)
+
+    def _on_scope_speed_combo_changed(self, index):
+        self.worker.set_scope_speed(self.scope_speed_combo.itemData(index))
+
+    @Slot(int)
+    def _on_scope_span_changed(self, span_index):
+        # Reflects a real polled value (radio_worker.py's _poll_loop) --
+        # blocked while setting so this doesn't immediately re-fire
+        # _on_scope_span_combo_changed and write the same value straight
+        # back to the radio.
+        if self.scope_span_combo.currentIndex() != span_index:
+            self.scope_span_combo.blockSignals(True)
+            self.scope_span_combo.setCurrentIndex(span_index)
+            self.scope_span_combo.blockSignals(False)
+
+    @Slot(float)
+    def _on_scope_ref_changed(self, ref_db):
+        if self.scope_ref_spin.value() != ref_db:
+            self.scope_ref_spin.blockSignals(True)
+            self.scope_ref_spin.setValue(ref_db)
+            self.scope_ref_spin.blockSignals(False)
+
+    @Slot(int)
+    def _on_scope_speed_changed(self, speed_index):
+        index = self.scope_speed_combo.findData(speed_index)
+        if index != -1 and self.scope_speed_combo.currentIndex() != index:
+            self.scope_speed_combo.blockSignals(True)
+            self.scope_speed_combo.setCurrentIndex(index)
+            self.scope_speed_combo.blockSignals(False)
 
     def _update_active_receiver_ui(self, receiver):
         """Reflects `receiver` as the active one in the UI -- the

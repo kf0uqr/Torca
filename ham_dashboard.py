@@ -510,15 +510,15 @@ class HamClockWindow(QWidget):
         self.map_widget.satellite_left_clicked.connect(self._on_satellite_left_clicked)
 
         self.utc_label = QLabel("--:--:-- UTC")
-        self.utc_label.setStyleSheet("font-size: 20px; font-weight: bold;")
         self.local_label = QLabel("--:--:-- Local")
-        self.local_label.setStyleSheet("font-size: 20px; font-weight: bold;")
-
         self.sfi_label = QLabel("SFI: --")
         self.ssn_label = QLabel("SSN: --")
         self.k_index_label = QLabel("K-index: --")
-        for label in (self.sfi_label, self.ssn_label, self.k_index_label):
-            label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        # Same size/weight for all five clocks_row labels (previously
+        # the clocks were 20px and SFI/SSN/K-index 16px) -- per
+        # explicit instruction, one consistent size across the row.
+        for label in (self.utc_label, self.local_label, self.sfi_label, self.ssn_label, self.k_index_label):
+            label.setStyleSheet("font-size: 18px; font-weight: bold;")
 
         self.solar_updated_label = QLabel("Solar data: waiting for first update from NOAA...")
         self.solar_updated_label.setStyleSheet("color: #888; font-size: 11px;")
@@ -953,13 +953,21 @@ class HamClockWindow(QWidget):
         external_apps_row.addWidget(self.wsjtx_autolog_button)
         external_apps_row.addStretch()
 
+        # Stretches BETWEEN each label (not before the first or after
+        # the last) rather than one trailing addStretch() -- per
+        # explicit instruction, spreads all five across the full
+        # window width (first flush-left, last flush-right) instead of
+        # clustering them on the left with empty space on the right.
         clocks_row = QHBoxLayout()
         clocks_row.addWidget(self.utc_label)
-        clocks_row.addWidget(self.local_label)
-        clocks_row.addWidget(self.sfi_label)
-        clocks_row.addWidget(self.ssn_label)
-        clocks_row.addWidget(self.k_index_label)
         clocks_row.addStretch()
+        clocks_row.addWidget(self.local_label)
+        clocks_row.addStretch()
+        clocks_row.addWidget(self.sfi_label)
+        clocks_row.addStretch()
+        clocks_row.addWidget(self.ssn_label)
+        clocks_row.addStretch()
+        clocks_row.addWidget(self.k_index_label)
 
         map_buttons_row = QHBoxLayout()
         map_buttons_row.addWidget(self.satellite_button)

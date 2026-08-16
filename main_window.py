@@ -396,6 +396,7 @@ class RadioWindow(QWidget):
         self._current_freq_hz = freq_hz
         self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
         self._update_band_button_highlight()
+        self.spectrum_widget.set_tuned_frequency(freq_hz)
 
     @Slot(str, int)
     def _on_meter_updated(self, meter_type, level):
@@ -773,6 +774,8 @@ class RadioWindow(QWidget):
 
     @Slot(str, object)
     def _on_control_updated(self, key, value):
+        if key == "mode":
+            self.spectrum_widget.set_mode(value)
         widget = self.control_widgets.get(key)
         if widget is None:
             return

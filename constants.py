@@ -114,6 +114,29 @@ WATERFALL_ROWS = 200     # how many past scope frames the waterfall keeps on scr
 TUNING_STEPS = [("10 Hz", 10), ("100 Hz", 100), ("1 kHz", 1_000), ("10 kHz", 10_000)]
 DEGREES_PER_KNOB_STEP = 15
 
+# Approximate occupied-bandwidth passband for the scope's mode overlay
+# (widgets.py's SpectrumWidget) -- (hz_below_tuned_freq, hz_above_tuned_freq)
+# per mode, matching the confirmed CONTROL_DEFINITIONS["mode"]["options"]
+# values below. NOT read from the radio (there's no live "actual filter
+# bandwidth in Hz" value available -- the "filter" control is a bare
+# FIL1/2/3 slot number, not a Hz figure), so these are reasonable typical
+# defaults for ham VHF/UHF/HF operation, not a precise per-radio reading.
+# LSB/USB are asymmetric (passband is entirely below/above the tuned
+# frequency, respectively, matching real SSB); everything else is
+# centered on it.
+MODE_BANDWIDTH_HZ = {
+    "LSB": (2400, 0),
+    "USB": (0, 2400),
+    "AM": (3000, 3000),
+    "CW": (250, 250),
+    "CW_R": (250, 250),
+    "RTTY": (350, 350),
+    "RTTY_R": (350, 350),
+    "FM": (6000, 6000),
+    "WFM": (90000, 90000),
+    "DV": (3000, 3000),
+}
+
 # Audio format used for the local capture/playback streams. Only raw PCM16
 # mono is handled -- if the radio reports a different codec via its
 # audio_codec/audio_tx_codec attributes, AudioBridge disables streaming

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QWidget, QMenu
 
 from constants import (
     METER_DEFINITIONS, S_METER_RAW_S9, S_METER_RAW_MAX, S_METER_S9_FRACTION, DEGREES_PER_KNOB_STEP,
-    WATERFALL_ROWS,
+    WATERFALL_ROWS, MODE_BANDWIDTH_HZ,
 )
 
 # Amplitude (0-160, per ScopeFrame.pixels) -> color, modeled on rigplane's
@@ -48,6 +48,28 @@ class SpectrumWidget(QWidget):
         self.setMinimumHeight(120)
         self._frame = None
         self._overlays = {}  # corner -> (widget, margin)
+        self._tuned_freq_hz = None  # set via set_tuned_frequency() -- whichever receiver the scope is currently following
+        self._mode = None           # set via set_mode() -- CONTROL_DEFINITIONS["mode"]'s plain string values (e.g. "USB", "FM")
+
+    def set_tuned_frequency(self, freq_hz):
+        """The actual VFO/receiver frequency the scope is centered on --
+        NOT necessarily the same as the scope frame's own start/end span
+        (which is what the amplitude trace is drawn against), though in
+        the radio's normal center-sweep mode they'll line up. Computing
+        the tuning-line position from this against the frame's real
+        start/end (rather than just always drawing at the literal middle
+        pixel) keeps it correct even if that ever isn't exactly true."""
+        self._tuned_freq_hz = freq_hz
+        self.update()
+
+    def set_mode(self, mode):
+        """`mode` is one of CONTROL_DEFINITIONS["mode"]["options"]'s
+        plain string values (e.g. "USB", "FM") -- looked up in
+        MODE_BANDWIDTH_HZ for the passband overlay; an unrecognized mode
+        just means no bandwidth shading gets drawn (the tuning line
+        itself doesn't depend on mode)."""
+        self._mode = mode
+        self.update()
 
     def set_overlay_widget(self, widget, margin=8, corner="top-right"):
         """Reparents `widget` onto this scope as a fixed overlay (e.g.
@@ -88,6 +110,20 @@ class SpectrumWidget(QWidget):
         self._frame = frame
         self.update()
 
+    def _freq_to_x(self, freq_hz, w):
+        """Maps a frequency to an x-pixel against the current frame's own
+        start/end span (NOT assumed to always be exactly `w` wide across
+        the whole displayed range -- e.g. a fixed-edge scope configuration
+        wouldn't necessarily keep the tuned frequency dead-center, even
+        though the radio's normal center-sweep mode does). Returns None
+        if there's no frame yet or the span is degenerate (start==end)."""
+        if self._frame is None:
+            return None
+        start, end = self._frame.start_freq_hz, self._frame.end_freq_hz
+        if start == end:
+            return None
+        return (freq_hz - start) / (end - start) * w
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(10, 10, 20))
@@ -101,6 +137,24 @@ class SpectrumWidget(QWidget):
         n = len(pixels)
         w, h = self.width(), self.height()
 
+        # Passband/bandwidth shading -- drawn BEFORE the amplitude trace
+        # so the trace itself stays fully crisp/visible on top of it,
+        # rather than the shading obscuring it. Semi-transparent fill,
+        # no border -- just a rough visual hint of occupied bandwidth,
+        # not a precise reading (see MODE_BANDWIDTH_HZ's own comment).
+        if self._tuned_freq_hz is not None and self._mode in MODE_BANDWIDTH_HZ:
+            low_hz, high_hz = MODE_BANDWIDTH_HZ[self._mode]
+            x_low = self._freq_to_x(self._tuned_freq_hz - low_hz, w)
+            x_high = self._freq_to_x(self._tuned_freq_hz + high_hz, w)
+            if x_low is not None and x_high is not None:
+                x_low, x_high = sorted((x_low, x_high))
+                # Clip to the visible area -- a wide passband (WFM) can
+                # easily extend past either edge of a narrow scope span.
+                x_low = max(0.0, x_low)
+                x_high = min(float(w), x_high)
+                if x_high > x_low:
+                    painter.fillRect(QRectF(x_low, 0, x_high - x_low, h), QColor(0, 150, 255, 45))
+
         painter.setPen(QPen(QColor(0, 220, 120), 1.5))
         path = QPainterPath()
         for i, amp in enumerate(pixels):
@@ -111,6 +165,14 @@ class SpectrumWidget(QWidget):
             else:
                 path.lineTo(x, y)
         painter.drawPath(path)
+
+        # Tuning line -- drawn on top of both the shading and the trace
+        # so it always reads clearly regardless of what's under it.
+        if self._tuned_freq_hz is not None:
+            x_tuned = self._freq_to_x(self._tuned_freq_hz, w)
+            if x_tuned is not None and 0 <= x_tuned <= w:
+                painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
+                painter.drawLine(QPointF(x_tuned, 0), QPointF(x_tuned, h))
 
         painter.setPen(QColor(150, 150, 150))
         start_text = f"{self._frame.start_freq_hz / 1e6:.4f} MHz"

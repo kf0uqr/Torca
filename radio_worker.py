@@ -921,7 +921,7 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"{definition['label']}: {set_name}({value!r}) failed ({exc}).")
 
-    def set_receiver_control_value(self, receiver: int, key: str, value, restore: bool = True):
+    def set_receiver_control_value(self, receiver: int, key: str, value, restore: bool = True, vfo_slot: str = None):
         """Thread-safe: call from the GUI thread. Like set_control_value,
         but sets `key` on a SPECIFIC receiver regardless of which one is
         currently active -- e.g. setting Main's mode while Sub is the
@@ -939,7 +939,21 @@ class RadioWorker(QThread):
         start_ptt_after_vfo's docstring). Sub naturally becomes active
         again on its own within a couple of seconds regardless, via the
         RX tick loop's own continuous re-selection -- so there's nothing
-        left needing an explicit, immediate switch-back here."""
+        left needing an explicit, immediate switch-back here.
+
+        vfo_slot, when given, explicitly selects that VFO A/B slot on
+        `receiver` before setting `key` -- confirmed live that mode is
+        stored PER VFO SLOT, not per receiver, same two-independent-axes
+        shape frequency already has (see select_receiver_vfo_and_set_
+        frequency's docstring). apply_satellite_mode runs at transponder
+        -selection time, before PTT has ever switched Main to VFO B, so
+        without this the mode was landing on whichever VFO Main
+        currently had selected (normally still A, its idle/RX VFO) --
+        genuinely setting mode there, just not on VFO B, the one that
+        actually transmits, which kept whatever it last happened to
+        remember (confirmed live: showed CW, stale from unrelated
+        earlier testing) regardless of what apply_satellite_mode
+        computed."""
         if self.loop is None:
             return
         if key not in self._control_methods:
@@ -948,22 +962,27 @@ class RadioWorker(QThread):
                 "(no working getter+setter was found on connect)."
             )
             return
-        asyncio.run_coroutine_threadsafe(self._set_receiver_control_value(receiver, key, value, restore), self.loop)
+        asyncio.run_coroutine_threadsafe(
+            self._set_receiver_control_value(receiver, key, value, restore, vfo_slot), self.loop
+        )
 
-    async def _set_receiver_control_value(self, receiver: int, key: str, value, restore: bool = True):
+    async def _set_receiver_control_value(self, receiver: int, key: str, value, restore: bool = True, vfo_slot: str = None):
         """Temporarily selects `receiver` (if it isn't already active),
-        sets `key` on it via the same path _set_control_value uses, then
-        (if restore) restores whichever receiver was active before -- a
-        single bundled coroutine, not three separately-dispatched ones,
-        for the same reason every other multi-step dual-receiver
-        operation in this file is bundled: two independently-scheduled
-        run_coroutine_threadsafe() calls don't guarantee real-world
-        completion order (see _set_receiver_frequency's docstring for the
-        self-perpetuating-oscillation bug this caused the one time it
-        wasn't followed). Single-receiver radios have no "other receiver"
-        to switch to or restore, so this is a no-op wrapper around the
-        normal _set_control_value path for them."""
+        optionally selects a specific VFO slot on it, sets `key` via the
+        same path _set_control_value uses, then (if restore) restores
+        whichever receiver was active before -- a single bundled
+        coroutine, not several separately-dispatched ones, for the same
+        reason every other multi-step dual-receiver operation in this
+        file is bundled: independently-scheduled run_coroutine_
+        threadsafe() calls don't guarantee real-world completion order
+        (see _set_receiver_frequency's docstring for the self-
+        perpetuating-oscillation bug this caused the one time it wasn't
+        followed). Single-receiver radios have no "other receiver" to
+        switch to or restore -- vfo_slot still applies for them (there's
+        exactly one receiver, but still two independent VFO slots)."""
         if not self.is_dual_receiver:
+            if vfo_slot is not None and "vfo" in self._control_methods:
+                await self._set_control_value("vfo", vfo_slot)
             await self._set_control_value(key, value)
             return
         previously_active = self._active_receiver
@@ -974,6 +993,11 @@ class RadioWorker(QThread):
             except Exception as exc:
                 self.error.emit(f"Select receiver ({receiver}) for {key} failed: {exc}")
                 return
+        if vfo_slot is not None:
+            try:
+                await self.radio.set_vfo_slot(vfo_slot, receiver=receiver)
+            except Exception as exc:
+                self.error.emit(f"VFO slot select (receiver {receiver}) for {key} failed: {exc}")
         await self._set_control_value(key, value)
         if restore and receiver != previously_active:
             try:

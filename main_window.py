@@ -771,29 +771,29 @@ class RadioWindow(QWidget):
         "full_duplex": downlink mode applied via set_control_value
         (targets whichever receiver is currently active -- Sub, since
         that's who's listening). Uplink mode applied to Main
-        specifically via set_receiver_control_value, preferring the
-        transponder's own recorded uplink_mode (correctly handles
-        inverting linear transponders, e.g. AO-7's LSB-up/USB-down) and
-        falling back to mirroring the downlink mode only when it's FM/
-        WFM (safe -- FM transponders don't invert) and no uplink_mode
-        was recorded. Any other case leaves Main's mode alone rather
-        than guess.
+        specifically via set_receiver_control_value, mirroring the
+        downlink mode -- deliberately NOT preferring the transponder's
+        own recorded uplink_mode field (an inverting-transponder-aware
+        design, e.g. AO-7's real LSB-up/USB-down): per explicit
+        instruction, that field is empty for every stored satellite in
+        practice, so preferring it just meant Main's mode never got set
+        for anything except FM transponders (uplink_mode absent AND
+        downlink mode not FM/WFM left Main untouched). Uplink and
+        downlink are now always set to the same mode.
 
         "downlink": downlink mode only, via set_control_value (this
         radio has no Main to speak of).
 
-        "uplink": same uplink-mode preference logic as full_duplex's
-        Main half, applied via the plain (non-receiver-specific)
-        set_control_value -- this radio has no Sub/downlink concept, so
-        there's no separate "which receiver" question here at all."""
+        "uplink": same mirrored mode as full_duplex's Main half,
+        applied via the plain (non-receiver-specific) set_control_value
+        -- this radio has no Sub/downlink concept, so there's no
+        separate "which receiver" question here at all."""
         if transponder is None or not self.worker.is_connected():
             return
         if "mode" not in self.control_widgets:
             return
         downlink_mode_value = radio_mode_for_transponder(transponder.get("mode"))
-        uplink_mode_value = radio_mode_for_transponder(transponder.get("uplink_mode"))
-        if uplink_mode_value is None and downlink_mode_value in ("FM", "WFM"):
-            uplink_mode_value = downlink_mode_value
+        uplink_mode_value = downlink_mode_value
 
         if self._role == "full_duplex":
             if downlink_mode_value is not None:

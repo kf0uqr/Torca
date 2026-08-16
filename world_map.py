@@ -149,6 +149,7 @@ class WorldMapWidget(QWidget):
         self._satellite_mode = False
         self._satellite_positions = []  # list of {"name", "lat", "lon", "altitude_km", "footprint"}
         self._qso_markers = []  # list of {"lat", "lon", "band", "time", "callsign"} -- see set_qso_markers
+        self._pskreporter_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_pskreporter_markers
         # Hover tooltip needs mouseMoveEvent to fire without a button
         # held down -- off by default on a plain QWidget.
         self.setMouseTracking(True)
@@ -423,6 +424,19 @@ class WorldMapWidget(QWidget):
                 sx, sy = self._content_to_screen(cx, cy, w, h)
                 painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
 
+        if self._pskreporter_markers:
+            # Deliberately a distinct hue from every other marker
+            # category (green QSOs, yellow/orange satellites, red
+            # operator location) -- per explicit instruction, so all
+            # three spot categories stay visually distinguishable from
+            # each other at a glance.
+            painter.setPen(QPen(QColor(15, 15, 20), 1))
+            painter.setBrush(QColor(190, 110, 255))
+            for spot in self._pskreporter_markers:
+                cx, cy = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
+                sx, sy = self._content_to_screen(cx, cy, w, h)
+                painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
+
         # Attribution for the background map image, if it loaded (CC BY
         # 4.0 requires this) -- fixed corner label regardless of zoom/pan.
         if self._background_image is not None:
@@ -468,6 +482,22 @@ class WorldMapWidget(QWidget):
         (the button's own OFF state) just stops drawing/hit-testing
         them, same shape as set_satellite_positions([])."""
         self._qso_markers = markers
+        self.update()
+
+    def set_pskreporter_markers(self, markers):
+        """markers: list of {"lat", "lon", "tooltip"} -- ham_dashboard.py's
+        PSKReporter map button, converted from PSKReporter spots
+        (pskreporter.fetch_pskreporter_spots), converted from each
+        spot's locator (adif.grid_square_to_latlon). Unlike QSO/
+        satellite markers, the tooltip text is pre-built by the caller
+        (not band/time/callsign fields the widget formats itself) --
+        PSKReporter spots carry a variably-shaped bag of extra fields
+        (region, DXCC, LoTW upload date, ...) that this widget has no
+        reason to know the specific names of; ham_dashboard.py owns
+        deciding what "all the pskreporter data for that spot" means.
+        Empty list (the button's own OFF state) just stops drawing/
+        hit-testing them, same shape as set_qso_markers([])."""
+        self._pskreporter_markers = markers
         self.update()
 
     # Pixel radius around a QSO marker that still counts as a hover/
@@ -527,6 +557,24 @@ class WorldMapWidget(QWidget):
     @staticmethod
     def _qso_tooltip_text(qso):
         return f"{qso.get('callsign', '?')}\n{qso.get('band', '?')}\n{qso.get('time', '?')}"
+
+    # Same screen-pixel-radius reasoning as _QSO_HIT_RADIUS_PX.
+    _PSKREPORTER_HIT_RADIUS_PX = 8
+
+    def _pskreporter_marker_at(self, widget_pos):
+        """Same shared hit-test shape as _qso_marker_at, for the
+        PSKReporter spot markers."""
+        if not self._pskreporter_markers:
+            return None
+        pos, w, h = self._widget_pos_to_content(widget_pos)
+        hit_radius = self._PSKREPORTER_HIT_RADIUS_PX / self._zoom
+        closest, closest_dist = None, None
+        for spot in self._pskreporter_markers:
+            x, y = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
+            dist = math.hypot(x - pos.x(), y - pos.y())
+            if dist <= hit_radius and (closest_dist is None or dist < closest_dist):
+                closest, closest_dist = spot, dist
+        return closest
 
     # Pixel radius around a satellite's marker that still counts as a hit
     # -- markers are drawn at a 4px radius (see _draw_satellite_marker),
@@ -622,6 +670,10 @@ class WorldMapWidget(QWidget):
         qso = self._qso_marker_at(event.position())
         if qso is not None:
             QToolTip.showText(event.globalPosition().toPoint(), self._qso_tooltip_text(qso), self)
+            return
+        spot = self._pskreporter_marker_at(event.position())
+        if spot is not None:
+            QToolTip.showText(event.globalPosition().toPoint(), spot.get("tooltip", "?"), self)
         else:
             QToolTip.hideText()
 
@@ -642,12 +694,15 @@ class WorldMapWidget(QWidget):
             closest_name = self._satellite_at(event.position())
             if closest_name is not None:
                 self.satellite_right_clicked.emit(closest_name)
-            elif self._qso_marker_at(event.position()) is None:
+            elif (
+                self._qso_marker_at(event.position()) is None
+                and self._pskreporter_marker_at(event.position()) is None
+            ):
                 # Right-clicking genuinely empty map (no satellite, no
-                # QSO marker under the cursor) resets the view -- the
-                # only reset affordance this needs, since scrolling back
-                # out to MIN_ZOOM is otherwise the only way back once
-                # zoomed/panned in.
+                # QSO/PSKReporter marker under the cursor) resets the
+                # view -- the only reset affordance this needs, since
+                # scrolling back out to MIN_ZOOM is otherwise the only
+                # way back once zoomed/panned in.
                 self._zoom = self.MIN_ZOOM
                 self._pan_x = 0.0
                 self._pan_y = 0.0
@@ -667,6 +722,10 @@ class WorldMapWidget(QWidget):
             # explicitly asked for as an alternative to hovering, not
             # just a side effect of it.
             QToolTip.showText(event.globalPosition().toPoint(), self._qso_tooltip_text(qso), self)
+            return
+        spot = self._pskreporter_marker_at(event.position())
+        if spot is not None:
+            QToolTip.showText(event.globalPosition().toPoint(), spot.get("tooltip", "?"), self)
             return
         closest_name = self._satellite_at(event.position())
         if closest_name is not None:

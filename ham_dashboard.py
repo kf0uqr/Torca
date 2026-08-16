@@ -34,7 +34,7 @@ import datetime
 import os
 import platform
 
-from PySide6.QtCore import Qt, QTimer, Slot, QSettings
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot, QSettings
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget,
@@ -55,6 +55,9 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QDialogButtonBox,
     QMenu,
+    QRadioButton,
+    QButtonGroup,
+    QInputDialog,
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
@@ -66,6 +69,7 @@ from satellite_session import SatelliteSession
 from log_book_window import LogBookWindow
 import adif
 import qso_log
+import pskreporter
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from audio import (
     pactl_available,
@@ -320,7 +324,99 @@ class RigctldDialog(QDialog):
 # every second by simple subtraction from the cached absolute times
 # (see _update_passes_countdowns), piggybacked on the existing clock
 # timer rather than a separate one.
-PASSES_REFRESH_INTERVAL_MS = 5 * 60 * 1000
+# (label, seconds) -- offered in PskReporterSettingsDialog's lookback
+# combo. Capped at pskreporter.MAX_LOOKBACK_SECONDS (24h), which is
+# PSKReporter's own documented hard limit on flowStartSeconds.
+PSKREPORTER_LOOKBACK_OPTIONS = [
+    ("Last 15 minutes", 15 * 60),
+    ("Last 30 minutes", 30 * 60),
+    ("Last hour", 60 * 60),
+    ("Last 3 hours", 3 * 60 * 60),
+    ("Last 6 hours", 6 * 60 * 60),
+    ("Last 12 hours", 12 * 60 * 60),
+    ("Last 24 hours", pskreporter.MAX_LOOKBACK_SECONDS),
+]
+
+
+class PskReporterWorker(QThread):
+    """One-shot fetch off the GUI thread -- same shape as world_map.py's
+    WorldMapImageFetcher (a single blocking urllib call, not the full
+    persistent-connection RadioWorker machinery). Never runs on a
+    timer -- only ever started by an explicit user action (toggling the
+    PSKReporter button on, or changing its settings while already on) --
+    PSKReporter's own usage guidance asks clients not to poll
+    frequently."""
+
+    spots_ready = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, callsign, direction, since_seconds, parent=None):
+        super().__init__(parent)
+        self._callsign = callsign
+        self._direction = direction
+        self._since_seconds = since_seconds
+
+    def run(self):
+        try:
+            spots = pskreporter.fetch_pskreporter_spots(self._callsign, self._direction, self._since_seconds)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.spots_ready.emit(spots)
+
+
+class PskReporterSettingsDialog(QDialog):
+    """Right-click the PSKReporter button to open this: how far back to
+    look, and which direction of reception reports to show -- stations
+    that heard you, stations you're hearing, or both."""
+
+    def __init__(self, since_seconds, direction, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PSKReporter Settings")
+
+        self.lookback_combo = QComboBox()
+        for label, seconds in PSKREPORTER_LOOKBACK_OPTIONS:
+            self.lookback_combo.addItem(label, seconds)
+        index = self.lookback_combo.findData(since_seconds)
+        self.lookback_combo.setCurrentIndex(index if index != -1 else 1)  # default: 30 minutes
+
+        self.heard_you_radio = QRadioButton("Stations that heard you")
+        self.hearing_radio = QRadioButton("Stations you are hearing")
+        self.both_radio = QRadioButton("Both")
+        self._direction_group = QButtonGroup(self)
+        for button in (self.heard_you_radio, self.hearing_radio, self.both_radio):
+            self._direction_group.addButton(button)
+        {
+            pskreporter.DIRECTION_HEARD_YOU: self.heard_you_radio,
+            pskreporter.DIRECTION_HEARING: self.hearing_radio,
+            "both": self.both_radio,
+        }.get(direction, self.heard_you_radio).setChecked(True)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        form = QFormLayout()
+        form.addRow("Time frame:", self.lookback_combo)
+        form.addRow("Direction:", self.heard_you_radio)
+        form.addRow("", self.hearing_radio)
+        form.addRow("", self.both_radio)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def result_since_seconds(self):
+        return self.lookback_combo.currentData()
+
+    def result_direction(self):
+        if self.hearing_radio.isChecked():
+            return pskreporter.DIRECTION_HEARING
+        if self.both_radio.isChecked():
+            return "both"
+        return pskreporter.DIRECTION_HEARD_YOU
+
 
 class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
@@ -332,6 +428,8 @@ class HamClockWindow(QWidget):
         super().__init__(parent)
         self.setWindowTitle("Ham Dashboard")
         position_on_screen_half(self, "right")
+
+        self._ensure_operator_callsign()
 
         # No radio connects at startup any more -- this window is the
         # first thing that opens, so observer location (for Doppler
@@ -463,6 +561,29 @@ class HamClockWindow(QWidget):
         self.qso_map_button.toggled.connect(self._on_qso_map_toggled)
         self.qso_map_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.qso_map_button.customContextMenuRequested.connect(self._on_qso_map_menu_requested)
+
+        # ---- PSKReporter map overlay ----
+        self._pskreporter_since_seconds = settings.value(
+            "pskreporter_lookback_seconds", PSKREPORTER_LOOKBACK_OPTIONS[1][1], type=int
+        )
+        self._pskreporter_direction = settings.value(
+            "pskreporter_direction", pskreporter.DIRECTION_HEARD_YOU
+        )
+        self._pskreporter_spots_cache = []  # raw fetched spots (unfiltered by band) -- see _build_pskreporter_markers
+        self._pskreporter_worker = None
+        self.pskreporter_button = QPushButton("PSKReporter: OFF")
+        self.pskreporter_button.setCheckable(True)
+        self.pskreporter_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.pskreporter_button.setToolTip(
+            "Toggle showing your PSKReporter spots on the map (only for "
+            "your own callsign). Right-click to choose the time frame "
+            "and direction."
+        )
+        self.pskreporter_button.toggled.connect(self._on_pskreporter_toggled)
+        self.pskreporter_button.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pskreporter_button.customContextMenuRequested.connect(self._on_pskreporter_menu_requested)
 
         # Filters which band's QSOs the map overlay shows -- every band
         # this app knows about (same list/order as HF_6M_BANDS +
@@ -637,6 +758,7 @@ class HamClockWindow(QWidget):
         map_buttons_row = QHBoxLayout()
         map_buttons_row.addWidget(self.satellite_button)
         map_buttons_row.addWidget(self.qso_map_button)
+        map_buttons_row.addWidget(self.pskreporter_button)
         map_buttons_row.addWidget(self.qso_band_filter_combo)
         map_buttons_row.addStretch()
 
@@ -712,6 +834,29 @@ class HamClockWindow(QWidget):
         self.solar_worker = SolarDataWorker()
         self.solar_worker.data_updated.connect(self._on_solar_data)
         self.solar_worker.start()
+
+    def _ensure_operator_callsign(self):
+        """Prompts for the operator's own callsign immediately on first
+        launch ever (per explicit instruction) -- PSKReporter queries
+        are always scoped to "reports mentioning THIS callsign", so
+        there's no meaningful PSKReporter map without one. Persisted
+        via QSettings once given; if the operator cancels or leaves it
+        blank, nothing is saved and this just asks again next launch
+        (and _on_pskreporter_toggled re-prompts if they try to use the
+        feature before then) -- never blocks startup or nags mid-
+        session."""
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        self._operator_callsign = settings.value("operator_callsign", "") or ""
+        if self._operator_callsign:
+            return
+        text, ok = QInputDialog.getText(
+            self, "Your Callsign",
+            "Enter your callsign (used to look up your PSKReporter spots):"
+        )
+        callsign = text.strip().upper() if ok else ""
+        if callsign:
+            self._operator_callsign = callsign
+            settings.setValue("operator_callsign", callsign)
 
     def _load_observer_location(self):
         """Reads observer_lat/lon/elevation from QSettings -- the same
@@ -798,6 +943,11 @@ class HamClockWindow(QWidget):
         QSettings("IcomRadioApp", "RadioControl").setValue("qso_map_band_filter", band or "")
         if self.qso_map_button.isChecked():
             self.map_widget.set_qso_markers(self._build_qso_markers())
+        # Per explicit instruction, the band filter also applies to
+        # PSKReporter spots -- re-filters the already-fetched cache
+        # (no new network fetch needed, same reasoning as QSO markers).
+        if self.pskreporter_button.isChecked():
+            self.map_widget.set_pskreporter_markers(self._build_pskreporter_markers())
 
     def _build_qso_markers(self):
         """Newest self._qso_map_count logged QSOs (None = all) that have
@@ -837,6 +987,109 @@ class HamClockWindow(QWidget):
                 "callsign": qso.get("CALL") or "?",
             })
         return markers
+
+    def _on_pskreporter_toggled(self, checked):
+        if checked and not self._operator_callsign:
+            # Callsign wasn't given (or was skipped) at first launch --
+            # ask again now, since the feature is unusable without one.
+            self._ensure_operator_callsign()
+            if not self._operator_callsign:
+                self.pskreporter_button.setChecked(False)
+                return
+        self.pskreporter_button.setText("PSKReporter: ON" if checked else "PSKReporter: OFF")
+        if checked:
+            self._start_pskreporter_fetch()
+        else:
+            self.map_widget.set_pskreporter_markers([])
+
+    def _on_pskreporter_menu_requested(self, _pos):
+        dialog = PskReporterSettingsDialog(self._pskreporter_since_seconds, self._pskreporter_direction, self)
+        if dialog.exec() == QDialog.Accepted:
+            self._pskreporter_since_seconds = dialog.result_since_seconds()
+            self._pskreporter_direction = dialog.result_direction()
+            settings = QSettings("IcomRadioApp", "RadioControl")
+            settings.setValue("pskreporter_lookback_seconds", self._pskreporter_since_seconds)
+            settings.setValue("pskreporter_direction", self._pskreporter_direction)
+            if self.pskreporter_button.isChecked():
+                self._start_pskreporter_fetch()
+
+    def _start_pskreporter_fetch(self):
+        if self._pskreporter_worker is not None and self._pskreporter_worker.isRunning():
+            return  # a fetch is already in flight -- let it finish rather than piling up requests
+        worker = PskReporterWorker(
+            self._operator_callsign, self._pskreporter_direction, self._pskreporter_since_seconds, self
+        )
+        worker.spots_ready.connect(self._on_pskreporter_spots_ready)
+        worker.failed.connect(self._on_pskreporter_fetch_failed)
+        self._pskreporter_worker = worker
+        worker.start()
+
+    def _on_pskreporter_spots_ready(self, spots):
+        self._pskreporter_spots_cache = spots
+        if self.pskreporter_button.isChecked():
+            self.map_widget.set_pskreporter_markers(self._build_pskreporter_markers())
+
+    def _on_pskreporter_fetch_failed(self, message):
+        QMessageBox.warning(self, "PSKReporter", f"Couldn't fetch PSKReporter spots:\n{message}")
+        self.pskreporter_button.setChecked(False)
+
+    def _build_pskreporter_markers(self):
+        """Filters self._pskreporter_spots_cache (the last fetch's raw
+        results, unfiltered by band) to the band picked in
+        qso_band_filter_combo -- per explicit instruction, the same
+        band filter that applies to QSO markers also applies here, and
+        this re-filters the already-fetched cache rather than
+        re-fetching, same reasoning as _build_qso_markers. Spots
+        without a parseable locator are skipped (nothing to plot them
+        at)."""
+        band_filter = self.qso_band_filter_combo.currentData()
+        spots = self._pskreporter_spots_cache
+        if band_filter is not None:
+            spots = [spot for spot in spots if spot.get("band") == band_filter]
+        markers = []
+        for spot in spots:
+            latlon = adif.grid_square_to_latlon(spot.get("locator"))
+            if latlon is None:
+                continue
+            lat, lon = latlon
+            markers.append({"lat": lat, "lon": lon, "tooltip": self._pskreporter_tooltip_text(spot)})
+        return markers
+
+    @staticmethod
+    def _pskreporter_tooltip_text(spot):
+        """Everything PSKReporter reported for this spot, per explicit
+        instruction ("all of the pskreporter data for that spot")."""
+        direction = spot.get("direction")
+        lines = [
+            spot.get("callsign", "?"),
+            {
+                pskreporter.DIRECTION_HEARD_YOU: "Heard you",
+                pskreporter.DIRECTION_HEARING: "You heard them",
+            }.get(direction, direction or "?"),
+            f"Band: {spot.get('band', '?')}",
+            f"Mode: {spot.get('mode', '?')}",
+        ]
+        if spot.get("snr") is not None:
+            lines.append(f"SNR: {spot['snr']} dB")
+        flow_start = spot.get("flow_start_seconds")
+        if flow_start:
+            dt = datetime.datetime.fromtimestamp(flow_start, tz=datetime.timezone.utc)
+            lines.append(f"Time: {dt.strftime('%Y-%m-%d %H:%M')} UTC")
+        # senderRegion/senderDXCC describe whoever transmitted -- for a
+        # "hearing" spot, that's the OTHER station; for "heard_you",
+        # it's YOU, so receiverRegion/receiverDXCC (the other station,
+        # who received you) is the correct side to show instead.
+        raw = spot.get("raw") or {}
+        if direction == pskreporter.DIRECTION_HEARING:
+            region, country = raw.get("senderRegion"), raw.get("senderDXCC")
+        else:
+            region, country = raw.get("receiverRegion"), raw.get("receiverDXCC")
+        if region:
+            lines.append(f"Region: {region}")
+        if country:
+            lines.append(f"Country: {country}")
+        lines.append(f"Grid: {spot.get('locator', '?')}")
+        return "\n".join(lines)
 
     def _update_satellite_positions(self):
         now = datetime.datetime.now(datetime.timezone.utc)

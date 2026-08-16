@@ -101,14 +101,23 @@ class VirtualCableDialog(QDialog):
     transmits through) -- not necessarily the same radio, since a "poor
     man's full duplex" setup might decode one radio's downlink while
     transmitting through a separate uplink radio. Also picks the RX
-    mix (Main/Sub/Both) for whichever radio is chosen for RX. Doesn't
-    touch any audio/PulseAudio state itself -- just collects the choice
-    and hands it back via the result_*() methods; HamClockWindow's
-    _apply_virtual_cable_config() does the actual work."""
+    mix (Main/Sub/Both) for whichever radio is chosen for RX.
 
-    def __init__(self, connected_radios, current_rx_window, current_tx_window, current_channel, parent=None):
+    Start/Stop apply immediately (via the on_start/on_stop callbacks --
+    actually calling HamClockWindow._apply_virtual_cable_config(), this
+    dialog never touches audio/PulseAudio state itself) and the dialog
+    stays open afterward, so the RX/TX/mix choice can be adjusted and
+    re-applied without reopening it -- e.g. start with one radio,
+    listen for a moment, then switch which radio feeds RX without
+    losing the dialog. Close just dismisses it; it doesn't itself
+    start or stop anything."""
+
+    def __init__(self, connected_radios, current_rx_window, current_tx_window, current_channel,
+                 on_start, on_stop, is_active, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Virtual Cables")
+        self._on_start = on_start
+        self._on_stop = on_stop
 
         self.rx_combo = QComboBox()
         self.rx_combo.addItem("None (no RX audio cable)", None)
@@ -147,9 +156,25 @@ class VirtualCableDialog(QDialog):
         form.addRow("TX Radio (what you transmit through):", self.tx_combo)
         form.addRow("RX Audio Mix:", self.channel_combo)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("color: #aaa;")
+        self._set_status(is_active, current_rx_window, current_tx_window)
+
+        self.start_button = QPushButton("Start")
+        self.start_button.setStyleSheet("QPushButton { background-color: #2a6; color: white; font-weight: bold; }")
+        self.start_button.setToolTip("Applies the RX/TX/mix selection above immediately.")
+        self.start_button.clicked.connect(self._on_start_clicked)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setToolTip("Disables the virtual cables (restores each radio's original audio devices).")
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.start_button)
+        button_row.addWidget(self.stop_button)
+        button_row.addStretch()
+        button_row.addWidget(close_button)
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel(
@@ -159,17 +184,30 @@ class VirtualCableDialog(QDialog):
             "for a separate uplink/downlink pair."
         ))
         layout.addLayout(form)
-        layout.addWidget(buttons)
+        layout.addWidget(self.status_label)
+        layout.addLayout(button_row)
         self.setLayout(layout)
 
-    def result_rx_window(self):
-        return self.rx_combo.currentData()
+    def _set_status(self, active, rx_window, tx_window):
+        if not active:
+            self.status_label.setText("Status: OFF")
+            return
+        parts = []
+        if rx_window is not None:
+            parts.append(f"RX: {rx_window._details['radio_model']}")
+        if tx_window is not None:
+            parts.append(f"TX: {tx_window._details['radio_model']}")
+        self.status_label.setText(f"Status: ON ({', '.join(parts) or 'nothing selected'})")
 
-    def result_tx_window(self):
-        return self.tx_combo.currentData()
+    def _on_start_clicked(self):
+        rx_window = self.rx_combo.currentData()
+        tx_window = self.tx_combo.currentData()
+        self._on_start(rx_window, tx_window, self.channel_combo.currentData())
+        self._set_status(rx_window is not None or tx_window is not None, rx_window, tx_window)
 
-    def result_channel(self):
-        return self.channel_combo.currentData()
+    def _on_stop_clicked(self):
+        self._on_stop()
+        self._set_status(False, None, None)
 
 
 # Recomputing pass predictions (upcoming_passes) is real work -- SGP4
@@ -865,14 +903,23 @@ class HamClockWindow(QWidget):
     # ---- Virtual Cables ----
 
     def _on_virtual_cable_button_clicked(self):
+        is_active = self._virtual_cable_rx_window is not None or self._virtual_cable_tx_window is not None
         dialog = VirtualCableDialog(
             self._connected_radios, self._virtual_cable_rx_window, self._virtual_cable_tx_window,
-            self._virtual_cable_channel, self,
+            self._virtual_cable_channel,
+            on_start=self._on_virtual_cable_dialog_start,
+            on_stop=self._on_virtual_cable_dialog_stop,
+            is_active=is_active,
+            parent=self,
         )
-        if dialog.exec() != QDialog.Accepted:
-            return
-        self._virtual_cable_channel = dialog.result_channel()
-        self._apply_virtual_cable_config(dialog.result_rx_window(), dialog.result_tx_window(), self._virtual_cable_channel)
+        dialog.exec()  # Start/Stop inside already applied whatever was clicked -- Close just dismisses
+
+    def _on_virtual_cable_dialog_start(self, rx_window, tx_window, channel):
+        self._virtual_cable_channel = channel
+        self._apply_virtual_cable_config(rx_window, tx_window, channel)
+
+    def _on_virtual_cable_dialog_stop(self):
+        self._apply_virtual_cable_config(None, None, self._virtual_cable_channel)
 
     def _apply_virtual_cable_config(self, rx_window, tx_window, channel):
         """rx_window/tx_window are RadioWindow instances or None (no

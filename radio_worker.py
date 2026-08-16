@@ -1191,6 +1191,17 @@ class RadioWorker(QThread):
         asyncio.run_coroutine_threadsafe(self._set_frequency(freq_hz), self.loop)
 
     async def _set_frequency(self, freq_hz: int):
+        # This method has no receiver parameter at all -- both of its
+        # callers (the tuning knob's Main-active branch, and rigctld's
+        # CAT frequency-set callback for external apps like WSJT-X) are
+        # conceptually always about Main (or the sole VFO on a single-
+        # receiver radio; Sub always goes through the receiver-aware
+        # select_receiver_vfo_and_set_frequency path instead, which
+        # already resolves this itself). Without this, switching Main to
+        # a band Sub currently occupies was simply rejected outright by
+        # the radio. No-op on a single-receiver radio
+        # (_resolve_receiver_band_conflict's own guard).
+        await self._resolve_receiver_band_conflict(RECEIVER_MAIN, freq_hz)
         try:
             await self.radio.set_frequency(freq_hz)
         except Exception as exc:
@@ -1685,6 +1696,26 @@ class RadioWorker(QThread):
         band_code = BAND_STACKING_CODES.get(band_label)
         if (radio_model, band_label) in BAND_STACKING_EXCLUDED:
             band_code = None  # confirmed to hang on this radio -- skip straight to the band edge
+
+        if receiver is None:
+            # Targeting Main (see this method's own docstring -- receiver
+            # is only ever non-None for a non-Main receiver). Neither the
+            # band-stacking-recall path nor the low-edge fallback below
+            # had any band-conflict handling -- unlike the receiver-is-
+            # not-None/Sub path just below, which routes through
+            # _select_receiver_vfo_and_set_frequency and already resolves
+            # this itself. Without it, switching Main to a band Sub
+            # currently occupies (or vice versa, handled on Sub's own
+            # path) was simply rejected outright by the radio -- the same
+            # hardware constraint _resolve_receiver_band_conflict already
+            # handles everywhere else (satellite tracking start, PTT).
+            # Using low_edge_hz for this check even when band-stacking
+            # recall ends up being used is safe: whatever frequency gets
+            # recalled is guaranteed to be within the same band as
+            # low_edge_hz (that's what makes it a band-stacking register
+            # FOR this band). No-op on a single-receiver radio
+            # (_resolve_receiver_band_conflict's own guard).
+            await self._resolve_receiver_band_conflict(RECEIVER_MAIN, low_edge_hz)
 
         if band_code is not None and receiver is None:
             freq_hz, reason = await _try_recall_band_stack(self.radio, band_code)

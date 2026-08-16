@@ -119,6 +119,34 @@ class WorldMapWidget(QWidget):
         # held down -- off by default on a plain QWidget.
         self.setMouseTracking(True)
 
+        # ---- Zoom/pan ----
+        # zoom=1.0 is the original fit-to-widget view (no scaling, pan
+        # locked to 0,0 by _clamp_pan -- there's nowhere to pan to
+        # without room to scroll into). Content is scaled/panned via a
+        # single QPainter transform applied around all the existing
+        # drawing code in paintEvent, rather than reworking every
+        # individual _lonlat_to_xy call site -- so the background image,
+        # grid, terminator shading, and every marker all zoom/pan
+        # together for free. _pan_x/_pan_y are offsets, in UNZOOMED
+        # map-content pixels, of the view center from the map's true
+        # center (map_rect's own w/2, h/2) -- see _clamp_pan for why
+        # that unit choice makes the valid range shrink cleanly to
+        # {0,0} at zoom=1.
+        self.MIN_ZOOM = 1.0
+        self.MAX_ZOOM = 12.0
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        # Left-button drag-to-pan vs. click (satellite select / QSO
+        # tooltip) disambiguation -- see mousePressEvent/mouseMoveEvent/
+        # mouseReleaseEvent. Click behavior is decided on RELEASE now
+        # (was on press, before panning existed): only fires if the
+        # press-to-release movement never exceeded _DRAG_THRESHOLD_PX.
+        self._drag_start_pos = None
+        self._drag_start_pan = (0.0, 0.0)
+        self._drag_active = False
+        self._DRAG_THRESHOLD_PX = 4
+
         # Animated arrow along each shown ground track (sat["path"]),
         # indicating direction of travel -- a single shared progress
         # value (0.0-1.0, wrapping) rather than one per satellite, so
@@ -204,6 +232,24 @@ class WorldMapWidget(QWidget):
         painter.save()
         painter.translate(map_rect.x(), map_rect.y())
         w, h = map_rect.width(), map_rect.height()
+        # Clip to the letterboxed map rect itself (not just the widget's
+        # own rect, already the default) -- without this, zoomed-in
+        # content spills into the letterbox bars whenever the widget's
+        # box isn't exactly MAP_ASPECT_RATIO, since the zoom transform
+        # below can make drawn content larger than map_rect.
+        painter.setClipRect(QRectF(0, 0, w, h))
+
+        # Zoom/pan transform -- scales/translates everything drawn below
+        # this point (background image, grid, terminator, every
+        # marker), restored before the fixed-position attribution text
+        # so that stays put regardless of zoom. See __init__'s comment
+        # on _pan_x/_pan_y's units for why this specific translate/
+        # scale/translate order is what makes them "offset from center
+        # in unzoomed content pixels".
+        painter.save()
+        painter.translate(w / 2.0, h / 2.0)
+        painter.scale(self._zoom, self._zoom)
+        painter.translate(-(w / 2.0 + self._pan_x), -(h / 2.0 + self._pan_y))
 
         if self._background_image is not None:
             painter.drawImage(QRectF(0, 0, w, h), self._background_image)
@@ -259,12 +305,6 @@ class WorldMapWidget(QWidget):
                 painter.setPen(QColor(255, 255, 255))
                 painter.drawText(QPointF(ox + 8, oy - 8), self._operator_label)
 
-        # Attribution for the background map image, if it loaded (CC BY
-        # 4.0 requires this).
-        if self._background_image is not None:
-            painter.setPen(QColor(200, 200, 200, 180))
-            painter.drawText(QPointF(6, h - 6), WORLD_MAP_ATTRIBUTION)
-
         if self._satellite_mode:
             for sat in self._satellite_positions:
                 self._draw_satellite_footprint(painter, sat, w, h)
@@ -279,6 +319,17 @@ class WorldMapWidget(QWidget):
             for qso in self._qso_markers:
                 x, y = self._lonlat_to_xy(qso["lat"], qso["lon"], w, h)
                 painter.drawEllipse(QPointF(x, y), 3.5, 3.5)
+
+        painter.restore()  # undo the zoom/pan transform -- attribution text below stays fixed
+
+        # Attribution for the background map image, if it loaded (CC BY
+        # 4.0 requires this). Deliberately drawn AFTER restoring the
+        # zoom transform (but still inside the map_rect clip/translate)
+        # so it stays a fixed corner label regardless of zoom/pan,
+        # rather than scaling/panning away with the map content.
+        if self._background_image is not None:
+            painter.setPen(QColor(200, 200, 200, 180))
+            painter.drawText(QPointF(6, h - 6), WORLD_MAP_ATTRIBUTION)
 
         painter.restore()
 
@@ -302,24 +353,41 @@ class WorldMapWidget(QWidget):
     # Pixel radius around a QSO marker that still counts as a hover/
     # click hit -- markers are drawn at a 3.5px radius (see paintEvent),
     # matching the same slack-for-imprecision reasoning as satellite
-    # markers' own _SATELLITE_HIT_RADIUS_PX.
+    # markers' own _SATELLITE_HIT_RADIUS_PX. Measured in SCREEN pixels
+    # (see _widget_pos_to_content) so the hit area doesn't effectively
+    # shrink to nothing when zoomed out, or balloon when zoomed in.
     _QSO_HIT_RADIUS_PX = 8
+
+    def _widget_pos_to_content(self, widget_pos):
+        """Converts a widget-space position (e.g. from a mouse event)
+        into the map's unzoomed content-pixel space -- the same space
+        _lonlat_to_xy already returns coordinates in -- by inverting
+        paintEvent's zoom/pan transform. Every hit-test (satellites, QSO
+        markers) compares against content-space coordinates via this,
+        rather than transforming each marker's position individually,
+        since there's only ever one cursor position to convert per
+        hit-test call. Returns (content_pos, w, h)."""
+        map_rect = self._map_rect()
+        local = widget_pos - map_rect.topLeft()
+        w, h = map_rect.width(), map_rect.height()
+        cx = (local.x() - w / 2.0) / self._zoom + w / 2.0 + self._pan_x
+        cy = (local.y() - h / 2.0) / self._zoom + h / 2.0 + self._pan_y
+        return QPointF(cx, cy), w, h
 
     def _qso_marker_at(self, widget_pos):
         """Returns whichever QSO marker dict is under widget_pos
-        (within _QSO_HIT_RADIUS_PX), or None -- same shared hit-test
-        shape as _satellite_at, used by both the hover and click
-        tooltip paths below."""
+        (within _QSO_HIT_RADIUS_PX screen pixels), or None -- same
+        shared hit-test shape as _satellite_at, used by both the hover
+        and click tooltip paths below."""
         if not self._qso_markers:
             return None
-        map_rect = self._map_rect()
-        pos = widget_pos - map_rect.topLeft()
-        w, h = map_rect.width(), map_rect.height()
+        pos, w, h = self._widget_pos_to_content(widget_pos)
+        hit_radius = self._QSO_HIT_RADIUS_PX / self._zoom  # screen px -> content px
         closest, closest_dist = None, None
         for qso in self._qso_markers:
             x, y = self._lonlat_to_xy(qso["lat"], qso["lon"], w, h)
             dist = math.hypot(x - pos.x(), y - pos.y())
-            if dist <= self._QSO_HIT_RADIUS_PX and (closest_dist is None or dist < closest_dist):
+            if dist <= hit_radius and (closest_dist is None or dist < closest_dist):
                 closest, closest_dist = qso, dist
         return closest
 
@@ -327,41 +395,102 @@ class WorldMapWidget(QWidget):
     def _qso_tooltip_text(qso):
         return f"{qso.get('callsign', '?')}\n{qso.get('band', '?')}\n{qso.get('time', '?')}"
 
+    # Pixel radius around a satellite's marker that still counts as a hit
+    # -- markers are drawn at a 4px radius (see _draw_satellite_marker),
+    # so this gives some slack for imprecise clicking without the hit
+    # areas of nearby satellites overlapping too much. Screen pixels,
+    # same reasoning as _QSO_HIT_RADIUS_PX above.
+    _SATELLITE_HIT_RADIUS_PX = 10
+
+    def _satellite_at(self, widget_pos):
+        """Returns the name of whichever satellite marker is under
+        widget_pos (within _SATELLITE_HIT_RADIUS_PX screen pixels), or
+        None -- shared hit-test behind both the double-click (select/
+        track) and right-click (Satellite Info) handlers below."""
+        if not self._satellite_mode or not self._satellite_positions:
+            return None
+        pos, w, h = self._widget_pos_to_content(widget_pos)
+        hit_radius = self._SATELLITE_HIT_RADIUS_PX / self._zoom
+        closest_name, closest_dist = None, None
+        for sat in self._satellite_positions:
+            x, y = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)
+            dist = math.hypot(x - pos.x(), y - pos.y())
+            if dist <= hit_radius and (closest_dist is None or dist < closest_dist):
+                closest_name, closest_dist = sat["name"], dist
+        return closest_name
+
+    def _clamp_pan(self):
+        """Keeps the view center's pan offset within whatever range
+        still shows real content on every edge -- at zoom=1 the valid
+        range is exactly {0,0} (fit-to-widget, nowhere to pan), and it
+        widens as zoom increases (more of the oversized content is
+        available to scroll to). Without this, dragging or zooming near
+        an edge could push the visible viewport off the map entirely
+        (blank space and/or the background image sliding fully out of
+        the clip rect)."""
+        map_rect = self._map_rect()
+        w, h = map_rect.width(), map_rect.height()
+        if self._zoom <= 1.0:
+            self._pan_x = 0.0
+            self._pan_y = 0.0
+            return
+        max_pan_x = (w / 2.0) * (1.0 - 1.0 / self._zoom)
+        max_pan_y = (h / 2.0) * (1.0 - 1.0 / self._zoom)
+        self._pan_x = max(-max_pan_x, min(max_pan_x, self._pan_x))
+        self._pan_y = max(-max_pan_y, min(max_pan_y, self._pan_y))
+
+    def _zoom_at(self, widget_pos, factor):
+        """Multiplies the zoom level by factor (clamped to [MIN_ZOOM,
+        MAX_ZOOM]), adjusting pan so the content point currently under
+        widget_pos stays under it -- the usual "zoom toward the cursor"
+        map UX, rather than always zooming toward the view center."""
+        content_pos, w, h = self._widget_pos_to_content(widget_pos)
+        if w <= 0 or h <= 0:
+            return
+        new_zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, self._zoom * factor))
+        if new_zoom == self._zoom:
+            return
+        map_rect = self._map_rect()
+        local = widget_pos - map_rect.topLeft()
+        self._zoom = new_zoom
+        self._pan_x = content_pos.x() - w / 2.0 - (local.x() - w / 2.0) / new_zoom
+        self._pan_y = content_pos.y() - h / 2.0 - (local.y() - h / 2.0) / new_zoom
+        self._clamp_pan()
+        self.update()
+
+    def wheelEvent(self, event):
+        # angleDelta().y() is in eighths of a degree, +/-120 per typical
+        # notch -- one notch is one ZOOM_STEP application.
+        steps = event.angleDelta().y() / 120.0
+        if steps == 0:
+            return
+        self._zoom_at(event.position(), self._ZOOM_STEP ** steps)
+        event.accept()
+
+    _ZOOM_STEP = 1.15
+
     def mouseMoveEvent(self, event):
+        if self._drag_start_pos is not None and (event.buttons() & Qt.LeftButton):
+            delta = event.position() - self._drag_start_pos
+            if not self._drag_active and delta.manhattanLength() > self._DRAG_THRESHOLD_PX:
+                self._drag_active = True
+            if self._drag_active:
+                # Converts a SCREEN-pixel drag delta into content-space
+                # pan -- see _clamp_pan's docstring for _pan_x/_pan_y's
+                # units (unzoomed content pixels), so a drag of d screen
+                # px needs to move pan by d/zoom to keep the dragged
+                # point following the cursor exactly.
+                self._pan_x = self._drag_start_pan[0] - delta.x() / self._zoom
+                self._pan_y = self._drag_start_pan[1] - delta.y() / self._zoom
+                self._clamp_pan()
+                QToolTip.hideText()
+                self.update()
+                return
         qso = self._qso_marker_at(event.position())
         if qso is not None:
             QToolTip.showText(event.globalPosition().toPoint(), self._qso_tooltip_text(qso), self)
         else:
             QToolTip.hideText()
-
-    # Pixel radius around a satellite's marker that still counts as a hit
-    # -- markers are drawn at a 4px radius (see _draw_satellite_marker),
-    # so this gives some slack for imprecise clicking without the hit
-    # areas of nearby satellites overlapping too much.
-    _SATELLITE_HIT_RADIUS_PX = 10
-
-    def _satellite_at(self, widget_pos):
-        """Returns the name of whichever satellite marker is under
-        widget_pos (within _SATELLITE_HIT_RADIUS_PX), or None -- shared
-        hit-test behind both the double-click (select/track) and
-        right-click (Satellite Info) handlers below."""
-        if not self._satellite_mode or not self._satellite_positions:
-            return None
-        # Markers are drawn in the letterboxed map rect's own (0,0)-origin
-        # coordinate space (see paintEvent's painter.translate()) -- shift
-        # the click position into that same space before comparing, or
-        # every hit-test would be off by the letterbox's offset whenever
-        # the widget's box isn't exactly MAP_ASPECT_RATIO.
-        map_rect = self._map_rect()
-        pos = widget_pos - map_rect.topLeft()
-        w, h = map_rect.width(), map_rect.height()
-        closest_name, closest_dist = None, None
-        for sat in self._satellite_positions:
-            x, y = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)
-            dist = math.hypot(x - pos.x(), y - pos.y())
-            if dist <= self._SATELLITE_HIT_RADIUS_PX and (closest_dist is None or dist < closest_dist):
-                closest_name, closest_dist = sat["name"], dist
-        return closest_name
 
     def mouseDoubleClickEvent(self, event):
         closest_name = self._satellite_at(event.position())
@@ -370,20 +499,45 @@ class WorldMapWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            qso = self._qso_marker_at(event.position())
-            if qso is not None:
-                # Click shows the same tooltip hovering already would --
-                # explicitly asked for as an alternative to hovering, not
-                # just a side effect of it.
-                QToolTip.showText(event.globalPosition().toPoint(), self._qso_tooltip_text(qso), self)
-                return
-        closest_name = self._satellite_at(event.position())
-        if closest_name is None:
+            # Click-vs-drag is decided on RELEASE (see mouseReleaseEvent)
+            # -- just record where the press started here.
+            self._drag_start_pos = event.position()
+            self._drag_start_pan = (self._pan_x, self._pan_y)
+            self._drag_active = False
             return
         if event.button() == Qt.RightButton:
-            self.satellite_right_clicked.emit(closest_name)
-        elif event.button() == Qt.LeftButton:
-            # Also fires as the first press of a double-click (Qt sends
+            closest_name = self._satellite_at(event.position())
+            if closest_name is not None:
+                self.satellite_right_clicked.emit(closest_name)
+            elif self._qso_marker_at(event.position()) is None:
+                # Right-clicking genuinely empty map (no satellite, no
+                # QSO marker under the cursor) resets the view -- the
+                # only reset affordance this needs, since scrolling back
+                # out to MIN_ZOOM is otherwise the only way back once
+                # zoomed/panned in.
+                self._zoom = self.MIN_ZOOM
+                self._pan_x = 0.0
+                self._pan_y = 0.0
+                self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        was_dragging = self._drag_active
+        self._drag_start_pos = None
+        self._drag_active = False
+        if was_dragging:
+            return  # just finished a pan -- not a click
+        qso = self._qso_marker_at(event.position())
+        if qso is not None:
+            # Click shows the same tooltip hovering already would --
+            # explicitly asked for as an alternative to hovering, not
+            # just a side effect of it.
+            QToolTip.showText(event.globalPosition().toPoint(), self._qso_tooltip_text(qso), self)
+            return
+        closest_name = self._satellite_at(event.position())
+        if closest_name is not None:
+            # Also fires as the first release of a double-click (Qt sends
             # press/release/press/doubleClick/release for one) -- that's
             # fine, ham_dashboard.py's double-click handler sets the same
             # "active" state itself, so this is just redundant, not wrong.

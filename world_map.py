@@ -150,6 +150,7 @@ class WorldMapWidget(QWidget):
         self._satellite_positions = []  # list of {"name", "lat", "lon", "altitude_km", "footprint"}
         self._qso_markers = []  # list of {"lat", "lon", "band", "time", "callsign"} -- see set_qso_markers
         self._pskreporter_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_pskreporter_markers
+        self._pota_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_pota_markers
         # Hover tooltip needs mouseMoveEvent to fire without a button
         # held down -- off by default on a plain QWidget.
         self.setMouseTracking(True)
@@ -427,12 +428,20 @@ class WorldMapWidget(QWidget):
         if self._pskreporter_markers:
             # Deliberately a distinct hue from every other marker
             # category (green QSOs, yellow/orange satellites, red
-            # operator location) -- per explicit instruction, so all
-            # three spot categories stay visually distinguishable from
-            # each other at a glance.
+            # operator location, teal POTA spots) -- per explicit
+            # instruction, so every spot category stays visually
+            # distinguishable from every other at a glance.
             painter.setPen(QPen(QColor(15, 15, 20), 1))
             painter.setBrush(QColor(190, 110, 255))
             for spot in self._pskreporter_markers:
+                cx, cy = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
+                sx, sy = self._content_to_screen(cx, cy, w, h)
+                painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
+
+        if self._pota_markers:
+            painter.setPen(QPen(QColor(15, 15, 20), 1))
+            painter.setBrush(QColor(0, 200, 200))
+            for spot in self._pota_markers:
                 cx, cy = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
                 sx, sy = self._content_to_screen(cx, cy, w, h)
                 painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
@@ -498,6 +507,17 @@ class WorldMapWidget(QWidget):
         Empty list (the button's own OFF state) just stops drawing/
         hit-testing them, same shape as set_qso_markers([])."""
         self._pskreporter_markers = markers
+        self.update()
+
+    def set_pota_markers(self, markers):
+        """markers: list of {"lat", "lon", "tooltip"} -- ham_dashboard.py's
+        POTA map button, converted from pota.fetch_pota_spots() (which
+        already includes latitude/longitude directly, no grid-square
+        conversion needed). Same pre-built-tooltip shape as
+        set_pskreporter_markers, same reasoning: POTA spots carry their
+        own bag of fields (park name/reference, spotter, comments,
+        count, ...) this widget doesn't need to know the shape of."""
+        self._pota_markers = markers
         self.update()
 
     # Pixel radius around a QSO marker that still counts as a hover/
@@ -570,6 +590,24 @@ class WorldMapWidget(QWidget):
         hit_radius = self._PSKREPORTER_HIT_RADIUS_PX / self._zoom
         closest, closest_dist = None, None
         for spot in self._pskreporter_markers:
+            x, y = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
+            dist = math.hypot(x - pos.x(), y - pos.y())
+            if dist <= hit_radius and (closest_dist is None or dist < closest_dist):
+                closest, closest_dist = spot, dist
+        return closest
+
+    # Same screen-pixel-radius reasoning as _QSO_HIT_RADIUS_PX.
+    _POTA_HIT_RADIUS_PX = 8
+
+    def _pota_marker_at(self, widget_pos):
+        """Same shared hit-test shape as _qso_marker_at, for the POTA
+        spot markers."""
+        if not self._pota_markers:
+            return None
+        pos, w, h = self._widget_pos_to_content(widget_pos)
+        hit_radius = self._POTA_HIT_RADIUS_PX / self._zoom
+        closest, closest_dist = None, None
+        for spot in self._pota_markers:
             x, y = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
             dist = math.hypot(x - pos.x(), y - pos.y())
             if dist <= hit_radius and (closest_dist is None or dist < closest_dist):
@@ -674,6 +712,10 @@ class WorldMapWidget(QWidget):
         spot = self._pskreporter_marker_at(event.position())
         if spot is not None:
             QToolTip.showText(event.globalPosition().toPoint(), spot.get("tooltip", "?"), self)
+            return
+        pota_spot = self._pota_marker_at(event.position())
+        if pota_spot is not None:
+            QToolTip.showText(event.globalPosition().toPoint(), pota_spot.get("tooltip", "?"), self)
         else:
             QToolTip.hideText()
 
@@ -697,12 +739,13 @@ class WorldMapWidget(QWidget):
             elif (
                 self._qso_marker_at(event.position()) is None
                 and self._pskreporter_marker_at(event.position()) is None
+                and self._pota_marker_at(event.position()) is None
             ):
                 # Right-clicking genuinely empty map (no satellite, no
-                # QSO/PSKReporter marker under the cursor) resets the
-                # view -- the only reset affordance this needs, since
-                # scrolling back out to MIN_ZOOM is otherwise the only
-                # way back once zoomed/panned in.
+                # QSO/PSKReporter/POTA marker under the cursor) resets
+                # the view -- the only reset affordance this needs,
+                # since scrolling back out to MIN_ZOOM is otherwise the
+                # only way back once zoomed/panned in.
                 self._zoom = self.MIN_ZOOM
                 self._pan_x = 0.0
                 self._pan_y = 0.0
@@ -726,6 +769,10 @@ class WorldMapWidget(QWidget):
         spot = self._pskreporter_marker_at(event.position())
         if spot is not None:
             QToolTip.showText(event.globalPosition().toPoint(), spot.get("tooltip", "?"), self)
+            return
+        pota_spot = self._pota_marker_at(event.position())
+        if pota_spot is not None:
+            QToolTip.showText(event.globalPosition().toPoint(), pota_spot.get("tooltip", "?"), self)
             return
         closest_name = self._satellite_at(event.position())
         if closest_name is not None:

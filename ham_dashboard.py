@@ -71,6 +71,7 @@ from log_book_window import LogBookWindow
 import adif
 import qso_log
 import pskreporter
+import pota
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
 from wsjtx_udp import WsjtxUdpListener, WSJTX_DEFAULT_PORT
 from audio import (
@@ -367,6 +368,24 @@ class PskReporterWorker(QThread):
         self.spots_ready.emit(spots)
 
 
+class PotaWorker(QThread):
+    """One-shot fetch off the GUI thread, same shape as
+    PskReporterWorker -- POTA's activator-spot list has no per-caller
+    scoping (unlike PSKReporter's callsign-specific query), so there's
+    nothing to configure here at all."""
+
+    spots_ready = Signal(list)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            spots = pota.fetch_pota_spots()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.spots_ready.emit(spots)
+
+
 class PskReporterSettingsDialog(QDialog):
     """Right-click the PSKReporter button to open this: your callsign
     (every PSKReporter query is scoped to just this one -- editable
@@ -597,6 +616,23 @@ class HamClockWindow(QWidget):
         self.pskreporter_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.pskreporter_button.customContextMenuRequested.connect(self._on_pskreporter_menu_requested)
 
+        # ---- POTA (Parks on the Air) map overlay ----
+        self._pota_spots_cache = []  # raw fetched spots (unfiltered by band) -- see _build_pota_markers
+        self._pota_worker = None
+        self.pota_button = QPushButton("POTA: OFF")
+        self.pota_button.setCheckable(True)
+        self.pota_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.pota_button.setToolTip(
+            "Toggle showing currently active POTA (Parks on the Air) "
+            "activator spots on the map. Right-click to refresh -- spots "
+            "go stale within their own short activation window."
+        )
+        self.pota_button.toggled.connect(self._on_pota_toggled)
+        self.pota_button.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pota_button.customContextMenuRequested.connect(self._on_pota_menu_requested)
+
         # Filters which band's QSOs the map overlay shows -- every band
         # this app knows about (same list/order as HF_6M_BANDS +
         # VHF_UHF_BANDS, already ADIF's own lowercase BAND convention --
@@ -798,6 +834,7 @@ class HamClockWindow(QWidget):
         map_buttons_row.addWidget(self.satellite_button)
         map_buttons_row.addWidget(self.qso_map_button)
         map_buttons_row.addWidget(self.pskreporter_button)
+        map_buttons_row.addWidget(self.pota_button)
         map_buttons_row.addWidget(self.qso_band_filter_combo)
         map_buttons_row.addStretch()
 
@@ -983,10 +1020,13 @@ class HamClockWindow(QWidget):
         if self.qso_map_button.isChecked():
             self.map_widget.set_qso_markers(self._build_qso_markers())
         # Per explicit instruction, the band filter also applies to
-        # PSKReporter spots -- re-filters the already-fetched cache
-        # (no new network fetch needed, same reasoning as QSO markers).
+        # PSKReporter/POTA spots -- re-filters the already-fetched
+        # cache (no new network fetch needed, same reasoning as QSO
+        # markers).
         if self.pskreporter_button.isChecked():
             self.map_widget.set_pskreporter_markers(self._build_pskreporter_markers())
+        if self.pota_button.isChecked():
+            self.map_widget.set_pota_markers(self._build_pota_markers())
 
     def _build_qso_markers(self):
         """Newest self._qso_map_count logged QSOs (None = all) that have
@@ -1139,6 +1179,73 @@ class HamClockWindow(QWidget):
         if country:
             lines.append(f"Country: {country}")
         lines.append(f"Grid: {spot.get('locator', '?')}")
+        return "\n".join(lines)
+
+    def _on_pota_toggled(self, checked):
+        self.pota_button.setText("POTA: ON" if checked else "POTA: OFF")
+        if checked:
+            self._start_pota_fetch()
+        else:
+            self.map_widget.set_pota_markers([])
+
+    def _on_pota_menu_requested(self, _pos):
+        menu = QMenu(self)
+        menu.addAction("Refresh Now").triggered.connect(self._start_pota_fetch)
+        menu.exec(self.pota_button.mapToGlobal(_pos))
+
+    def _start_pota_fetch(self):
+        if self._pota_worker is not None and self._pota_worker.isRunning():
+            return  # a fetch is already in flight -- let it finish
+        worker = PotaWorker(self)
+        worker.spots_ready.connect(self._on_pota_spots_ready)
+        worker.failed.connect(self._on_pota_fetch_failed)
+        self._pota_worker = worker
+        worker.start()
+
+    def _on_pota_spots_ready(self, spots):
+        self._pota_spots_cache = spots
+        if self.pota_button.isChecked():
+            self.map_widget.set_pota_markers(self._build_pota_markers())
+
+    def _on_pota_fetch_failed(self, message):
+        QMessageBox.warning(self, "POTA", f"Couldn't fetch POTA spots:\n{message}")
+        self.pota_button.setChecked(False)
+
+    def _build_pota_markers(self):
+        """Filters self._pota_spots_cache (the last fetch's raw
+        results, unfiltered by band) to the band picked in
+        qso_band_filter_combo -- same shared filter as QSO/PSKReporter
+        markers, re-filtering the already-fetched cache rather than
+        re-fetching."""
+        band_filter = self.qso_band_filter_combo.currentData()
+        spots = self._pota_spots_cache
+        if band_filter is not None:
+            spots = [spot for spot in spots if spot.get("band") == band_filter]
+        return [
+            {"lat": spot["lat"], "lon": spot["lon"], "tooltip": self._pota_tooltip_text(spot)}
+            for spot in spots
+        ]
+
+    @staticmethod
+    def _pota_tooltip_text(spot):
+        lines = [
+            spot.get("activator", "?"),
+            f"{spot.get('reference', '?')}" + (f" -- {spot['park_name']}" if spot.get("park_name") else ""),
+            f"Band: {spot.get('band', '?')}",
+            f"Mode: {spot.get('mode', '?')}",
+        ]
+        spot_time = spot.get("spot_time")
+        if spot_time:
+            try:
+                dt = datetime.datetime.fromisoformat(spot_time)
+                lines.append(f"Time: {dt.strftime('%Y-%m-%d %H:%M')} UTC")
+            except ValueError:
+                lines.append(f"Time: {spot_time}")
+        if spot.get("count") is not None:
+            lines.append(f"QSOs so far: {spot['count']}")
+        if spot.get("comments"):
+            lines.append(f"Comment: {spot['comments']}")
+        lines.append(f"Spotted by: {spot.get('spotter', '?')}")
         return "\n".join(lines)
 
     def _update_satellite_positions(self):

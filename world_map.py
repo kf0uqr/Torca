@@ -13,8 +13,8 @@ import pathlib
 import urllib.error
 import urllib.request
 
-from PySide6.QtCore import Qt, QRect, QRectF, QPointF, Signal, QThread
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QImage, QFont
+from PySide6.QtCore import Qt, QRect, QRectF, QPointF, Signal, QThread, QTimer
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF, QImage, QFont
 from PySide6.QtWidgets import QWidget, QSizePolicy
 
 from solar_data import _solar_subpoint, _solar_elevation
@@ -89,6 +89,10 @@ class WorldMapWidget(QWidget):
     # whatever box the widget is given -- see _map_rect().
     MAP_ASPECT_RATIO = 2.0
 
+    # Path direction-arrow animation -- see _advance_path_animation.
+    _PATH_ANIMATION_INTERVAL_MS = 60
+    _PATH_ANIMATION_SPEED = 0.008  # progress fraction per tick -- one full lap of a shown path in a few seconds
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(220)
@@ -111,10 +115,34 @@ class WorldMapWidget(QWidget):
         self._satellite_mode = False
         self._satellite_positions = []  # list of {"name", "lat", "lon", "altitude_km", "footprint"}
 
+        # Animated arrow along each shown ground track (sat["path"]),
+        # indicating direction of travel -- a single shared progress
+        # value (0.0-1.0, wrapping) rather than one per satellite, so
+        # every visible path's arrow moves at the same wall-clock pace
+        # even though their real ground speeds differ slightly.
+        # ground_track_points() (satellite_tracking.py) orders points
+        # chronologically (past -> future), so walking progress 0->1
+        # through a path's point list is the same direction the
+        # satellite is actually travelling.
+        self._path_animation_progress = 0.0
+        self._path_animation_timer = QTimer(self)
+        self._path_animation_timer.timeout.connect(self._advance_path_animation)
+        self._path_animation_timer.start(self._PATH_ANIMATION_INTERVAL_MS)
+
         self._image_fetcher = WorldMapImageFetcher()
         self._image_fetcher.image_ready.connect(self._on_image_ready)
         self._image_fetcher.failed.connect(self._on_image_failed)
         self._image_fetcher.start()
+
+    def _advance_path_animation(self):
+        # Only worth repainting (a full paintEvent -- background image
+        # blit, grid, terminator, every satellite) at this fast a cadence
+        # while there's actually an animated path on screen; otherwise
+        # this timer is a cheap no-op every tick.
+        if not self._satellite_mode or not any(sat.get("path") for sat in self._satellite_positions):
+            return
+        self._path_animation_progress = (self._path_animation_progress + self._PATH_ANIMATION_SPEED) % 1.0
+        self.update()
 
     def _on_image_ready(self, path):
         image = QImage(path)
@@ -370,6 +398,37 @@ class WorldMapWidget(QWidget):
                 x, y = self._lonlat_to_xy(lat, lon, w, h)
                 path.lineTo(x, y)
             painter.drawPath(path)
+        self._draw_path_direction_arrow(painter, points, w, h, sat.get("active"))
+
+    def _draw_path_direction_arrow(self, painter, points, w, h, active):
+        """A small arrowhead that animates along the ground track
+        (self._path_animation_progress, 0.0-1.0) to show which way the
+        satellite is actually moving -- points is already ordered past
+        -> future (ground_track_points), so walking it start-to-end is
+        the real direction of travel."""
+        segment_count = len(points) - 1
+        if segment_count < 1:
+            return
+        position = self._path_animation_progress * segment_count
+        index = min(int(position), segment_count - 1)
+        frac = position - index
+        lat0, lon0 = points[index]
+        lat1, lon1 = points[index + 1]
+        if abs(lon1 - lon0) > 180:
+            return  # crosses the antimeridian -- skip this frame rather than draw a spurious jump
+        x0, y0 = self._lonlat_to_xy(lat0, lon0, w, h)
+        x1, y1 = self._lonlat_to_xy(lat1, lon1, w, h)
+        x = x0 + (x1 - x0) * frac
+        y = y0 + (y1 - y0) * frac
+        angle = math.atan2(y1 - y0, x1 - x0)
+        size = 7.0 if active else 5.0
+        spread = 2.6  # radians off the heading for each back corner -- a narrow-ish forward-pointing triangle
+        tip = QPointF(x + size * math.cos(angle), y + size * math.sin(angle))
+        left = QPointF(x + size * math.cos(angle + spread), y + size * math.sin(angle + spread))
+        right = QPointF(x + size * math.cos(angle - spread), y + size * math.sin(angle - spread))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 235) if active else QColor(255, 200, 120, 210))
+        painter.drawPolygon(QPolygonF([tip, left, right]))
 
     def _draw_satellite_marker(self, painter, sat, w, h):
         x, y = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)

@@ -1005,12 +1005,19 @@ class SatelliteConfigDialog(QDialog):
     Escape is the same as Cancel) would be a surprising, silent data
     loss -- not just an unsaved-edit annoyance."""
 
-    def __init__(self, satellites, parent=None, on_change=None):
+    def __init__(self, satellites, parent=None, on_change=None,
+                 observer_lat=None, observer_lon=None, observer_elevation_km=0.0):
         super().__init__(parent)
         self.setWindowTitle("Satellite Tracking")
         self.resize(560, 400)
         self._satellites = [dict(sat) for sat in satellites]  # local working copy until OK is pressed
         self._on_change = on_change
+        # Threaded through to SatelliteInfoDialog (right-click ->
+        # Satellite Info...) so its Upcoming Passes section can compute
+        # real pass predictions without needing its own copy of this.
+        self._observer_lat = observer_lat
+        self._observer_lon = observer_lon
+        self._observer_elevation_km = observer_elevation_km
 
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Show", "Name"])
@@ -1180,7 +1187,11 @@ class SatelliteConfigDialog(QDialog):
         path_action.setChecked(bool(sat.get("show_path")))
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen is info_action:
-            SatelliteInfoDialog(sat, self).exec()
+            SatelliteInfoDialog(
+                sat, self,
+                observer_lat=self._observer_lat, observer_lon=self._observer_lon,
+                observer_elevation_km=self._observer_elevation_km,
+            ).exec()
         elif chosen is path_action:
             # Applies immediately (same as fetch/edit transponders
             # above) rather than waiting for OK -- it's a map display
@@ -1199,17 +1210,19 @@ class SatelliteConfigDialog(QDialog):
 
 
 class SatelliteInfoDialog(QDialog):
-    """Read-only view of everything this app has stored on one
+    """Read-only view of everything this app has stored/knows about one
     satellite -- right-click it (on the map, in the upcoming-passes
     table, or in the Satellite Tracking management dialog's list) to
     open this. Purely informational, no OK/Cancel distinction -- just
     Close."""
 
-    def __init__(self, satellite, parent=None):
+    UPCOMING_PASSES_COUNT = 10
+
+    def __init__(self, satellite, parent=None, observer_lat=None, observer_lon=None, observer_elevation_km=0.0):
         super().__init__(parent)
         name = satellite.get("name", "?")
         self.setWindowTitle(f"Satellite Info -- {name}")
-        self.resize(560, 420)
+        self.resize(600, 560)
 
         line1 = satellite.get("line1", "")
         line2 = satellite.get("line2", "")
@@ -1250,6 +1263,44 @@ class SatelliteInfoDialog(QDialog):
             table.setItem(row, 5, QTableWidgetItem("Yes" if transponder.get("invert") else "No"))
             table.setItem(row, 6, QTableWidgetItem("Yes" if transponder.get("alive", True) else "No"))
 
+        # (0, 0) is what an unset observer location defaults to elsewhere
+        # in this app (nobody's actual station is at 0N 0E) -- same
+        # "treat as not set" convention as ham_dashboard.py's own
+        # _on_satellite_double_clicked.
+        passes_columns = ["Start (UTC)", "Max El", "Duration", "Status"]
+        passes_table = QTableWidget(0, len(passes_columns))
+        passes_table.setHorizontalHeaderLabels(passes_columns)
+        passes_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        passes_table.setSelectionMode(QTableWidget.NoSelection)
+        passes_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        if not observer_lat and not observer_lon:
+            passes_label_text = "Upcoming Passes: set your location (Connect New Radio dialog) to see these."
+        elif not SGP4_AVAILABLE:
+            passes_label_text = "Upcoming Passes: needs the 'sgp4' package for orbital propagation, which isn't installed."
+        else:
+            upcoming = find_passes(
+                line1, line2, datetime.datetime.now(datetime.timezone.utc),
+                observer_lat, observer_lon, observer_elevation_km,
+                max_passes=self.UPCOMING_PASSES_COUNT,
+            )
+            passes_label_text = (
+                f"Upcoming Passes (next {len(upcoming)}):" if upcoming
+                else "Upcoming Passes: none found in the next 7 days (invalid TLE, or this satellite doesn't rise here)."
+            )
+            passes_table.setRowCount(len(upcoming))
+            for row, pass_info in enumerate(upcoming):
+                start_item = QTableWidgetItem(pass_info["aos_time"].strftime("%Y-%m-%d %H:%M:%S"))
+                el_item = QTableWidgetItem(f"{pass_info['max_elevation_deg']:.0f}°")
+                el_item.setTextAlignment(Qt.AlignCenter)
+                duration_item = QTableWidgetItem(format_countdown(pass_info["duration_seconds"]))
+                duration_item.setTextAlignment(Qt.AlignCenter)
+                status_item = QTableWidgetItem("IN PROGRESS" if pass_info.get("active") else "Upcoming")
+                status_item.setTextAlignment(Qt.AlignCenter)
+                passes_table.setItem(row, 0, start_item)
+                passes_table.setItem(row, 1, el_item)
+                passes_table.setItem(row, 2, duration_item)
+                passes_table.setItem(row, 3, status_item)
+
         button_box = QDialogButtonBox(QDialogButtonBox.Close)
         button_box.rejected.connect(self.reject)
 
@@ -1260,5 +1311,7 @@ class SatelliteInfoDialog(QDialog):
             else "No transponder data stored -- fetch from SatNOGS or add it in Edit Transponders."
         ))
         layout.addWidget(table)
+        layout.addWidget(QLabel(passes_label_text))
+        layout.addWidget(passes_table)
         layout.addWidget(button_box)
         self.setLayout(layout)

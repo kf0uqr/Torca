@@ -688,7 +688,11 @@ class HamClockWindow(QWidget):
         # inside the dialog (see SatelliteConfigDialog's on_change) -- so
         # that data survives even if the dialog gets closed/cancelled
         # afterward instead of OK'd.
-        dialog = SatelliteConfigDialog(self.satellites, self, on_change=persist)
+        dialog = SatelliteConfigDialog(
+            self.satellites, self, on_change=persist,
+            observer_lat=self._observer_lat, observer_lon=self._observer_lon,
+            observer_elevation_km=self._observer_elevation_m / 1000.0,
+        )
         if dialog.exec() == QDialog.Accepted:
             persist(dialog.result_satellites())
             if self.satellite_button.isChecked():
@@ -807,7 +811,7 @@ class HamClockWindow(QWidget):
         path_action.setChecked(bool(satellite.get("show_path")))
         chosen = menu.exec(self.upcoming_passes_table.viewport().mapToGlobal(pos))
         if chosen is info_action:
-            SatelliteInfoDialog(satellite, self).exec()
+            self._open_satellite_info(satellite)
         elif chosen is path_action:
             self._toggle_satellite_show_path(satellite, path_action.isChecked())
 
@@ -817,14 +821,21 @@ class HamClockWindow(QWidget):
         if self.satellite_button.isChecked():
             self._update_satellite_positions()  # immediate feedback -- the 5s timer would also catch up on its own
 
+    def _open_satellite_info(self, satellite):
+        SatelliteInfoDialog(
+            satellite, self,
+            observer_lat=self._observer_lat, observer_lon=self._observer_lon,
+            observer_elevation_km=self._observer_elevation_m / 1000.0,
+        ).exec()
+
     def _on_satellite_right_clicked(self, name):
         """Right-clicked on the map marker -- opens a read-only info
         dialog with everything this app has stored on the satellite
-        (TLE, NORAD ID, transponders)."""
+        (TLE, NORAD ID, transponders, upcoming passes)."""
         satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
         if satellite is None:
             return
-        SatelliteInfoDialog(satellite, self).exec()
+        self._open_satellite_info(satellite)
 
     def _on_satellite_left_clicked(self, name):
         """Left-clicked on the map marker, or a passes-table row --

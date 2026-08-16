@@ -132,18 +132,24 @@ class LogBookWindow(QWidget):
         self._sync_worker = None
         self._upload_worker = None
         self._reupload_worker = None
+        self._delete_worker = None
         self._open_dialogs = []  # keeps non-modal New QSO/Edit windows alive -- see _track_dialog
 
         self.table = QTableWidget(0, 0)
         self.table.setSortingEnabled(True)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        # Extended, not Single -- lets Delete Selected clear out several
+        # QSOs at once (e.g. a batch of test entries) via ctrl/shift-
+        # click, same as any standard list/table multi-select.
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
 
         self.new_qso_button = QPushButton("New QSO...")
         self.new_qso_button.clicked.connect(self._on_new_qso_clicked)
         self.edit_button = QPushButton("Edit Selected")
         self.edit_button.clicked.connect(self._on_edit_clicked)
+        self.delete_button = QPushButton("Delete Selected")
+        self.delete_button.clicked.connect(self._on_delete_clicked)
         self.columns_button = QPushButton("Manage Columns...")
         self.columns_button.clicked.connect(self._on_manage_columns_clicked)
         self.sync_button = QPushButton()
@@ -157,6 +163,7 @@ class LogBookWindow(QWidget):
         toolbar = QHBoxLayout()
         toolbar.addWidget(self.new_qso_button)
         toolbar.addWidget(self.edit_button)
+        toolbar.addWidget(self.delete_button)
         toolbar.addWidget(self.columns_button)
         toolbar.addStretch()
         toolbar.addWidget(self.sync_button)
@@ -210,11 +217,20 @@ class LogBookWindow(QWidget):
         self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)
 
-    def _selected_qso_index(self):
-        selected = self.table.selectedItems()
-        if not selected:
-            return None
-        return selected[0].data(Qt.UserRole)
+    def _selected_qso_indexes(self):
+        """Returns the self._qsos index (at the time of the last
+        _rebuild_table) for every currently selected row, in no
+        particular order -- possibly empty. ExtendedSelection mode
+        means this can be more than one row (Delete Selected supports
+        bulk removal; Edit Selected requires exactly one, checked at
+        its own call site)."""
+        rows = {item.row() for item in self.table.selectedItems()}
+        indexes = []
+        for row in rows:
+            item = self.table.item(row, 0)
+            if item is not None:
+                indexes.append(item.data(Qt.UserRole))
+        return indexes
 
     # ---- New QSO / Edit ----
     #
@@ -280,10 +296,11 @@ class LogBookWindow(QWidget):
         self._upload_worker = None
 
     def _on_edit_clicked(self):
-        index = self._selected_qso_index()
-        if index is None:
-            QMessageBox.information(self, "Edit Selected", "Select a QSO in the table first.")
+        indexes = self._selected_qso_indexes()
+        if len(indexes) != 1:
+            QMessageBox.information(self, "Edit Selected", "Select exactly one QSO to edit.")
             return
+        index = indexes[0]
         original = qso_log.ensure_uuid(self._qsos[index])
         self._qsos[index] = original  # persists a freshly-assigned UUID, if this record didn't have one yet
         qso_uuid = original[qso_log.UUID_FIELD]
@@ -336,6 +353,84 @@ class LogBookWindow(QWidget):
             self._rebuild_table()
         self.status_label.setText(f"QRZ re-upload failed ({message}) -- QSO saved locally, will re-sync next time.")
         self._reupload_worker = None
+
+    # ---- Delete ----
+
+    def _on_delete_clicked(self):
+        indexes = self._selected_qso_indexes()
+        if not indexes:
+            QMessageBox.information(self, "Delete Selected", "Select one or more QSOs in the table first.")
+            return
+
+        targets = []
+        for index in indexes:
+            qso = qso_log.ensure_uuid(self._qsos[index])
+            self._qsos[index] = qso
+            targets.append(qso)
+
+        preview = ", ".join(f"{qso.get('CALL', '?')} ({qso.get('QSO_DATE', '?')})" for qso in targets[:5])
+        if len(targets) > 5:
+            preview += f", and {len(targets) - 5} more"
+        any_synced = any(qso_log.is_synced(qso) for qso in targets)
+        confirm = QMessageBox.question(
+            self, "Delete QSO" + ("s" if len(targets) > 1 else ""),
+            f"Delete {len(targets)} QSO(s): {preview}?\n\n"
+            "This cannot be undone" + (" on QRZ.com either." if any_synced else "."),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        api_key = self._get_qrz_api_key()
+        synced_targets = [qso for qso in targets if qso.get(qso_log.LOGID_FIELD) and api_key]
+        synced_uuids = {qso[qso_log.UUID_FIELD] for qso in synced_targets}
+        unsynced_targets = [qso for qso in targets if qso[qso_log.UUID_FIELD] not in synced_uuids]
+
+        # Local-only (or no key configured) QSOs have nothing to
+        # reconcile with QRZ -- remove them right away.
+        for qso in unsynced_targets:
+            self._remove_qso_by_uuid(qso[qso_log.UUID_FIELD])
+        if unsynced_targets and not synced_targets:
+            self.status_label.setText(f"Deleted {len(unsynced_targets)} QSO(s) locally.")
+
+        if not synced_targets:
+            return
+
+        # Synced ones are only removed locally once QRZ confirms the
+        # delete -- see QrzDeleteWorker's docstring -- so a failure
+        # here never leaves a QSO silently missing locally while still
+        # sitting on QRZ.
+        logids = [qso[qso_log.LOGID_FIELD] for qso in synced_targets]
+        uuids_to_remove = [qso[qso_log.UUID_FIELD] for qso in synced_targets]
+        self.status_label.setText(f"Deleting {len(logids)} QSO(s) from QRZ...")
+        self.delete_button.setEnabled(False)
+        self._delete_worker = qso_log.QrzDeleteWorker(api_key, logids, self)
+        self._delete_worker.finished_delete.connect(lambda u=uuids_to_remove: self._on_delete_finished(u))
+        self._delete_worker.failed.connect(self._on_delete_failed)
+        self._delete_worker.start()
+
+    def _remove_qso_by_uuid(self, qso_uuid):
+        index = self._find_qso_index_by_uuid(qso_uuid)
+        if index is not None:
+            del self._qsos[index]
+            qso_log.save_qso_log(self._qsos)
+            self._rebuild_table()
+
+    def _on_delete_finished(self, uuids_to_remove):
+        for qso_uuid in uuids_to_remove:
+            index = self._find_qso_index_by_uuid(qso_uuid)
+            if index is not None:
+                del self._qsos[index]
+        qso_log.save_qso_log(self._qsos)
+        self._rebuild_table()
+        self.status_label.setText(f"Deleted {len(uuids_to_remove)} QSO(s) from QRZ and locally.")
+        self.delete_button.setEnabled(True)
+        self._delete_worker = None
+
+    def _on_delete_failed(self, message):
+        self.status_label.setText(f"QRZ delete failed ({message}) -- those QSOs were NOT removed, try again.")
+        self.delete_button.setEnabled(True)
+        self._delete_worker = None
 
     # ---- Manage Columns / QRZ Settings ----
 

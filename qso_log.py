@@ -283,3 +283,29 @@ class QrzReuploadWorker(QThread):
             self.failed.emit(str(exc))
             return
         self.finished_reupload.emit(updated)
+
+
+class QrzDeleteWorker(QThread):
+    """Deletes one or more QSOs from QRZ by LOGID, in a single request
+    (qrz_delete already accepts a list) -- used by LogBookWindow's
+    Delete Selected for whichever selected QSOs were previously synced
+    (have a LOGID) when a QRZ key is configured. Local removal only
+    happens after this succeeds -- see log_book_window.py's
+    _on_delete_finished -- so a QRZ delete failure never leaves a QSO
+    silently missing locally while still sitting on QRZ."""
+
+    finished_delete = Signal()
+    failed = Signal(str)
+
+    def __init__(self, api_key, logids, parent=None):
+        super().__init__(parent)
+        self._api_key = api_key
+        self._logids = logids
+
+    def run(self):
+        try:
+            qrz_logbook.qrz_delete(self._api_key, self._logids)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished_delete.emit()

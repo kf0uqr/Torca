@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QInputDialog,
+    QLineEdit,
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
@@ -366,13 +367,19 @@ class PskReporterWorker(QThread):
 
 
 class PskReporterSettingsDialog(QDialog):
-    """Right-click the PSKReporter button to open this: how far back to
-    look, and which direction of reception reports to show -- stations
-    that heard you, stations you're hearing, or both."""
+    """Right-click the PSKReporter button to open this: your callsign
+    (every PSKReporter query is scoped to just this one -- editable
+    here in case the first-launch prompt was skipped, mistyped, or the
+    operator wants to change it later), how far back to look, and
+    which direction of reception reports to show -- stations that
+    heard you, stations you're hearing, or both."""
 
-    def __init__(self, since_seconds, direction, parent=None):
+    def __init__(self, callsign, since_seconds, direction, parent=None):
         super().__init__(parent)
         self.setWindowTitle("PSKReporter Settings")
+
+        self.callsign_edit = QLineEdit(callsign)
+        self.callsign_edit.setPlaceholderText("e.g. KF0UQR")
 
         self.lookback_combo = QComboBox()
         for label, seconds in PSKREPORTER_LOOKBACK_OPTIONS:
@@ -397,6 +404,7 @@ class PskReporterSettingsDialog(QDialog):
         button_box.rejected.connect(self.reject)
 
         form = QFormLayout()
+        form.addRow("Your callsign:", self.callsign_edit)
         form.addRow("Time frame:", self.lookback_combo)
         form.addRow("Direction:", self.heard_you_radio)
         form.addRow("", self.hearing_radio)
@@ -406,6 +414,9 @@ class PskReporterSettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(button_box)
         self.setLayout(layout)
+
+    def result_callsign(self):
+        return self.callsign_edit.text().strip().upper()
 
     def result_since_seconds(self):
         return self.lookback_combo.currentData()
@@ -1003,15 +1014,26 @@ class HamClockWindow(QWidget):
             self.map_widget.set_pskreporter_markers([])
 
     def _on_pskreporter_menu_requested(self, _pos):
-        dialog = PskReporterSettingsDialog(self._pskreporter_since_seconds, self._pskreporter_direction, self)
+        dialog = PskReporterSettingsDialog(
+            self._operator_callsign, self._pskreporter_since_seconds, self._pskreporter_direction, self
+        )
         if dialog.exec() == QDialog.Accepted:
+            self._operator_callsign = dialog.result_callsign()
             self._pskreporter_since_seconds = dialog.result_since_seconds()
             self._pskreporter_direction = dialog.result_direction()
             settings = QSettings("IcomRadioApp", "RadioControl")
+            settings.setValue("operator_callsign", self._operator_callsign)
             settings.setValue("pskreporter_lookback_seconds", self._pskreporter_since_seconds)
             settings.setValue("pskreporter_direction", self._pskreporter_direction)
             if self.pskreporter_button.isChecked():
-                self._start_pskreporter_fetch()
+                if self._operator_callsign:
+                    self._start_pskreporter_fetch()
+                else:
+                    # Callsign was cleared -- nothing meaningful to show.
+                    # setChecked(False) itself fires _on_pskreporter_toggled,
+                    # which clears the map's markers -- no need to also do
+                    # it here.
+                    self.pskreporter_button.setChecked(False)
 
     def _start_pskreporter_fetch(self):
         if self._pskreporter_worker is not None and self._pskreporter_worker.isRunning():

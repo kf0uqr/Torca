@@ -302,21 +302,6 @@ S_METER_S9_FRACTION = 0.65
 # included as a common Icom meter reading, but `get_voltage` is a guessed
 # method name. If selecting it errors out, that confirms it isn't there;
 # check `dir(radio)` on your install to find the real name if one exists.
-# Keywords for the one-time dir(radio) diagnostic dump printed on connect
-# (see RadioWorker._print_radio_attribute_diagnostic). Edit this list to
-# search for something else -- e.g. add "sub" while chasing a SUB-receiver
-# method name, or "af"/"squelch" for level-control names. Set to None (or
-# an empty tuple) to skip keyword filtering entirely and just dump every
-# get_/send_ attribute instead -- see DIAGNOSTIC_DIR_PREFIXES below.
-DIAGNOSTIC_DIR_KEYWORDS = ("power", "watt", "temp", "bsr", "band_stack", "ptt", "tx", "key")
-# Prefixes for a broader, unfiltered dump -- every attribute starting with
-# one of these prints regardless of DIAGNOSTIC_DIR_KEYWORDS, for scanning
-# by eye when a keyword search comes up empty (e.g. temperature wasn't
-# found under "temp" -- it might be named something unexpected). Includes
-# set_ now too -- PTT is fundamentally a setter action with no obvious
-# getter to have caught it via the get_/send_-only dump used so far.
-DIAGNOSTIC_DIR_PREFIXES = ("get_", "send_", "set_")
-
 METER_DEFINITIONS = {
     "s_meter": {
         "label": "S-Meter",

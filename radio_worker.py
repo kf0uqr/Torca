@@ -85,8 +85,6 @@ from constants import (
     LEVEL_DEFINITIONS,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
-    DIAGNOSTIC_DIR_KEYWORDS,
-    DIAGNOSTIC_DIR_PREFIXES,
     POLL_INTERVAL_SEC,
     AUDIO_DEVICE_SYSTEM_DEFAULT,
 )
@@ -154,6 +152,7 @@ class RadioWorker(QThread):
         super().__init__(parent)
         self._details = details
         self.loop = None       # asyncio event loop, created inside run()
+        self._main_task = None  # the _main() asyncio Task, created inside run() -- see stop()
         self.radio = None      # rigplane Radio, set once connected
         self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
@@ -279,8 +278,28 @@ class RadioWorker(QThread):
         # removing all VFO-slot switching. This lock closes that
         # window.
         self._receiver_switch_lock = asyncio.Lock()
+        # A distinct Task (not just run_until_complete(self._main())
+        # directly) so stop() can cancel it from the GUI thread and
+        # actually interrupt whatever _main() is doing right now --
+        # confirmed necessary live: closing the window while a slow/
+        # unresponsive CI-V round-trip was still in flight during
+        # startup (real hardware over USB serial can take multiple
+        # seconds to time out on some commands, per BAND_STACKING_
+        # EXCLUDED's own docstring) left the old stop() -- which only
+        # set self._stop_requested, a flag _poll_loop's own while-
+        # condition checks and nothing else does -- completely unable
+        # to interrupt it. main_window.py's closeEvent only waits 2s
+        # (worker.wait(2000)) before returning regardless, so Qt then
+        # destroyed the still-running QThread out from under it:
+        # "QThread: Destroyed while thread '' is still running" /
+        # Aborted. Cancelling the task makes _main() unwind promptly
+        # from wherever it actually is (any await point, not just
+        # between poll iterations) instead.
+        self._main_task = self.loop.create_task(self._main())
         try:
-            self.loop.run_until_complete(self._main())
+            self.loop.run_until_complete(self._main_task)
+        except asyncio.CancelledError:
+            pass
         finally:
             self.loop.close()
 
@@ -831,68 +850,6 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"{definition['label']}: {set_name}() failed ({exc}).")
 
-    def _print_radio_attribute_diagnostic(self):
-        """Prints two things on connect, to help find real getter/setter
-        names for something rigplane doesn't document, without writing a
-        separate throwaway script:
-        1. Every attribute matching DIAGNOSTIC_DIR_KEYWORDS (quick, targeted).
-        2. Every attribute starting with DIAGNOSTIC_DIR_PREFIXES (comprehensive
-           -- for scanning by eye when the keyword search comes up empty,
-           in case the real name doesn't contain the keyword you'd expect)."""
-        if DIAGNOSTIC_DIR_KEYWORDS:
-            keyword_matches = sorted(
-                n for n in dir(self.radio)
-                if any(k in n.lower() for k in DIAGNOSTIC_DIR_KEYWORDS) and not n.startswith("_")
-            )
-            print(f"[DIAGNOSTIC] dir(radio) matching {DIAGNOSTIC_DIR_KEYWORDS}:")
-            for name in keyword_matches:
-                print(f"  {name}")
-            if not keyword_matches:
-                print("  (no matches)")
-
-        prefix_matches = sorted(
-            n for n in dir(self.radio)
-            if n.startswith(DIAGNOSTIC_DIR_PREFIXES)
-        )
-        print(f"[DIAGNOSTIC] dir(radio) starting with {DIAGNOSTIC_DIR_PREFIXES}:")
-        for name in prefix_matches:
-            print(f"  {name}")
-        if not prefix_matches:
-            print("  (no matches)")
-
-    async def _probe_band_stack_methods(self):
-        """Safe, read-only probing of get_bsr/get_band_stack (found via a
-        dir(radio) scan on a real IC-705) to learn their actual call
-        signature by observation. Since both are getters, calling them
-        with a few plausible argument shapes can't change radio state --
-        unlike guessing at a setter, which is why this is safe to try
-        automatically rather than needing the person to write a script.
-        Prints whatever each call returns, or the exception if the args
-        were wrong, so the real signature is visible in the console."""
-        candidate_args = [
-            (),
-            ("40m",), ("2m",),
-            (3,), (7,),
-            ("40m", 1), (3, 1),
-            (0x03, 0x01),
-        ]
-        for name in ("get_bsr", "get_band_stack"):
-            method = getattr(self.radio, name, None)
-            if method is None:
-                continue
-            print(f"[DIAGNOSTIC] probing {name}():")
-            for args in candidate_args:
-                try:
-                    result = await method(*args)
-                    arg_str = ", ".join(repr(a) for a in args)
-                    print(f"  {name}({arg_str}) -> {result!r}")
-                except TypeError as exc:
-                    arg_str = ", ".join(repr(a) for a in args)
-                    print(f"  {name}({arg_str}) -> TypeError: {exc}")
-                except Exception as exc:
-                    arg_str = ", ".join(repr(a) for a in args)
-                    print(f"  {name}({arg_str}) -> {type(exc).__name__}: {exc}")
-
     async def _main(self):
         try:
             config = self._build_config()
@@ -924,34 +881,43 @@ class RadioWorker(QThread):
 
         self.is_dual_receiver = DualReceiverCapable is not None and isinstance(self.radio, DualReceiverCapable)
         self.connected.emit()
-        self._print_radio_attribute_diagnostic()
-        await self._probe_band_stack_methods()
-        await self._setup_audio()
-        await self._setup_levels()
-        self._setup_meters()
-        self._setup_controls()
-
-        # Scope data arrives unsolicited over CI-V; register a callback
-        # rather than polling for it. The callback fires on this thread's
-        # event loop, so it must only emit a signal -- never touch a widget.
+        # Everything from here through _poll_loop() is wrapped in one
+        # try/finally so self._radio_cm.__aexit__() (closing the actual
+        # serial/network connection) always runs -- including if stop()
+        # cancels this task while still in setup (_setup_audio/_setup_
+        # levels/etc, or enable_scope's own up-to-5s verification wait),
+        # not just once _poll_loop() is reached. Without this, closing
+        # the window during a slow real-hardware startup would cancel
+        # cleanly (no more Qt abort -- see stop()'s docstring) but leak
+        # the underlying connection, likely blocking a subsequent
+        # reconnect attempt ("port busy") until the OS reclaims it.
         try:
-            self.radio.on_scope_data(self._handle_scope_frame)
-            await self.radio.enable_scope()
-            self.is_scope_capable = True
-            # is_scope_capable becomes true here, well AFTER connected.emit()
-            # above -- main_window.py's _on_connected (which runs off that
-            # signal) would almost always see it still False, since this
-            # await completes on its own schedule long after the GUI thread
-            # gets queued to enable other controls. Confirmed live: on a
-            # real 9700, the scope itself loaded fine but the span/ref/
-            # speed controls stayed greyed out forever, exactly this race.
-            # A dedicated signal, fired only once this really is known true,
-            # is what main_window.py's scope controls listen for instead.
-            self.scope_ready.emit()
-        except Exception as exc:
-            self.error.emit(f"Scope unavailable: {exc}")
+            await self._setup_audio()
+            await self._setup_levels()
+            self._setup_meters()
+            self._setup_controls()
 
-        try:
+            # Scope data arrives unsolicited over CI-V; register a
+            # callback rather than polling for it. The callback fires
+            # on this thread's event loop, so it must only emit a
+            # signal -- never touch a widget.
+            try:
+                self.radio.on_scope_data(self._handle_scope_frame)
+                await self.radio.enable_scope()
+                self.is_scope_capable = True
+                # is_scope_capable becomes true here, well AFTER connected.emit()
+                # above -- main_window.py's _on_connected (which runs off that
+                # signal) would almost always see it still False, since this
+                # await completes on its own schedule long after the GUI thread
+                # gets queued to enable other controls. Confirmed live: on a
+                # real 9700, the scope itself loaded fine but the span/ref/
+                # speed controls stayed greyed out forever, exactly this race.
+                # A dedicated signal, fired only once this really is known true,
+                # is what main_window.py's scope controls listen for instead.
+                self.scope_ready.emit()
+            except Exception as exc:
+                self.error.emit(f"Scope unavailable: {exc}")
+
             await self._poll_loop()
         finally:
             if self.audio_bridge:
@@ -2151,8 +2117,25 @@ class RadioWorker(QThread):
             self.error.emit(f"Band: setting frequency failed ({exc}).")
 
     def stop(self):
-        """Request a clean shutdown of the polling loop and thread."""
+        """Request a clean shutdown of the polling loop and thread.
+        Called from the GUI thread (main_window.py's closeEvent).
+
+        Cancels the _main() task directly (via call_soon_threadsafe,
+        the correct thread-safe way to touch another thread's asyncio
+        loop) rather than only setting self._stop_requested -- that
+        flag is exactly as before (still what cleanly ends _poll_loop
+        once it's actually running, checked at the top of its own
+        while loop), but it did nothing at all to interrupt _main()
+        during connection/startup, which can genuinely take several
+        seconds on real hardware (slow/unresponsive CI-V round-trips,
+        enable_scope's own up-to-5s verification wait). Cancellation
+        unwinds _main() from wherever it currently is, not just
+        between poll iterations, so closeEvent's worker.wait(2000)
+        actually has something to succeed at instead of timing out and
+        leaving Qt to destroy a still-running QThread (a hard abort)."""
         self._stop_requested = True
+        if self.loop is not None and self._main_task is not None:
+            self.loop.call_soon_threadsafe(self._main_task.cancel)
         # wait_for_thread (QThread.wait) is called by the GUI after this
 
 

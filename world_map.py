@@ -34,6 +34,40 @@ WORLD_MAP_IMAGE_URL = (
 WORLD_MAP_CACHE_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "world_map.png"
 WORLD_MAP_ATTRIBUTION = "Map: Wikimedia Commons (CC BY 4.0)"
 
+# Despite its filename/description, the actual fetched file (7194x3386
+# as of this writing) is NOT a true pole-to-pole -90..+90 equirectangular
+# render -- confirmed empirically by cross-referencing known ruler-
+# straight political borders at fixed latitudes against their real
+# pixel rows in this specific file: the 49th-parallel US/Canada border
+# (its Lake of the Woods "Northwest Angle" notch is unmistakable) sits
+# at row 680, and the Egypt-Sudan border (dead straight at 22N, with
+# its Halaib Triangle corner) sits at row 1203 -- not the rows a naive
+# full -90/+90 span would predict (771 and 1279 respectively, ~90px/
+# ~5deg off). Fitting a line through those two points gives this
+# image's TRUE top/bottom latitude bounds: row 0 is actually about
+# +84.1 (missing the northernmost polar cap entirely) and its last row
+# overshoots to about -90.6 (a few rows of plain ocean fill past the
+# real South Pole, not real geography). Horizontal (longitude)
+# placement WAS confirmed correct (land reaches to within a couple
+# pixels of both the left and right edges, as a genuine -180/+180 span
+# should) -- only vertical placement needed correcting.
+#
+# _draw_background_image below uses this to draw the image at its
+# actual position/scale instead of naively stretching it to fill the
+# full latitude range -- everything else (the grid, terminator,
+# satellite/QSO markers, operator location) was already using the
+# correct/real -180..180 / -90..90 math the whole time; it was only
+# ever this raster image that didn't line up with it. Guarded by an
+# exact pixel-dimension match so a differently-sized image (e.g. if
+# Wikimedia ever serves an edited/replaced file at that same URL, per
+# WORLD_MAP_IMAGE_URL's own docstring about it being a "stable
+# redirect to whatever the CURRENT version is") falls back to the
+# naive full -90/+90 assumption instead of applying a now-wrong
+# correction blindly.
+_CALIBRATED_IMAGE_SIZE = (7194, 3386)
+_CALIBRATED_LAT_TOP = 84.109
+_CALIBRATED_LAT_BOTTOM = -90.647
+
 
 class WorldMapImageFetcher(QThread):
     """Downloads the background map image once, if not already cached
@@ -300,7 +334,7 @@ class WorldMapWidget(QWidget):
         painter.translate(-(w / 2.0 + self._pan_x), -(h / 2.0 + self._pan_y))
 
         if self._background_image is not None:
-            painter.drawImage(QRectF(0, 0, w, h), self._background_image)
+            self._draw_background_image(painter, w, h)
         else:
             painter.fillRect(QRectF(0, 0, w, h), QColor(10, 20, 40))
 
@@ -396,6 +430,28 @@ class WorldMapWidget(QWidget):
             painter.drawText(QPointF(6, h - 6), WORLD_MAP_ATTRIBUTION)
 
         painter.restore()
+
+    def _draw_background_image(self, painter, w, h):
+        """Draws self._background_image into the (0,0,w,h) content
+        rect -- but at the image's OWN true lat/lon bounds (see
+        _CALIBRATED_LAT_TOP/_CALIBRATED_LAT_BOTTOM's module-level
+        comment) rather than naively stretching it to fill the full
+        -90..+90 range, which left it visibly misaligned from the grid
+        and every marker (all of which already use the correct/real
+        latitude math). A solid ocean-color base fill covers the small
+        gap this leaves near the North Pole (this image's content
+        doesn't reach that far), which otherwise would have shown
+        whatever's behind the map (the widget's own dark background)
+        instead of more ocean."""
+        image = self._background_image
+        if (image.width(), image.height()) == _CALIBRATED_IMAGE_SIZE:
+            lat_top, lat_bottom = _CALIBRATED_LAT_TOP, _CALIBRATED_LAT_BOTTOM
+        else:
+            lat_top, lat_bottom = 90.0, -90.0
+        y0 = (90.0 - lat_top) / 180.0 * h
+        y1 = (90.0 - lat_bottom) / 180.0 * h
+        painter.fillRect(QRectF(0, 0, w, h), QColor(72, 114, 255))
+        painter.drawImage(QRectF(0, y0, w, y1 - y0), image)
 
     def set_satellite_mode(self, enabled):
         self._satellite_mode = enabled

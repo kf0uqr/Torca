@@ -334,18 +334,40 @@ class WorldMapWidget(QWidget):
         painter.drawLine(QPointF(w / 2, 0), QPointF(w / 2, h))
         painter.drawLine(QPointF(0, h / 2), QPointF(w, h / 2))
 
+        # Geographic overlays that make sense to zoom WITH the map --
+        # coverage circles and ground tracks are real areas/paths over
+        # the earth, same as the grid/terminator above.
+        if self._satellite_mode:
+            for sat in self._satellite_positions:
+                self._draw_satellite_footprint(painter, sat, w, h)
+            for sat in self._satellite_positions:
+                self._draw_satellite_path(painter, sat, w, h)
+
+        painter.restore()  # undo the zoom/pan transform
+
+        # Point markers and their text labels -- the sub-solar point,
+        # operator location, satellite markers/names, and QSO dots --
+        # are deliberately drawn AFTER restoring the zoom transform,
+        # at their correctly zoomed/panned SCREEN position (via
+        # _content_to_screen) but with a FIXED, unscaled size. Per
+        # explicit feedback: these ballooning to the same degree as the
+        # background map when zoomed in made them harder to read, not
+        # easier -- a location marker only needs to be "found", not
+        # "measured", so it doesn't need to get bigger just because the
+        # map under it did.
+
         # Sub-solar point (directly overhead sun).
         decl, sub_lon = _solar_subpoint(now)
-        sx = (sub_lon + 180) / 360.0 * w
-        sy = (90 - decl) / 180.0 * h
+        cx, cy = self._lonlat_to_xy(decl, sub_lon, w, h)
+        sx, sy = self._content_to_screen(cx, cy, w, h)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(255, 210, 60))
         painter.drawEllipse(QPointF(sx, sy), 5, 5)
 
         # Operator's own location, if set.
         if self._operator_lat is not None and self._operator_lon is not None:
-            ox = (self._operator_lon + 180) / 360.0 * w
-            oy = (90 - self._operator_lat) / 180.0 * h
+            cx, cy = self._lonlat_to_xy(self._operator_lat, self._operator_lon, w, h)
+            ox, oy = self._content_to_screen(cx, cy, w, h)
             painter.setPen(QPen(QColor(255, 255, 255), 2))
             painter.setBrush(QColor(255, 60, 60))
             painter.drawEllipse(QPointF(ox, oy), 5, 5)
@@ -355,26 +377,20 @@ class WorldMapWidget(QWidget):
 
         if self._satellite_mode:
             for sat in self._satellite_positions:
-                self._draw_satellite_footprint(painter, sat, w, h)
-            for sat in self._satellite_positions:
-                self._draw_satellite_path(painter, sat, w, h)
-            for sat in self._satellite_positions:
-                self._draw_satellite_marker(painter, sat, w, h)
+                cx, cy = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)
+                sx, sy = self._content_to_screen(cx, cy, w, h)
+                self._draw_satellite_marker(painter, sat, sx, sy)
 
         if self._qso_markers:
             painter.setPen(QPen(QColor(15, 15, 20), 1))
             painter.setBrush(QColor(80, 230, 130))
             for qso in self._qso_markers:
-                x, y = self._lonlat_to_xy(qso["lat"], qso["lon"], w, h)
-                painter.drawEllipse(QPointF(x, y), 3.5, 3.5)
-
-        painter.restore()  # undo the zoom/pan transform -- attribution text below stays fixed
+                cx, cy = self._lonlat_to_xy(qso["lat"], qso["lon"], w, h)
+                sx, sy = self._content_to_screen(cx, cy, w, h)
+                painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
 
         # Attribution for the background map image, if it loaded (CC BY
-        # 4.0 requires this). Deliberately drawn AFTER restoring the
-        # zoom transform (but still inside the map_rect clip/translate)
-        # so it stays a fixed corner label regardless of zoom/pan,
-        # rather than scaling/panning away with the map content.
+        # 4.0 requires this) -- fixed corner label regardless of zoom/pan.
         if self._background_image is not None:
             painter.setPen(QColor(200, 200, 200, 180))
             painter.drawText(QPointF(6, h - 6), WORLD_MAP_ATTRIBUTION)
@@ -421,6 +437,19 @@ class WorldMapWidget(QWidget):
         cx = (local.x() - w / 2.0) / self._zoom + w / 2.0 + self._pan_x
         cy = (local.y() - h / 2.0) / self._zoom + h / 2.0 + self._pan_y
         return QPointF(cx, cy), w, h
+
+    def _content_to_screen(self, cx, cy, w, h):
+        """Inverse of _widget_pos_to_content's math: converts a
+        content-space (unzoomed, _lonlat_to_xy) coordinate into where
+        it currently lands on screen (still in the map_rect's own
+        (0,0)-origin frame, i.e. the frame paintEvent is in right after
+        restoring the zoom transform). Used to position fixed-size
+        markers/labels at the correct zoomed/panned spot without
+        drawing them WITH the zoom scale active (which would also scale
+        their size -- see paintEvent's comment on why that's undesirable)."""
+        sx = w / 2.0 + (cx - (w / 2.0 + self._pan_x)) * self._zoom
+        sy = h / 2.0 + (cy - (h / 2.0 + self._pan_y)) * self._zoom
+        return sx, sy
 
     def _qso_marker_at(self, widget_pos):
         """Returns whichever QSO marker dict is under widget_pos
@@ -695,8 +724,11 @@ class WorldMapWidget(QWidget):
         painter.setBrush(QColor(255, 255, 255, 235) if active else QColor(255, 200, 120, 210))
         painter.drawPolygon(QPolygonF([tip, left, right]))
 
-    def _draw_satellite_marker(self, painter, sat, w, h):
-        x, y = self._lonlat_to_xy(sat["lat"], sat["lon"], w, h)
+    def _draw_satellite_marker(self, painter, sat, x, y):
+        """x, y: already-computed SCREEN-space position (see paintEvent
+        -- deliberately not content-space + w/h like the footprint/path
+        drawing methods, since this marker+label is drawn AFTER the
+        zoom transform is restored, at a fixed unscaled size)."""
         if sat.get("active"):
             painter.setPen(QPen(QColor(255, 255, 255, 220), 1))
             painter.setBrush(QColor(255, 230, 0))

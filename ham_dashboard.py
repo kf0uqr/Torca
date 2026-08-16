@@ -20,8 +20,11 @@ tells it. Double-clicking a satellite on the map (or a row in the
 upcoming-passes table) starts a session here directly -- no signal
 hop out to some other window needed, since this DOES own tracking now.
 
-Virtual Cables and rigctld are also both here, each with their own
-"which connected radio" target picker, rather than living on whichever
+Virtual Cables (its own dialog -- RX radio, TX radio, and RX Main/Sub/
+Both mix, independently chosen, since a "poor man's full duplex" setup
+may want to decode one radio's downlink while transmitting through a
+different uplink radio) and rigctld (its own "which connected radio"
+target picker) are also both here, rather than living on whichever
 RadioWindow happened to have the button -- makes sense once more than
 one radio can be connected. WSJT-X launching has no radio dependency
 at all and moved here too, for the same "one central place" reasoning.
@@ -38,6 +41,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
+    QFormLayout,
     QLabel,
     QPushButton,
     QMessageBox,
@@ -49,6 +53,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QSpinBox,
     QFileDialog,
+    QDialogButtonBox,
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
@@ -58,6 +63,23 @@ from connection_dialog import ConnectionDialog
 from main_window import RadioWindow
 from satellite_session import SatelliteSession
 from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
+from audio import (
+    pactl_available,
+    create_null_sink,
+    unload_pactl_module,
+    get_default_sink_name,
+    get_default_source_name,
+    set_default_sink,
+    set_default_source,
+    find_own_sink_input_ids,
+    find_own_source_output_ids,
+    move_sink_input,
+    move_source_output,
+    VIRTUAL_CABLE_RX_NAME,
+    VIRTUAL_CABLE_RX_DESC,
+    VIRTUAL_CABLE_TX_NAME,
+    VIRTUAL_CABLE_TX_DESC,
+)
 from constants import RADIO_ROLES
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
@@ -71,6 +93,84 @@ from satellite_tracking import (
     format_countdown,
     SGP4_AVAILABLE,
 )
+
+class VirtualCableDialog(QDialog):
+    """Lets the operator pick, independently, which connected radio's
+    audio feeds the RX virtual cable (what an external app like WSJT-X
+    hears) and which one the TX virtual cable drives (what it
+    transmits through) -- not necessarily the same radio, since a "poor
+    man's full duplex" setup might decode one radio's downlink while
+    transmitting through a separate uplink radio. Also picks the RX
+    mix (Main/Sub/Both) for whichever radio is chosen for RX. Doesn't
+    touch any audio/PulseAudio state itself -- just collects the choice
+    and hands it back via the result_*() methods; HamClockWindow's
+    _apply_virtual_cable_config() does the actual work."""
+
+    def __init__(self, connected_radios, current_rx_window, current_tx_window, current_channel, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Virtual Cables")
+
+        self.rx_combo = QComboBox()
+        self.rx_combo.addItem("None (no RX audio cable)", None)
+        self.tx_combo = QComboBox()
+        self.tx_combo.addItem("None (no TX audio cable)", None)
+        for window in connected_radios:
+            details = window._details
+            role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
+            connection_label = details.get("host") or details.get("serial_port") or "?"
+            label = f"{details['radio_model']} ({role_label}) -- {connection_label}"
+            self.rx_combo.addItem(label, window)
+            self.tx_combo.addItem(label, window)
+
+        rx_index = self.rx_combo.findData(current_rx_window)
+        if rx_index != -1:
+            self.rx_combo.setCurrentIndex(rx_index)
+        tx_index = self.tx_combo.findData(current_tx_window)
+        if tx_index != -1:
+            self.tx_combo.setCurrentIndex(tx_index)
+
+        self.channel_combo = QComboBox()
+        self.channel_combo.addItem("Both (Main + Sub mixed)", "mix")
+        self.channel_combo.addItem("Main only", "main")
+        self.channel_combo.addItem("Sub only", "sub")
+        self.channel_combo.setToolTip(
+            "Which receiver's audio goes to the RX cable -- only meaningful "
+            "when the RX radio above is dual-receiver; harmless no-op "
+            "otherwise."
+        )
+        channel_index = self.channel_combo.findData(current_channel)
+        if channel_index != -1:
+            self.channel_combo.setCurrentIndex(channel_index)
+
+        form = QFormLayout()
+        form.addRow("RX Radio (what you hear):", self.rx_combo)
+        form.addRow("TX Radio (what you transmit through):", self.tx_combo)
+        form.addRow("RX Audio Mix:", self.channel_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel(
+            "Creates virtual audio devices (Linux/PulseAudio or PipeWire only) "
+            "so an external app (WSJT-X, etc.) can send/receive audio through "
+            "the radios below. RX and TX can be different radios -- useful "
+            "for a separate uplink/downlink pair."
+        ))
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def result_rx_window(self):
+        return self.rx_combo.currentData()
+
+    def result_tx_window(self):
+        return self.tx_combo.currentData()
+
+    def result_channel(self):
+        return self.channel_combo.currentData()
+
 
 # Recomputing pass predictions (upcoming_passes) is real work -- SGP4
 # propagation across a multi-day search window for every selected
@@ -252,40 +352,32 @@ class HamClockWindow(QWidget):
         self.satellite_overlay_label.setWordWrap(True)
         self.satellite_overlay_label.setStyleSheet("color: #ccc; font-size: 12px;")
 
-        # ---- Virtual Cables (moved from RadioWindow -- now targets
-        # whichever connected radio is picked, since more than one can
-        # be connected at once) ----
-        self.virtual_cable_target_combo = QComboBox()
-        self.virtual_cable_target_combo.setToolTip("Which connected radio's audio to route through the virtual cables.")
-
-        self.virtual_cable_channel_combo = QComboBox()
-        self.virtual_cable_channel_combo.addItem("RX Cable: Mixed (Main + Sub)", "mix")
-        self.virtual_cable_channel_combo.addItem("RX Cable: Main only", "main")
-        self.virtual_cable_channel_combo.addItem("RX Cable: Sub only", "sub")
-        self.virtual_cable_channel_combo.setToolTip(
-            "Which receiver's audio goes to the RX virtual cable (e.g. for "
-            "WSJT-X digital-mode decoding on a satellite downlink) -- 'Sub "
-            "only' keeps Main's audio from bleeding into the decode. Only "
-            "meaningful for a dual-receiver target radio; harmless no-op "
-            "otherwise. Takes effect immediately, including while Virtual "
-            "Cables is already on."
-        )
-        self.virtual_cable_channel_combo.currentIndexChanged.connect(self._on_virtual_cable_channel_changed)
+        # ---- Virtual Cables (moved from RadioWindow -- opens a dialog
+        # to pick RX radio / TX radio (independently -- doesn't have to
+        # be the same one) / RX Main-Sub-Both mix, rather than living
+        # inline here, now that there are two radio choices plus the
+        # mix to make instead of just one target) ----
+        self._virtual_cable_rx_window = None
+        self._virtual_cable_tx_window = None
+        self._virtual_cable_channel = "mix"
+        self._virtual_cable_modules = None    # (rx_module_id, tx_module_id) while active
+        self._virtual_cable_previous_sink = None
+        self._virtual_cable_previous_source = None
+        self._virtual_cable_move_timer = None
+        self._virtual_cable_move_attempts = 0
+        self._virtual_cable_sink_input_ids = []
+        self._virtual_cable_source_output_ids = []
 
         self.virtual_cable_button = QPushButton("Virtual Cables: OFF")
-        self.virtual_cable_button.setCheckable(True)
         self.virtual_cable_button.setEnabled(False)
-        self.virtual_cable_button.setStyleSheet(
-            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
-        )
         self.virtual_cable_button.setToolTip(
-            "Creates two virtual audio devices (Linux/PulseAudio or PipeWire "
+            "Configure virtual audio devices (Linux/PulseAudio or PipeWire "
             "only) so an external app (WSJT-X, etc.) can send/receive audio "
-            "through the target radio's connection, in place of the physical "
-            "devices chosen for it in the connection dialog. Click again to "
-            "switch back to those original devices."
+            "through a connected radio's connection -- RX and TX can be "
+            "different radios, e.g. decoding one radio's downlink while "
+            "transmitting through a separate uplink radio."
         )
-        self.virtual_cable_button.toggled.connect(self._on_virtual_cable_toggled)
+        self.virtual_cable_button.clicked.connect(self._on_virtual_cable_button_clicked)
 
         # ---- Rigctld (moved from RadioWindow -- own target picker,
         # independent of Virtual Cables', since a real setup might want
@@ -328,15 +420,10 @@ class HamClockWindow(QWidget):
         rigctld_column.addWidget(self.rigctld_port_input)
         rigctld_column.addWidget(self.rigctld_button)
 
-        virtual_cable_column = QVBoxLayout()
-        virtual_cable_column.addWidget(self.virtual_cable_target_combo)
-        virtual_cable_column.addWidget(self.virtual_cable_channel_combo)
-        virtual_cable_column.addWidget(self.virtual_cable_button)
-
         external_apps_row = QHBoxLayout()
         external_apps_row.addWidget(self.wsjtx_button)
         external_apps_row.addLayout(rigctld_column)
-        external_apps_row.addLayout(virtual_cable_column)
+        external_apps_row.addWidget(self.virtual_cable_button)
         external_apps_row.addStretch()
 
         clocks_row = QHBoxLayout()
@@ -746,53 +833,188 @@ class HamClockWindow(QWidget):
             if item.data(Qt.UserRole) is window:
                 self.connected_radios_list.takeItem(row)
                 break
-        if self.virtual_cable_button.isChecked() and self.virtual_cable_target_combo.currentData() is window:
-            self.virtual_cable_button.setChecked(False)  # triggers _on_virtual_cable_toggled(False) on this still-alive window
+        if window is self._virtual_cable_rx_window or window is self._virtual_cable_tx_window:
+            # Reconfigure without the closing radio -- drops it from
+            # whichever side(s) it held; the OTHER side (if it's a
+            # different, still-open radio) keeps running.
+            new_rx = None if window is self._virtual_cable_rx_window else self._virtual_cable_rx_window
+            new_tx = None if window is self._virtual_cable_tx_window else self._virtual_cable_tx_window
+            self._apply_virtual_cable_config(new_rx, new_tx, self._virtual_cable_channel)
         if self.rigctld_button.isChecked() and self.rigctld_target_combo.currentData() is window:
             self.rigctld_button.setChecked(False)
         self._refresh_target_combos()
 
     def _refresh_target_combos(self):
-        for combo in (self.virtual_cable_target_combo, self.rigctld_target_combo):
-            previous = combo.currentData()
-            combo.blockSignals(True)
-            combo.clear()
-            for window in self._connected_radios:
-                details = window._details
-                role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
-                connection_label = details.get("host") or details.get("serial_port") or "?"
-                combo.addItem(f"{details['radio_model']} ({role_label}) -- {connection_label}", window)
-            if previous is not None:
-                index = combo.findData(previous)
-                if index != -1:
-                    combo.setCurrentIndex(index)
-            combo.blockSignals(False)
+        previous = self.rigctld_target_combo.currentData()
+        self.rigctld_target_combo.blockSignals(True)
+        self.rigctld_target_combo.clear()
+        for window in self._connected_radios:
+            details = window._details
+            role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
+            connection_label = details.get("host") or details.get("serial_port") or "?"
+            self.rigctld_target_combo.addItem(f"{details['radio_model']} ({role_label}) -- {connection_label}", window)
+        if previous is not None:
+            index = self.rigctld_target_combo.findData(previous)
+            if index != -1:
+                self.rigctld_target_combo.setCurrentIndex(index)
+        self.rigctld_target_combo.blockSignals(False)
         has_radios = bool(self._connected_radios)
         self.virtual_cable_button.setEnabled(has_radios)
         self.rigctld_button.setEnabled(has_radios)
 
     # ---- Virtual Cables ----
 
-    def _on_virtual_cable_toggled(self, checked):
-        window = self.virtual_cable_target_combo.currentData()
-        if window is None:
-            if checked:
-                self.virtual_cable_button.blockSignals(True)
-                self.virtual_cable_button.setChecked(False)
-                self.virtual_cable_button.blockSignals(False)
+    def _on_virtual_cable_button_clicked(self):
+        dialog = VirtualCableDialog(
+            self._connected_radios, self._virtual_cable_rx_window, self._virtual_cable_tx_window,
+            self._virtual_cable_channel, self,
+        )
+        if dialog.exec() != QDialog.Accepted:
             return
-        if checked:
-            self.virtual_cable_button.setText("Virtual Cables: ON")
-            window.worker.enable_virtual_cables()
-        else:
-            self.virtual_cable_button.setText("Virtual Cables: OFF")
-            window.worker.disable_virtual_cables()
-        self.virtual_cable_target_combo.setEnabled(not checked)
+        self._virtual_cable_channel = dialog.result_channel()
+        self._apply_virtual_cable_config(dialog.result_rx_window(), dialog.result_tx_window(), self._virtual_cable_channel)
 
-    def _on_virtual_cable_channel_changed(self, _index):
-        window = self.virtual_cable_target_combo.currentData()
-        if window is not None:
-            window.worker.set_rx_downmix_channel(self.virtual_cable_channel_combo.currentData())
+    def _apply_virtual_cable_config(self, rx_window, tx_window, channel):
+        """rx_window/tx_window are RadioWindow instances or None (no
+        cable that direction). Always fully tears down whatever was
+        previously configured first, rather than incrementally diffing
+        -- this is a deliberate, infrequent action (opening the dialog
+        and clicking OK, or a radio closing), not a hot path, and a full
+        reset is far simpler to reason about correctly than tracking
+        every possible from-state to-state transition (same radio for
+        both -> different radios, one side dropped, etc.)."""
+        self._teardown_virtual_cables()
+
+        if rx_window is None and tx_window is None:
+            self.virtual_cable_button.setText("Virtual Cables: OFF")
+            return
+
+        if not pactl_available():
+            QMessageBox.warning(
+                self, "Virtual Cables",
+                "Requires Linux with PulseAudio or PipeWire (pactl not found) "
+                "-- on Windows/macOS, install a virtual audio cable driver "
+                "like VB-CABLE or BlackHole instead, then select it directly "
+                "in each radio's own connection dialog."
+            )
+            return
+
+        try:
+            rx_module = create_null_sink(VIRTUAL_CABLE_RX_NAME, VIRTUAL_CABLE_RX_DESC)
+            tx_module = create_null_sink(VIRTUAL_CABLE_TX_NAME, VIRTUAL_CABLE_TX_DESC)
+        except Exception as exc:
+            QMessageBox.critical(self, "Virtual Cables", f"Couldn't create sinks ({exc}).")
+            return
+        self._virtual_cable_modules = (rx_module, tx_module)
+
+        # Same reasoning as the original per-worker implementation this
+        # replaced: redirect PulseAudio's own DEFAULT sink/source at the
+        # new cables (this PortAudio build doesn't expose each
+        # individually-named sink, only a generic "default" device) --
+        # done exactly ONCE here now, rather than per-worker, since two
+        # different radios' bridges may both be about to open against
+        # "system default" (RX radio's output, TX radio's input) and the
+        # null sinks themselves must only ever be created once.
+        self._virtual_cable_previous_sink = get_default_sink_name()
+        self._virtual_cable_previous_source = get_default_source_name()
+        set_default_sink(VIRTUAL_CABLE_RX_NAME)
+        set_default_source(f"{VIRTUAL_CABLE_TX_NAME}.monitor")
+
+        self._virtual_cable_rx_window = rx_window
+        self._virtual_cable_tx_window = tx_window
+        if rx_window is not None and rx_window is tx_window:
+            rx_window.worker.set_virtual_cable_bridge(rx=True, tx=True)
+        else:
+            if rx_window is not None:
+                rx_window.worker.set_virtual_cable_bridge(rx=True, tx=False)
+            if tx_window is not None:
+                tx_window.worker.set_virtual_cable_bridge(rx=False, tx=True)
+        if rx_window is not None:
+            rx_window.worker.set_rx_downmix_channel(channel)
+
+        # Confirmed by direct testing (same as the original per-worker
+        # implementation): changing PulseAudio's default sink/source
+        # doesn't retroactively redirect where an already-open stream
+        # connects -- what actually works is MOVING the stream once
+        # it's open. Non-blocking QTimer retry (not a blocking sleep
+        # loop) since this runs on the GUI thread now, not inside a
+        # worker's own asyncio loop -- freezing the whole app for up to
+        # ~2s while PulseAudio catches up would be a bad trade for what
+        # pactl itself does near-instantly once the stream exists.
+        self._virtual_cable_move_attempts = 0
+        self._virtual_cable_sink_input_ids = []
+        self._virtual_cable_source_output_ids = []
+        self._virtual_cable_move_timer = QTimer(self)
+        self._virtual_cable_move_timer.timeout.connect(self._try_move_virtual_cable_streams)
+        self._virtual_cable_move_timer.start(300)
+        self._try_move_virtual_cable_streams()  # also try immediately -- no need to wait a full 300ms for the first attempt
+
+        label_parts = []
+        if rx_window is not None:
+            label_parts.append(f"RX: {rx_window._details['radio_model']}")
+        if tx_window is not None:
+            label_parts.append(f"TX: {tx_window._details['radio_model']}")
+        self.virtual_cable_button.setText(f"Virtual Cables: ON ({', '.join(label_parts)})")
+
+    def _try_move_virtual_cable_streams(self):
+        my_pid = os.getpid()
+        needs_sink = self._virtual_cable_rx_window is not None
+        needs_source = self._virtual_cable_tx_window is not None
+        if needs_sink and not self._virtual_cable_sink_input_ids:
+            self._virtual_cable_sink_input_ids = find_own_sink_input_ids(my_pid)
+        if needs_source and not self._virtual_cable_source_output_ids:
+            self._virtual_cable_source_output_ids = find_own_source_output_ids(my_pid)
+        for sink_input_id in self._virtual_cable_sink_input_ids:
+            move_sink_input(sink_input_id, VIRTUAL_CABLE_RX_NAME)
+        for source_output_id in self._virtual_cable_source_output_ids:
+            move_source_output(source_output_id, f"{VIRTUAL_CABLE_TX_NAME}.monitor")
+
+        self._virtual_cable_move_attempts += 1
+        sink_done = not needs_sink or bool(self._virtual_cable_sink_input_ids)
+        source_done = not needs_source or bool(self._virtual_cable_source_output_ids)
+        if (sink_done and source_done) or self._virtual_cable_move_attempts >= 6:
+            if self._virtual_cable_move_timer is not None:
+                self._virtual_cable_move_timer.stop()
+                self._virtual_cable_move_timer = None
+            if not (sink_done and source_done):
+                missing = []
+                if not sink_done:
+                    missing.append("playback")
+                if not source_done:
+                    missing.append("recording")
+                print(
+                    f"[AUDIO] Virtual Cables: couldn't automatically find/move this "
+                    f"app's own {' and '.join(missing)} stream in PulseAudio -- you "
+                    "may need to reassign it manually in pavucontrol (Playback/"
+                    "Recording tabs)."
+                )
+
+    def _teardown_virtual_cables(self):
+        """Safe to call unconditionally, including when nothing is
+        currently configured (every guard below is a no-op against the
+        cleared-out init state)."""
+        if self._virtual_cable_move_timer is not None:
+            self._virtual_cable_move_timer.stop()
+            self._virtual_cable_move_timer = None
+
+        if self._virtual_cable_rx_window is not None:
+            self._virtual_cable_rx_window.worker.set_virtual_cable_bridge(rx=False, tx=False)
+        if self._virtual_cable_tx_window is not None and self._virtual_cable_tx_window is not self._virtual_cable_rx_window:
+            self._virtual_cable_tx_window.worker.set_virtual_cable_bridge(rx=False, tx=False)
+        self._virtual_cable_rx_window = None
+        self._virtual_cable_tx_window = None
+
+        if self._virtual_cable_previous_sink:
+            set_default_sink(self._virtual_cable_previous_sink)
+        if self._virtual_cable_previous_source:
+            set_default_source(self._virtual_cable_previous_source)
+        self._virtual_cable_previous_sink = None
+        self._virtual_cable_previous_source = None
+
+        if self._virtual_cable_modules:
+            for module_id in self._virtual_cable_modules:
+                unload_pactl_module(module_id)
+            self._virtual_cable_modules = None
 
     # ---- Rigctld ----
 
@@ -864,10 +1086,7 @@ class HamClockWindow(QWidget):
         self.satellite_session.stop()
         if self.rigctld_server is not None:
             self.rigctld_server.stop()
-        if self.virtual_cable_button.isChecked():
-            window = self.virtual_cable_target_combo.currentData()
-            if window is not None:
-                window.worker.disable_virtual_cables()  # best-effort; that window's own worker.stop() (below) may cut this off before it finishes
+        self._teardown_virtual_cables()  # best-effort; each affected window's own worker.stop() (below) may cut this off before it finishes
         for window in list(self._connected_radios):
             window.close()
         self._satellite_timer.stop()

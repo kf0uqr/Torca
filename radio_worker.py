@@ -10,7 +10,6 @@ import asyncio
 import copy
 import importlib
 import inspect
-import os
 
 from PySide6.QtCore import QThread, Signal
 
@@ -92,24 +91,7 @@ from constants import (
     AUDIO_DEVICE_SYSTEM_DEFAULT,
 )
 from rig_discovery import find_method_name
-from audio import (
-    AudioBridge,
-    pactl_available,
-    create_null_sink,
-    unload_pactl_module,
-    get_default_sink_name,
-    get_default_source_name,
-    set_default_sink,
-    set_default_source,
-    find_own_sink_input_ids,
-    find_own_source_output_ids,
-    move_sink_input,
-    move_source_output,
-    VIRTUAL_CABLE_RX_NAME,
-    VIRTUAL_CABLE_RX_DESC,
-    VIRTUAL_CABLE_TX_NAME,
-    VIRTUAL_CABLE_TX_DESC,
-)
+from audio import AudioBridge
 
 async def _try_recall_band_stack(radio, band_code, register=BAND_STACKING_REGISTER_LATEST):
     """Confirmed working: radio.get_bsr(band, register) (get_band_stack is
@@ -218,15 +200,23 @@ class RadioWorker(QThread):
         # preference for feeding an external decoder (e.g. WSJT-X on a
         # satellite downlink) something other than the full Main+Sub
         # mix, kept separate from this app's own listening audio, which
-        # always stays "mix" (see _setup_audio/_disable_virtual_cables,
-        # neither of which reads this). Persisted here rather than on
-        # the AudioBridge itself so the choice survives across
-        # enable/disable virtual-cables cycles, each of which replaces
-        # the AudioBridge instance entirely.
+        # always stays "mix" (see _setup_audio and
+        # _set_virtual_cable_bridge's rx/tx=False branch, neither of
+        # which reads this). Persisted here rather than on the
+        # AudioBridge itself so the choice survives across virtual-
+        # cable-bridge reconfiguration, which replaces the AudioBridge
+        # instance entirely.
         self._rx_downmix_channel = "mix"
-        self._virtual_cable_modules = None  # (rx_module_id, tx_module_id) while virtual cables are active
-        self._virtual_cable_previous_sink = None    # PulseAudio's default sink before enabling virtual cables
-        self._virtual_cable_previous_source = None  # PulseAudio's default source before enabling virtual cables
+        # True while this worker's own audio bridge is pointed at
+        # system-default devices for a virtual cable (RX and/or TX) --
+        # see set_virtual_cable_bridge. The null-sink pair itself, and
+        # PulseAudio's default sink/source, are no longer managed here
+        # at all -- HamClockWindow owns that now (satellite_session.py's
+        # sibling, ham_dashboard.py), since a virtual cable pairing can
+        # span two DIFFERENT radios (one for RX, one for TX) and the
+        # sinks must only ever be created once regardless of how many
+        # radios' bridges point at them.
+        self._virtual_cable_active = False
         self._meter_getters = {}  # meter_type -> resolved getter name, populated by _setup_meters()
         self._control_methods = {}  # control key -> (get_name, set_name), populated by _setup_controls()
         self._control_enums = {}    # control key -> resolved enum class, for controls needing enum_import
@@ -331,145 +321,66 @@ class RadioWorker(QThread):
 
     async def _set_rx_downmix_channel(self, channel: str):
         self._rx_downmix_channel = channel
-        if self._virtual_cable_modules is not None and self.audio_bridge is not None:
+        if self._virtual_cable_active and self.audio_bridge is not None:
             self.audio_bridge.set_rx_downmix_channel(channel)
 
-    def enable_virtual_cables(self):
-        """Thread-safe: call from the GUI thread. Creates two PulseAudio/
-        PipeWire null-sinks (see the module-level comment above
-        AudioBridge) and switches this app's own audio bridge to use
-        them instead of whatever devices were chosen in the connection
-        dialog, so an external app can send/receive audio through this
-        app's radio connection. Linux/PulseAudio-or-PipeWire only."""
+    def set_virtual_cable_bridge(self, rx: bool, tx: bool):
+        """Thread-safe: call from the GUI thread. Points this radio's
+        own audio bridge at system-default devices for RX and/or TX (or
+        restores the connection-dialog devices if both are False) --
+        the actual virtual-cable null sinks, PulseAudio default-sink/
+        source redirection, and moving this process's own PortAudio
+        streams onto them are no longer this worker's job at all.
+
+        That responsibility moved to HamClockWindow (ham_dashboard.py)
+        because a single virtual-cable pairing can now span TWO
+        different radios -- one feeding the RX cable, a different one
+        driven by the TX cable (e.g. decoding a downlink-only radio's
+        audio while transmitting through a separate uplink-only radio).
+        The null sinks must only ever be created ONCE regardless of how
+        many radios' bridges end up pointed at them; doing that
+        per-worker (the original design, back when only one radio was
+        ever virtual-cable-enabled at a time) would try to create the
+        same-named sink twice and collide.
+        """
         if self.loop is None:
             return
-        asyncio.run_coroutine_threadsafe(self._enable_virtual_cables(), self.loop)
+        asyncio.run_coroutine_threadsafe(self._set_virtual_cable_bridge(rx, tx), self.loop)
 
-    async def _enable_virtual_cables(self):
-        if not pactl_available():
-            self.error.emit(
-                "Virtual Cables: requires Linux with PulseAudio or PipeWire "
-                "(pactl not found) -- on Windows/macOS, install a virtual "
-                "audio cable driver like VB-CABLE or BlackHole instead, "
-                "then select it directly in the connection dialog."
-            )
-            return
-
-        try:
-            rx_module = create_null_sink(VIRTUAL_CABLE_RX_NAME, VIRTUAL_CABLE_RX_DESC)
-            tx_module = create_null_sink(VIRTUAL_CABLE_TX_NAME, VIRTUAL_CABLE_TX_DESC)
-        except Exception as exc:
-            self.error.emit(f"Virtual Cables: couldn't create sinks ({exc}).")
-            return
-        self._virtual_cable_modules = (rx_module, tx_module)
-
-        # Confirmed via two live tests: trying to get PortAudio to
-        # enumerate each new sink as its own separately-named device
-        # doesn't work on this system -- its PortAudio build appears to
-        # only expose a generic "default" device (the same one the
-        # normal, non-virtual RX stream already uses successfully). So
-        # instead of fighting that, redirect PulseAudio's own DEFAULT
-        # sink/source at the new cables, and just use PortAudio's
-        # "default" device (device=None, which sounddevice/PortAudio
-        # resolves to whatever the system default currently is) -- a
-        # mechanism already proven to work, rather than one that isn't.
-        self._virtual_cable_previous_sink = get_default_sink_name()
-        self._virtual_cable_previous_source = get_default_source_name()
-        set_default_sink(VIRTUAL_CABLE_RX_NAME)
-        set_default_source(f"{VIRTUAL_CABLE_TX_NAME}.monitor")
-
+    async def _set_virtual_cable_bridge(self, rx: bool, tx: bool):
         if self.audio_bridge is not None:
             await self.audio_bridge.stop()
 
-        self.audio_bridge = AudioBridge(
-            self.radio, self.loop,
-            input_device=AUDIO_DEVICE_SYSTEM_DEFAULT,
-            output_device=AUDIO_DEVICE_SYSTEM_DEFAULT,
-            status_callback=self.audio_status.emit,
-            rx_downmix_channel=self._rx_downmix_channel,
-        )
-        await self.audio_bridge.start()
-
-        # Confirmed by direct testing: changing PulseAudio's default
-        # sink/source doesn't retroactively (or even prospectively, for
-        # this app's stream specifically) redirect where our own already-
-        # open stream connects -- what actually worked, done manually via
-        # pavucontrol, was MOVING the already-open stream to the new
-        # sink/source. Doing that automatically here instead of relying
-        # on the default-redirection alone. Retries briefly since the
-        # stream may take a moment to register with PulseAudio after
-        # opening.
-        my_pid = os.getpid()
-        sink_input_ids = []
-        source_output_ids = []
-        for _attempt in range(6):
-            if not sink_input_ids:
-                sink_input_ids = find_own_sink_input_ids(my_pid)
-            if not source_output_ids:
-                source_output_ids = find_own_source_output_ids(my_pid)
-            if sink_input_ids and source_output_ids:
-                break
-            await asyncio.sleep(0.3)
-
-        for sink_input_id in sink_input_ids:
-            move_sink_input(sink_input_id, VIRTUAL_CABLE_RX_NAME)
-        for source_output_id in source_output_ids:
-            move_source_output(source_output_id, f"{VIRTUAL_CABLE_TX_NAME}.monitor")
-
-        if not sink_input_ids or not source_output_ids:
-            missing = []
-            if not sink_input_ids:
-                missing.append("playback")
-            if not source_output_ids:
-                missing.append("recording")
-            self.audio_status.emit(
-                f"Virtual Cables: couldn't automatically find/move this app's "
-                f"own {' and '.join(missing)} stream in PulseAudio -- you may "
-                "need to reassign it manually in pavucontrol (Playback/"
-                "Recording tabs), same as before."
-            )
-
-        self.audio_status.emit(
-            f"Virtual Cables active. In WSJT-X (or similar), set its input "
-            f"device to \"Monitor of {VIRTUAL_CABLE_RX_DESC}\" and its "
-            f"output device to \"{VIRTUAL_CABLE_TX_DESC}\"."
-        )
-
-    def disable_virtual_cables(self):
-        """Thread-safe: call from the GUI thread. Restores the audio
-        devices originally chosen in the connection dialog and tears
-        down the virtual sinks."""
-        if self.loop is None:
-            return
-        asyncio.run_coroutine_threadsafe(self._disable_virtual_cables(), self.loop)
-
-    async def _disable_virtual_cables(self):
-        if self.audio_bridge is not None:
-            await self.audio_bridge.stop()
-
-        if self._virtual_cable_previous_sink:
-            set_default_sink(self._virtual_cable_previous_sink)
-        if self._virtual_cable_previous_source:
-            set_default_source(self._virtual_cable_previous_source)
-        self._virtual_cable_previous_sink = None
-        self._virtual_cable_previous_source = None
-
-        if self._virtual_cable_modules:
-            for module_id in self._virtual_cable_modules:
-                unload_pactl_module(module_id)
-            self._virtual_cable_modules = None
-
-        input_device = self._details.get("audio_input_device")
-        output_device = self._details.get("audio_output_device")
-        if input_device or output_device:
+        if rx or tx:
+            # device=None (AUDIO_DEVICE_SYSTEM_DEFAULT resolves to
+            # PortAudio's "default" device) rather than trying to open
+            # the null-sink/its monitor by name -- confirmed via earlier
+            # live testing that this PortAudio build only exposes a
+            # generic "default" device, not each individually-named
+            # sink; HamClockWindow instead redirects PulseAudio's own
+            # system default at the cables and moves this stream onto
+            # them once opened.
             self.audio_bridge = AudioBridge(
-                self.radio, self.loop, input_device, output_device,
+                self.radio, self.loop,
+                input_device=AUDIO_DEVICE_SYSTEM_DEFAULT if tx else None,
+                output_device=AUDIO_DEVICE_SYSTEM_DEFAULT if rx else None,
                 status_callback=self.audio_status.emit,
+                rx_downmix_channel=self._rx_downmix_channel,
             )
             await self.audio_bridge.start()
+            self._virtual_cable_active = True
         else:
-            self.audio_bridge = None
-        self.audio_status.emit("Virtual Cables disabled -- restored original audio devices.")
+            input_device = self._details.get("audio_input_device")
+            output_device = self._details.get("audio_output_device")
+            if input_device or output_device:
+                self.audio_bridge = AudioBridge(
+                    self.radio, self.loop, input_device, output_device,
+                    status_callback=self.audio_status.emit,
+                )
+                await self.audio_bridge.start()
+            else:
+                self.audio_bridge = None
+            self._virtual_cable_active = False
 
     def start_ptt(self):
         """Thread-safe: call from the GUI thread on PTT button press.

@@ -883,12 +883,11 @@ class RadioWindow(QWidget):
         self._satellite_session.unregister(self)
         # Emitted BEFORE worker.stop() -- HamClockWindow's handler may
         # still need to call something on this worker (e.g.
-        # disable_virtual_cables(), if this radio was its target), which
-        # needs the worker's asyncio loop still alive to have any chance
-        # of actually running (best-effort either way -- worker.stop()
-        # right after this may still cut it off before it finishes,
-        # exactly as disable_virtual_cables() itself already
-        # acknowledges elsewhere).
+        # set_virtual_cable_bridge(False, False), if this radio was a
+        # Virtual Cables RX/TX target), which needs the worker's asyncio
+        # loop still alive to have any chance of actually running (best-
+        # effort either way -- worker.stop() right after this may still
+        # cut it off before it finishes).
         self.closed.emit(self)
         self.worker.stop()
         self.worker.wait(2000)  # give the polling loop a moment to exit cleanly

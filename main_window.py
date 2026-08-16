@@ -570,56 +570,59 @@ class RadioWindow(QWidget):
             else:
                 self.worker.stop_ptt()
         else:
-            # Same VFO A(RX)/B(TX) swap on Main for BOTH dual- and
-            # single-receiver radios -- confirmed live on a real 9700,
-            # with a controlled test that gave each VFO its own distinct
-            # mode to tell them apart directly, that PTT-driven
-            # transmission always follows Main's own current VFO A/B
-            # context and NEVER Sub, regardless of what's written to
-            # Sub's frequency/VFO slot. (The radio's own split feature
-            # doesn't need to be on for this at all -- this explicitly
-            # commands the VFO/frequency itself either way.) Sub carries
-            # the downlink, continuously re-tuned while receiving -- not
-            # touched at all during a transmission (the scope stays on
-            # it regardless, so it's still worth watching even though
-            # it's not being re-tuned) -- see apply_satellite_tick.
-            #
-            # A standalone "uplink"-role radio (is_dual_receiver False,
-            # receiver=None throughout) takes exactly this same single-
-            # receiver path -- it's already precisely what that role
-            # needs: VFO B on press, VFO A on release, no receiver
-            # concept at all.
-            target_vfo = "B" if checked else "A"
-            # Satellite mode, dual-receiver only: PTT also switches the
-            # active receiver -- Main for the transmission (so the
-            # tuning knob/AF/RF/squelch controls follow it, since Main
-            # is what's actually being adjusted while transmitting),
-            # back to Sub on release. Bundled into the same atomic
-            # worker call as the VFO retune and PTT keying (receiver
-            # param on start_ptt_after_vfo) rather than a separately-
-            # dispatched select_receiver(), for the same ordering
-            # reasons as everything else here. Never touches the scope
-            # -- that stays on Sub throughout a transmission so you can
-            # see yourself on the downlink while transmitting.
             receiver = None
             if self.worker.is_dual_receiver:
                 receiver = RECEIVER_MAIN if checked else RECEIVER_SUB
-            if checked:
-                self.worker.start_ptt_after_vfo(target_vfo, freq_hz, receiver, check_conflict=False)
-            elif self.worker.is_dual_receiver:
-                # Release, dual-receiver only: does NOT retune Main to
-                # VFO A/downlink_hz -- confirmed live on a real 9700,
-                # Main can't switch to a band Sub currently occupies,
-                # and Sub is sitting on exactly that downlink band
-                # continuously throughout the transmission
-                # (apply_satellite_tick never touches it during TX).
-                # Main just stays wherever the transmission left it (the
-                # uplink band, VFO B) until the next PTT press retunes it
-                # fresh -- nothing needs Main in between, since Sub is
-                # what's actually active/watched during RX.
-                self.worker.stop_ptt_and_select_receiver(receiver)
+
+            if self.worker.is_dual_receiver:
+                # Full-duplex (dual-receiver, e.g. 9700): per explicit
+                # instruction, after several rounds of live VFO/mode
+                # corruption on a real 9700 traced back to switching
+                # Main's VFO A<->B on every PTT press/release -- Main
+                # and Sub now both just stay on whichever VFO they
+                # already started the session on (VFO A, if the
+                # operator set it up that way, same as Sub already
+                # always does) and are retuned IN PLACE, never VFO-
+                # switched at all. Main has no real "idle" state to
+                # preserve separately anyway in this role (it's TX-only
+                # in full_duplex -- Sub handles all reception), so
+                # there's nothing lost by not having a separate VFO
+                # "slot" for the uplink versus wherever it's sitting
+                # between transmissions.
+                #
+                # PTT also switches the active receiver -- Main for the
+                # transmission (so the tuning knob/AF/RF/squelch
+                # controls follow it), back to Sub on release. Bundled
+                # into the same atomic worker call as the retune and
+                # PTT keying, same ordering reasoning as everywhere else
+                # here. Never touches the scope -- that stays on Sub
+                # throughout a transmission so you can see yourself on
+                # the downlink while transmitting.
+                if checked:
+                    self.worker.start_ptt_with_frequency(freq_hz, receiver)
+                else:
+                    # Release: does NOT retune Main to the downlink
+                    # frequency -- Sub is sitting on exactly that
+                    # frequency continuously throughout the transmission
+                    # (apply_satellite_tick never touches it during TX).
+                    # Main just stays wherever the transmission left it
+                    # until the next PTT press retunes it fresh --
+                    # nothing needs Main in between, since Sub is what's
+                    # actually active/watched during RX.
+                    self.worker.stop_ptt_and_select_receiver(receiver)
             else:
-                self.worker.stop_ptt_then_vfo(target_vfo, freq_hz)
+                # Standalone single-receiver "uplink" role (receiver=
+                # None throughout) -- unchanged, still uses VFO A(idle)/
+                # B(TX) to represent the two states; the Main/Sub VFO-
+                # switching removal above is specific to the dual-
+                # receiver case only, not part of what was reported
+                # broken.
+                target_vfo = "B" if checked else "A"
+                if checked:
+                    self.worker.start_ptt_after_vfo(target_vfo, freq_hz, receiver, check_conflict=False)
+                else:
+                    self.worker.stop_ptt_then_vfo(target_vfo, freq_hz)
+
             if receiver is not None:
                 self._update_active_receiver_ui(receiver)
             self._current_freq_hz = freq_hz
@@ -666,40 +669,16 @@ class RadioWindow(QWidget):
             if transmitting:
                 freq_hz = uplink_hz
                 if freq_hz is not None:
-                    # Reported live on a real 9700, three rounds:
-                    # (1) mode drifting and both Main AND Sub ending up
-                    # on VFO B -- select_vfo_and_set_frequency() had no
-                    # receiver targeting at all, unlike every other
-                    # dual-receiver operation here;
-                    # (2) switching to select_receiver_vfo_and_set_
-                    # frequency() (properly receiver-scoped) still
-                    # corrupted Sub's correctly-tracking downlink down
-                    # to a band's raw low edge -- that primitive
-                    # internally re-runs _resolve_receiver_band_conflict
-                    # every tick, a live read of Sub's own frequency
-                    # that appears to become unreliable while actively
-                    # transmitting, occasionally misreading Sub as
-                    # sharing Main's band and forcibly relocating it;
-                    # (3) skipping that repeated full selection in favor
-                    # of a bare set_receiver_frequency() on later ticks
-                    # (mirroring _sub_vfo_a_selected's own pattern) then
-                    # let Main itself drift back to VFO A -- confirmed
-                    # live -- because that call explicitly does NOT
-                    # touch which VFO slot is selected (see its own
-                    # docstring; it exists for Sub's continuous-
-                    # downlink case, which never needs a VFO change at
-                    # all once selected).
-                    #
-                    # So Main genuinely needs reselect-receiver +
-                    # reselect-VFO-B + set-frequency EVERY tick -- just
-                    # never the conflict check, which is only truly
-                    # needed once, at the moment of switching bands
-                    # (start_ptt_after_vfo, at PTT-press time).
-                    # check_conflict=False gets exactly that: every
-                    # other part of the bundle still runs every time.
-                    self.worker.select_receiver_vfo_and_set_frequency(
-                        RECEIVER_MAIN, freq_hz, vfo_slot="B", check_conflict=False
-                    )
+                    # Per explicit instruction, after several rounds of
+                    # live VFO/mode corruption traced back to switching
+                    # Main's VFO A<->B at all: Main now just stays on
+                    # whichever VFO it started the session on (same as
+                    # Sub already always does) and gets retuned in
+                    # place -- set_receiver_frequency reselects Main as
+                    # active (necessary for reliability -- see its own
+                    # docstring) and writes the frequency directly, no
+                    # VFO-slot switching and no conflict check.
+                    self.worker.set_receiver_frequency(RECEIVER_MAIN, freq_hz)
             else:
                 freq_hz = downlink_hz
                 if freq_hz is not None:
@@ -765,7 +744,7 @@ class RadioWindow(QWidget):
                 self.worker.set_control_value("mode", downlink_mode_value)
             if uplink_mode_value is not None:
                 self.worker.set_receiver_control_value(
-                    RECEIVER_MAIN, "mode", uplink_mode_value, restore=False, vfo_slot="B"
+                    RECEIVER_MAIN, "mode", uplink_mode_value, restore=False
                 )
         elif self._role == "downlink":
             if downlink_mode_value is not None:

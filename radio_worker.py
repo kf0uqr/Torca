@@ -1724,6 +1724,40 @@ class RadioWorker(QThread):
             )
         await self._start_ptt()
 
+    def start_ptt_with_frequency(self, freq_hz: int, receiver: int = None):
+        """Thread-safe: call from the GUI thread. Selects `receiver`
+        (if given) as active, retunes its CURRENT VFO -- whichever one
+        it already has selected, no VFO A/B switching at all -- THEN
+        keys PTT, all as one atomic coroutine (same ordering-guarantee
+        reasoning as start_ptt_after_vfo).
+
+        Per explicit instruction, this replaces start_ptt_after_vfo for
+        full-duplex satellite PTT (main_window.py's _on_ptt_toggled,
+        dual-receiver branch only -- the standalone single-receiver
+        "uplink" role still uses start_ptt_after_vfo/VFO A-B switching
+        unchanged): after several rounds of live VFO-slot and mode
+        corruption on a real 9700, traced to switching Main's VFO A<->B
+        on every PTT press/release, the simplest fix is to just not do
+        that at all -- Main (like Sub already does) stays on whichever
+        VFO it started the session on and gets retuned in place. Main
+        has no real "idle" state to preserve separately in this role
+        anyway (it's TX-only in full_duplex -- Sub handles all
+        reception), so nothing is lost by not having a distinct VFO
+        "slot" for the uplink."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._start_ptt_with_frequency(freq_hz, receiver), self.loop)
+
+    async def _start_ptt_with_frequency(self, freq_hz: int, receiver: int = None):
+        if receiver is not None:
+            try:
+                await self.radio.select_receiver(receiver)
+                self._active_receiver = receiver
+            except Exception as exc:
+                self.error.emit(f"Select active receiver ({receiver}) failed: {exc}")
+        await self._set_frequency(freq_hz, check_conflict=False)
+        await self._start_ptt()
+
     def stop_ptt_then_vfo(self, vfo_value, freq_hz: int):
         """Thread-safe: call from the GUI thread. The release-side
         counterpart to start_ptt_after_vfo() -- stops transmitting

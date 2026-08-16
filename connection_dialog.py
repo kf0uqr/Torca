@@ -105,16 +105,15 @@ def allowed_satellite_roles(active_roles):
 
     A satellite pass only makes sense driven one of two ways at a
     time: one Full Duplex radio, or one Downlink + one Uplink pair --
-    never a mix, and never a duplicate of either half of the pair.
-    "Non-Sat" is always available regardless, since it doesn't
-    participate in satellite tracking at all.
+    never a mix, never a duplicate of either half of the pair, and
+    never a second Full Duplex radio once one is already handling
+    both directions -- there's no scenario needing more than one
+    transmit/receive slot for satellite work at a time. "Non-Sat" is
+    always available regardless, since it doesn't participate in
+    satellite tracking at all.
     """
     if "full_duplex" in active_roles:
-        # A second Full Duplex radio is still fine (e.g. two
-        # independent full-duplex-capable radios each running their
-        # own pass) -- but Downlink/Uplink no longer make sense once
-        # a Full Duplex radio is already handling both directions.
-        return {"full_duplex", "non_sat"}
+        return {"non_sat"}
     if "downlink" in active_roles and "uplink" in active_roles:
         # The pair is already complete.
         return {"non_sat"}

@@ -715,29 +715,42 @@ class RadioWindow(QWidget):
         "full_duplex": downlink mode applied via set_control_value
         (targets whichever receiver is currently active -- Sub, since
         that's who's listening). Uplink mode applied to Main
-        specifically via set_receiver_control_value, mirroring the
-        downlink mode -- deliberately NOT preferring the transponder's
-        own recorded uplink_mode field (an inverting-transponder-aware
-        design, e.g. AO-7's real LSB-up/USB-down): per explicit
-        instruction, that field is empty for every stored satellite in
-        practice, so preferring it just meant Main's mode never got set
-        for anything except FM transponders (uplink_mode absent AND
-        downlink mode not FM/WFM left Main untouched). Uplink and
-        downlink are now always set to the same mode.
+        specifically via set_receiver_control_value -- deliberately NOT
+        preferring the transponder's own recorded uplink_mode field (an
+        inverting-transponder-aware design, e.g. AO-7's real LSB-up/
+        USB-down): per explicit instruction, that field is empty for
+        every stored satellite in practice, so preferring it just meant
+        Main's mode never got set for anything except FM transponders
+        (uplink_mode absent AND downlink mode not FM/WFM left Main
+        untouched). Uplink mirrors the downlink mode, EXCEPT for a
+        transponder with invert=True and a downlink mode of USB or LSB
+        -- inverting linear transponders (e.g. AO-7's Mode U/V, RS-44's
+        Mode V/u) swap sideband between uplink and downlink, so
+        transmitting the same sideband as the downlink would actually
+        come out backwards on the far end. invert IS reliably populated
+        by SatNOGS (unlike uplink_mode), so it's used instead. Only
+        applies to USB/LSB -- there's no equivalent "inverted" concept
+        asked for here for FM/CW/etc., so every other mode still just
+        mirrors the downlink as before.
 
         "downlink": downlink mode only, via set_control_value (this
         radio has no Main to speak of).
 
-        "uplink": same mirrored mode as full_duplex's Main half,
-        applied via the plain (non-receiver-specific) set_control_value
-        -- this radio has no Sub/downlink concept, so there's no
-        separate "which receiver" question here at all."""
+        "uplink": same mirrored/inverted mode as full_duplex's Main
+        half, applied via the plain (non-receiver-specific)
+        set_control_value -- this radio has no Sub/downlink concept, so
+        there's no separate "which receiver" question here at all."""
         if transponder is None or not self.worker.is_connected():
             return
         if "mode" not in self.control_widgets:
             return
         downlink_mode_value = radio_mode_for_transponder(transponder.get("mode"))
         uplink_mode_value = downlink_mode_value
+        if transponder.get("invert"):
+            if downlink_mode_value == "USB":
+                uplink_mode_value = "LSB"
+            elif downlink_mode_value == "LSB":
+                uplink_mode_value = "USB"
 
         if self._role == "full_duplex":
             if downlink_mode_value is not None:

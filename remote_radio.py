@@ -46,15 +46,16 @@ needed to test this):
   get_af_level()/etc already return (confirmed live) -- no unit
   conversion needed between a remote and a local connection.
 
-Not yet implemented (see the plan's phasing -- this file covers
-control/state only so far): scope (`/api/v1/scope`) and audio
-(`/api/v1/audio`). `isinstance(remote_radio, ScopeCapable)` /
-`isinstance(remote_radio, AudioTransport)` are both `@runtime_checkable`
-Protocols (confirmed by reading rigplane/core/radio_protocol.py) --
-purely structural, satisfied by which methods a class defines, no
-registration needed -- so those capabilities will "turn on" for
-radio_worker.py automatically the moment their methods are added here,
-with no changes needed on radio_worker.py's side.
+Scope (`/api/v1/scope`) is implemented. Audio (`/api/v1/audio`) is not
+yet (see the plan's phasing). `isinstance(remote_radio, AudioTransport)`
+is a `@runtime_checkable` Protocol (confirmed by reading
+rigplane/core/radio_protocol.py) -- purely structural, satisfied by
+which methods a class defines, no registration needed -- so that
+capability will "turn on" for radio_worker.py automatically the moment
+its methods are added here, with no changes needed on radio_worker.py's
+side. (Scope itself isn't gated by an isinstance() check at all --
+radio_worker.py just calls enable_scope() in a try/except -- so no
+Protocol conformance was needed for it to "turn on".)
 """
 
 import asyncio
@@ -63,6 +64,7 @@ import json
 import os
 import struct
 
+from rigplane.scope import ScopeFrame
 from rigplane.web._delta_encoder import apply_delta
 
 _WS_OP_TEXT = 0x1
@@ -72,6 +74,14 @@ _WS_OP_PING = 0x9
 _WS_OP_PONG = 0xA
 
 _DEFAULT_COMMAND_TIMEOUT = 5.0
+
+# Scope binary frame header, confirmed from rigplane.web.protocol.encode_scope_frame
+# (there's no decode counterpart there -- server only ever encodes -- so this
+# mirrors that function's layout by hand): msg_type(1) + receiver(1) + mode(1)
+# + start_freq_hz(u32 LE) + end_freq_hz(u32 LE) + sequence(u16 LE) + flags(1)
+# + pixel_count(u16 LE), then pixel_count pixel bytes.
+_SCOPE_MSG_TYPE = 0x01
+_SCOPE_HEADER_SIZE = 16
 
 
 class RemoteRadioError(RuntimeError):
@@ -238,6 +248,9 @@ class RemoteWebRadio:
         self._radio_model = "Remote Radio"
         self._pending_commands: dict = {}
         self._next_command_id = 0
+        self._scope_ws = None
+        self._scope_reader_task = None
+        self._scope_callback = None
 
     # ---- Async context manager (Radio protocol lifecycle) ------------
 
@@ -271,6 +284,7 @@ class RemoteWebRadio:
             await self.__aenter__()
 
     async def disconnect(self) -> None:
+        await self.disable_scope()
         if self._control_reader_task is not None:
             self._control_reader_task.cancel()
             try:
@@ -481,3 +495,105 @@ class RemoteWebRadio:
     get_nb, set_nb = _level_property("set_nb", ("nb",), param_name="on")
     get_nr, set_nr = _level_property("set_nr", ("nr",), param_name="on")
     get_agc, set_agc = _level_property("set_agc", ("agc",), param_name="value")
+
+    # ---- Scope (spectrum/waterfall) ----------------------------------------
+    # Only the methods radio_worker.py actually calls (grepped directly,
+    # not the full rigplane ScopeCapable Protocol surface -- radio_worker.py
+    # calls these unconditionally in a try/except rather than gating behind
+    # an isinstance() check, so nothing else needs to structurally match).
+    #
+    # Scope frames arrive unsolicited on their own WS channel (/api/v1/scope)
+    # once opened -- confirmed by reading web/handlers/scope.py: the server
+    # auto-enables the radio's scope the moment a client connects
+    # (ScopeHandler.run -> server.ensure_scope_enabled), no control message
+    # needed. There's no decode counterpart to protocol.py's
+    # encode_scope_frame in rigplane itself (only the server-side encoder
+    # exists -- its only client is the bundled browser SPA, which decodes
+    # in JS), so the 16-byte header is unpacked here by hand, mirroring
+    # encode_scope_frame's own layout byte-for-byte.
+
+    def on_scope_data(self, callback) -> None:
+        self._scope_callback = callback
+
+    async def enable_scope(self, **kwargs) -> None:
+        if self._scope_ws is not None:
+            return
+        self._scope_ws = await _WebSocketClient.connect(self._host, self._port, "/api/v1/scope", token=self._token)
+        self._scope_reader_task = asyncio.ensure_future(self._scope_reader_loop())
+
+    async def disable_scope(self) -> None:
+        if self._scope_reader_task is not None:
+            self._scope_reader_task.cancel()
+            try:
+                await self._scope_reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._scope_reader_task = None
+        if self._scope_ws is not None:
+            await self._scope_ws.close()
+            self._scope_ws = None
+
+    async def _scope_reader_loop(self) -> None:
+        try:
+            while True:
+                opcode, payload = await self._scope_ws.recv()
+                if opcode != _WS_OP_BINARY or len(payload) < _SCOPE_HEADER_SIZE:
+                    continue
+                if payload[0] != _SCOPE_MSG_TYPE:
+                    continue
+                receiver, mode = payload[1], payload[2]
+                start_hz, end_hz = struct.unpack_from("<II", payload, 3)
+                flags = payload[13]
+                pixel_count = struct.unpack_from("<H", payload, 14)[0]
+                pixels = payload[_SCOPE_HEADER_SIZE:_SCOPE_HEADER_SIZE + pixel_count]
+                frame = ScopeFrame(
+                    receiver=receiver,
+                    mode=mode,
+                    start_freq_hz=start_hz,
+                    end_freq_hz=end_hz,
+                    pixels=pixels,
+                    out_of_range=bool(flags & 0x01),
+                )
+                if self._scope_callback is not None:
+                    self._scope_callback(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Scope channel died -- same "let the next real call fail
+            # naturally" approach as _control_reader_loop above.
+            pass
+
+    async def get_scope_span(self) -> int:
+        return int(self._state.get("scopeControls", {}).get("span", 0))
+
+    async def set_scope_span(self, span_index: int) -> None:
+        await self._send_command("set_scope_span", {"span": span_index})
+        self._state.setdefault("scopeControls", {})["span"] = span_index
+
+    async def get_scope_ref(self) -> float:
+        return float(self._state.get("scopeControls", {}).get("refDb", 0.0))
+
+    async def set_scope_ref(self, ref_db: float) -> None:
+        # The web command's "ref" param is an int (confirmed via
+        # web/handlers/control.py: `ref = int(params["ref"])`) -- half-dB
+        # precision is lost going through the remote API even though a
+        # local connection supports 0.5 dB steps. A rigplane server-side
+        # limitation, not something to work around here.
+        ref_int = int(round(ref_db))
+        await self._send_command("set_scope_ref", {"ref": ref_int})
+        self._state.setdefault("scopeControls", {})["refDb"] = float(ref_int)
+
+    async def get_scope_speed(self) -> int:
+        return int(self._state.get("scopeControls", {}).get("speed", 0))
+
+    async def set_scope_speed(self, speed_index: int) -> None:
+        await self._send_command("set_scope_speed", {"speed": speed_index})
+        self._state.setdefault("scopeControls", {})["speed"] = speed_index
+
+    async def set_scope_receiver(self, receiver: int) -> None:
+        # Command name is "switch_scope_receiver", NOT "set_scope_receiver"
+        # -- confirmed directly from web/handlers/control.py's command
+        # whitelist; every other scope setter here does follow the
+        # set_<field> pattern, this one just doesn't.
+        await self._send_command("switch_scope_receiver", {"receiver": receiver})
+        self._state.setdefault("scopeControls", {})["receiver"] = receiver

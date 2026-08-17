@@ -232,21 +232,6 @@ LEVEL_DEFINITIONS = {
         "getter_candidates": ["get_squelch"],
         "setter_candidates": ["set_squelch"],
     },
-    "monitor": {
-        "label": "Monitor",
-        # MONI: lets you hear your own transmitted audio through the
-        # speaker, for checking audio quality/compression while
-        # transmitting. get_monitor_gain/set_monitor_gain (the actual
-        # 0-255 level) confirmed present via a dir(radio) scan -- no
-        # get_monitor/set_monitor fallback: reading rigplane's own
-        # source (core/radio_protocol.py) confirms those are a
-        # DIFFERENT, boolean on/off toggle for the feature itself, not
-        # a level at all, so falling back to them here would silently
-        # misinterpret a True/False as a 0-255 gain value on any radio
-        # lacking get_monitor_gain specifically.
-        "getter_candidates": ["get_monitor_gain"],
-        "setter_candidates": ["set_monitor_gain"],
-    },
     "tx_level": {
         "label": "TX Level",
         # get_power/set_power confirmed (via the Power Output meter fix
@@ -281,11 +266,11 @@ LEVEL_DEFINITIONS = {
 # there's only one slider per key (main_window.py), not a separate
 # Main/Sub pair -- its label gets a live "(Sub)" suffix whenever the
 # active receiver isn't Main, via active_receiver_button, so it's clear
-# which receiver it's actually affecting at any given moment. "monitor"
-# (TX sidetone level) and "tx_level" (TX power) aren't receiver RX
-# settings at all -- only Main ever transmits (confirmed live: PTT
-# always transmits from Main on a 9700/7610, a hardware limitation, not
-# something these settings could route around either).
+# which receiver it's actually affecting at any given moment. "tx_level"
+# (TX power) isn't a receiver RX setting at all -- only Main ever
+# transmits (confirmed live: PTT always transmits from Main on a
+# 9700/7610, a hardware limitation, not something this setting could
+# route around either).
 DUAL_RECEIVER_LEVEL_KEYS = {"af_gain", "squelch", "rf_level"}
 
 # get_s_meter() returns a raw 0-255 value over CI-V (confirmed against

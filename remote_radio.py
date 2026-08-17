@@ -562,44 +562,33 @@ class RemoteWebRadio:
     # three are hand-written below rather than using _level_property.
     get_nr_level, set_nr_level = _level_property("set_nr_level", ("nrLevel",))
     get_nb_level, set_nb_level = _level_property("set_nb_level", ("nbLevel",))
-    # These two ARE real LEVEL_DEFINITIONS entries radio_worker.py actually
-    # calls ("monitor" and "tx_level") -- unlike the five above, these were
-    # simply never implemented at all in Phase 1, a second, independent gap
-    # alongside the isinstance(LevelsCapable) one.
+    # This IS a real LEVEL_DEFINITIONS entry radio_worker.py actually
+    # calls ("tx_level") -- unlike the five above, it was simply never
+    # implemented at all in Phase 1, a second, independent gap alongside
+    # the isinstance(LevelsCapable) one. (Monitor -- get_monitor_gain/
+    # set_monitor_gain -- was implemented too but later removed from
+    # LEVEL_DEFINITIONS entirely; no longer needed here.)
     #
     # NOT built with _level_property, unlike every other entry in this
-    # block: monitorGain/powerLevel are TOP-LEVEL state fields (alongside
-    # cwPitch/keySpeed -- confirmed via web/state_schema.py), not nested
-    # under state["main"]/["sub"] the way afLevel/rfGain/squelch/nrLevel/
+    # block: powerLevel is a TOP-LEVEL state field (alongside cwPitch/
+    # keySpeed -- confirmed via web/state_schema.py), not nested under
+    # state["main"]/["sub"] the way afLevel/rfGain/squelch/nrLevel/
     # nbLevel genuinely are. _level_property's getter/setter always reads
-    # and writes under a receiver branch, so using it here was a real bug
-    # (confirmed live): the optimistic-cache read-after-write in a quick
-    # test stayed self-consistent (wrong location, but the same wrong
-    # location for both get and set), masking that the real server-pushed
-    # state_update -- which correctly lands these at the top level -- was
-    # never actually being read from, making the poll loop's getter call
-    # return None every single cycle and crash _normalize_level_value's
-    # float(None). Hand-written the same way as mic_gain/drive_gain/
-    # compressor_level above, which don't have this bug for the same
-    # reason: they were never run through _level_property in the first
-    # place. monitorGain's web state field is a raw 0-255 int (not
-    # normalized, per LevelsCapable's own get_monitor_gain docstring) and
-    # powerLevel is a float -- doesn't matter which scale either uses:
-    # radio_worker.py's own _normalize_level_value already auto-detects
-    # raw-vs-normalized on the way in, and the server's
-    # _normalized_or_raw_level does the same on the way out.
-
-    async def get_monitor_gain(self) -> int:
-        return int(self._state.get("monitorGain", 0))
-
-    async def set_monitor_gain(self, level) -> None:
-        # Skip the optimistic write on a throttled ack -- see
-        # _level_property's setter for the full explanation (same
-        # server-side rate limiter, same silent-drop-but-ok:true shape).
-        result = await self._send_command("set_monitor_gain", {"level": level})
-        if result.get("throttled"):
-            return
-        self._state["monitorGain"] = level
+    # and writes under a receiver branch, so using it here would repeat
+    # the exact bug monitorGain had (confirmed live before its removal):
+    # the optimistic-cache read-after-write in a quick test stayed self-
+    # consistent (wrong location, but the same wrong location for both
+    # get and set), masking that the real server-pushed state_update --
+    # which correctly lands these at the top level -- was never actually
+    # being read from, making the poll loop's getter call return None
+    # every single cycle and crash _normalize_level_value's float(None).
+    # Hand-written the same way as mic_gain/drive_gain/compressor_level
+    # above, which don't have this bug for the same reason: they were
+    # never run through _level_property in the first place. powerLevel
+    # is a float -- doesn't matter which scale it uses: radio_worker.py's
+    # own _normalize_level_value already auto-detects raw-vs-normalized
+    # on the way in, and the server's _normalized_or_raw_level does the
+    # same on the way out.
 
     async def get_power(self):
         return self._state.get("powerLevel", 0.0)

@@ -271,7 +271,7 @@ class RadioWindow(QWidget):
 
         self.status_label = QLabel("Connecting...")
 
-        # AF Gain/Squelch/Monitor/TX Level/RF Level -- built generically
+        # AF Gain/Squelch/TX Level/RF Level -- built generically
         # from LEVEL_DEFINITIONS, all disabled until _on_connected().
         #
         # On a dual-receiver radio, AF Gain/Squelch/RF Level (the

@@ -40,7 +40,7 @@ import subprocess
 import sys
 
 APP_DIR = pathlib.Path(__file__).resolve().parent
-GITHUB_REPO_URL = "https://github.com/kf0uqr/irc.git"
+GITHUB_REPO_URL = "https://github.com/kf0uqr/Torca.git"
 GITHUB_BRANCH = "main"
 UPDATE_CACHE_DIR = pathlib.Path.home() / ".icom_radio_app_cache" / "torca-src"
 

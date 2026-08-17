@@ -29,8 +29,8 @@ Also included:
 ### System-wide (Linux)
 
 ```bash
-git clone https://github.com/kf0uqr/irc.git
-cd irc
+git clone https://github.com/kf0uqr/Torca.git
+cd Torca
 sudo ./install.sh
 ```
 
@@ -40,8 +40,8 @@ Installs the app and its own Python virtual environment to `/opt/torca`, and add
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/kf0uqr/irc.git
-cd irc
+git clone https://github.com/kf0uqr/Torca.git
+cd Torca
 
 # 2. Create and activate a virtual environment
 python3 -m venv venv
@@ -120,3 +120,7 @@ Roughly every 5 seconds per receiver, the radio's display may briefly flash to V
 | `ham_dashboard.py` | `HamClockWindow`, ties the above three together |
 | `main_window.py` | `RadioWindow`, the main application window |
 | `theme.py` | Dark theme applied to the whole app |
+
+## License
+
+[MIT](LICENSE)

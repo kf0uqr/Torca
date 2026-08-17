@@ -61,7 +61,7 @@ class RadioWindow(QWidget):
             self._connection_label = f"{details['remote_host']}:{details['remote_port']} (Remote Server)"
         else:
             self._connection_label = f"{details['serial_port']} (USB)"
-        self.setWindowTitle(f"Icom Radio Control -- {details['radio_model']}")
+        self.setWindowTitle(f"TORCA -- {details['radio_model']}")
 
         self.freq_display = QLabel("-- MHz")
         self.freq_display.setStyleSheet(

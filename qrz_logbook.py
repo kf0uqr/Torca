@@ -27,7 +27,7 @@ QRZ_LOGBOOK_API_URL = "https://logbook.qrz.com/api"
 # QRZ requires an identifiable User-Agent -- "ApplicationName/version.number",
 # max 128 chars -- confirmed via their own docs; a generic/default urllib
 # user agent risks rate limiting.
-_USER_AGENT = "Radione/1.0"
+_USER_AGENT = "TORCA/1.0"
 
 
 class QrzApiError(Exception):

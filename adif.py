@@ -101,9 +101,9 @@ def parse_adif_records(text: str) -> list:
 # qsolog.adi a genuinely conventional, portable ADIF file that imports
 # cleanly into other loggers, not just something this app itself reads.
 ADIF_HEADER = (
-    "Radione QSO Log\n"
+    "TORCA QSO Log\n"
     "<adif_ver:5>3.1.4\n"
-    "<programid:7>Radione\n"
+    "<programid:5>TORCA\n"
     "<eoh>\n\n"
 )
 

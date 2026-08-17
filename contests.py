@@ -35,7 +35,7 @@ CONTEST_CALENDAR_ICS_URL = (
 
 # Same identifying-User-Agent convention used for every other external
 # fetch in this app.
-_USER_AGENT = "Radione/1.0 (desktop ham radio control application)"
+_USER_AGENT = "TORCA/1.0 (desktop ham radio control application)"
 
 
 def _unfold_ics_lines(text: str) -> list:

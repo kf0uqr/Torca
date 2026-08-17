@@ -1,16 +1,16 @@
 #!/bin/bash
-# Installs (or uninstalls) Radione as a system-wide application on
+# Installs (or uninstalls) TORCA as a system-wide application on
 # Linux: application files + their own Python virtual environment live
-# in /opt/radione, and a small launcher goes in /usr/local/bin so
-# "radione" works from anywhere once /usr/local/bin is on PATH (true
+# in /opt/torca, and a small launcher goes in /usr/local/bin so
+# "torca" works from anywhere once /usr/local/bin is on PATH (true
 # by default on essentially every Linux distro).
 #
 # The FIRST install needs root (sudo) -- /opt and /usr/local/bin both
-# require it. After that, /opt/radione is handed over to the user who
+# require it. After that, /opt/torca is handed over to the user who
 # ran the install (chown, below) specifically so later reinstalls/
 # updates -- e.g. the Ham Dashboard's own "Check for Updates" button,
 # see updater.py -- don't need root at all: only the one-time creation
-# of /opt/radione itself and the /usr/local/bin launcher genuinely
+# of /opt/torca itself and the /usr/local/bin launcher genuinely
 # need elevated permissions, not the app files themselves. Re-running
 # this script as the owning user (no sudo) refreshes an existing,
 # already-yours install in place.
@@ -22,9 +22,9 @@
 #   sudo ./install.sh --uninstall -y Uninstall without the confirmation prompt
 set -euo pipefail
 
-INSTALL_DIR="/opt/radione"
-LAUNCHER_PATH="/usr/local/bin/radione"
-SERVER_LAUNCHER_PATH="/usr/local/bin/radione-server"
+INSTALL_DIR="/opt/torca"
+LAUNCHER_PATH="/usr/local/bin/torca"
+SERVER_LAUNCHER_PATH="/usr/local/bin/torca-server"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 INSTALL_COMMIT_MARKER="$INSTALL_DIR/.install_commit"
@@ -39,7 +39,7 @@ for arg in "$@"; do
             cat <<USAGE
 Usage: sudo $0 [--uninstall] [-y|--yes]
 
-  (no args)     Install (or reinstall/update) Radione to $INSTALL_DIR
+  (no args)     Install (or reinstall/update) TORCA to $INSTALL_DIR
                 and add a launcher at $LAUNCHER_PATH. Needs sudo only
                 for a first install (or one you don't already own).
   --uninstall   Remove everything this script installed. Always needs sudo.
@@ -61,7 +61,7 @@ do_uninstall() {
     fi
 
     if [[ ! -d "$INSTALL_DIR" && ! -e "$LAUNCHER_PATH" && ! -e "$SERVER_LAUNCHER_PATH" ]]; then
-        echo "Radione doesn't appear to be installed (no $INSTALL_DIR or $LAUNCHER_PATH found)."
+        echo "TORCA doesn't appear to be installed (no $INSTALL_DIR or $LAUNCHER_PATH found)."
         exit 0
     fi
 
@@ -81,12 +81,12 @@ do_uninstall() {
     rm -rf "$INSTALL_DIR"
     rm -f "$LAUNCHER_PATH"
     rm -f "$SERVER_LAUNCHER_PATH"
-    echo "Radione uninstalled."
+    echo "TORCA uninstalled."
 }
 
 do_install() {
     if [[ ! -f "$SCRIPT_DIR/main.py" || ! -f "$SCRIPT_DIR/requirements.txt" ]]; then
-        echo "main.py/requirements.txt not found next to this script -- run it from a Radione checkout." >&2
+        echo "main.py/requirements.txt not found next to this script -- run it from a TORCA checkout." >&2
         exit 1
     fi
 
@@ -183,7 +183,7 @@ do_install() {
         echo "Installing launcher to $LAUNCHER_PATH..."
         cat > "$LAUNCHER_PATH" <<EOF
 #!/bin/bash
-# Launches Radione. Installed by install.sh -- re-run that script
+# Launches TORCA. Installed by install.sh -- re-run that script
 # (don't hand-edit this file) to reinstall or uninstall.
 exec "$INSTALL_DIR/bin/python3" "$INSTALL_DIR/main.py" "\$@"
 EOF
@@ -216,9 +216,9 @@ EOF
     fi
 
     echo
-    echo "Radione installed successfully."
-    echo "Run it with: radione"
-    echo "Share a locally-connected radio over the network with: radione-server (see README.md)"
+    echo "TORCA installed successfully."
+    echo "Run it with: torca"
+    echo "Share a locally-connected radio over the network with: torca-server (see README.md)"
     echo "Uninstall any time with: sudo $0 --uninstall"
 }
 

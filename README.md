@@ -1,4 +1,4 @@
-# Icom Radio Control (Radione) - v0.0.1a
+# TORCA -- That One Radio Control App - v0.0.1a
 
 A PySide6 GUI for controlling Icom radios (7300, 9700, 705) via [rigplane](https://pypi.org/project/rigplane/), with a dedicated worker thread for all async radio I/O.
 
@@ -34,7 +34,7 @@ cd irc
 sudo ./install.sh
 ```
 
-Installs the app and its own Python virtual environment to `/opt/radione`, and adds a `radione` command to `/usr/local/bin`. Re-run `sudo ./install.sh` any time to reinstall/upgrade, or `sudo ./install.sh --uninstall` to remove everything it installed.
+Installs the app and its own Python virtual environment to `/opt/torca`, and adds a `torca` command to `/usr/local/bin`. Re-run `sudo ./install.sh` any time to reinstall/upgrade, or `sudo ./install.sh --uninstall` to remove everything it installed.
 
 ### Manual (any platform)
 
@@ -54,7 +54,7 @@ pip install -r requirements.txt
 ## Running
 
 ```bash
-radione          # if installed via install.sh
+torca            # if installed via install.sh
 python main.py   # manual install
 ```
 
@@ -71,27 +71,27 @@ Location can be entered by hand, or looked up approximately from your public IP 
 
 ## Connecting to a radio over the network
 
-USB-only radios (e.g. IC-7300) normally require Radione to run on the same machine they're plugged into. `radione-server` lifts that limit: run it on the machine physically connected to the radio, and connect to it from any other Radione instance on the network as if it were a LAN radio -- frequency, mode, PTT, meters, levels, spectrum scope, and RX/TX audio all work the same as a direct connection.
+USB-only radios (e.g. IC-7300) normally require TORCA to run on the same machine they're plugged into. `torca-server` lifts that limit: run it on the machine physically connected to the radio, and connect to it from any other TORCA instance on the network as if it were a LAN radio -- frequency, mode, PTT, meters, levels, spectrum scope, and RX/TX audio all work the same as a direct connection.
 
-Under the hood this is just [rigplane](https://pypi.org/project/rigplane/)'s own `web` server (`radione-server` is a thin wrapper around its `rigplane` CLI, already in Radione's venv) -- no separate protocol or server of Radione's own.
+Under the hood this is just [rigplane](https://pypi.org/project/rigplane/)'s own `web` server (`torca-server` is a thin wrapper around its `rigplane` CLI, already in TORCA's venv) -- no separate protocol or server of TORCA's own.
 
 ### 1. Share the radio
 
 On the machine with the radio physically connected:
 
 ```bash
-radione-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web    # installed via install.sh
-./radione-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web  # manual/dev checkout
+torca-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web    # installed via install.sh
+./torca-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web  # manual/dev checkout
 ```
 
 - **`--model` is required.** Without it, rigplane's serial backend silently defaults to `IC-7610` and talks to your radio with the wrong CI-V address -- it'll connect, but frequency reads back as 0 Hz and tuning commands are silently ignored. Match it to your actual radio (`IC-7300`, `IC-9700`, `IC-7610`, `IC-705`, `X6200`).
 - Connection flags (`--backend`, `--serial-port`, `--model`, etc.) go *before* `web`, not after -- `web`'s own arguments only cover LAN radios (`--radio-host` etc.), not serial ones.
 - Defaults to port 8080 with no auth token (LAN-trusted). Add `--auth-token YOURTOKEN` to require one, and `--port` to use a different port.
-- Run `radione-server --help` (or `rigplane --help` / `rigplane web --help`) for the full flag list -- audio bridge options, TLS, etc.
+- Run `torca-server --help` (or `rigplane --help` / `rigplane web --help`) for the full flag list -- audio bridge options, TLS, etc.
 
 ### 2. Connect to it
 
-In Radione's connect dialog (on any machine on the network, including the same one), choose **Remote Server** as the connection type and enter:
+In TORCA's connect dialog (on any machine on the network, including the same one), choose **Remote Server** as the connection type and enter:
 
 - **Server Host** -- the sharing machine's IP or hostname (`127.0.0.1` if testing on the same machine)
 - **Server Port** -- `8080` unless you changed it with `--port`
@@ -99,7 +99,7 @@ In Radione's connect dialog (on any machine on the network, including the same o
 
 ### Known quirk: brief VFO A/B flicker while receiving
 
-Roughly every 5 seconds per receiver, the radio's display may briefly flash to VFO B and back. This is rigplane's own server-side "unselected VFO slot" refresh (keeping VFO B's frequency/mode known for split display) swapping A/B via CI-V, reading, and swapping back -- cosmetic only, not something Radione does or can currently disable (no config flag exists for it as of rigplane 2.11.1). It's automatically suppressed while transmitting.
+Roughly every 5 seconds per receiver, the radio's display may briefly flash to VFO B and back. This is rigplane's own server-side "unselected VFO slot" refresh (keeping VFO B's frequency/mode known for split display) swapping A/B via CI-V, reading, and swapping back -- cosmetic only, not something TORCA does or can currently disable (no config flag exists for it as of rigplane 2.11.1). It's automatically suppressed while transmitting.
 
 ## Project layout
 
@@ -111,7 +111,7 @@ Roughly every 5 seconds per receiver, the radio's display may briefly flash to V
 | `audio.py` | `AudioBridge` + Linux virtual-audio-cable helpers |
 | `radio_worker.py` | `RadioWorker` (QThread owning the radio connection) |
 | `connection_dialog.py` | `ConnectionDialog` (connection details, location, saved profiles), shown before the main window |
-| `remote_radio.py` | `RemoteWebRadio` -- client for a radio shared over the network via `radione-server` / rigplane's own `web` server |
+| `remote_radio.py` | `RemoteWebRadio` -- client for a radio shared over the network via `torca-server` / rigplane's own `web` server |
 | `widgets.py` | `SpectrumWidget`, `WaterfallWidget`, `MeterWidget`, `TuningKnobWidget` |
 | `wsjtx_rigctld.py` | WSJT-X launcher + `RigctldServer` |
 | `solar_data.py` | NOAA/hamqsl fetching, `SolarDataWorker`, astronomy helpers |

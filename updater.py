@@ -17,7 +17,7 @@ update mechanics differ (see detect_mode()):
   codebase's "checkout doubles as its own venv" convention.
 - "installed": no .git here, but the directory IS writable by the
   current user -- an install.sh install, one made (or updated) since
-  install.sh started chown'ing /opt/radione to the installing user
+  install.sh started chown'ing /opt/torca to the installing user
   specifically so this doesn't need root. Update = git clone/refresh
   a small cache checkout under ~/.icom_radio_app_cache, then run THAT
   checkout's own install.sh (no sudo -- see install.sh's own docstring
@@ -42,7 +42,7 @@ import sys
 APP_DIR = pathlib.Path(__file__).resolve().parent
 GITHUB_REPO_URL = "https://github.com/kf0uqr/irc.git"
 GITHUB_BRANCH = "main"
-UPDATE_CACHE_DIR = pathlib.Path.home() / ".icom_radio_app_cache" / "radione-src"
+UPDATE_CACHE_DIR = pathlib.Path.home() / ".icom_radio_app_cache" / "torca-src"
 
 MODE_DEV = "dev"
 MODE_INSTALLED = "installed"
@@ -141,7 +141,7 @@ def perform_update(status_callback=lambda message: None):
             [sys.executable, "-m", "pip", "install", "-r", str(APP_DIR / "requirements.txt")],
             cwd=APP_DIR, timeout=300,
         )
-        status_callback("Updated -- restart Radione to use the new version.")
+        status_callback("Updated -- restart TORCA to use the new version.")
         return
 
     if mode == MODE_INSTALLED:
@@ -157,13 +157,13 @@ def perform_update(status_callback=lambda message: None):
                 ["git", "clone", "--branch", GITHUB_BRANCH, "--depth", "1", GITHUB_REPO_URL, str(UPDATE_CACHE_DIR)],
                 timeout=120,
             )
-        status_callback("Reinstalling to /opt/radione (this may take a minute)...")
-        # No sudo: /opt/radione is writable by this user (install.sh's
+        status_callback("Reinstalling to /opt/torca (this may take a minute)...")
+        # No sudo: /opt/torca is writable by this user (install.sh's
         # own chown, done at first install specifically for this) --
         # install.sh itself only re-requires root if that's NOT true
         # (see its own docstring).
         _run(["bash", "install.sh"], cwd=UPDATE_CACHE_DIR, timeout=300)
-        status_callback("Updated -- restart Radione to use the new version.")
+        status_callback("Updated -- restart TORCA to use the new version.")
         return
 
     raise RuntimeError(

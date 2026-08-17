@@ -53,14 +53,14 @@ from PySide6.QtWidgets import QApplication
 from ham_dashboard import HamClockWindow
 from theme import apply_dark_theme
 
-# Diagnostic only -- RADIONE_DEBUG_RIGPLANE=1 python3 main.py. Surfaces
+# Diagnostic only -- TORCA_DEBUG_RIGPLANE=1 python3 main.py. Surfaces
 # rigplane's own internal DEBUG logging (logging.getLogger("rigplane")),
 # which includes lines like "civ-rx: active receiver -> SUB" whenever it
 # detects an active-receiver change -- useful for seeing, in real time,
 # whether something is flipping the active receiver back and forth
 # during dual-receiver (9700/7610) operation, independent of anything
 # this app's own code does. Off by default since it's fairly verbose.
-if os.environ.get("RADIONE_DEBUG_RIGPLANE"):
+if os.environ.get("TORCA_DEBUG_RIGPLANE"):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     logging.getLogger("rigplane").setLevel(logging.DEBUG)
 

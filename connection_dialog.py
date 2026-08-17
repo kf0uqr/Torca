@@ -179,7 +179,7 @@ class ConnectionDialog(QDialog):
         self.connection_combo.addItem("Remote Server", "remote")
         self.connection_combo.setToolTip(
             "Remote Server: connect to a radio being shared over the network "
-            "by radione-server (or a plain `rigplane web` server) running on "
+            "by torca-server (or a plain `rigplane web` server) running on "
             "a different machine -- typically a USB-only radio with no LAN "
             "capability of its own. Full feature parity with a direct "
             "connection: frequency/mode/PTT/levels/meters. No CI-V address "
@@ -602,7 +602,7 @@ class ConnectionDialog(QDialog):
         elif connection_type == "remote":
             remote_host = self.remote_host_input.text().strip()
             if not remote_host:
-                QMessageBox.warning(self, "Missing server host", "Enter the radione-server / rigplane web server's address.")
+                QMessageBox.warning(self, "Missing server host", "Enter the torca-server / rigplane web server's address.")
                 return
             details.update({
                 "remote_host": remote_host,

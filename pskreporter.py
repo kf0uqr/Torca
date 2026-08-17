@@ -39,7 +39,7 @@ PSKREPORTER_QUERY_URL = "https://retrieve.pskreporter.info/query"
 # fetch in this app (world_map.py's WorldMapImageFetcher, satellite_
 # tracking.py's fetch_transponders/fetch_amateur_tles) -- PSKReporter's
 # own docs ask API consumers to identify themselves.
-_USER_AGENT = "Radione/1.0 (desktop ham radio control application)"
+_USER_AGENT = "TORCA/1.0 (desktop ham radio control application)"
 
 # PSKReporter's own documented cap on flowStartSeconds -- confirmed via
 # jasonhancock/go-pskreporter (WithFlowStartSeconds, max -86400).

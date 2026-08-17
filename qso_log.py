@@ -20,7 +20,13 @@ QSO_LOG_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "qsolog.adi"
 # itself defines for exactly this kind of private metadata) recording
 # QRZ sync state directly on each record -- keeps qsolog.adi a single,
 # genuinely valid, portable ADIF file rather than a local-only format
-# with sync bookkeeping bolted on separately.
+# with sync bookkeeping bolted on separately. Deliberately NOT renamed
+# to APP_TORCA_* for the app's TORCA rebrand -- these field names are
+# already written into every user's real, persisted qsolog.adi. Renaming
+# them would silently orphan every already-synced QSO's LOGID (making
+# already_synced_to_qrz() return False for old rows) and could push
+# duplicates to QRZ Logbook. The field name is a private wire format,
+# invisible in the UI -- no reason to churn it just for the rebrand.
 LOGID_FIELD = "APP_RADIONE_LOGID"
 SYNCED_FIELD = "APP_RADIONE_SYNCED"
 # A permanent local identity, independent of QRZ's LOGID (which a

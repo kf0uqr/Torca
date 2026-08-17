@@ -849,7 +849,7 @@ class HamClockWindow(QWidget):
         self._update_check_worker = None
         self._update_perform_worker = None
         self.update_button = QPushButton("Check for Updates...")
-        self.update_button.setToolTip("Checks GitHub for a newer version of Radione, and can update in place.")
+        self.update_button.setToolTip("Checks GitHub for a newer version of TORCA, and can update in place.")
         self.update_button.clicked.connect(self._on_update_button_clicked)
 
         self.connected_radios_list = QListWidget()
@@ -2018,7 +2018,7 @@ class HamClockWindow(QWidget):
         self.update_button.setText("Check for Updates...")
         QMessageBox.information(
             self, "Update Complete",
-            "Radione has been updated. Restart the app to use the new version."
+            "TORCA has been updated. Restart the app to use the new version."
         )
 
     def _on_update_failed(self, message):
@@ -2401,7 +2401,7 @@ class HamClockWindow(QWidget):
         # them (PSKReporter/POTA refresh, an update check or an update
         # actually installing) -- same risk if closed while one's still
         # in flight. UpdatePerformWorker gets a much longer allowance:
-        # killing the app mid-install could leave a broken /opt/radione,
+        # killing the app mid-install could leave a broken /opt/torca,
         # worse than a slow quit.
         for worker, timeout_ms in (
             (self._pskreporter_worker, 15000),

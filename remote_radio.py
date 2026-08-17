@@ -332,7 +332,7 @@ class RemoteWebRadio:
 
     @property
     def backend_id(self) -> str:
-        return "radione_remote_web"
+        return "torca_remote_web"
 
     @property
     def capabilities(self) -> set:
@@ -377,7 +377,7 @@ class RemoteWebRadio:
     async def _send_command(self, name: str, params: dict = None, timeout: float = _DEFAULT_COMMAND_TIMEOUT) -> dict:
         if self._control_ws is None:
             raise RemoteRadioError(f"{name}: not connected.")
-        command_id = f"radione-{self._next_command_id}"
+        command_id = f"torca-{self._next_command_id}"
         self._next_command_id += 1
         future = asyncio.get_event_loop().create_future()
         self._pending_commands[command_id] = future

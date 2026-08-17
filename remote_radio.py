@@ -223,7 +223,23 @@ def _level_property(command_name: str, state_path: tuple, *, param_name: str = "
         return node if node != {} else None
 
     async def setter(self, value, receiver: int = 0) -> None:
-        await self._send_command(command_name, {param_name: value, "receiver": receiver})
+        result = await self._send_command(command_name, {param_name: value, "receiver": receiver})
+        if result.get("throttled"):
+            # Confirmed live: the server's rate limiter (20/sec/command/
+            # client -- web/handlers/control.py) ACKs a dropped command
+            # as ok:true with result={"throttled": True} rather than an
+            # error, so a fast slider drag firing many set_* calls in a
+            # row silently drops the excess ones WITHOUT this ever
+            # raising. Applying the optimistic write below unconditionally
+            # made the slider jump straight to wherever the drag ended,
+            # even on commands the radio never actually received -- then
+            # a few seconds later the next real state sync corrected it
+            # back to the radio's true value, looking like a random
+            # partial snap-back. Skipping the write on a throttled ack
+            # leaves the last command that actually landed as the
+            # optimistic value until that real sync arrives, instead of
+            # lying about one that didn't.
+            return
         branch = self._receiver_branch(receiver)
         self._state.setdefault(branch, {})[state_path[-1]] = value
 
@@ -403,7 +419,15 @@ class RemoteWebRadio:
         return int(self._state.get(branch, {}).get("freqHz", 0))
 
     async def set_frequency(self, freq_hz: int, receiver: int = 0) -> None:
+        # Confirmed live: rapid tuning-knob turns hit the server's 20/sec
+        # set_* rate limit constantly -- a throttled command ACKs ok:true
+        # with result={"throttled": True} rather than an error (see
+        # _level_property's setter for the full explanation), so this
+        # must skip the optimistic write on a throttled ack or the
+        # displayed frequency lies about a turn the radio never received.
         result = await self._send_command("set_freq", {"freq": freq_hz, "receiver": receiver})
+        if result.get("throttled"):
+            return
         branch = self._receiver_branch(receiver)
         self._state.setdefault(branch, {})["freqHz"] = result.get("freq", freq_hz)
 
@@ -418,7 +442,9 @@ class RemoteWebRadio:
         params = {"mode": mode, "receiver": receiver}
         if filter_width is not None:
             params["filter"] = filter_width
-        await self._send_command("set_mode", params)
+        result = await self._send_command("set_mode", params)
+        if result.get("throttled"):
+            return
         branch = self._receiver_branch(receiver)
         self._state.setdefault(branch, {})["mode"] = mode
 
@@ -441,7 +467,9 @@ class RemoteWebRadio:
         return self._state.get(branch, {}).get("activeSlot", "A")
 
     async def set_vfo_slot(self, slot: str, receiver: int = 0) -> None:
-        await self._send_command("set_vfo", {"vfo": slot, "receiver": receiver})
+        result = await self._send_command("set_vfo", {"vfo": slot, "receiver": receiver})
+        if result.get("throttled"):
+            return
         branch = self._receiver_branch(receiver)
         self._state.setdefault(branch, {})["activeSlot"] = slot
 
@@ -449,7 +477,9 @@ class RemoteWebRadio:
         return bool(self._state.get("split", False))
 
     async def set_split(self, on: bool) -> None:
-        await self._send_command("set_split", {"on": on})
+        result = await self._send_command("set_split", {"on": on})
+        if result.get("throttled"):
+            return
         self._state["split"] = bool(on)
 
     # ---- CW (key speed / pitch) -- matches radio_worker.py's own names ----
@@ -458,14 +488,18 @@ class RemoteWebRadio:
         return int(self._state.get("keySpeed", 0))
 
     async def set_key_speed(self, wpm: int) -> None:
-        await self._send_command("set_key_speed", {"speed": wpm})
+        result = await self._send_command("set_key_speed", {"speed": wpm})
+        if result.get("throttled"):
+            return
         self._state["keySpeed"] = wpm
 
     async def get_cw_pitch(self) -> int:
         return int(self._state.get("cwPitch", 600))
 
     async def set_cw_pitch(self, pitch_hz: int) -> None:
-        await self._send_command("set_cw_pitch", {"value": pitch_hz})
+        result = await self._send_command("set_cw_pitch", {"value": pitch_hz})
+        if result.get("throttled"):
+            return
         self._state["cwPitch"] = pitch_hz
 
     async def send_cw_text(self, text: str) -> None:
@@ -559,35 +593,48 @@ class RemoteWebRadio:
         return int(self._state.get("monitorGain", 0))
 
     async def set_monitor_gain(self, level) -> None:
-        await self._send_command("set_monitor_gain", {"level": level})
+        # Skip the optimistic write on a throttled ack -- see
+        # _level_property's setter for the full explanation (same
+        # server-side rate limiter, same silent-drop-but-ok:true shape).
+        result = await self._send_command("set_monitor_gain", {"level": level})
+        if result.get("throttled"):
+            return
         self._state["monitorGain"] = level
 
     async def get_power(self):
         return self._state.get("powerLevel", 0.0)
 
     async def set_power(self, level) -> None:
-        await self._send_command("set_power", {"level": level})
+        result = await self._send_command("set_power", {"level": level})
+        if result.get("throttled"):
+            return
         self._state["powerLevel"] = level
 
     async def get_mic_gain(self) -> int:
         return int(self._state.get("micGain", 0))
 
     async def set_mic_gain(self, level: int) -> None:
-        await self._send_command("set_mic_gain", {"level": level})
+        result = await self._send_command("set_mic_gain", {"level": level})
+        if result.get("throttled"):
+            return
         self._state["micGain"] = level
 
     async def get_drive_gain(self) -> int:
         return int(self._state.get("driveGain", 0))
 
     async def set_drive_gain(self, level: int) -> None:
-        await self._send_command("set_drive_gain", {"level": level})
+        result = await self._send_command("set_drive_gain", {"level": level})
+        if result.get("throttled"):
+            return
         self._state["driveGain"] = level
 
     async def get_compressor_level(self) -> int:
         return int(self._state.get("compressorLevel", 0))
 
     async def set_compressor_level(self, level: int) -> None:
-        await self._send_command("set_compressor_level", {"level": level})
+        result = await self._send_command("set_compressor_level", {"level": level})
+        if result.get("throttled"):
+            return
         self._state["compressorLevel"] = level
 
     # ---- Scope (spectrum/waterfall) ----------------------------------------
@@ -661,7 +708,9 @@ class RemoteWebRadio:
         return int(self._state.get("scopeControls", {}).get("span", 0))
 
     async def set_scope_span(self, span_index: int) -> None:
-        await self._send_command("set_scope_span", {"span": span_index})
+        result = await self._send_command("set_scope_span", {"span": span_index})
+        if result.get("throttled"):
+            return
         self._state.setdefault("scopeControls", {})["span"] = span_index
 
     async def get_scope_ref(self) -> float:
@@ -674,14 +723,18 @@ class RemoteWebRadio:
         # local connection supports 0.5 dB steps. A rigplane server-side
         # limitation, not something to work around here.
         ref_int = int(round(ref_db))
-        await self._send_command("set_scope_ref", {"ref": ref_int})
+        result = await self._send_command("set_scope_ref", {"ref": ref_int})
+        if result.get("throttled"):
+            return
         self._state.setdefault("scopeControls", {})["refDb"] = float(ref_int)
 
     async def get_scope_speed(self) -> int:
         return int(self._state.get("scopeControls", {}).get("speed", 0))
 
     async def set_scope_speed(self, speed_index: int) -> None:
-        await self._send_command("set_scope_speed", {"speed": speed_index})
+        result = await self._send_command("set_scope_speed", {"speed": speed_index})
+        if result.get("throttled"):
+            return
         self._state.setdefault("scopeControls", {})["speed"] = speed_index
 
     async def set_scope_receiver(self, receiver: int) -> None:

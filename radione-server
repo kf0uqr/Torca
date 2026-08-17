@@ -1,0 +1,12 @@
+#!/bin/bash
+# Shares a locally-connected radio (typically USB/serial, e.g. IC-7300)
+# over the network via rigplane's own `web` server, for another Radione
+# instance to connect to via the connect dialog's "Remote Server" option
+# (see README.md). Just rigplane's own CLI, already in this venv -- no
+# separate `source bin/activate` needed. Pass connection flags BEFORE
+# any web-specific flags, e.g.:
+#   ./radione-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web
+
+source bin/activate
+rigplane "$@"
+deactivate

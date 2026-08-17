@@ -24,6 +24,7 @@ set -euo pipefail
 
 INSTALL_DIR="/opt/radione"
 LAUNCHER_PATH="/usr/local/bin/radione"
+SERVER_LAUNCHER_PATH="/usr/local/bin/radione-server"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 INSTALL_COMMIT_MARKER="$INSTALL_DIR/.install_commit"
@@ -59,7 +60,7 @@ do_uninstall() {
         exit 1
     fi
 
-    if [[ ! -d "$INSTALL_DIR" && ! -e "$LAUNCHER_PATH" ]]; then
+    if [[ ! -d "$INSTALL_DIR" && ! -e "$LAUNCHER_PATH" && ! -e "$SERVER_LAUNCHER_PATH" ]]; then
         echo "Radione doesn't appear to be installed (no $INSTALL_DIR or $LAUNCHER_PATH found)."
         exit 0
     fi
@@ -67,6 +68,7 @@ do_uninstall() {
     echo "This will remove:"
     [[ -d "$INSTALL_DIR" ]] && echo "  $INSTALL_DIR (application files + virtual environment)"
     [[ -e "$LAUNCHER_PATH" ]] && echo "  $LAUNCHER_PATH (launcher)"
+    [[ -e "$SERVER_LAUNCHER_PATH" ]] && echo "  $SERVER_LAUNCHER_PATH (launcher)"
 
     if [[ "$ASSUME_YES" != true ]]; then
         read -r -p "Continue? [y/N] " reply || reply="n"
@@ -78,6 +80,7 @@ do_uninstall() {
 
     rm -rf "$INSTALL_DIR"
     rm -f "$LAUNCHER_PATH"
+    rm -f "$SERVER_LAUNCHER_PATH"
     echo "Radione uninstalled."
 }
 
@@ -186,6 +189,17 @@ exec "$INSTALL_DIR/bin/python3" "$INSTALL_DIR/main.py" "\$@"
 EOF
         chmod 755 "$LAUNCHER_PATH"
 
+        echo "Installing launcher to $SERVER_LAUNCHER_PATH..."
+        cat > "$SERVER_LAUNCHER_PATH" <<EOF
+#!/bin/bash
+# Shares a locally-connected radio over the network via rigplane's own
+# web server -- see README.md's remote-connection section. Installed by
+# install.sh -- re-run that script (don't hand-edit this file) to
+# reinstall or uninstall.
+exec "$INSTALL_DIR/bin/rigplane" "\$@"
+EOF
+        chmod 755 "$SERVER_LAUNCHER_PATH"
+
         if [[ -n "${SUDO_USER:-}" ]]; then
             echo "Handing $INSTALL_DIR over to $SUDO_USER (so future updates don't need root)..."
             chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$INSTALL_DIR"
@@ -194,16 +208,17 @@ EOF
             echo "future reinstalls/updates will need sudo too."
         fi
     else
-        # Updating an install we already own -- the launcher's content
-        # never changes release to release (it just execs a fixed
+        # Updating an install we already own -- the launchers' content
+        # never changes release to release (they just exec a fixed
         # path), and ownership is already correct, so there's nothing
         # under /usr/local/bin or root-owned to touch.
-        echo "Updated as $(whoami) -- launcher at $LAUNCHER_PATH unchanged (its content never needs to)."
+        echo "Updated as $(whoami) -- launchers at $LAUNCHER_PATH / $SERVER_LAUNCHER_PATH unchanged (their content never needs to)."
     fi
 
     echo
     echo "Radione installed successfully."
     echo "Run it with: radione"
+    echo "Share a locally-connected radio over the network with: radione-server (see README.md)"
     echo "Uninstall any time with: sudo $0 --uninstall"
 }
 

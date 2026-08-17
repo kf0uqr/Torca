@@ -69,6 +69,38 @@ Location can be entered by hand, or looked up approximately from your public IP 
 3. **Start/Stop Tracking** pauses and resumes re-tuning without losing the selection -- the satellite (and any tuning offset) stays put until you double-click a different one on the map.
 4. How PTT drives the uplink depends on the radio, detected automatically at connect time: on a single-receiver radio (IC-7300/IC-705), **Split** (next to VFO A/B) turns on automatically while tracking runs, and **PTT** swaps VFO B in with a Doppler-corrected *uplink* for the transmission and back to VFO A's downlink the instant you release. On a dual-receiver radio (IC-9700/IC-7610), Main tracks the downlink while receiving and Sub takes over with the Doppler-corrected uplink for the duration of a transmission -- only whichever one is actually in use gets touched, so the radio stays put on it instead of the two flickering back and forth.
 
+## Connecting to a radio over the network
+
+USB-only radios (e.g. IC-7300) normally require Radione to run on the same machine they're plugged into. `radione-server` lifts that limit: run it on the machine physically connected to the radio, and connect to it from any other Radione instance on the network as if it were a LAN radio -- frequency, mode, PTT, meters, levels, spectrum scope, and RX/TX audio all work the same as a direct connection.
+
+Under the hood this is just [rigplane](https://pypi.org/project/rigplane/)'s own `web` server (`radione-server` is a thin wrapper around its `rigplane` CLI, already in Radione's venv) -- no separate protocol or server of Radione's own.
+
+### 1. Share the radio
+
+On the machine with the radio physically connected:
+
+```bash
+radione-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web    # installed via install.sh
+./radione-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web  # manual/dev checkout
+```
+
+- **`--model` is required.** Without it, rigplane's serial backend silently defaults to `IC-7610` and talks to your radio with the wrong CI-V address -- it'll connect, but frequency reads back as 0 Hz and tuning commands are silently ignored. Match it to your actual radio (`IC-7300`, `IC-9700`, `IC-7610`, `IC-705`, `X6200`).
+- Connection flags (`--backend`, `--serial-port`, `--model`, etc.) go *before* `web`, not after -- `web`'s own arguments only cover LAN radios (`--radio-host` etc.), not serial ones.
+- Defaults to port 8080 with no auth token (LAN-trusted). Add `--auth-token YOURTOKEN` to require one, and `--port` to use a different port.
+- Run `radione-server --help` (or `rigplane --help` / `rigplane web --help`) for the full flag list -- audio bridge options, TLS, etc.
+
+### 2. Connect to it
+
+In Radione's connect dialog (on any machine on the network, including the same one), choose **Remote Server** as the connection type and enter:
+
+- **Server Host** -- the sharing machine's IP or hostname (`127.0.0.1` if testing on the same machine)
+- **Server Port** -- `8080` unless you changed it with `--port`
+- **Auth Token** -- leave blank unless you set `--auth-token`
+
+### Known quirk: brief VFO A/B flicker while receiving
+
+Roughly every 5 seconds per receiver, the radio's display may briefly flash to VFO B and back. This is rigplane's own server-side "unselected VFO slot" refresh (keeping VFO B's frequency/mode known for split display) swapping A/B via CI-V, reading, and swapping back -- cosmetic only, not something Radione does or can currently disable (no config flag exists for it as of rigplane 2.11.1). It's automatically suppressed while transmitting.
+
 ## Project layout
 
 | File | Purpose |
@@ -79,6 +111,7 @@ Location can be entered by hand, or looked up approximately from your public IP 
 | `audio.py` | `AudioBridge` + Linux virtual-audio-cable helpers |
 | `radio_worker.py` | `RadioWorker` (QThread owning the radio connection) |
 | `connection_dialog.py` | `ConnectionDialog` (connection details, location, saved profiles), shown before the main window |
+| `remote_radio.py` | `RemoteWebRadio` -- client for a radio shared over the network via `radione-server` / rigplane's own `web` server |
 | `widgets.py` | `SpectrumWidget`, `WaterfallWidget`, `MeterWidget`, `TuningKnobWidget` |
 | `wsjtx_rigctld.py` | WSJT-X launcher + `RigctldServer` |
 | `solar_data.py` | NOAA/hamqsl fetching, `SolarDataWorker`, astronomy helpers |

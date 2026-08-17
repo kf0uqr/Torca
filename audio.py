@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from array import array
 
 try:
@@ -295,6 +296,19 @@ class AudioBridge:
         self._rx_stereo_diag_r_abs_sum = 0
         self._rx_stereo_diag_l_peak = 0
         self._rx_stereo_diag_r_peak = 0
+
+        # Diagnostic for the direct-USB warble investigation: measures the
+        # REAL observed average incoming byte rate against what real-time
+        # playback actually needs (sample_rate * AUDIO_SAMPLE_WIDTH *
+        # AUDIO_CHANNELS bytes/sec, post-downmix), reported once every ~5s
+        # of real audio. A sustained warble that gets pushed later by a
+        # bigger jitter buffer (rather than eliminated) is the signature of
+        # a genuine average-rate deficit, not bursty jitter -- this turns
+        # that suspicion into an actual measured number instead of another
+        # guess. One-shot per bridge instance; removable once resolved.
+        self._rx_rate_start_monotonic = None
+        self._rx_rate_bytes = 0
+        self._rx_rate_next_report_at = None
 
         # Optional second consumer of this bridge's already-downmixed
         # mono RX PCM -- e.g. RadioWorker.start_cw_decode() piggybacking
@@ -620,6 +634,7 @@ class AudioBridge:
                 )
             self._status(f"RX audio: first chunk received ({len(data)} bytes{detail}).")
         self._rx_chunk_count += 1
+        self._report_rx_rate(len(data))
         if self._extra_rx_callback is not None:
             self._extra_rx_callback(data)
         try:
@@ -636,6 +651,37 @@ class AudioBridge:
                 self._rx_queue.put_nowait(data)
             except queue.Full:
                 pass
+
+    def _report_rx_rate(self, chunk_bytes: int) -> None:
+        """Diagnostic for the direct-USB warble investigation -- see the
+        comment on the _rx_rate_* fields in __init__. Logs the real
+        observed average incoming byte rate every ~5s of real audio,
+        against the real-time rate playback actually needs."""
+        now = time.monotonic()
+        if self._rx_rate_start_monotonic is None:
+            self._rx_rate_start_monotonic = now
+            self._rx_rate_next_report_at = now + 5.0
+            self._rx_rate_bytes = 0
+            return
+        self._rx_rate_bytes += chunk_bytes
+        if now < self._rx_rate_next_report_at:
+            return
+        elapsed = now - self._rx_rate_start_monotonic
+        if elapsed <= 0:
+            return
+        observed_rate = self._rx_rate_bytes / elapsed
+        expected_rate = self.sample_rate * AUDIO_SAMPLE_WIDTH * AUDIO_CHANNELS
+        # Negative = arriving SLOWER than real-time playback consumes it
+        # (a deficit -- eventually underruns no matter the buffer size);
+        # positive = arriving faster (buffer grows, adding latency over
+        # time but never underruns).
+        rate_diff_pct = (observed_rate - expected_rate) / expected_rate * 100.0
+        self._status(
+            f"RX audio: observed rate {observed_rate:.0f} B/s vs expected "
+            f"{expected_rate} B/s real-time ({rate_diff_pct:+.2f}%) over "
+            f"{elapsed:.1f}s, {self._rx_rate_bytes} bytes."
+        )
+        self._rx_rate_next_report_at = now + 5.0
 
     @staticmethod
     def _extract_pcm_bytes(packet):

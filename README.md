@@ -97,9 +97,13 @@ In TORCA's connect dialog (on any machine on the network, including the same one
 - **Server Port** -- `8080` unless you changed it with `--port`
 - **Auth Token** -- leave blank unless you set `--auth-token`
 
-### Known quirk: brief VFO A/B flicker while receiving
+### VFO A/B flicker + audio glitch, and how torca-server disables it
 
-Roughly every 5 seconds per receiver, the radio's display may briefly flash to VFO B and back. This is rigplane's own server-side "unselected VFO slot" refresh (keeping VFO B's frequency/mode known for split display) swapping A/B via CI-V, reading, and swapping back -- cosmetic only, not something TORCA does or can currently disable (no config flag exists for it as of rigplane 2.11.1). It's automatically suppressed while transmitting.
+rigplane's own "unselected VFO slot" refresh opportunistically swaps to VFO B, reads it, and swaps back via real CI-V commands roughly every 5 seconds per receiver, to keep VFO B's frequency/mode known for split display. Two side effects on a real radio: the display briefly flashes to VFO B and back, and -- on radios whose USB audio output follows the active VFO (confirmed on an IC-7300) -- RX audio streamed over the web audio channel briefly glitches on the same cadence.
+
+rigplane has no public flag or config option to disable this (as of v2.11.1). `torca-server` disables it anyway: it runs through `torca_server.py`, a thin wrapper that patches the relevant internal (`RadioPoller._UNSELECTED_SLOT_INTERVAL`) before handing off to rigplane's own CLI unchanged. This relies on a private, underscore-prefixed rigplane internal, not a stable API -- if a future rigplane release restructures it, the patch just becomes a no-op (caught and reported, not fatal) and the flicker/glitch would return. The direct tradeoff: VFO B's frequency/mode goes stale in the server's own state, since the refresh that keeps it current is exactly what's disabled -- irrelevant unless something (e.g. a split-mode display) depends on it.
+
+If you connect directly (serial/USB, not through `torca-server`) rather than via Remote Server, this patch doesn't apply and both side effects are still present.
 
 ## Project layout
 
@@ -112,6 +116,7 @@ Roughly every 5 seconds per receiver, the radio's display may briefly flash to V
 | `radio_worker.py` | `RadioWorker` (QThread owning the radio connection) |
 | `connection_dialog.py` | `ConnectionDialog` (connection details, location, saved profiles), shown before the main window |
 | `remote_radio.py` | `RemoteWebRadio` -- client for a radio shared over the network via `torca-server` / rigplane's own `web` server |
+| `torca_server.py` | Wrapper `torca-server` runs -- patches out rigplane's periodic unselected-VFO-slot refresh, then dispatches to rigplane's own CLI |
 | `widgets.py` | `SpectrumWidget`, `WaterfallWidget`, `MeterWidget`, `TuningKnobWidget` |
 | `wsjtx_rigctld.py` | WSJT-X launcher + `RigctldServer` |
 | `solar_data.py` | NOAA/hamqsl fetching, `SolarDataWorker`, astronomy helpers |

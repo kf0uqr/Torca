@@ -105,6 +105,7 @@ DEFAULT_USERNAME = "user"
 DEFAULT_PASSWORD = ""
 DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"  # or e.g. COM3 on Windows
 DEFAULT_BAUD_RATE = 19200
+DEFAULT_REMOTE_PORT = 8080  # matches rigplane.web.server.WebConfig's own default port
 
 POLL_INTERVAL_SEC = 0.5  # how often to read frequency/s-meter from the radio
 WATERFALL_ROWS = 200     # how many past scope frames the waterfall keeps on screen

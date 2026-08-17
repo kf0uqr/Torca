@@ -57,6 +57,8 @@ class RadioWindow(QWidget):
         self._satellite_session = satellite_session
         if details["connection_type"] == "network":
             self._connection_label = f"{details['host']} (LAN)"
+        elif details["connection_type"] == "remote":
+            self._connection_label = f"{details['remote_host']}:{details['remote_port']} (Remote Server)"
         else:
             self._connection_label = f"{details['serial_port']} (USB)"
         self.setWindowTitle(f"Icom Radio Control -- {details['radio_model']}")

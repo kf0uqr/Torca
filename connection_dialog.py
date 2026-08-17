@@ -37,6 +37,7 @@ from constants import (
     DEFAULT_PASSWORD,
     DEFAULT_SERIAL_PORT,
     DEFAULT_BAUD_RATE,
+    DEFAULT_REMOTE_PORT,
 )
 from audio import sd, SOUNDDEVICE_AVAILABLE
 
@@ -175,6 +176,16 @@ class ConnectionDialog(QDialog):
         self.connection_combo = QComboBox()
         self.connection_combo.addItem("Network (LAN)", "network")
         self.connection_combo.addItem("USB (Serial)", "usb")
+        self.connection_combo.addItem("Remote Server", "remote")
+        self.connection_combo.setToolTip(
+            "Remote Server: connect to a radio being shared over the network "
+            "by radione-server (or a plain `rigplane web` server) running on "
+            "a different machine -- typically a USB-only radio with no LAN "
+            "capability of its own. Full feature parity with a direct "
+            "connection: frequency/mode/PTT/levels/meters. No CI-V address "
+            "needed here -- the server already has its own connection to "
+            "the actual radio."
+        )
         self.connection_combo.currentIndexChanged.connect(self._on_connection_type_changed)
 
         self.addr_input = QLineEdit()
@@ -200,6 +211,18 @@ class ConnectionDialog(QDialog):
         self.baud_rate_input = QSpinBox()
         self.baud_rate_input.setRange(300, 921_600)
         self.baud_rate_input.setValue(DEFAULT_BAUD_RATE)
+
+        # --- Remote Server-specific fields ---
+        self.remote_host_input = QLineEdit()
+        self.remote_host_input.setPlaceholderText("192.168.1.50")
+
+        self.remote_port_input = QSpinBox()
+        self.remote_port_input.setRange(1, 65535)
+        self.remote_port_input.setValue(DEFAULT_REMOTE_PORT)
+
+        self.remote_token_input = QLineEdit()
+        self.remote_token_input.setEchoMode(QLineEdit.Password)
+        self.remote_token_input.setPlaceholderText("leave blank if the server has no auth token set")
 
         # --- Audio device selection (independent of CI-V connection type) ---
         self.audio_input_combo = QComboBox()
@@ -257,7 +280,12 @@ class ConnectionDialog(QDialog):
             ("Serial Port:", self.serial_port_input),
             ("Baud Rate:", self.baud_rate_input),
         ]
-        for label, widget in self.network_rows + self.usb_rows:
+        self.remote_rows = [
+            ("Server Host:", self.remote_host_input),
+            ("Server Port:", self.remote_port_input),
+            ("Auth Token:", self.remote_token_input),
+        ]
+        for label, widget in self.network_rows + self.usb_rows + self.remote_rows:
             form.addRow(label, widget)
 
         form.addRow("Audio Input:", self.audio_input_combo)
@@ -374,6 +402,9 @@ class ConnectionDialog(QDialog):
             "password": self.password_input.text(),
             "serial_port": self.serial_port_input.text().strip(),
             "baud_rate": self.baud_rate_input.value(),
+            "remote_host": self.remote_host_input.text().strip(),
+            "remote_port": self.remote_port_input.value(),
+            "remote_token": self.remote_token_input.text(),
             "audio_input_name": self.audio_input_combo.currentText(),
             "audio_output_name": self.audio_output_combo.currentText(),
             "observer_lat": self.lat_input.value(),
@@ -408,6 +439,12 @@ class ConnectionDialog(QDialog):
             self.serial_port_input.setText(profile["serial_port"])
         if profile.get("baud_rate"):
             self.baud_rate_input.setValue(profile["baud_rate"])
+        if profile.get("remote_host"):
+            self.remote_host_input.setText(profile["remote_host"])
+        if profile.get("remote_port"):
+            self.remote_port_input.setValue(profile["remote_port"])
+        if "remote_token" in profile:
+            self.remote_token_input.setText(profile["remote_token"])
 
         audio_input_index = self.audio_input_combo.findText(profile.get("audio_input_name", ""))
         if audio_input_index != -1:
@@ -494,35 +531,51 @@ class ConnectionDialog(QDialog):
             self._on_connection_type_changed(self.connection_combo.currentIndex())
 
     def _on_connection_type_changed(self, _index):
-        is_network = self.connection_combo.currentData() == "network"
-        for _label, widget in self.network_rows:
-            widget.setEnabled(is_network)
-            widget.setVisible(is_network)
-        for _label, widget in self.usb_rows:
-            widget.setEnabled(not is_network)
-            widget.setVisible(not is_network)
-        # Also hide/show the row labels themselves.
+        connection_type = self.connection_combo.currentData()
+        groups = {
+            "network": self.network_rows,
+            "usb": self.usb_rows,
+            "remote": self.remote_rows,
+        }
+        # CI-V Address isn't its own tracked group (added directly to
+        # the form, not via network_rows/usb_rows/remote_rows) -- a
+        # Remote Server connection doesn't need it at all, since the
+        # server already has its own connection (and its own CI-V
+        # address) to the actual radio.
         form = self.layout().itemAt(0).layout()
-        for label, widget in self.network_rows:
-            row_label = form.labelForField(widget)
-            if row_label is not None:
-                row_label.setVisible(is_network)
-        for label, widget in self.usb_rows:
-            row_label = form.labelForField(widget)
-            if row_label is not None:
-                row_label.setVisible(not is_network)
+        addr_label = form.labelForField(self.addr_input)
+        needs_addr = connection_type != "remote"
+        self.addr_input.setVisible(needs_addr)
+        self.addr_input.setEnabled(needs_addr)
+        if addr_label is not None:
+            addr_label.setVisible(needs_addr)
+
+        for group_type, rows in groups.items():
+            visible = connection_type == group_type
+            for _label, widget in rows:
+                widget.setEnabled(visible)
+                widget.setVisible(visible)
+                row_label = form.labelForField(widget)
+                if row_label is not None:
+                    row_label.setVisible(visible)
 
     def _on_accept(self):
-        addr_text = self.addr_input.text().strip()
-        try:
-            addr = int(addr_text, 16)
-        except ValueError:
-            QMessageBox.warning(
-                self, "Invalid address", "CI-V address must be hex, e.g. A2."
-            )
-            return
-
         connection_type = self.connection_combo.currentData()
+
+        # No CI-V address for a Remote Server connection -- the server
+        # already has its own connection (and its own CI-V address) to
+        # the actual radio; this client never speaks CI-V directly.
+        addr = None
+        if connection_type != "remote":
+            addr_text = self.addr_input.text().strip()
+            try:
+                addr = int(addr_text, 16)
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid address", "CI-V address must be hex, e.g. A2."
+                )
+                return
+
         details = {
             "radio_model": self.radio_combo.currentText(),
             "role": self.role_combo.currentData(),
@@ -545,6 +598,16 @@ class ConnectionDialog(QDialog):
                 "port": self.port_input.value(),
                 "username": self.username_input.text().strip(),
                 "password": self.password_input.text(),
+            })
+        elif connection_type == "remote":
+            remote_host = self.remote_host_input.text().strip()
+            if not remote_host:
+                QMessageBox.warning(self, "Missing server host", "Enter the radione-server / rigplane web server's address.")
+                return
+            details.update({
+                "remote_host": remote_host,
+                "remote_port": self.remote_port_input.value(),
+                "remote_token": self.remote_token_input.text(),
             })
         else:
             serial_port = self.serial_port_input.text().strip()

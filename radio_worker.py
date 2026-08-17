@@ -90,6 +90,7 @@ from constants import (
 )
 from rig_discovery import find_method_name
 from audio import AudioBridge
+from remote_radio import RemoteWebRadio
 
 async def _try_recall_band_stack(radio, band_code, register=BAND_STACKING_REGISTER_LATEST):
     """Confirmed working: radio.get_bsr(band, register) (get_band_stack is
@@ -852,29 +853,47 @@ class RadioWorker(QThread):
 
     async def _main(self):
         try:
-            config = self._build_config()
-            try:
-                self._radio_cm = create_radio(config)
+            if self._details.get("connection_type") == "remote":
+                # Bypasses rigplane's own create_radio()/BackendConfig
+                # dispatch entirely -- RemoteWebRadio isn't one of
+                # rigplane's own four backend types, it's this app's
+                # own client for rigplane's separate `web` server (see
+                # remote_radio.py's own docstring). Everything from
+                # here on (__aenter__, isinstance capability checks,
+                # _setup_audio/_setup_levels/_setup_meters/
+                # _setup_controls, the scope-enable block, _poll_loop)
+                # is already fully backend-agnostic and needs no
+                # remote-specific handling at all.
+                self._radio_cm = RemoteWebRadio(
+                    self._details["remote_host"],
+                    self._details["remote_port"],
+                    self._details.get("remote_token", ""),
+                )
                 self.radio = await self._radio_cm.__aenter__()
-            except Exception as exc:
-                if getattr(config, "audio_codec_explicit", False):
-                    # See _build_config's docstring: an explicit stereo
-                    # request disarms rigplane's own automatic mono-
-                    # retry-on-rejection fallback, so re-implement it
-                    # here -- one retry with the radio profile's own
-                    # (proven-safe) codec default before actually giving
-                    # up. Whatever failure this produces (if any) is
-                    # what actually gets reported below, same as before
-                    # this stereo attempt existed.
-                    self.audio_status.emit(
-                        f"Connect: stereo audio request failed ({exc}) -- retrying "
-                        "with the radio profile's default (mono) codec."
-                    )
-                    config = self._build_config(force_stereo=False)
+            else:
+                config = self._build_config()
+                try:
                     self._radio_cm = create_radio(config)
                     self.radio = await self._radio_cm.__aenter__()
-                else:
-                    raise
+                except Exception as exc:
+                    if getattr(config, "audio_codec_explicit", False):
+                        # See _build_config's docstring: an explicit stereo
+                        # request disarms rigplane's own automatic mono-
+                        # retry-on-rejection fallback, so re-implement it
+                        # here -- one retry with the radio profile's own
+                        # (proven-safe) codec default before actually giving
+                        # up. Whatever failure this produces (if any) is
+                        # what actually gets reported below, same as before
+                        # this stereo attempt existed.
+                        self.audio_status.emit(
+                            f"Connect: stereo audio request failed ({exc}) -- retrying "
+                            "with the radio profile's default (mono) codec."
+                        )
+                        config = self._build_config(force_stereo=False)
+                        self._radio_cm = create_radio(config)
+                        self.radio = await self._radio_cm.__aenter__()
+                    else:
+                        raise
         except Exception as exc:
             self.connection_failed.emit(str(exc))
             return

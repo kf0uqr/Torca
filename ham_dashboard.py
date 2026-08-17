@@ -143,7 +143,7 @@ class VirtualCableDialog(QDialog):
         for window in connected_radios:
             details = window._details
             role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
-            connection_label = details.get("host") or details.get("serial_port") or "?"
+            connection_label = details.get("host") or details.get("serial_port") or details.get("remote_host") or "?"
             label = f"{details['radio_model']} ({role_label}) -- {connection_label}"
             self.rx_combo.addItem(label, window)
             self.tx_combo.addItem(label, window)
@@ -255,7 +255,7 @@ class RigctldDialog(QDialog):
         for window in connected_radios:
             details = window._details
             role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
-            connection_label = details.get("host") or details.get("serial_port") or "?"
+            connection_label = details.get("host") or details.get("serial_port") or details.get("remote_host") or "?"
             label = f"{details['radio_model']} ({role_label}) -- {connection_label}"
 
             if window in ports:
@@ -1910,7 +1910,7 @@ class HamClockWindow(QWidget):
         self._connected_radios.append(window)
 
         role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
-        connection_label = details.get("host") or details.get("serial_port") or "?"
+        connection_label = details.get("host") or details.get("serial_port") or details.get("remote_host") or "?"
         item = QListWidgetItem(f"{details['radio_model']} ({role_label}) -- {connection_label}")
         item.setData(Qt.UserRole, window)
         self.connected_radios_list.addItem(item)

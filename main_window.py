@@ -43,6 +43,7 @@ from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
 from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
 from satellite_tracking import radio_mode_for_transponder
 from cw_window import CwToolWindow
+from sstv_window import SstvToolWindow
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 
@@ -196,6 +197,14 @@ class RadioWindow(QWidget):
         self.cw_tool_button.setEnabled(False)
         self.cw_tool_button.clicked.connect(self._on_cw_tool_clicked)
         self.cw_window = None
+
+        # Opens the per-radio SSTV image decode tool (sstv_window.py)
+        # -- same singleton/lazy-construction/enable-on-connect
+        # pattern as the CW Tool button above.
+        self.sstv_tool_button = QPushButton("SSTV Tool...")
+        self.sstv_tool_button.setEnabled(False)
+        self.sstv_tool_button.clicked.connect(self._on_sstv_tool_clicked)
+        self.sstv_window = None
 
         # Scope span/reference level/sweep speed -- rigplane's
         # set_scope_span/set_scope_ref/set_scope_speed (radio_worker.py),
@@ -391,6 +400,7 @@ class RadioWindow(QWidget):
         knob_row.addWidget(self.ptt_button)
         knob_row.addWidget(self.active_receiver_button)
         knob_row.addWidget(self.cw_tool_button)
+        knob_row.addWidget(self.sstv_tool_button)
 
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
@@ -443,6 +453,7 @@ class RadioWindow(QWidget):
         self.tuning_knob.setEnabled(True)
         self.ptt_button.setEnabled(True)
         self.cw_tool_button.setEnabled(True)
+        self.sstv_tool_button.setEnabled(True)
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
             self.active_receiver_button.setEnabled(True)
@@ -463,6 +474,13 @@ class RadioWindow(QWidget):
         self.cw_window.show()
         self.cw_window.raise_()
         self.cw_window.activateWindow()
+
+    def _on_sstv_tool_clicked(self):
+        if self.sstv_window is None:
+            self.sstv_window = SstvToolWindow(self)
+        self.sstv_window.show()
+        self.sstv_window.raise_()
+        self.sstv_window.activateWindow()
 
     @Slot(str)
     def _on_connection_failed(self, message):
@@ -1040,6 +1058,8 @@ class RadioWindow(QWidget):
             # worker is about to stop, and an orphaned CW Tool window
             # left open would still reference it.
             self.cw_window.closing_for_real()
+        if self.sstv_window is not None:
+            self.sstv_window.closing_for_real()
         self._satellite_session.unregister(self)
         # Emitted BEFORE worker.stop() -- HamClockWindow's handler may
         # still need to call something on this worker (e.g.

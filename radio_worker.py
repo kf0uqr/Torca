@@ -82,6 +82,7 @@ from constants import (
     BAND_STACKING_CODES,
     BAND_STACKING_REGISTER_LATEST,
     BAND_STACKING_EXCLUDED,
+    LEVEL_DEBOUNCE_SECONDS,
     LEVEL_DEFINITIONS,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
@@ -252,6 +253,17 @@ class RadioWorker(QThread):
         # 0-255 CI-V level scale. Cache per level key which one worked so
         # _call_level_setter() only has to probe once per level.
         self._level_value_mode = {}
+        # key -> pending asyncio.Task, for set_level_value()'s debounce.
+        # A fast slider drag (or a remote connection's tuning knob) fires
+        # many rapid calls for the same key; without this every single
+        # intermediate value got sent as its own command, which either
+        # floods a local radio with far more CI-V traffic than the drag
+        # gesture itself needs, or -- confirmed live on a remote
+        # connection -- hits the web server's 20/sec/command rate limit
+        # and gets silently dropped, later corrected by the next real
+        # poll and looking like the slider "bouncing back". See
+        # set_level_value()/_debounce_level_value().
+        self._level_debounce_tasks = {}
 
     def run(self):
         """Thread entry point: create and own the asyncio loop here."""
@@ -838,10 +850,36 @@ class RadioWorker(QThread):
         self._level_value_mode[cache_key] = "int255"
 
     def set_level_value(self, key: str, value: float):
-        """Thread-safe: call from the GUI thread. value is 0.0-1.0."""
+        """Thread-safe: call from the GUI thread. value is 0.0-1.0.
+
+        Debounced (LEVEL_DEBOUNCE_SECONDS): rather than sending a command
+        for every single intermediate value during a drag, each call
+        resets a short timer for that key -- only once the caller stops
+        calling (the user stops moving the slider/knob) does the last
+        value actually get sent. The widget's own on-screen position
+        still follows the drag in real time regardless (that's native
+        Qt behavior, untouched by this) -- only the underlying radio
+        command is delayed/coalesced."""
         if self.loop is None or key not in self._level_methods:
             return
-        asyncio.run_coroutine_threadsafe(self._set_level_value(key, value), self.loop)
+        asyncio.run_coroutine_threadsafe(self._debounce_level_value(key, value), self.loop)
+
+    async def _debounce_level_value(self, key: str, value: float):
+        # Runs on self.loop, same as every task it touches here, so
+        # cancelling/replacing the pending task for this key is never
+        # racing a concurrent call for the same key.
+        existing = self._level_debounce_tasks.get(key)
+        if existing is not None and not existing.done():
+            existing.cancel()
+
+        async def _wait_then_apply():
+            try:
+                await asyncio.sleep(LEVEL_DEBOUNCE_SECONDS)
+            except asyncio.CancelledError:
+                return
+            await self._set_level_value(key, value)
+
+        self._level_debounce_tasks[key] = asyncio.ensure_future(_wait_then_apply())
 
     async def _set_level_value(self, key: str, value: float):
         _get_name, set_name = self._level_methods[key]
@@ -939,6 +977,14 @@ class RadioWorker(QThread):
 
             await self._poll_loop()
         finally:
+            # Cancel any pending debounced level-value sends -- without
+            # this, a slider drag right before disconnect could leave a
+            # task scheduled to call self.radio well after
+            # _radio_cm.__aexit__() below has torn it down.
+            for task in self._level_debounce_tasks.values():
+                if not task.done():
+                    task.cancel()
+            self._level_debounce_tasks.clear()
             if self.audio_bridge:
                 await self.audio_bridge.stop()
             try:

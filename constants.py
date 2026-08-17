@@ -210,6 +210,17 @@ AUDIO_OUTPUT_BLOCK_MS = 20
 # tx_level aren't part of that (or any other) formal rigplane
 # Protocol, so those still probe multiple plausible names via
 # find_method_name, same as before.
+# How long set_level_value() waits after the LAST call for a given key
+# before actually sending the command -- each new call for the same key
+# resets this, so a continuous slider drag or tuning-knob spin only
+# sends once the user actually stops, not once per intermediate value.
+# 150ms is short enough that a deliberate pause mid-drag still feels
+# responsive, but long enough to collapse a fast drag's flood of
+# valueChanged events (which can easily exceed the remote web server's
+# 20/sec/command rate limit -- see radio_worker.py's set_level_value)
+# into a single command.
+LEVEL_DEBOUNCE_SECONDS = 0.15
+
 LEVEL_DEFINITIONS = {
     "af_gain": {
         "label": "AF Gain",

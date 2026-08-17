@@ -183,7 +183,7 @@ AUDIO_TX_PCM_FRAME_BYTES = AUDIO_TX_PCM_FRAME_SAMPLES * AUDIO_SAMPLE_WIDTH * AUD
 # when rigplane's audio chunks actually arrive (network/USB timing isn't
 # perfectly regular). Bigger = smoother but more latency between "radio
 # receives it" and "you hear it".
-AUDIO_JITTER_BUFFER_MS = 150
+AUDIO_JITTER_BUFFER_MS = 500
 # Fixed PortAudio callback size for the output stream. A fixed size (rather
 # than PortAudio's variable default) makes the RX buffering logic's
 # behavior more predictable across platforms.

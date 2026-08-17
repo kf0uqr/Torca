@@ -46,16 +46,16 @@ needed to test this):
   get_af_level()/etc already return (confirmed live) -- no unit
   conversion needed between a remote and a local connection.
 
-Scope (`/api/v1/scope`) is implemented. Audio (`/api/v1/audio`) is not
-yet (see the plan's phasing). `isinstance(remote_radio, AudioTransport)`
-is a `@runtime_checkable` Protocol (confirmed by reading
-rigplane/core/radio_protocol.py) -- purely structural, satisfied by
-which methods a class defines, no registration needed -- so that
-capability will "turn on" for radio_worker.py automatically the moment
-its methods are added here, with no changes needed on radio_worker.py's
-side. (Scope itself isn't gated by an isinstance() check at all --
-radio_worker.py just calls enable_scope() in a try/except -- so no
-Protocol conformance was needed for it to "turn on".)
+Scope (`/api/v1/scope`) and audio (`/api/v1/audio`, PCM16 RX+TX) are
+both implemented. Opus and WebRTC are explicitly out of scope (LAN-
+first use case; PCM16 already gives full parity). Audio IS gated by
+`isinstance(remote_radio, AudioTransport)` (radio_worker.py:364) --
+a `@runtime_checkable` Protocol (confirmed by reading
+rigplane/core/radio_protocol.py), purely structural, satisfied by
+which methods/properties a class defines -- all 5 properties and 5
+methods it requires are implemented below. (Scope, by contrast, isn't
+gated by an isinstance() check at all -- radio_worker.py just calls
+enable_scope() in a try/except.)
 """
 
 import asyncio
@@ -64,8 +64,17 @@ import json
 import os
 import struct
 
+from rigplane import AudioCodec
+from rigplane.audio.lan_stream import AudioPacket
 from rigplane.scope import ScopeFrame
 from rigplane.web._delta_encoder import apply_delta
+from rigplane.web.protocol import (
+    AUDIO_CODEC_PCM16,
+    AUDIO_HEADER_SIZE,
+    MSG_TYPE_AUDIO_RX,
+    MSG_TYPE_AUDIO_TX,
+    encode_audio_frame,
+)
 
 _WS_OP_TEXT = 0x1
 _WS_OP_BINARY = 0x2
@@ -251,6 +260,12 @@ class RemoteWebRadio:
         self._scope_ws = None
         self._scope_reader_task = None
         self._scope_callback = None
+        self._audio_ws = None
+        self._audio_reader_task = None
+        self._rx_callback = None
+        self._audio_sample_rate = 48000
+        self._audio_channels = 1
+        self._audio_tx_seq = 0
 
     # ---- Async context manager (Radio protocol lifecycle) ------------
 
@@ -285,6 +300,7 @@ class RemoteWebRadio:
 
     async def disconnect(self) -> None:
         await self.disable_scope()
+        await self._close_audio_ws()
         if self._control_reader_task is not None:
             self._control_reader_task.cancel()
             try:
@@ -597,3 +613,139 @@ class RemoteWebRadio:
         # set_<field> pattern, this one just doesn't.
         await self._send_command("switch_scope_receiver", {"receiver": receiver})
         self._state.setdefault("scopeControls", {})["receiver"] = receiver
+
+    # ---- Audio (RX/TX, PCM16 only for v1 -- Opus/WebRTC deferred per plan) --
+    # Unlike scope, radio_worker.py DOES gate audio behind a structural
+    # isinstance(self.radio, AudioTransport) check (radio_worker.py:364) --
+    # confirmed by reading rigplane's AudioTransport Protocol in full
+    # (core/radio_protocol.py:877-963): 5 properties + 5 methods, all
+    # implemented below. RX and TX share ONE /api/v1/audio WebSocket
+    # connection (confirmed via web/handlers/audio.py's AudioHandler:
+    # JSON audio_start/audio_stop control text interleaved with binary
+    # RX frames from the server and binary TX frames from the client, on
+    # the same connection) -- opened lazily on whichever of start_rx()/
+    # start_tx() is called first, closed only in disconnect(). TX frames
+    # are built with rigplane's own encode_audio_frame (reused directly,
+    # like apply_delta above) since the server's _handle_tx_audio only
+    # ever reads the first 2 header bytes (msg_type, codec) -- confirmed
+    # by reading it -- so the seq/sample_rate/channels/frame_ms fields
+    # sent here are accepted but functionally unused server-side.
+
+    @property
+    def audio_bus(self):
+        # Nothing in this app reads .audio_bus directly (confirmed via
+        # grep of audio.py/radio_worker.py) -- it exists only so
+        # isinstance(remote_radio, AudioTransport) is structurally true.
+        return None
+
+    @property
+    def audio_codec(self) -> AudioCodec:
+        # audio.py's _is_stereo_rx_codec() keys off "2CH" in this name to
+        # decide whether to downmix -- report the server's actual
+        # negotiated channel count (from the audio_format ack) rather
+        # than assuming mono.
+        return AudioCodec.PCM_2CH_16BIT if self._audio_channels == 2 else AudioCodec.PCM_1CH_16BIT
+
+    @property
+    def audio_tx_codec(self) -> AudioCodec:
+        # TX capture (audio.py) is always mono (constants.AUDIO_CHANNELS
+        # == 1); the server transcodes to whatever the actual radio's TX
+        # codec needs, so this only needs to satisfy audio.py's own
+        # "contains pcm" validation, not describe the real radio.
+        return AudioCodec.PCM_1CH_16BIT
+
+    @property
+    def audio_sample_rate(self) -> int:
+        return self._audio_sample_rate
+
+    @property
+    def audio_duplex_mode(self):
+        # RX and TX flow over the same full-duplex WebSocket/TCP
+        # connection simultaneously -- no exclusive-device contention
+        # the way a local shared OS audio device would have.
+        return "full"
+
+    async def _ensure_audio_ws(self) -> None:
+        if self._audio_ws is not None:
+            return
+        self._audio_ws = await _WebSocketClient.connect(self._host, self._port, "/api/v1/audio", token=self._token)
+        self._audio_reader_task = asyncio.ensure_future(self._audio_reader_loop())
+
+    async def _close_audio_ws(self) -> None:
+        if self._audio_reader_task is not None:
+            self._audio_reader_task.cancel()
+            try:
+                await self._audio_reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._audio_reader_task = None
+        if self._audio_ws is not None:
+            await self._audio_ws.close()
+            self._audio_ws = None
+
+    async def _audio_reader_loop(self) -> None:
+        try:
+            while True:
+                opcode, payload = await self._audio_ws.recv()
+                if opcode == _WS_OP_TEXT:
+                    try:
+                        msg = json.loads(payload)
+                    except ValueError:
+                        continue
+                    if msg.get("type") == "audio_format":
+                        self._audio_sample_rate = int(msg.get("sample_rate", self._audio_sample_rate))
+                        self._audio_channels = int(msg.get("channels", self._audio_channels))
+                    continue
+                if opcode != _WS_OP_BINARY or len(payload) < AUDIO_HEADER_SIZE:
+                    continue
+                if payload[0] != MSG_TYPE_AUDIO_RX:
+                    continue
+                seq = struct.unpack_from("<H", payload, 2)[0]
+                data = payload[AUDIO_HEADER_SIZE:]
+                if self._rx_callback is not None:
+                    self._rx_callback(AudioPacket(ident=0, send_seq=seq, data=data))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def start_rx(self, callback) -> None:
+        await self._ensure_audio_ws()
+        self._rx_callback = callback
+        await self._audio_ws.send_text(json.dumps({
+            "type": "audio_start", "direction": "rx", "preferred_rx_codec": "pcm16",
+        }))
+
+    async def stop_rx(self) -> None:
+        self._rx_callback = None
+        if self._audio_ws is not None:
+            try:
+                await self._audio_ws.send_text(json.dumps({"type": "audio_stop", "direction": "rx"}))
+            except Exception:
+                pass
+
+    async def start_tx(self) -> None:
+        await self._ensure_audio_ws()
+        await self._audio_ws.send_text(json.dumps({"type": "audio_start", "direction": "tx"}))
+
+    async def push_tx(self, data: bytes) -> None:
+        if self._audio_ws is None:
+            raise RemoteRadioError("push_tx: audio channel not open (call start_tx() first).")
+        # frame_ms is advisory only (confirmed via encode_audio_frame's own
+        # docstring and _handle_tx_audio ignoring it server-side) -- derived
+        # from the actual payload the same way the broadcaster derives it
+        # for RX, purely for wire-format consistency.
+        frame_ms = max(1, min((len(data) * 1000) // max(1, self._audio_sample_rate * 2), 255))
+        frame = encode_audio_frame(
+            MSG_TYPE_AUDIO_TX, AUDIO_CODEC_PCM16, self._audio_tx_seq,
+            self._audio_sample_rate // 100, 1, frame_ms, data,
+        )
+        self._audio_tx_seq = (self._audio_tx_seq + 1) & 0xFFFF
+        await self._audio_ws.send_binary(frame)
+
+    async def stop_tx(self) -> None:
+        if self._audio_ws is not None:
+            try:
+                await self._audio_ws.send_text(json.dumps({"type": "audio_stop", "direction": "tx"}))
+            except Exception:
+                pass

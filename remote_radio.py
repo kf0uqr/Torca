@@ -511,6 +511,57 @@ class RemoteWebRadio:
     get_nb, set_nb = _level_property("set_nb", ("nb",), param_name="on")
     get_nr, set_nr = _level_property("set_nr", ("nr",), param_name="on")
     get_agc, set_agc = _level_property("set_agc", ("agc",), param_name="value")
+    # rigplane's LevelsCapable Protocol (core/radio_protocol.py) requires
+    # these five in addition to af_level/rf_gain/squelch above -- NOT used
+    # by anything in LEVEL_DEFINITIONS/CONTROL_DEFINITIONS (confirmed via
+    # grep; the app never calls them directly), but radio_worker.py's own
+    # _setup_levels() gates its ENTIRE LEVEL_DEFINITIONS discovery loop
+    # behind isinstance(self.radio, LevelsCapable) -- missing even one of
+    # these silently failed that check and disabled every level slider
+    # (af_gain/squelch/rf_level/monitor/tx_level) for every remote
+    # connection, not just the ones these five cover. Confirmed live: this
+    # was exactly the "sliders don't seem to be working" bug. nr_level/
+    # nb_level take a receiver kwarg per the Protocol and the web command
+    # (web/handlers/control.py's set_nr_level/set_nb_level cases) --
+    # mic_gain/drive_gain/compressor_level don't (confirmed via both the
+    # Protocol signatures and the web command param shapes), so those
+    # three are hand-written below rather than using _level_property.
+    get_nr_level, set_nr_level = _level_property("set_nr_level", ("nrLevel",))
+    get_nb_level, set_nb_level = _level_property("set_nb_level", ("nbLevel",))
+    # These two ARE real LEVEL_DEFINITIONS entries radio_worker.py actually
+    # calls ("monitor" and "tx_level") -- unlike the five above, these were
+    # simply never implemented at all in Phase 1, a second, independent gap
+    # alongside the isinstance(LevelsCapable) one. monitorGain's web state
+    # field is a raw 0-255 int (not normalized, per LevelsCapable's own
+    # get_monitor_gain docstring) and powerLevel is a float -- doesn't
+    # matter which scale either uses: radio_worker.py's own
+    # _normalize_level_value already auto-detects raw-vs-normalized on the
+    # way in, and the server's _normalized_or_raw_level does the same on
+    # the way out, so _level_property's plain pass-through works unmodified
+    # for both, exactly like af_level/rf_gain/squelch above.
+    get_monitor_gain, set_monitor_gain = _level_property("set_monitor_gain", ("monitorGain",))
+    get_power, set_power = _level_property("set_power", ("powerLevel",))
+
+    async def get_mic_gain(self) -> int:
+        return int(self._state.get("micGain", 0))
+
+    async def set_mic_gain(self, level: int) -> None:
+        await self._send_command("set_mic_gain", {"level": level})
+        self._state["micGain"] = level
+
+    async def get_drive_gain(self) -> int:
+        return int(self._state.get("driveGain", 0))
+
+    async def set_drive_gain(self, level: int) -> None:
+        await self._send_command("set_drive_gain", {"level": level})
+        self._state["driveGain"] = level
+
+    async def get_compressor_level(self) -> int:
+        return int(self._state.get("compressorLevel", 0))
+
+    async def set_compressor_level(self, level: int) -> None:
+        await self._send_command("set_compressor_level", {"level": level})
+        self._state["compressorLevel"] = level
 
     # ---- Scope (spectrum/waterfall) ----------------------------------------
     # Only the methods radio_worker.py actually calls (grepped directly,

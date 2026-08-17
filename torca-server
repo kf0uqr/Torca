@@ -2,11 +2,14 @@
 # Shares a locally-connected radio (typically USB/serial, e.g. IC-7300)
 # over the network via rigplane's own `web` server, for another TORCA
 # instance to connect to via the connect dialog's "Remote Server" option
-# (see README.md). Just rigplane's own CLI, already in this venv -- no
-# separate `source bin/activate` needed. Pass connection flags BEFORE
-# any web-specific flags, e.g.:
+# (see README.md). Runs through torca_server.py rather than exec'ing
+# rigplane directly -- that wrapper disables rigplane's periodic
+# unselected-VFO-slot refresh (confirmed to cause a brief RX audio
+# glitch every ~5s on radios whose USB audio follows the active VFO),
+# then dispatches to rigplane's own CLI unchanged. Pass connection
+# flags BEFORE any web-specific flags, e.g.:
 #   ./torca-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web
 
 source bin/activate
-rigplane "$@"
+python3 torca_server.py "$@"
 deactivate

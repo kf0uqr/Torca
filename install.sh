@@ -193,10 +193,12 @@ EOF
         cat > "$SERVER_LAUNCHER_PATH" <<EOF
 #!/bin/bash
 # Shares a locally-connected radio over the network via rigplane's own
-# web server -- see README.md's remote-connection section. Installed by
-# install.sh -- re-run that script (don't hand-edit this file) to
-# reinstall or uninstall.
-exec "$INSTALL_DIR/bin/rigplane" "\$@"
+# web server -- see README.md's remote-connection section. Runs through
+# torca_server.py (disables rigplane's periodic unselected-VFO-slot
+# refresh -- see that file's docstring) rather than exec'ing rigplane
+# directly. Installed by install.sh -- re-run that script (don't
+# hand-edit this file) to reinstall or uninstall.
+exec "$INSTALL_DIR/bin/python3" "$INSTALL_DIR/torca_server.py" "\$@"
 EOF
         chmod 755 "$SERVER_LAUNCHER_PATH"
 

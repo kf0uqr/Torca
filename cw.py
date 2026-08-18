@@ -77,6 +77,18 @@ _UNIT_ADAPT_RATE = 0.3
 # missing with no indication why.
 UNKNOWN_CHAR_PLACEHOLDER = "*"
 
+# Accepted WPM range for decoded output -- per explicit instruction:
+# a character is only appended to the transcript while the adaptive
+# unit_ms estimate implies a speed in this range (see CwDecoder.
+# current_wpm/_finalize_character). Ordinary audio-band noise/voice
+# rarely produces on/off timing that happens to land in a plausible
+# human CW-sending range, so this is an effective, cheap garbage
+# filter -- real amateur CW traffic is overwhelmingly sent somewhere
+# in 10-30 WPM; the rare faster QRQ operator falls outside it, a
+# deliberate trade-off for killing noise decode.
+MIN_ACCEPTED_WPM = 10.0
+MAX_ACCEPTED_WPM = 30.0
+
 
 def estimate_cw_send_duration_ms(text: str, wpm: int) -> float:
     """Estimates how long the radio's own keyer will take to key out
@@ -348,8 +360,17 @@ class CwDecoder:
     def _off_gap_ended(self, duration_ms) -> str:
         if duration_ms < self._unit_ms * _INTRA_INTER_GAP_THRESHOLD_UNITS:
             return ""  # still within the same character
-        output = self._finalize_character()
-        if duration_ms >= self._unit_ms * _INTER_WORD_GAP_THRESHOLD_UNITS:
+        had_pending_symbols = bool(self._current_symbols)
+        char = self._finalize_character()
+        is_word_gap = duration_ms >= self._unit_ms * _INTER_WORD_GAP_THRESHOLD_UNITS
+        if had_pending_symbols and not char:
+            # _finalize_character suppressed a real, completed character
+            # (implausible WPM -- see its own docstring), not just a
+            # continued gap between already-flushed words -- skip the
+            # trailing space too rather than emitting an orphan one.
+            return ""
+        output = char
+        if is_word_gap:
             output += " "
         return output
 
@@ -357,5 +378,15 @@ class CwDecoder:
         symbols = self._current_symbols
         self._current_symbols = ""
         if not symbols:
+            return ""
+        if not (MIN_ACCEPTED_WPM <= self.current_wpm <= MAX_ACCEPTED_WPM):
+            # Implausible speed -- almost certainly noise/voice audio
+            # producing on/off timing that isn't real human-sent CW,
+            # not a genuine character. Discard rather than append
+            # garbage to the transcript (see MIN_ACCEPTED_WPM's own
+            # comment). The mark timing has already been folded into
+            # _unit_ms by _on_mark_ended either way, so the estimate
+            # keeps adapting/can recover even though this character is
+            # dropped.
             return ""
         return _PATTERN_TO_CHAR.get(symbols, UNKNOWN_CHAR_PLACEHOLDER)

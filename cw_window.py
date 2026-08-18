@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from constants import AUDIO_DEFAULT_SAMPLE_RATE
-from cw import CwDecoder, estimate_cw_send_duration_ms
+from cw import CwDecoder, estimate_cw_send_duration_ms, MIN_ACCEPTED_WPM, MAX_ACCEPTED_WPM
 
 _MACROS_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "cw_macros.json"
 
@@ -501,7 +501,16 @@ class CwToolWindow(QWidget):
         if self._decoder is None:
             return
         if self._decoder.has_signal:
-            self.decode_status_label.setText(f"Decoding -- tone detected, ~{self._decoder.current_wpm:.0f} WPM")
+            wpm = self._decoder.current_wpm
+            text = f"Decoding -- tone detected, ~{wpm:.0f} WPM"
+            if not (MIN_ACCEPTED_WPM <= wpm <= MAX_ACCEPTED_WPM):
+                # cw.CwDecoder silently drops decoded characters outside
+                # this range (see its own MIN_ACCEPTED_WPM comment) --
+                # surfaced here so an operator watching an empty
+                # transcript with a tone clearly detected knows why,
+                # rather than assuming decode is just broken.
+                text += " (ignoring -- outside accepted 10-30 WPM range)"
+            self.decode_status_label.setText(text)
         else:
             self.decode_status_label.setText("Decoding -- listening for tone...")
 

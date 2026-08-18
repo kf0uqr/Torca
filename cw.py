@@ -247,12 +247,6 @@ class CwDecoder:
     # ages out of it quickly.
     _MARK_HISTORY_SIZE = 6
 
-    # Same idea as _MARK_HISTORY_SIZE, for recent GAP durations (see
-    # _classify_gap) -- slightly larger since gap clustering there
-    # needs to resolve three categories (intra-character/inter-
-    # character/inter-word), not just two.
-    _GAP_HISTORY_SIZE = 8
-
     # An on/off change has to persist for at least this many blocks
     # before it's accepted as a real mark/gap boundary -- otherwise
     # it's folded back into whatever state was already confirmed (see
@@ -268,15 +262,16 @@ class CwDecoder:
     # fairly often (not just as a rare one-off), the estimate ends up
     # spending most of its time pinned high, only occasionally
     # reading correctly (and decoding) when a mark happens to come
-    # through clean. Confirmed live that 2 blocks (8ms) wasn't quite
-    # enough margin -- a brief noise dropout can straddle a block
-    # boundary and still read as "off" across 2 separate blocks even
-    # if the dropout itself is only ~5ms, since each block's Goertzel
-    # power reflects whatever fraction of the notch actually falls
-    # inside it. 3 blocks (~12ms at this decoder's ~4ms block size)
-    # gives real margin against that while staying safely under the
-    # shortest legitimate mark OR gap this decoder accepts (a dot, or
-    # the intra-character gap between elements, is 20ms at
+    # through clean. 2 blocks (~8ms at this decoder's ~4ms block size)
+    # Confirmed live that 2 blocks (8ms) wasn't quite enough margin --
+    # a brief noise dropout can straddle a block boundary and still
+    # read as "off" across 2 separate blocks even if the dropout
+    # itself is only ~5ms, since each block's Goertzel power reflects
+    # whatever fraction of the notch actually falls inside it. 3
+    # blocks (~12ms at this decoder's ~4ms block size) gives real
+    # margin against that while staying safely under the shortest
+    # legitimate mark OR gap this decoder accepts (a dot, or the
+    # intra-character gap between elements, is 20ms at
     # MAX_ACCEPTED_WPM=60).
     _MIN_TRANSITION_BLOCKS = 3
 
@@ -299,7 +294,6 @@ class CwDecoder:
         self._peak = None          # adaptive, learned from observed block power
         self._priming_powers = []  # collected until _PRIMING_BLOCKS is reached, then discarded
         self._mark_history = deque(maxlen=self._MARK_HISTORY_SIZE)
-        self._gap_history = deque(maxlen=self._GAP_HISTORY_SIZE)
         self._tone_on = False
         self._state_elapsed_ms = 0.0   # time spent in the current CONFIRMED on/off state so far (includes any not-yet-confirmed candidate blocks -- see _advance_state)
         self._candidate_state = None   # an is_on value being tentatively tracked as a possible new state, or None
@@ -556,62 +550,12 @@ class CwDecoder:
         threshold = (short_center + long_center) / 2.0
         return duration_ms < threshold
 
-    # Need at least this many recent gaps before trusting their
-    # minimum as a real measurement (see _classify_gap) rather than
-    # falling back to a fixed multiple of unit_ms.
-    _MIN_GAPS_FOR_ESTIMATE = 3
-
-    def _classify_gap(self, duration_ms) -> str:
-        """Returns "intra" (still the same character), "inter_char"
-        (character boundary), or "inter_word" (word boundary -- emits
-        a space).
-
-        With enough recent gap history, anchors the classification
-        thresholds to the MINIMUM of recently observed gaps rather
-        than a fixed multiple of the running unit_ms (a MARK-based
-        measurement) estimate -- confirmed live on real (noisy) radio
-        audio that unit_ms being even slightly off from the true GAP
-        timing (real keying isn't perfectly symmetric between mark and
-        gap duration, and this decoder's own mark/gap detection paths
-        aren't perfectly symmetric either) could misjudge a real
-        intra-character gap as a character boundary, cutting a
-        character short right after its first element -- which is
-        exactly what a spurious extra "E" or "T" (the shortest
-        possible dot/dash) in the transcript looks like. The minimum
-        recent gap is a good, low-noise proxy specifically for the
-        true intra-character gap length: that category is both the
-        shortest of the three AND, in ordinary text, by far the most
-        common, so it reliably dominates any reasonably-sized recent
-        window.
-
-        An EARLIER version of this tried reusing _cluster_marks' 2-
-        means clustering here too (which works well for dot/dash,
-        genuinely only 2 categories) -- confirmed live that this
-        breaks down for gaps because there are 3 real categories
-        mixed in one window, and an unweighted 2-way split doesn't
-        reliably separate them the same way (it can just as easily
-        end up splitting off only the rare word gaps and lumping
-        intra- and inter-character gaps together, systematically
-        misclassifying every inter-character gap as intra and
-        breaking character segmentation entirely)."""
-        recent = list(self._gap_history)
-        if len(recent) >= self._MIN_GAPS_FOR_ESTIMATE:
-            intra_estimate = min(recent)
-        else:
-            intra_estimate = self._unit_ms
-        is_intra = duration_ms < intra_estimate * _INTRA_INTER_GAP_THRESHOLD_UNITS
-        is_word = duration_ms >= intra_estimate * _INTER_WORD_GAP_THRESHOLD_UNITS
-        if is_intra:
-            return "intra"
-        return "inter_word" if is_word else "inter_char"
-
     def _off_gap_ended(self, duration_ms) -> str:
-        gap_kind = self._classify_gap(duration_ms)
-        self._gap_history.append(duration_ms)
-        if gap_kind == "intra":
+        if duration_ms < self._unit_ms * _INTRA_INTER_GAP_THRESHOLD_UNITS:
             return ""  # still within the same character
         had_pending_symbols = bool(self._current_symbols)
         char = self._finalize_character()
+        is_word_gap = duration_ms >= self._unit_ms * _INTER_WORD_GAP_THRESHOLD_UNITS
         if had_pending_symbols and not char:
             # _finalize_character suppressed a real, completed character
             # (implausible WPM -- see its own docstring), not just a
@@ -619,7 +563,7 @@ class CwDecoder:
             # trailing space too rather than emitting an orphan one.
             return ""
         output = char
-        if gap_kind == "inter_word":
+        if is_word_gap:
             output += " "
         return output
 

@@ -259,6 +259,37 @@ class CwToolWindow(QWidget):
         decode_buttons_row.addWidget(self.clear_button)
         decode_buttons_row.addStretch()
 
+        # Lets an operator who's confirmed the real speed by ear (or
+        # by watching the status label's live estimate settle while
+        # decode looks right) anchor the decoder to it instead of
+        # trusting the adaptive estimate for the rest of the session
+        # -- per explicit instruction/real-world testing, this
+        # decoder's adaptive tracking, even after several rounds of
+        # hardening, still drifts enough on real noisy audio to
+        # visibly hurt decode quality sometimes. See cw.CwDecoder.
+        # set_known_wpm's own docstring for the unlocked-seed-vs-
+        # locked distinction.
+        self.known_speed_spin = QSpinBox()
+        self.known_speed_spin.setRange(int(MIN_ACCEPTED_WPM), int(MAX_ACCEPTED_WPM))
+        self.known_speed_spin.setValue(20)
+        self.known_speed_spin.setSuffix(" WPM")
+        self.known_speed_spin.valueChanged.connect(self._on_known_speed_spin_changed)
+
+        self.lock_speed_button = QPushButton("Lock Speed")
+        self.lock_speed_button.setCheckable(True)
+        self.lock_speed_button.setToolTip(
+            "Once the speed is obvious (e.g. the status line below keeps reading "
+            "the same WPM while decode looks right), lock the decoder to it "
+            "instead of letting the estimate keep adapting (and possibly drifting)."
+        )
+        self.lock_speed_button.toggled.connect(self._on_lock_speed_toggled)
+
+        known_speed_row = QHBoxLayout()
+        known_speed_row.addWidget(QLabel("Known Speed:"))
+        known_speed_row.addWidget(self.known_speed_spin)
+        known_speed_row.addWidget(self.lock_speed_button)
+        known_speed_row.addStretch()
+
         self.decode_status_label = QLabel("Not decoding.")
         self.decode_status_label.setStyleSheet("color: #aaa;")
 
@@ -268,6 +299,7 @@ class CwToolWindow(QWidget):
         decode_group = QVBoxLayout()
         decode_group.addWidget(QLabel("<b>Decode</b>"))
         decode_group.addLayout(decode_buttons_row)
+        decode_group.addLayout(known_speed_row)
         decode_group.addWidget(self.decode_status_label)
         decode_group.addWidget(self.transcript)
 
@@ -437,6 +469,8 @@ class CwToolWindow(QWidget):
         if checked:
             sample_rate = getattr(worker.radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
             self._decoder = CwDecoder(sample_rate, self.pitch_spin.value())
+            if self.lock_speed_button.isChecked():
+                self._decoder.set_known_wpm(self.known_speed_spin.value(), lock=True)
             try:
                 worker.start_cw_decode(self._on_decode_audio_frame)
             except RuntimeError as exc:
@@ -473,6 +507,23 @@ class CwToolWindow(QWidget):
             self.decode_toggle_button.setText("Start Decoding")
             self.decode_status_label.setText("Not decoding.")
 
+    def _on_lock_speed_toggled(self, checked):
+        self.lock_speed_button.setText("Unlock Speed" if checked else "Lock Speed")
+        if self._decoder is None:
+            return  # applied when decode next starts instead -- see _on_decode_toggled
+        if checked:
+            self._decoder.set_known_wpm(self.known_speed_spin.value(), lock=True)
+        else:
+            self._decoder.clear_known_wpm()
+
+    def _on_known_speed_spin_changed(self, value):
+        # Only takes effect immediately while actually locked -- an
+        # operator adjusting the spin box before locking (or after
+        # unlocking) shouldn't perturb whatever the decoder is
+        # currently doing.
+        if self._decoder is not None and self.lock_speed_button.isChecked():
+            self._decoder.set_known_wpm(value, lock=True)
+
     def _on_decode_audio_frame(self, pcm_bytes):
         # Runs on RadioWorker's asyncio-loop thread. cw.CwDecoder has
         # no thread-safety of its own, but it's only ever touched here
@@ -502,7 +553,10 @@ class CwToolWindow(QWidget):
             return
         if self._decoder.has_signal:
             wpm = self._decoder.current_wpm
-            text = f"Decoding -- tone detected, ~{wpm:.0f} WPM"
+            if self._decoder.is_wpm_locked:
+                text = f"Decoding -- tone detected, locked at {wpm:.0f} WPM"
+            else:
+                text = f"Decoding -- tone detected, ~{wpm:.0f} WPM"
             if not (MIN_ACCEPTED_WPM <= wpm <= MAX_ACCEPTED_WPM):
                 # cw.CwDecoder silently drops decoded characters outside
                 # this range (see its own MIN_ACCEPTED_WPM comment) --

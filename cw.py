@@ -301,6 +301,44 @@ class CwDecoder:
         self._unit_ms = _DEFAULT_UNIT_MS
         self._current_symbols = ""     # dots/dashes accumulated for the in-progress character
         self._have_signal = False      # true once at least one full mark has been seen -- for UI feedback
+        self._locked_unit_ms = None    # set via set_known_wpm(lock=True) -- see that method's docstring
+
+    def set_known_wpm(self, wpm: float, lock: bool = False):
+        """Lets an operator who's confirmed the real speed by ear (or
+        by watching current_wpm settle while decode looks right) seed
+        -- or, with lock=True, permanently anchor -- the estimate,
+        instead of waiting on/trusting the adaptive one. Per explicit
+        instruction/real-world testing: this decoder's adaptive
+        estimate, even after several rounds of hardening (clustering,
+        slew-rate clamping, de-glitching), still drifts enough on real
+        noisy audio to visibly affect decode quality -- a known-good
+        WPM sidesteps that class of problem entirely for the rest of
+        the session, at the cost of not tracking a genuine mid-QSO
+        speed change (see clear_known_wpm to release it).
+
+        Unlocked (lock=False): just overwrites the CURRENT unit_ms
+        with this value -- a one-time better starting point (like
+        _DEFAULT_UNIT_MS, but operator-confirmed instead of a generic
+        guess) that normal adaptation still runs on top of afterward,
+        and can still drift away from again.
+
+        Locked (lock=True): _adapt_unit_ms becomes a no-op for as
+        long as the lock is set -- unit_ms (and therefore current_wpm)
+        stays pinned exactly here regardless of what any subsequent
+        mark/gap measures, until clear_known_wpm() is called."""
+        unit_ms = 1200.0 / wpm if wpm > 0 else _DEFAULT_UNIT_MS
+        self._unit_ms = unit_ms
+        self._locked_unit_ms = unit_ms if lock else None
+
+    def clear_known_wpm(self):
+        """Releases a lock set via set_known_wpm(lock=True) -- normal
+        adaptive tracking resumes from wherever unit_ms currently is
+        (not reset back to _DEFAULT_UNIT_MS)."""
+        self._locked_unit_ms = None
+
+    @property
+    def is_wpm_locked(self) -> bool:
+        return self._locked_unit_ms is not None
 
     @property
     def current_wpm(self) -> float:
@@ -481,7 +519,12 @@ class CwDecoder:
         `rate`, then hard-clamps the resulting step to at most
         _MAX_UNIT_MS_STEP_FRACTION of the current value (see that
         constant's own comment for why the rate alone isn't a
-        sufficient safeguard against one badly-off measurement)."""
+        sufficient safeguard against one badly-off measurement). A
+        no-op while set_known_wpm(lock=True) is active -- see that
+        method's docstring."""
+        if self._locked_unit_ms is not None:
+            self._unit_ms = self._locked_unit_ms
+            return
         blended = self._unit_ms * (1 - rate) + target * rate
         max_step = self._unit_ms * _MAX_UNIT_MS_STEP_FRACTION
         delta = max(-max_step, min(max_step, blended - self._unit_ms))

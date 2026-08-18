@@ -410,6 +410,66 @@ class ContestsWorker(QThread):
         self.events_ready.emit(events)
 
 
+class ContestDetailsDialog(QDialog):
+    """Opened by double-clicking a row in the Contests tab -- shows the
+    full name (the table column is elided when narrow), start/end in
+    both UTC and local time (the table only shows UTC), duration, and
+    -- when contests.py's DESCRIPTION parsing found one -- a link to
+    the contest's details page on contestcalendar.com/hornucopia.com,
+    opened in the user's own default browser (QLabel's
+    setOpenExternalLinks, backed by QDesktopServices) only when they
+    click it, not automatically."""
+
+    def __init__(self, event, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Contest Details")
+        self.setMinimumWidth(420)
+
+        name_label = QLabel(event["name"])
+        name_label.setWordWrap(True)
+        name_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+
+        start_utc = event["start"]
+        end_utc = event["end"]
+        start_local = start_utc.astimezone()
+        end_local = end_utc.astimezone()
+        duration = end_utc - start_utc
+
+        form = QFormLayout()
+        form.addRow("Start (UTC):", QLabel(start_utc.strftime("%Y-%m-%d %H:%M")))
+        form.addRow("End (UTC):", QLabel(end_utc.strftime("%Y-%m-%d %H:%M")))
+        form.addRow("Start (local):", QLabel(start_local.strftime("%Y-%m-%d %H:%M %Z")))
+        form.addRow("End (local):", QLabel(end_local.strftime("%Y-%m-%d %H:%M %Z")))
+        form.addRow("Duration:", QLabel(_format_duration(duration)))
+
+        layout = QVBoxLayout()
+        layout.addWidget(name_label)
+        layout.addLayout(form)
+
+        info_url = event.get("info_url")
+        if info_url:
+            link_label = QLabel(f'<a href="{info_url}">{info_url}</a>')
+            link_label.setOpenExternalLinks(True)
+            link_label.setWordWrap(True)
+            layout.addWidget(link_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+
+def _format_duration(delta: datetime.timedelta) -> str:
+    total_minutes = int(delta.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
 class UpdateCheckWorker(QThread):
     """One-shot check off the GUI thread -- updater.check_for_update()
     does real network I/O (git ls-remote against GitHub)."""
@@ -596,6 +656,7 @@ class HamClockWindow(QWidget):
         self.contests_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.contests_table.setSelectionMode(QTableWidget.NoSelection)
         self.contests_table.verticalHeader().setVisible(False)
+        self.contests_table.cellDoubleClicked.connect(self._on_contest_row_double_clicked)
         self.contests_status_label = QLabel("Loading contest calendar...")
         self.contests_status_label.setStyleSheet("color: #888; font-size: 11px;")
         self.contests_refresh_button = QPushButton("Refresh")
@@ -1497,6 +1558,7 @@ class HamClockWindow(QWidget):
             else:
                 color = self._CONTEST_LATER_COLOR
             name_item = QTableWidgetItem(event["name"])
+            name_item.setData(Qt.UserRole, event)  # retrieved by _on_contest_row_double_clicked
             start_item = QTableWidgetItem(event["start"].strftime("%Y-%m-%d %H:%M"))
             end_item = QTableWidgetItem(event["end"].strftime("%Y-%m-%d %H:%M"))
             for item in (name_item, start_item, end_item):
@@ -1508,6 +1570,19 @@ class HamClockWindow(QWidget):
         self.contests_status_label.setText(
             f"{len(upcoming)} current/upcoming contest{'s' if len(upcoming) != 1 else ''}"
         )
+
+    def _on_contest_row_double_clicked(self, row, column):
+        # The event dict is stashed on column 0's item (see
+        # _rebuild_contests_table) regardless of which column was
+        # actually double-clicked.
+        name_item = self.contests_table.item(row, 0)
+        if name_item is None:
+            return
+        event = name_item.data(Qt.UserRole)
+        if event is None:
+            return
+        dialog = ContestDetailsDialog(event, self)
+        dialog.exec()
 
     def _on_dx_connect_toggled(self, checked):
         if checked:

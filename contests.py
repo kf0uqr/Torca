@@ -25,6 +25,7 @@ both of those forms defensively, but the confirmed-live case is the
 """
 
 import datetime
+import re
 import urllib.error
 import urllib.request
 
@@ -97,11 +98,29 @@ def _unescape_ics_text(value: str) -> str:
     return "".join(result)
 
 
+_DESCRIPTION_HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
+
+
+def _extract_info_url(description: str) -> "str | None":
+    """This feed's DESCRIPTION is a single HTML anchor tag pointing at
+    the contest's details page on contestcalendar.com/hornucopia.com,
+    e.g. '<a href="http://www.contestcalendar.com/contestdetails.php
+    ?ref=608">Info</a>' -- confirmed live against a real fetch. Pulls
+    just the href out; returns None if DESCRIPTION is missing or
+    doesn't match this shape rather than guessing."""
+    if not description:
+        return None
+    match = _DESCRIPTION_HREF_RE.search(_unescape_ics_text(description))
+    return match.group(1) if match else None
+
+
 def parse_contest_calendar_ics(text: str) -> list:
     """Returns every VEVENT in `text` as {"name", "start" (UTC
-    datetime), "end" (UTC datetime)} -- an event missing SUMMARY,
-    DTSTART, or DTEND, or with an unparseable date value, is skipped
-    rather than guessed."""
+    datetime), "end" (UTC datetime), "info_url" (str or None)} -- an
+    event missing SUMMARY, DTSTART, or DTEND, or with an unparseable
+    date value, is skipped rather than guessed. info_url comes from
+    DESCRIPTION (see _extract_info_url) and is None if that property
+    is absent or doesn't contain a recognizable link."""
     events = []
     current = None
     for line in _unfold_ics_lines(text):
@@ -115,6 +134,7 @@ def parse_contest_calendar_ics(text: str) -> list:
                         "name": _unescape_ics_text(current["SUMMARY"]),
                         "start": _parse_ics_datetime(current["DTSTART"]),
                         "end": _parse_ics_datetime(current["DTEND"]),
+                        "info_url": _extract_info_url(current.get("DESCRIPTION")),
                     })
                 except ValueError:
                     pass
@@ -126,7 +146,7 @@ def parse_contest_calendar_ics(text: str) -> list:
             continue
         prop, _sep, value = line.partition(":")
         prop = prop.split(";", 1)[0]  # drop any ";PARAM=..." suffix (e.g. "DTSTART;VALUE=DATE")
-        if prop in ("SUMMARY", "DTSTART", "DTEND"):
+        if prop in ("SUMMARY", "DTSTART", "DTEND", "DESCRIPTION"):
             current[prop] = value
     return events
 

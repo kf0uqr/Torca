@@ -127,7 +127,9 @@ class RadioWindow(QWidget):
 
         self.spectrum_widget = SpectrumWidget()
         self.spectrum_widget.set_overlay_widget(self.freq_display)
+        self.spectrum_widget.frequency_clicked.connect(self._on_scope_clicked)
         self.waterfall_widget = WaterfallWidget()
+        self.waterfall_widget.frequency_clicked.connect(self._on_scope_clicked)
 
         self.tuning_knob = TuningKnobWidget()
         self.tuning_knob.setEnabled(False)
@@ -1038,6 +1040,38 @@ class RadioWindow(QWidget):
         # spinning the knob; the next poll cycle will confirm/correct it.
         self._current_freq_hz = new_freq_hz
         self.freq_display.setText(f"{new_freq_hz / 1e6:.6f} MHz")
+        self._update_band_button_highlight()
+
+    def _on_scope_clicked(self, freq_hz):
+        """Click-to-tune: a left-click on the spectrum scope or
+        waterfall (widgets.py's SpectrumWidget/WaterfallWidget
+        frequency_clicked) retunes to that frequency, snapped to the
+        currently selected step size (step_combo -- same one the
+        tuning knob uses) so a slightly-off pixel click still lands on
+        a round number. Reuses _on_knob_steps' exact dual-receiver/
+        satellite-tracking branching (confirmed working there) rather
+        than a new, untested tuning path -- the only real difference
+        is this computes an absolute target frequency instead of a
+        relative step."""
+        step_hz = self.step_combo.currentData()
+        if step_hz:
+            freq_hz = round(freq_hz / step_hz) * step_hz
+        freq_hz = max(0, freq_hz)
+
+        if self._role in ("full_duplex", "downlink") and self._satellite_session.is_tracking():
+            if self._current_freq_hz is None:
+                return
+            self._satellite_session.adjust_offset(freq_hz - self._current_freq_hz)
+            return
+
+        if self.worker.is_dual_receiver and self.active_receiver_button.text() == "Active: SUB":
+            self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, freq_hz, "A")
+        else:
+            self.worker.set_frequency(freq_hz)
+        # Update optimistically, same as _on_knob_steps -- the next
+        # poll cycle confirms/corrects it.
+        self._current_freq_hz = freq_hz
+        self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
         self._update_band_button_highlight()
 
     def _update_band_button_highlight(self):

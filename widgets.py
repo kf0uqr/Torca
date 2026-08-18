@@ -43,9 +43,16 @@ def amplitude_to_color(amp, max_amp=160):
 class SpectrumWidget(QWidget):
     """Amplitude-vs-frequency plot of the most recent ScopeFrame."""
 
+    # Emitted on a left-click anywhere in the plot, with the clicked
+    # x-pixel's frequency (Hz) per _x_to_freq -- RadioWindow connects
+    # this to click-to-tune (see main_window.py's _on_scope_clicked).
+    # Not emitted if there's no frame yet (nothing to click against).
+    frequency_clicked = Signal(float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(120)
+        self.setCursor(Qt.CrossCursor)
         self._frame = None
         self._overlays = {}  # corner -> (widget, margin)
         self._tuned_freq_hz = None  # set via set_tuned_frequency() -- whichever receiver the scope is currently following
@@ -124,6 +131,22 @@ class SpectrumWidget(QWidget):
             return None
         return (freq_hz - start) / (end - start) * w
 
+    def _x_to_freq(self, x, w):
+        """Inverse of _freq_to_x -- maps a clicked x-pixel back to a
+        frequency against the current frame's start/end span. Returns
+        None if there's no frame yet or the widget has zero width."""
+        if self._frame is None or w <= 0:
+            return None
+        start, end = self._frame.start_freq_hz, self._frame.end_freq_hz
+        return start + (x / w) * (end - start)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            freq_hz = self._x_to_freq(event.position().x(), self.width())
+            if freq_hz is not None:
+                self.frequency_clicked.emit(freq_hz)
+        super().mousePressEvent(event)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(10, 10, 20))
@@ -184,17 +207,29 @@ class SpectrumWidget(QWidget):
 class WaterfallWidget(QWidget):
     """Scrolling history of ScopeFrames, newest at the top."""
 
+    # Same click-to-tune contract as SpectrumWidget.frequency_clicked --
+    # see that class's docstring. Every row shares the most recently
+    # received frame's start/end span for the x-to-frequency mapping
+    # (rows are historical amplitude data, but the frequency axis
+    # itself doesn't change row-to-row under normal use), so a click
+    # anywhere in a column, regardless of which row/how far back in
+    # time, maps to the same frequency.
+    frequency_clicked = Signal(float)
+
     def __init__(self, max_rows=WATERFALL_ROWS, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(200)
+        self.setCursor(Qt.CrossCursor)
         self._max_rows = max_rows
         self._image = None  # QImage buffer: width = pixels/frame, height = max_rows
+        self._frame = None  # most recent ScopeFrame -- only used for its start/end span, see _x_to_freq
 
     def set_frame(self, frame):
         pixels = frame.pixels
         n = len(pixels)
         if n == 0:
             return
+        self._frame = frame
 
         if self._image is None or self._image.width() != n:
             self._image = QImage(n, self._max_rows, QImage.Format_RGB32)
@@ -211,6 +246,24 @@ class WaterfallWidget(QWidget):
             self._image.setPixelColor(x, 0, amplitude_to_color(amp))
 
         self.update()
+
+    def _x_to_freq(self, x, w):
+        """Same idea as SpectrumWidget._x_to_freq, against the most
+        recently received frame's span rather than a per-row one --
+        see this class's frequency_clicked docstring for why that's
+        fine. Returns None if no frame has arrived yet or the widget
+        has zero width."""
+        if self._frame is None or w <= 0:
+            return None
+        start, end = self._frame.start_freq_hz, self._frame.end_freq_hz
+        return start + (x / w) * (end - start)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            freq_hz = self._x_to_freq(event.position().x(), self.width())
+            if freq_hz is not None:
+                self.frequency_clicked.emit(freq_hz)
+        super().mousePressEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)

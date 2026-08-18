@@ -509,7 +509,7 @@ class CwToolWindow(QWidget):
                 # surfaced here so an operator watching an empty
                 # transcript with a tone clearly detected knows why,
                 # rather than assuming decode is just broken.
-                text += " (ignoring -- outside accepted 10-30 WPM range)"
+                text += " (ignoring -- outside accepted 5-60 WPM range)"
             self.decode_status_label.setText(text)
         else:
             self.decode_status_label.setText("Decoding -- listening for tone...")

@@ -58,17 +58,62 @@ _DOT_DASH_THRESHOLD_UNITS = 2.0     # below -> dot, at/above -> dash
 _INTRA_INTER_GAP_THRESHOLD_UNITS = 2.0   # below -> still same character, at/above -> character boundary
 _INTER_WORD_GAP_THRESHOLD_UNITS = 5.0    # below -> character boundary, at/above -> word boundary (space)
 
-# A dot length corresponding to 20 WPM (1200/wpm ms per dot -- the
-# standard PARIS-word timing formula) -- used only as the decoder's
-# starting guess before it's seen any real marks to adapt from.
-_DEFAULT_UNIT_MS = 1200.0 / 20.0
+# A dot length corresponding to 25 WPM (1200/wpm ms per dot -- the
+# standard PARIS-word timing formula) -- the decoder's starting guess
+# before it's seen any real marks to adapt from. Per explicit
+# instruction: most real-world CW traffic this app's users actually
+# encounter runs somewhere around 20-30 WPM, so starting the guess at
+# 25 (rather than a generic 20) means the very first few marks -- the
+# ones classified before there's enough history for the more reliable
+# clustering approach below to kick in -- are compared against a
+# threshold much closer to the true speed from the start, instead of
+# needing several marks worth of adaptation to fix a bigger initial
+# error. See _on_mark_ended/_cluster_marks for how the estimate then
+# corrects toward however far off the true speed actually is.
+_DEFAULT_UNIT_MS = 1200.0 / 25.0
 
 # How much weight a newly-observed dot-like mark gets when updating the
 # running unit-length estimate (exponential moving average) -- low
 # enough that one anomalously short/long mark (noise, a misread dash)
-# doesn't yank the estimate around, high enough to track a genuine
-# speed change within a few characters.
+# doesn't yank the estimate around. Only used before there's enough
+# mark history for _cluster_marks to produce a real measurement (see
+# _CLUSTER_UNIT_ADAPT_RATE below for the much faster rate used once it
+# does) -- i.e. only for roughly the first character of a session.
 _UNIT_ADAPT_RATE = 0.3
+
+# Once _cluster_marks has enough history to measure the actual dot
+# length directly (an average over several recent marks, not one raw
+# sample), the estimate can be trusted with more weight per update
+# than a single mark can -- confirmed live that the old flat 0.3 rate
+# applied uniformly took many characters to fully correct a wrong
+# starting guess, which (combined with the WPM-range output filter,
+# see MIN_ACCEPTED_WPM) meant genuine code was getting silently
+# dropped while the estimate was still converging. Originally 0.5,
+# but confirmed live on real (not synthetic) radio audio that even a
+# 50% blend let one bad/noisy cluster measurement swing the estimate
+# wildly in a single step (WPM readings spiking to 100-200+) -- see
+# _MAX_UNIT_MS_STEP_FRACTION below for the hard clamp that's now the
+# main defense against that; this rate is deliberately more moderate
+# too rather than relying on the clamp alone.
+_CLUSTER_UNIT_ADAPT_RATE = 0.3
+
+# Hard limit on how much _unit_ms can move in a single mark update,
+# as a fraction of its current value -- applied on top of both
+# _UNIT_ADAPT_RATE and _CLUSTER_UNIT_ADAPT_RATE's blending (see
+# _adapt_unit_ms). Confirmed live: on real radio audio (noisier and
+# messier than clean synthetic test tones), even a moderate blend
+# rate wasn't enough -- a single sufficiently-bad measurement (a
+# spurious cluster split that still happened to pass _MIN_CLUSTER_
+# RATIO, or one badly-timed mark before clustering has enough
+# history) could still be extreme enough in absolute terms to swing
+# unit_ms drastically in one step. A blend rate alone can't bound
+# that: it limits how much of the BAD measurement gets absorbed, not
+# how far the bad measurement itself is from the truth. This clamps
+# the actual step size directly, regardless of how far off any one
+# measurement is -- the estimate can still fully correct a wrong
+# guess, just gradually (over several marks) instead of in one
+# possibly-wild jump.
+_MAX_UNIT_MS_STEP_FRACTION = 0.15
 
 # Placeholder emitted for a dot/dash sequence that doesn't match any
 # known character (noise, a misread mark, or genuinely unsupported
@@ -83,11 +128,13 @@ UNKNOWN_CHAR_PLACEHOLDER = "*"
 # current_wpm/_finalize_character). Ordinary audio-band noise/voice
 # rarely produces on/off timing that happens to land in a plausible
 # human CW-sending range, so this is an effective, cheap garbage
-# filter -- real amateur CW traffic is overwhelmingly sent somewhere
-# in 10-30 WPM; the rare faster QRQ operator falls outside it, a
-# deliberate trade-off for killing noise decode.
-MIN_ACCEPTED_WPM = 10.0
-MAX_ACCEPTED_WPM = 30.0
+# filter. Widened from an initial, too-tight 10-30 (per explicit
+# follow-up instruction/research) to 5-60 -- comfortably covers
+# everything from a slow beginner/QRS rag-chew up through real QRQ
+# contest speeds without narrowly clipping legitimate traffic at
+# either end.
+MIN_ACCEPTED_WPM = 5.0
+MAX_ACCEPTED_WPM = 60.0
 
 
 def estimate_cw_send_duration_ms(text: str, wpm: int) -> float:
@@ -200,11 +247,40 @@ class CwDecoder:
     # ages out of it quickly.
     _MARK_HISTORY_SIZE = 6
 
+    # An on/off change has to persist for at least this many blocks
+    # before it's accepted as a real mark/gap boundary -- otherwise
+    # it's folded back into whatever state was already confirmed (see
+    # _advance_state). Confirmed live (real radio audio, not clean
+    # synthetic test tones): without this, ordinary noise/QRM briefly
+    # dipping the signal mid-mark -- the same underlying class of
+    # problem _update_noise_floor's gating already fixed for the
+    # ADAPTIVE THRESHOLD, but this is a separate effect on the
+    # DETECTOR itself -- could fragment one real mark into several
+    # short bogus ones. Those fragments are shorter than the real
+    # mark, so they pull the speed estimate toward a much higher WPM
+    # every time it happens; since real noisy audio triggers this
+    # fairly often (not just as a rare one-off), the estimate ends up
+    # spending most of its time pinned high, only occasionally
+    # reading correctly (and decoding) when a mark happens to come
+    # through clean. 2 blocks (~8ms at this decoder's ~4ms block size)
+    # Confirmed live that 2 blocks (8ms) wasn't quite enough margin --
+    # a brief noise dropout can straddle a block boundary and still
+    # read as "off" across 2 separate blocks even if the dropout
+    # itself is only ~5ms, since each block's Goertzel power reflects
+    # whatever fraction of the notch actually falls inside it. 3
+    # blocks (~12ms at this decoder's ~4ms block size) gives real
+    # margin against that while staying safely under the shortest
+    # legitimate mark OR gap this decoder accepts (a dot, or the
+    # intra-character gap between elements, is 20ms at
+    # MAX_ACCEPTED_WPM=60).
+    _MIN_TRANSITION_BLOCKS = 3
+
     def __init__(self, sample_rate: int, tone_hz: float):
         self.sample_rate = sample_rate
         self.tone_hz = tone_hz
         self._block_size = max(1, int(round(sample_rate * self._BLOCK_MS / 1000.0)))
         self._block_duration_ms = self._block_size * 1000.0 / sample_rate
+        self._min_transition_ms = self._block_duration_ms * self._MIN_TRANSITION_BLOCKS
         self._detector = GoertzelDetector(sample_rate, tone_hz)
         self.reset()
 
@@ -219,7 +295,9 @@ class CwDecoder:
         self._priming_powers = []  # collected until _PRIMING_BLOCKS is reached, then discarded
         self._mark_history = deque(maxlen=self._MARK_HISTORY_SIZE)
         self._tone_on = False
-        self._state_elapsed_ms = 0.0   # time spent in the current on/off state so far
+        self._state_elapsed_ms = 0.0   # time spent in the current CONFIRMED on/off state so far (includes any not-yet-confirmed candidate blocks -- see _advance_state)
+        self._candidate_state = None   # an is_on value being tentatively tracked as a possible new state, or None
+        self._candidate_ms = 0.0       # how long the candidate above has persisted so far
         self._unit_ms = _DEFAULT_UNIT_MS
         self._current_symbols = ""     # dots/dashes accumulated for the in-progress character
         self._have_signal = False      # true once at least one full mark has been seen -- for UI feedback
@@ -267,23 +345,54 @@ class CwDecoder:
             self._peak = max(self._priming_powers)
             self._priming_powers = None
         else:
-            self._update_noise_and_peak(power)
+            # Peak always adapts (see _update_peak) -- including on the
+            # very first block of a new mark, while self._tone_on is
+            # still False (not toggled until _advance_state, below,
+            # decides this block). That's deliberate: it's what lets
+            # peak "bootstrap" onto a mark immediately even after
+            # having decayed close to the noise floor over a long
+            # preceding silence, rather than needing tone_on to already
+            # be True before it's allowed to move. Noise floor is
+            # gated instead (see _update_noise_floor) -- freezing IT
+            # during an active mark is what actually fixes the bug,
+            # and doesn't need the same bootstrap exception since
+            # silence, unlike a mark, doesn't have a single instant it
+            # "starts" that needs catching.
+            self._update_peak(power)
+            if not self._tone_on:
+                self._update_noise_floor(power)
         threshold = self._threshold()
         is_on = power > threshold if threshold is not None else False
         return self._advance_state(is_on)
 
-    def _update_noise_and_peak(self, power):
-        # Simple adaptive envelope tracker: the noise floor slowly
-        # follows the signal DOWN (so a burst of tone doesn't get
-        # mistaken for a rising noise floor) and quickly follows it UP
-        # when things get quieter; the peak does the opposite (quick
-        # to follow a rising tone, slow to decay once it stops) -- the
-        # combination adapts to varying signal strength without
-        # needing a fixed, hand-tuned absolute threshold.
+    def _update_noise_floor(self, power):
+        # Only adapts while NOT currently in a mark (self._tone_on is
+        # False -- see _process_block). Confirmed live that adapting
+        # this unconditionally on every block, including ones where a
+        # mark is actively playing, let a long sustained mark's own
+        # power slowly drag the "noise" floor up toward it (each block
+        # nudges it 2% closer) -- for a long enough mark (a dash, or
+        # any mark at a slower WPM -- e.g. a 12 WPM dash is ~75 blocks
+        # long at this decoder's ~4ms block size) that compounds far
+        # enough (over 75 blocks, ~80% of the way toward the tone's own
+        # power) that ordinary block-to-block Goertzel power jitter
+        # started registering as spurious false "off" gaps in the
+        # MIDDLE of a still-transmitting mark, fragmenting one real
+        # mark into several bogus short ones. Only following the floor
+        # while genuinely in silence avoids this entirely -- slowly
+        # follows the signal DOWN (so a burst of noise doesn't get
+        # mistaken for a rising floor), quickly follows it UP when
+        # things get quieter.
         if power < self._noise_floor:
             self._noise_floor = power
         else:
             self._noise_floor = self._noise_floor * 0.98 + power * 0.02
+
+    def _update_peak(self, power):
+        # Mirror of _update_noise_floor -- only adapts while currently
+        # IN a mark, so a long silence can't drag the peak down toward
+        # it for the same underlying reason. Quick to follow a rising
+        # tone, slow to decay once one ends.
         if power > self._peak:
             self._peak = power
         else:
@@ -298,53 +407,115 @@ class CwDecoder:
         return self._noise_floor + spread * 0.4
 
     def _advance_state(self, is_on: bool) -> str:
-        output = ""
         if is_on == self._tone_on:
+            # Matches the confirmed state -- also cancels any
+            # in-progress candidate flip in the other direction (it
+            # was a transient blip that didn't persist, not a real
+            # transition -- see _MIN_TRANSITION_BLOCKS).
+            self._candidate_state = None
+            self._candidate_ms = 0.0
             self._state_elapsed_ms += self._block_duration_ms
-            return output
-        # State just changed -- classify the run that just ended.
-        duration_ms = self._state_elapsed_ms + self._block_duration_ms
-        if self._tone_on:
-            output += self._on_mark_ended(duration_ms)
+            return ""
+
+        if self._candidate_state == is_on:
+            self._candidate_ms += self._block_duration_ms
         else:
-            output += self._off_gap_ended(duration_ms)
+            self._candidate_state = is_on
+            self._candidate_ms = self._block_duration_ms
+        self._state_elapsed_ms += self._block_duration_ms
+
+        if self._candidate_ms < self._min_transition_ms:
+            return ""  # hasn't persisted long enough yet -- still provisionally the confirmed state
+
+        # The candidate has persisted long enough to accept as a real
+        # transition. Exactly one block is attributed to the OLD
+        # state's finished duration (matching the pre-debounce
+        # convention of attributing the first differing block to the
+        # state that just ended, since we can't resolve sub-block
+        # timing); the rest of the persisted candidate period belongs
+        # to the NEW state that's starting now.
+        old_state_duration_ms = self._state_elapsed_ms - self._candidate_ms + self._block_duration_ms
+        output = ""
+        if self._tone_on:
+            output += self._on_mark_ended(old_state_duration_ms)
+        else:
+            output += self._off_gap_ended(old_state_duration_ms)
         self._tone_on = is_on
-        self._state_elapsed_ms = 0.0
+        self._state_elapsed_ms = self._candidate_ms - self._block_duration_ms
+        self._candidate_state = None
+        self._candidate_ms = 0.0
         return output
 
     def _on_mark_ended(self, duration_ms) -> str:
         self._have_signal = True
-        if self._classify_mark_is_dot(duration_ms):
+        history = list(self._mark_history) + [duration_ms]
+        cluster = self._cluster_marks(history)
+        is_dot = self._classify_mark_is_dot(duration_ms, cluster)
+        if is_dot:
             self._current_symbols += "."
-            candidate_unit = duration_ms
         else:
             self._current_symbols += "-"
-            # A dash is ~3 units -- back it out to a dot-length estimate
-            # before folding it into the running average, so dashes
-            # inform the speed estimate too (not just dots).
-            candidate_unit = duration_ms / 3.0
-        self._unit_ms = self._unit_ms * (1 - _UNIT_ADAPT_RATE) + candidate_unit * _UNIT_ADAPT_RATE
+        if cluster is not None:
+            # Enough recent marks to measure the real dot length
+            # directly (an average over several marks, not one raw
+            # sample) -- move unit_ms toward it at _CLUSTER_UNIT_ADAPT_
+            # RATE (faster than the single-mark EMA below) rather than
+            # continuing to crawl there one mark at a time.
+            short_center, _long_center = cluster
+            self._adapt_unit_ms(short_center, _CLUSTER_UNIT_ADAPT_RATE)
+        else:
+            if is_dot:
+                candidate_unit = duration_ms
+            else:
+                # A dash is ~3 units -- back it out to a dot-length
+                # estimate before folding it into the running average,
+                # so dashes inform the speed estimate too (not just
+                # dots).
+                candidate_unit = duration_ms / 3.0
+            self._adapt_unit_ms(candidate_unit, _UNIT_ADAPT_RATE)
         self._mark_history.append(duration_ms)
         return ""
 
-    def _classify_mark_is_dot(self, duration_ms) -> bool:
-        """Returns True if `duration_ms` is a dot, False if a dash.
-        With enough recent mark-duration history, uses simple 2-means
-        clustering (short cluster = dots, long cluster = dashes)
-        instead of a fixed multiple of the running unit_ms estimate.
-        This matters because unit_ms starts from a fixed 20 WPM guess
-        -- at a real speed far from that guess (e.g. 35 WPM), a fixed-
-        multiple-of-unit_ms threshold can misclassify real dashes as
-        dots, and since that wrong classification feeds right back
-        into the unit_ms estimate, it can stay wrong far longer than
-        it should. Clustering looks at the actual relative spread of
-        recently observed marks instead, which separates dots from
-        dashes correctly regardless of how far off the starting
-        assumption was, and converges within the first character or
-        two rather than staying stuck."""
-        history = list(self._mark_history) + [duration_ms]
+    def _adapt_unit_ms(self, target, rate):
+        """Moves self._unit_ms toward `target` by the given EMA
+        `rate`, then hard-clamps the resulting step to at most
+        _MAX_UNIT_MS_STEP_FRACTION of the current value (see that
+        constant's own comment for why the rate alone isn't a
+        sufficient safeguard against one badly-off measurement)."""
+        blended = self._unit_ms * (1 - rate) + target * rate
+        max_step = self._unit_ms * _MAX_UNIT_MS_STEP_FRACTION
+        delta = max(-max_step, min(max_step, blended - self._unit_ms))
+        self._unit_ms += delta
+
+    # A real dot/dash split should be close to the standard 3:1 PARIS
+    # ratio -- this is deliberately well below that (allowing for real
+    # operators not sending perfectly precise timing) but well above
+    # the natural jitter within a run of same-length marks. Confirmed
+    # live: with realistic (not mathematically perfect) mark timing, a
+    # run of several dots in a row (e.g. "H"/"S"/"5") naturally varies
+    # by a few percent mark-to-mark -- 2-means clustering, which always
+    # forces a 2-way split as long as there's ANY nonzero spread at
+    # all, was splitting that jitter into a fake "short"/"long" pair
+    # instead of recognizing it as one real cluster, misclassifying
+    # dots as dashes and (combined with _CLUSTER_UNIT_ADAPT_RATE's fast
+    # snap) corrupting the unit_ms/current_wpm estimate -- this is what
+    # was producing wildly inflated WPM readings (200+) on genuine,
+    # much slower code. Requiring the two candidate centers to actually
+    # be this far apart before trusting the split as real fixes it.
+    _MIN_CLUSTER_RATIO = 1.8
+
+    @classmethod
+    def _cluster_marks(cls, history):
+        """Simple 2-means clustering over recent mark durations (short
+        cluster = dots, long cluster = dashes). Returns (short_center,
+        long_center), or None if there isn't yet enough history, no
+        real spread in it, or the resulting two centers aren't
+        separated enough to plausibly be a genuine dot/dash split (see
+        _MIN_CLUSTER_RATIO) -- callers fall back to a fixed multiple of
+        the running unit_ms estimate in any of those cases (see
+        _classify_mark_is_dot/_on_mark_ended)."""
         if len(history) < 4 or max(history) - min(history) < 1e-6:
-            return duration_ms < self._unit_ms * _DOT_DASH_THRESHOLD_UNITS
+            return None
         short_center = min(history)
         long_center = max(history)
         for _ in range(4):
@@ -354,6 +525,28 @@ class CwDecoder:
                 short_center = sum(short_cluster) / len(short_cluster)
             if long_cluster:
                 long_center = sum(long_cluster) / len(long_cluster)
+        if short_center <= 0 or long_center / short_center < cls._MIN_CLUSTER_RATIO:
+            return None
+        return short_center, long_center
+
+    def _classify_mark_is_dot(self, duration_ms, cluster) -> bool:
+        """Returns True if `duration_ms` is a dot, False if a dash.
+        `cluster` is _cluster_marks' result (already computed once by
+        the caller, shared rather than recomputed here) -- with real
+        clustering data, splits on the midpoint between the short/long
+        cluster centers instead of a fixed multiple of the running
+        unit_ms estimate. This matters because unit_ms starts from a
+        fixed guess (see _DEFAULT_UNIT_MS) -- at a real speed far from
+        that guess, a fixed-multiple-of-unit_ms threshold can
+        misclassify real dashes as dots, and since that wrong
+        classification feeds right back into the unit_ms estimate, it
+        can stay wrong far longer than it should. Clustering looks at
+        the actual relative spread of recently observed marks instead,
+        which separates dots from dashes correctly regardless of how
+        far off the starting assumption was."""
+        if cluster is None:
+            return duration_ms < self._unit_ms * _DOT_DASH_THRESHOLD_UNITS
+        short_center, long_center = cluster
         threshold = (short_center + long_center) / 2.0
         return duration_ms < threshold
 

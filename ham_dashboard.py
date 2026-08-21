@@ -1697,6 +1697,22 @@ class HamClockWindow(QWidget):
             positions.append(position)
         self.map_widget.set_satellite_positions(positions)
 
+    # Shared red/yellow/green "traffic light" palette for the passes
+    # table -- per explicit instruction: used both for the Status
+    # column's AOS/LOS countdown color and the Max El column's
+    # elevation color below.
+    _PASS_RED = QColor(220, 60, 60)
+    _PASS_YELLOW = QColor(210, 180, 30)
+    _PASS_GREEN = QColor(60, 190, 90)
+
+    @classmethod
+    def _elevation_color(cls, elevation_deg):
+        if elevation_deg < 10:
+            return cls._PASS_RED
+        if elevation_deg < 30:
+            return cls._PASS_YELLOW
+        return cls._PASS_GREEN
+
     def _refresh_upcoming_passes(self):
         """Reruns the actual pass search (upcoming_passes()) -- the
         expensive part; see PASSES_REFRESH_INTERVAL_MS. No-op (clears
@@ -1722,7 +1738,10 @@ class HamClockWindow(QWidget):
                 item = QTableWidgetItem("")
                 item.setTextAlignment(Qt.AlignCenter)
                 self.upcoming_passes_table.setItem(row, col, item)
-            self.upcoming_passes_table.item(row, 2).setText(f"{pass_info['max_elevation_deg']:.0f}°")
+            max_el = pass_info["max_elevation_deg"]
+            el_item = self.upcoming_passes_table.item(row, 2)
+            el_item.setText(f"{max_el:.0f}°")
+            el_item.setForeground(self._elevation_color(max_el))
             self.upcoming_passes_table.item(row, 3).setText(format_countdown(pass_info["duration_seconds"]))
         self._update_passes_countdowns()
 
@@ -1738,24 +1757,33 @@ class HamClockWindow(QWidget):
         (rising) with the countdown to AOS; once the pass has started
         (AOS has passed but LOS hasn't), switches to a down arrow
         (setting) with the countdown to LOS instead -- per explicit
-        instruction. Derived from a live now-vs-aos/los comparison
-        rather than the "active" flag set when the pass was found, so
-        a pass that starts (or ends) between full searches is
-        reflected correctly here too, not just at the next 5-minute
-        refresh."""
+        instruction, colored yellow while counting down to AOS and
+        green while counting down to LOS (same red/yellow/green
+        palette as the Max El column, see _PASS_YELLOW/_PASS_GREEN).
+        Derived from a live now-vs-aos/los comparison rather than the
+        "active" flag set when the pass was found, so a pass that
+        starts (or ends) between full searches is reflected correctly
+        here too, not just at the next 5-minute refresh."""
         if not self._upcoming_passes:
             return
         now = datetime.datetime.now(datetime.timezone.utc)
         for row, pass_info in enumerate(self._upcoming_passes):
             if now < pass_info["aos_time"]:
                 text = f"↑{format_countdown((pass_info['aos_time'] - now).total_seconds())}"
+                color = self._PASS_YELLOW
             elif now <= pass_info["los_time"]:
                 text = f"↓{format_countdown((pass_info['los_time'] - now).total_seconds())}"
+                color = self._PASS_GREEN
             else:
                 text = "passed"  # stale -- _refresh_upcoming_passes will drop it at the next full search
+                color = None
             item = self.upcoming_passes_table.item(row, 1)
             if item is not None:
                 item.setText(text)
+                if color is not None:
+                    item.setForeground(color)
+                else:
+                    item.setData(Qt.ForegroundRole, None)  # back to the table's default text color
 
     def _on_pass_row_clicked(self, row, _column):
         """Single-click a row here is the same as left-clicking that

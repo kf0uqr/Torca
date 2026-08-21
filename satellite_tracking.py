@@ -688,18 +688,25 @@ def orbital_period_minutes(line2):
 
 def ground_track_points(line1, line2, dt_utc, num_points=72):
     """Computes the satellite's ground track (lat/lon points, no
-    altitude) over one full orbit centered on dt_utc -- half an orbit
-    before "now" and half an orbit after, the same visual convention
-    as other satellite tracking apps' orbit path line. Returns [] if
-    the orbital period can't be determined (invalid TLE) or sgp4
-    isn't installed."""
+    altitude) over the one full orbit starting at dt_utc -- the first
+    point is the satellite's current position, the last is one full
+    orbital period later (approximately back at the satellite again --
+    not exactly, since the ground track drifts westward orbit-to-orbit
+    as the Earth rotates underneath, same reason a real orbit's ground
+    track never perfectly retraces itself). Per explicit instruction:
+    this is what lets the drawn path visibly start at the satellite
+    and sweep forward through the coming orbit, rather than showing
+    half of it as already-past. Callers already recompute this
+    periodically from a fresh "now" (ham_dashboard.py's
+    _update_satellite_positions, every 5s) as the satellite moves, so
+    the path updates right along with it. Returns [] if the orbital
+    period can't be determined (invalid TLE) or sgp4 isn't installed."""
     period_minutes = orbital_period_minutes(line2)
     if period_minutes is None:
         return []
-    half_period = period_minutes / 2.0
     points = []
     for i in range(num_points + 1):
-        offset_minutes = -half_period + (period_minutes * i / num_points)
+        offset_minutes = period_minutes * i / num_points
         t = dt_utc + datetime.timedelta(minutes=offset_minutes)
         result = propagate_satellite(line1, line2, t)
         if result is None:

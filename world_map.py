@@ -872,9 +872,10 @@ class WorldMapWidget(QWidget):
     def _draw_path_direction_arrow(self, painter, points, w, h, active):
         """A small arrowhead that animates along the ground track
         (self._path_animation_progress, 0.0-1.0) to show which way the
-        satellite is actually moving -- points is already ordered past
-        -> future (ground_track_points), so walking it start-to-end is
-        the real direction of travel."""
+        satellite is actually moving -- points is already ordered
+        starting at the satellite's current position and running one
+        full orbit into the future (ground_track_points), so walking
+        it start-to-end is the real direction of travel."""
         segment_count = len(points) - 1
         if segment_count < 1:
             return

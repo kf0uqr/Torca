@@ -327,10 +327,10 @@ class RigctldDialog(QDialog):
 # selected satellites, ~4s worst case with all 97 in this app's own
 # amateur-satellite list selected at once. A 5-minute refresh keeps that
 # cost rare and pass predictions don't meaningfully change minute to
-# minute anyway; the *displayed* AOS/LOS times (see
-# _update_passes_countdowns) are cheap to redraw from the cached
-# absolute times and piggyback on the existing 1-second clock timer
-# rather than a separate one.
+# minute anyway; the *displayed* countdown to each pass still updates
+# every second by simple subtraction from the cached absolute times
+# (see _update_passes_countdowns), piggybacked on the existing clock
+# timer rather than a separate one.
 PASSES_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
 # (label, seconds) -- offered in PskReporterSettingsDialog's lookback
@@ -1731,21 +1731,28 @@ class HamClockWindow(QWidget):
 
     def _update_passes_countdowns(self):
         """Refreshes the "Status" column's text from the cached
-        self._upcoming_passes -- an up arrow next to the AOS (rise)
-        time and a down arrow next to LOS (set), per explicit
-        instruction, both in UTC (matching this dashboard's own UTC
-        clock and how the Contests tab shows its times). Both times
-        are fixed once a pass is found, so this doesn't strictly need
-        re-running every second the way the old live countdown did --
-        still piggybacked on the 1-second clock timer anyway (see
-        _update_clocks) since it's cheap (no orbital math) and simpler
-        than wiring up a separate refresh path just for this."""
+        self._upcoming_passes -- plain subtraction against already-
+        known absolute times, no orbital math, cheap enough to run on
+        the 1-second clock timer even though the underlying search
+        only reruns every few minutes. Before AOS, shows an up arrow
+        (rising) with the countdown to AOS; once the pass has started
+        (AOS has passed but LOS hasn't), switches to a down arrow
+        (setting) with the countdown to LOS instead -- per explicit
+        instruction. Derived from a live now-vs-aos/los comparison
+        rather than the "active" flag set when the pass was found, so
+        a pass that starts (or ends) between full searches is
+        reflected correctly here too, not just at the next 5-minute
+        refresh."""
         if not self._upcoming_passes:
             return
+        now = datetime.datetime.now(datetime.timezone.utc)
         for row, pass_info in enumerate(self._upcoming_passes):
-            aos_text = pass_info["aos_time"].strftime("%H:%M")
-            los_text = pass_info["los_time"].strftime("%H:%M")
-            text = f"↑{aos_text} ↓{los_text}"
+            if now < pass_info["aos_time"]:
+                text = f"↑{format_countdown((pass_info['aos_time'] - now).total_seconds())}"
+            elif now <= pass_info["los_time"]:
+                text = f"↓{format_countdown((pass_info['los_time'] - now).total_seconds())}"
+            else:
+                text = "passed"  # stale -- _refresh_upcoming_passes will drop it at the next full search
             item = self.upcoming_passes_table.item(row, 1)
             if item is not None:
                 item.setText(text)

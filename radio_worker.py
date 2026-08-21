@@ -1136,6 +1136,23 @@ class RadioWorker(QThread):
                     "'raw_255') -- defaulting to raw-scale math; watch the reading for sanity."
                 )
 
+        # SWR's METER_DEFINITIONS entry defaults to "direct" (get_swr's
+        # already-calibrated ratio) -- but if this radio/backend only
+        # exposes get_swr_meter (the raw, uncalibrated byte -- see that
+        # entry's own comment), switch to "linear" with a display_max
+        # matching the raw byte's real documented span (rigplane's
+        # legacy fallback formula, 1.0 + raw/255*8.9 -- confirmed via
+        # rigplane's own runtime/meter_cal.py) instead of the
+        # "direct" kind's 1.0-3.0 display window, which would badly
+        # under-represent a raw reading interpreted the wrong way.
+        if self._meter_getters.get("swr") == "get_swr_meter":
+            self._meter_definitions["swr"]["kind"] = "linear"
+            self._meter_definitions["swr"]["display_max"] = 9.9
+            self.audio_status.emit(
+                "SWR meter: get_swr unavailable on this radio/backend -- falling back to "
+                "the raw get_swr_meter byte (uncalibrated)."
+            )
+
     def _setup_controls(self):
         """Resolves the real getter/setter method names for every entry
         in CONTROL_DEFINITIONS via find_method_name -- same discovery

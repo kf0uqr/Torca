@@ -326,14 +326,33 @@ METER_DEFINITIONS = {
     },
     "swr": {
         "label": "SWR",
-        # get_swr vs get_swr_meter is the exact same control-vs-meter split
-        # confirmed on "power" (get_power was the level-control setting,
-        # get_power_meter the actual live reading) -- a dir(radio) dump
-        # showed BOTH exist here too, so get_swr may well have been the
-        # wrong one this whole time. Preferring the _meter name now.
-        "getter": "get_swr_meter",
-        "getter_candidates": ["get_swr_meter", "get_swr"],
-        "kind": "linear",
+        # Root-caused a real "SWR meter doesn't appear to be working"
+        # report to this entry preferring get_swr_meter (the RAW,
+        # uncalibrated 0-255 byte) over get_swr (the properly
+        # CALIBRATED ratio) -- confirmed by reading rigplane's own
+        # runtime/radio.py: get_swr() applies the rig's per-model
+        # piecewise calibration table (runtime/meter_cal.py) and
+        # returns an already-real-units ratio directly (e.g. 1.3);
+        # get_swr_meter() is documented as the raw byte ONLY, no
+        # calibration applied. Worse, this entry's raw-to-display
+        # scaling (raw_max=255 -> display_max=3.0) doesn't match the
+        # raw byte's real meaning either -- rigplane's own documented
+        # legacy fallback formula (used when no calibration table is
+        # configured) is `1.0 + raw/255*8.9`, i.e. the byte spans
+        # 1.0-9.9, not 1.0-3.0. Combined, a real SWR of e.g. 1.5:1
+        # (raw ~14 under that formula) rendered as ~1.1:1 and barely
+        # moved the bar -- looked dead/broken even under genuine
+        # mismatch. get_swr is now preferred (kind "direct", same as
+        # "power" when the radio reports native watts -- the value is
+        # already in real units, no raw_max scaling needed);
+        # get_swr_meter is kept only as a fallback for a radio/backend
+        # that doesn't expose get_swr, in which case RadioWorker.
+        # _setup_meters() switches this definition's "kind" back to
+        # "linear" with a corrected (9.9, not 3.0) display_max to
+        # match the raw byte's real span -- see its own comment.
+        "getter": "get_swr",
+        "getter_candidates": ["get_swr", "get_swr_meter"],
+        "kind": "direct",
         "unit": ":1",
         "raw_max": 255,
         "display_min": 1.0,

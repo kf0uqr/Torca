@@ -980,7 +980,7 @@ class HamClockWindow(QWidget):
         # not one per connected radio).
         self.satellite_overlay_label = QLabel("")
         self.satellite_overlay_label.setWordWrap(True)
-        self.satellite_overlay_label.setStyleSheet("color: #ccc; font-size: 12px;")
+        self.satellite_overlay_label.setStyleSheet("color: #ccc; font-size: 18px;")
 
         # ---- Virtual Cables (moved from RadioWindow -- opens a dialog
         # to pick RX radio / TX radio (independently -- doesn't have to

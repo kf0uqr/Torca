@@ -25,6 +25,7 @@ set -euo pipefail
 INSTALL_DIR="/opt/torca"
 LAUNCHER_PATH="/usr/local/bin/torca"
 SERVER_LAUNCHER_PATH="/usr/local/bin/torca-server"
+DESKTOP_FILE_PATH="/usr/share/applications/torca.desktop"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 INSTALL_COMMIT_MARKER="$INSTALL_DIR/.install_commit"
@@ -60,7 +61,7 @@ do_uninstall() {
         exit 1
     fi
 
-    if [[ ! -d "$INSTALL_DIR" && ! -e "$LAUNCHER_PATH" && ! -e "$SERVER_LAUNCHER_PATH" ]]; then
+    if [[ ! -d "$INSTALL_DIR" && ! -e "$LAUNCHER_PATH" && ! -e "$SERVER_LAUNCHER_PATH" && ! -e "$DESKTOP_FILE_PATH" ]]; then
         echo "TORCA doesn't appear to be installed (no $INSTALL_DIR or $LAUNCHER_PATH found)."
         exit 0
     fi
@@ -69,6 +70,7 @@ do_uninstall() {
     [[ -d "$INSTALL_DIR" ]] && echo "  $INSTALL_DIR (application files + virtual environment)"
     [[ -e "$LAUNCHER_PATH" ]] && echo "  $LAUNCHER_PATH (launcher)"
     [[ -e "$SERVER_LAUNCHER_PATH" ]] && echo "  $SERVER_LAUNCHER_PATH (launcher)"
+    [[ -e "$DESKTOP_FILE_PATH" ]] && echo "  $DESKTOP_FILE_PATH (desktop entry)"
 
     if [[ "$ASSUME_YES" != true ]]; then
         read -r -p "Continue? [y/N] " reply || reply="n"
@@ -81,6 +83,7 @@ do_uninstall() {
     rm -rf "$INSTALL_DIR"
     rm -f "$LAUNCHER_PATH"
     rm -f "$SERVER_LAUNCHER_PATH"
+    rm -f "$DESKTOP_FILE_PATH"
     echo "TORCA uninstalled."
 }
 
@@ -201,6 +204,21 @@ EOF
 exec "$INSTALL_DIR/bin/python3" "$INSTALL_DIR/torca_server.py" "\$@"
 EOF
         chmod 755 "$SERVER_LAUNCHER_PATH"
+
+        echo "Installing desktop entry to $DESKTOP_FILE_PATH..."
+        cat > "$DESKTOP_FILE_PATH" <<EOF
+[Desktop Entry]
+Type=Application
+Name=TORCA
+Comment=Control Icom radios via rigplane
+Exec=$LAUNCHER_PATH
+Icon=$INSTALL_DIR/icon.png
+Terminal=false
+Categories=HamRadio;Utility;
+EOF
+        chmod 644 "$DESKTOP_FILE_PATH"
+        command -v update-desktop-database >/dev/null 2>&1 \
+            && update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 
         if [[ -n "${SUDO_USER:-}" ]]; then
             echo "Handing $INSTALL_DIR over to $SUDO_USER (so future updates don't need root)..."

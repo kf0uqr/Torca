@@ -400,6 +400,12 @@ class RadioWindow(QWidget):
                     controls_row.addLayout(vfo_toggle_column)
                     controls_row.setAlignment(vfo_toggle_column, Qt.AlignTop)
                 vfo_toggle_column.addWidget(widget)
+                if key == "vfo":
+                    # active_receiver_button (dual-receiver Main/Sub
+                    # switch) stacks directly under VFO A/B -- where the
+                    # now-removed VFO/MEM button used to sit, per
+                    # explicit instruction.
+                    vfo_toggle_column.addWidget(self.active_receiver_button)
             else:  # "toggle"
                 widget = QPushButton(definition["label"])
                 widget.setCheckable(True)
@@ -432,15 +438,20 @@ class RadioWindow(QWidget):
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
-        knob_row.addWidget(self.ptt_button)
-        knob_row.addWidget(self.active_receiver_button)
-        knob_row.addWidget(self.cw_tool_button)
-        knob_row.addWidget(self.sstv_tool_button)
 
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
         tuning_row.addStretch()
         tuning_row.addLayout(knob_row)
+
+        # CW/SSTV tool launchers on the far left, PTT on the right
+        # (directly under the tuning knob's column) -- its own row just
+        # above the level sliders, per explicit instruction.
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.cw_tool_button)
+        action_row.addWidget(self.sstv_tool_button)
+        action_row.addStretch()
+        action_row.addWidget(self.ptt_button)
 
         layout = QVBoxLayout()
         layout.addLayout(scope_controls_row)
@@ -450,6 +461,7 @@ class RadioWindow(QWidget):
         layout.addLayout(self.meters_row_2)
         layout.addLayout(self.band_buttons_row)
         layout.addLayout(tuning_row)
+        layout.addLayout(action_row)
         layout.addLayout(levels_row)
         layout.addWidget(self.status_label)
         self.setLayout(layout)

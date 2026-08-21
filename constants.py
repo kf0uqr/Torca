@@ -549,31 +549,6 @@ CONTROL_DEFINITIONS = {
         "setter_candidates": ["set_vfo_slot", "set_vfo", "select_vfo"],
         "options": [("VFO A", "A"), ("VFO B", "B")],
     },
-    "memory_mode": {
-        "label": "VFO/MEM",
-        # Same click-to-swap button style as "vfo" above -- matches the
-        # real V/M button on these radios (toggles between VFO tuning
-        # and memory-channel recall). get_memory_mode/set_memory_mode
-        # confirmed present via a dir(radio) scan; values are a plain
-        # bool guess (True = memory mode) following the same convention
-        # that's worked for the other simple boolean toggles (NR/NB/
-        # Digital Mode) -- no enum_import, since there's no equivalent
-        # confirmed evidence of a dedicated enum here the way there was
-        # for AGC.
-        #
-        # write_only=True: confirmed via a runtime error straight from
-        # rigplane -- "Command 0x08 is SELECT-only (no GET variant)" per
-        # Icom's own CI-V reference manual. There is NO way to read the
-        # current VFO/Memory state over CI-V at all, only to select into
-        # one or the other, so this is never polled (it would just fail
-        # forever) -- the button's label reflects the last command sent,
-        # not a live-confirmed radio state.
-        "type": "vfo_toggle",
-        "write_only": True,
-        "getter_candidates": ["get_memory_mode"],
-        "setter_candidates": ["set_memory_mode"],
-        "options": [("VFO", False), ("MEMORY", True)],
-    },
     "split": {
         "label": "Split",
         # Plain bool toggle -- rigplane.SplitCapable (confirmed present:
@@ -583,8 +558,8 @@ CONTROL_DEFINITIONS = {
         # applies to the whole transceiver, not a per-receiver toggle" --
         # confirmed rig-global (Icom CI-V 0x0F / Yaesu `ST;` under the
         # hood), so no radio-model-specific handling needed. Placed last
-        # here (after "vfo"/"memory_mode") so it lands immediately after
-        # the VFO A/B column in controls_row's left-to-right order --
+        # here (after "vfo") so it lands immediately after the VFO A/B
+        # column in controls_row's left-to-right order --
         # same generic CONTROL_DEFINITIONS machinery as every other
         # toggle, not a hand-rolled one-off button.
         "type": "toggle",

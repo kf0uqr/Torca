@@ -602,8 +602,17 @@ def compute_satellite_state(satellite, transponder, observer_lat, observer_lon,
     found crossing has actually passed, not on every call.
 
     Returns (look, crossing_text, downlink_hz, downlink_doppler_hz,
-    uplink_hz, uplink_doppler_hz, next_crossing), or None if propagation
-    fails (invalid/missing TLE)."""
+    uplink_hz, uplink_doppler_hz, base_downlink_hz, base_uplink_hz,
+    next_crossing), or None if propagation fails (invalid/missing
+    TLE). base_downlink_hz/base_uplink_hz are the pre-Doppler-
+    correction frequencies -- the transponder's bare nominal
+    downlink/uplink, with the downlink side also carrying the
+    operator's accumulated manual tuning offset (freq_offset_hz, see
+    below) but NOT the Doppler shift. Exposed so a caller can show an
+    operator manually tuning within a pass "where they are in the
+    passband" (nominal position, offset included) independent of the
+    Doppler wobble, alongside the actual Doppler-corrected frequency
+    the radio is really tuned to."""
     line1, line2 = satellite.get("line1", ""), satellite.get("line2", "")
     now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -623,6 +632,7 @@ def compute_satellite_state(satellite, transponder, observer_lat, observer_lon,
 
     downlink_hz, downlink_doppler_hz = None, None
     uplink_hz, uplink_doppler_hz = None, None
+    base_downlink_hz, base_uplink_hz = None, None
     if transponder is not None:
         try:
             base_downlink_hz = round(float(transponder.get("downlink_mhz")) * 1e6)
@@ -658,7 +668,8 @@ def compute_satellite_state(satellite, transponder, observer_lat, observer_lon,
                 uplink_hz = round(result["frequency_hz"])
                 uplink_doppler_hz = result["doppler_hz"]
 
-    return look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz, next_crossing
+    return (look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz,
+            base_downlink_hz, base_uplink_hz, next_crossing)
 
 
 def footprint_points(lat, lon, altitude_km, num_points=72):

@@ -82,6 +82,30 @@ class RadioWindow(QWidget):
         # visible symptom), so this needs headroom rather than an exact fit.
         self.freq_display.setFixedWidth(280)
 
+        # Opposite corner from freq_display -- shows the nominal
+        # (pre-Doppler-correction) frequency while satellite tracking is
+        # active, so an operator manually tuning within a pass (the
+        # tuning knob adjusts a manual offset from the transponder's
+        # nominal downlink while tracking -- see apply_satellite_tick)
+        # can see where they actually are in the transponder's passband,
+        # independent of the Doppler wobble constantly moving the real
+        # (right-side) frequency around. Per explicit instruction. Same
+        # styling as freq_display for direct visual comparison, just
+        # left-aligned since it sits on the opposite side. Only
+        # meaningful for the satellite-tracking roles -- apply_satellite_
+        # tick/_on_ptt_toggled are the only things that ever set its
+        # text, and neither runs for "non_sat" radios, but it's hidden
+        # outright for those (and left blank/never shown) rather than
+        # sitting there confusingly empty.
+        self.nominal_freq_display = QLabel("-- MHz")
+        self.nominal_freq_display.setStyleSheet(
+            "font-size: 28px; font-weight: bold; color: white; "
+            "background-color: rgb(10, 10, 20); padding: 4px 10px; border-radius: 4px;"
+        )
+        self.nominal_freq_display.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.nominal_freq_display.setFixedWidth(280)
+        self.nominal_freq_display.setVisible(self._role in ("full_duplex", "downlink", "uplink"))
+
         # Three independently double-click-switchable meters side by side,
         # like a radio's multi-function meter that can show several
         # readings at once. Different defaults so they're not all showing
@@ -127,6 +151,7 @@ class RadioWindow(QWidget):
 
         self.spectrum_widget = SpectrumWidget()
         self.spectrum_widget.set_overlay_widget(self.freq_display)
+        self.spectrum_widget.set_overlay_widget(self.nominal_freq_display, corner="top-left")
         self.spectrum_widget.frequency_clicked.connect(self._on_scope_clicked)
         self.waterfall_widget = WaterfallWidget()
         self.waterfall_widget.frequency_clicked.connect(self._on_scope_clicked)
@@ -596,9 +621,11 @@ class RadioWindow(QWidget):
             else:
                 self.worker.stop_ptt()
             return
-        look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz = state
+        (look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz,
+         base_downlink_hz, base_uplink_hz) = state
 
         freq_hz = uplink_hz if checked else downlink_hz
+        nominal_freq_hz = base_uplink_hz if checked else base_downlink_hz
         if freq_hz is None:
             # No usable frequency for this direction (e.g. no uplink
             # stored for this transponder) -- key/unkey without a
@@ -670,12 +697,15 @@ class RadioWindow(QWidget):
                 self._update_active_receiver_ui(receiver)
             self._current_freq_hz = freq_hz
             self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+            if nominal_freq_hz is not None:
+                self.nominal_freq_display.setText(f"{nominal_freq_hz / 1e6:.6f} MHz")
             self._update_band_button_highlight()
 
     def _on_tracking_changed(self, tracking):
         self._sub_vfo_a_selected = False
 
-    def apply_satellite_tick(self, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz):
+    def apply_satellite_tick(self, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz,
+                              base_downlink_hz, base_uplink_hz):
         """Called by SatelliteSession every tracking tick (2s) and
         immediately on transponder/offset change. Role dispatch -- what
         THIS radio does with the shared Doppler state depends entirely
@@ -683,6 +713,14 @@ class RadioWindow(QWidget):
         original single-radio implementation, just relocated from what
         used to be _on_satellite_tracking_tick. Returns a warning string
         (possibly empty) for SatelliteSession to aggregate and surface.
+
+        base_downlink_hz/base_uplink_hz are the pre-Doppler-correction
+        counterparts of downlink_hz/uplink_hz (see compute_satellite_
+        state's own docstring) -- shown in nominal_freq_display
+        alongside freq_display whenever the latter is updated, so an
+        operator can see where they actually are in the passband
+        (nominal position, manual offset included) independent of the
+        Doppler wobble.
 
         "full_duplex": today's original dual-receiver logic, verbatim --
         Sub continuously re-tuned to the downlink while receiving, Main
@@ -733,6 +771,9 @@ class RadioWindow(QWidget):
             if freq_hz is not None:
                 self._current_freq_hz = freq_hz
                 self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                nominal_hz = base_uplink_hz if transmitting else base_downlink_hz
+                if nominal_hz is not None:
+                    self.nominal_freq_display.setText(f"{nominal_hz / 1e6:.6f} MHz")
                 self._update_band_button_highlight()
         elif self._role == "downlink":
             freq_hz = downlink_hz
@@ -741,6 +782,8 @@ class RadioWindow(QWidget):
             elif freq_hz is not None:
                 self.worker.select_vfo_and_set_frequency("A", freq_hz)
                 self._current_freq_hz = freq_hz
+                if base_downlink_hz is not None:
+                    self.nominal_freq_display.setText(f"{base_downlink_hz / 1e6:.6f} MHz")
                 self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
                 self._update_band_button_highlight()
         # "uplink": deliberately nothing here -- see docstring.

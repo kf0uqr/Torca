@@ -131,8 +131,9 @@ class SatelliteSession(QObject):
         _on_ptt_toggled for why -- an independently-scheduled retune
         arriving after PTT already started keying was a confirmed real
         bug earlier this session). Returns (look, crossing_text,
-        downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz),
-        or None if there's no active satellite or propagation fails."""
+        downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz,
+        base_downlink_hz, base_uplink_hz), or None if there's no active
+        satellite or propagation fails."""
         if self._active_satellite is None:
             return None
         result = compute_satellite_state(
@@ -156,11 +157,15 @@ class SatelliteSession(QObject):
         if state is None:
             self.state_updated.emit(satellite, None, "Orbit propagation failed (invalid TLE?)", None, None, "")
             return
-        look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz = state
+        (look, crossing_text, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz,
+         base_downlink_hz, base_uplink_hz) = state
 
         warnings = []
         for window in list(self._radios):
-            warning = window.apply_satellite_tick(downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz)
+            warning = window.apply_satellite_tick(
+                downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz,
+                base_downlink_hz, base_uplink_hz,
+            )
             if warning:
                 warnings.append(warning)
         warning_text = "  " + "; ".join(warnings) if warnings else ""

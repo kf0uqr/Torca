@@ -431,27 +431,35 @@ class RadioWindow(QWidget):
         # on the right. WSJT-X/Rigctld/Virtual Cables all moved to the
         # Ham Dashboard, which is the one place that makes sense once
         # multiple radios can be connected at once.
+        # CW/SSTV tool launchers stack at the bottom of the left column,
+        # far left of the window, directly above the level sliders.
         left_column = QVBoxLayout()
         left_column.addLayout(controls_row)
         left_column.addWidget(self.role_label)
+        left_column.addStretch()
+        left_column.addWidget(self.cw_tool_button)
+        left_column.addWidget(self.sstv_tool_button)
 
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
 
+        # PTT gets its own column, directly to the left of the tuning
+        # knob's column and bottom-anchored (via the stretch above it)
+        # so it sits right above the level sliders -- same fixed size
+        # (130 wide, matching the knob, x40 tall) it had back when it
+        # lived inside knob_row, before CW/SSTV moved out of that
+        # column, per explicit instruction.
+        self.ptt_button.setFixedWidth(130)
+        ptt_column = QVBoxLayout()
+        ptt_column.addStretch()
+        ptt_column.addWidget(self.ptt_button)
+
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
         tuning_row.addStretch()
+        tuning_row.addLayout(ptt_column)
         tuning_row.addLayout(knob_row)
-
-        # CW/SSTV tool launchers on the far left, PTT on the right
-        # (directly under the tuning knob's column) -- its own row just
-        # above the level sliders, per explicit instruction.
-        action_row = QHBoxLayout()
-        action_row.addWidget(self.cw_tool_button)
-        action_row.addWidget(self.sstv_tool_button)
-        action_row.addStretch()
-        action_row.addWidget(self.ptt_button)
 
         layout = QVBoxLayout()
         layout.addLayout(scope_controls_row)
@@ -461,7 +469,6 @@ class RadioWindow(QWidget):
         layout.addLayout(self.meters_row_2)
         layout.addLayout(self.band_buttons_row)
         layout.addLayout(tuning_row)
-        layout.addLayout(action_row)
         layout.addLayout(levels_row)
         layout.addWidget(self.status_label)
         self.setLayout(layout)

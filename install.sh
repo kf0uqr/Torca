@@ -188,6 +188,15 @@ do_install() {
 #!/bin/bash
 # Launches TORCA. Installed by install.sh -- re-run that script
 # (don't hand-edit this file) to reinstall or uninstall.
+#
+# PYTHONPATH is unset rather than inherited: TORCA ships its own
+# isolated venv with every dependency it needs, and a shell-level
+# PYTHONPATH (dist-package dirs from an old OS Python, a trailing
+# colon that resolves to the shell's cwd, etc.) sits ahead of that
+# venv's site-packages on sys.path -- so it can shadow this app's
+# real dependencies with unrelated same-named files/packages instead
+# of just being redundant.
+unset PYTHONPATH
 exec "$INSTALL_DIR/bin/python3" "$INSTALL_DIR/main.py" "\$@"
 EOF
         chmod 755 "$LAUNCHER_PATH"
@@ -201,6 +210,10 @@ EOF
 # refresh -- see that file's docstring) rather than exec'ing rigplane
 # directly. Installed by install.sh -- re-run that script (don't
 # hand-edit this file) to reinstall or uninstall.
+#
+# PYTHONPATH is unset rather than inherited -- see torca launcher's
+# comment above for why.
+unset PYTHONPATH
 exec "$INSTALL_DIR/bin/python3" "$INSTALL_DIR/torca_server.py" "\$@"
 EOF
         chmod 755 "$SERVER_LAUNCHER_PATH"

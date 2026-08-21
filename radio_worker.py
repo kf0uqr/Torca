@@ -1813,6 +1813,64 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Swap Main/Sub failed: {exc}")
 
+    def set_repeater_tone_settings(self, mode: str, freq_hz: float):
+        """Thread-safe: call from the GUI thread. mode is "none"/"tone"/
+        "tsql" -- matches wfview's own repeater tone type model (None/
+        Transmit Tone Only/Tone Squelch), the closest real-radio-
+        accurate mapping onto rigplane's two independent bools
+        (get/set_repeater_tone -- CI-V 0x16 0x42, transmit-tone-encode
+        on/off -- and get/set_repeater_tsql -- CI-V 0x16 0x43, tone-
+        squelch on/off): "tone" sets repeater_tone on/tsql off,
+        "tsql" sets repeater_tone off/tsql on (wfview's own docs: "Tone
+        Squelch: A tone is transmitted, and the same tone frequency is
+        used as a tone squelch" -- TSQL already implies tone
+        transmission, no need for both flags on at once), "none" clears
+        both. Always targets Main (RECEIVER_MAIN) regardless of which
+        receiver is currently active -- same reasoning as split itself
+        only ever operating against Main's VFO A/B pair (PTT always
+        transmits from Main, a confirmed real hardware limitation).
+
+        Bundled into one coroutine (frequency writes, then both on/off
+        flags) rather than several independently-dispatched calls --
+        same non-guaranteed-ordering reasoning documented throughout
+        this file for every other multi-step radio operation (see
+        _set_receiver_control_value's docstring). freq_hz is written to
+        BOTH set_tone_freq (0x1B 0x00, the transmit/TONE-mode
+        frequency) and set_tsql_freq (0x1B 0x01, the TSQL-mode
+        frequency) whenever mode != "none" -- confirmed via rigplane's
+        own source that these are two independently addressable CI-V
+        registers, not one shared value, and there's no way to know
+        from here which one a given mode change will actually read from
+        without live hardware to test against, so both are kept in sync
+        rather than guessing only one matters."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_repeater_tone_settings(mode, freq_hz), self.loop)
+
+    async def _set_repeater_tone_settings(self, mode: str, freq_hz: float):
+        receiver = RECEIVER_MAIN
+        if mode != "none":
+            try:
+                await self.radio.set_tone_freq(freq_hz, receiver=receiver)
+                self.audio_status.emit(f"[tone] set_tone_freq({freq_hz}) OK")
+            except Exception as exc:
+                self.error.emit(f"Set tone frequency failed: {exc}")
+            try:
+                await self.radio.set_tsql_freq(freq_hz, receiver=receiver)
+                self.audio_status.emit(f"[tone] set_tsql_freq({freq_hz}) OK")
+            except Exception as exc:
+                self.error.emit(f"Set TSQL frequency failed: {exc}")
+        try:
+            await self.radio.set_repeater_tone(mode == "tone", receiver=receiver)
+            self.audio_status.emit(f"[tone] set_repeater_tone({mode == 'tone'}) OK")
+        except Exception as exc:
+            self.error.emit(f"Set repeater tone failed: {exc}")
+        try:
+            await self.radio.set_repeater_tsql(mode == "tsql", receiver=receiver)
+            self.audio_status.emit(f"[tone] set_repeater_tsql({mode == 'tsql'}) OK")
+        except Exception as exc:
+            self.error.emit(f"Set repeater TSQL failed: {exc}")
+
     def set_receiver_frequency(self, receiver: int, freq_hz: int):
         """Thread-safe: call from the GUI thread. Only meaningful on a
         genuine dual-receiver radio (check self.is_dual_receiver first) --

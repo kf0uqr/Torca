@@ -3,19 +3,19 @@
 operation, modeled on wfview's "Rpt/Split" window
 (https://wfview.org/wfview-user-manual/repeater-and-split-operation/).
 
-Scope deliberately narrower than wfview's own dialog: wfview also has a
-"Repeater Duplex" section (simplex/+/-/auto shift direction, offset-per-
-band) and a "Repeater Tone Type"/"Tone Selection" section (CTCSS/DTCS).
-Neither is included here -- rigplane has no repeater-duplex-offset
-command at all (confirmed by reading its command modules directly, only
-tone/CTCSS commands exist, no duplex-shift ones), and tone/CTCSS is a
-distinct FM-repeater-access feature, not "split mode operation" as
-asked for. wfview's "AutoTrack" (continuous Sub-follows-Main-with-
-offset) is also left out -- wfview's own docs flag it as fragile/
-experimental ("do not use both [AutoTrack and Quick Split] at the same
-time"), and there's no live radio available this session to verify a
-from-scratch implementation actually behaves -- consistent with this
-project's standing rule to not guess at unverifiable radio behavior.
+Scope deliberately narrower than wfview's own dialog in two places:
+wfview's "Repeater Duplex" section (simplex/+/-/auto shift direction,
+offset-per-band) isn't included -- rigplane has no repeater-duplex-
+offset command at all (confirmed by reading its command modules
+directly). And DTCS/DCS isn't included in the Repeater Tone section
+below -- rigplane has no DTCS commands either, only CTCSS tone/TSQL
+(confirmed the same way). wfview's "AutoTrack" (continuous Sub-follows-
+Main-with-offset) is also left out -- wfview's own docs flag it as
+fragile/experimental ("do not use both [AutoTrack and Quick Split] at
+the same time"), and there's no live radio available this session to
+verify a from-scratch implementation actually behaves -- consistent
+with this project's standing rule to not guess at unverifiable radio
+behavior.
 
 Live-apply, not OK/Cancel: every button/checkbox here takes effect on
 the radio immediately when clicked, same as RigctldDialog/
@@ -32,6 +32,7 @@ means anything.
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFormLayout,
@@ -43,6 +44,19 @@ from PySide6.QtWidgets import (
 )
 
 from radio_worker import RECEIVER_MAIN, RECEIVER_SUB
+
+# The standard EIA/TIA CTCSS tone set (67.0-254.1 Hz) -- the same fixed
+# list every CTCSS-capable radio/repeater uses, not project-specific
+# (same "public standard, not guessed" reasoning cw.py's MORSE_CODE_
+# TABLE documents for itself). Matches rigplane's own encode_tone_freq
+# valid range (67.0-254.1 Hz) exactly.
+STANDARD_CTCSS_TONES_HZ = [
+    67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5,
+    94.8, 97.4, 100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3,
+    131.8, 136.5, 141.3, 146.2, 151.4, 156.7, 159.8, 162.2, 165.5, 167.9,
+    171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6, 199.5,
+    203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,
+]
 
 
 class SplitSettingsDialog(QDialog):
@@ -131,6 +145,32 @@ class SplitSettingsDialog(QDialog):
         split_layout.addLayout(freq_form)
         split_group.setLayout(split_layout)
 
+        # Repeater tone/CTCSS -- normally configured alongside split for
+        # FM repeater work (split's RX/TX frequency pair IS the
+        # repeater's input/output split), per explicit instruction.
+        # No live readback (see _on_set_rx_clicked's docstring for why
+        # -- same one-shot-fetch limitation applies here): starts on
+        # "None" with the first standard tone selected, not whatever
+        # the radio is actually currently set to.
+        tone_group = QGroupBox("Repeater Tone")
+        self.tone_mode_combo = QComboBox()
+        self.tone_mode_combo.addItem("None", "none")
+        self.tone_mode_combo.addItem("Transmit Tone Only", "tone")
+        self.tone_mode_combo.addItem("Tone Squelch", "tsql")
+        self.tone_freq_combo = QComboBox()
+        for tone_hz in STANDARD_CTCSS_TONES_HZ:
+            self.tone_freq_combo.addItem(f"{tone_hz:.1f} Hz", tone_hz)
+        tone_apply_button = QPushButton("Apply")
+        tone_apply_button.clicked.connect(self._on_tone_apply_clicked)
+
+        tone_form = QFormLayout()
+        tone_form.addRow("Type:", self.tone_mode_combo)
+        tone_form.addRow("Tone:", self.tone_freq_combo)
+        tone_row = QHBoxLayout()
+        tone_row.addLayout(tone_form)
+        tone_row.addWidget(tone_apply_button)
+        tone_group.setLayout(tone_row)
+
         vfo_group = QGroupBox("VFO")
         vfo_layout = QVBoxLayout()
         if radio_window.worker.is_dual_receiver:
@@ -174,6 +214,7 @@ class SplitSettingsDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(split_group)
+        layout.addWidget(tone_group)
         layout.addWidget(vfo_group)
         layout.addWidget(close_button)
         self.setLayout(layout)
@@ -225,3 +266,8 @@ class SplitSettingsDialog(QDialog):
 
     def _on_select_vfo_clicked(self, vfo_value):
         self.worker.set_control_value("vfo", vfo_value)
+
+    def _on_tone_apply_clicked(self):
+        mode = self.tone_mode_combo.currentData()
+        freq_hz = self.tone_freq_combo.currentData()
+        self.worker.set_repeater_tone_settings(mode, freq_hz)

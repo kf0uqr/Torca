@@ -46,6 +46,7 @@ from cw_window import CwToolWindow
 from split_dialog import SplitSettingsDialog
 from memories_window import MemoriesWindow
 from sstv_window import SstvToolWindow
+from rtty_window import RttyToolWindow
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 
@@ -234,6 +235,14 @@ class RadioWindow(QWidget):
         self.sstv_tool_button.setEnabled(False)
         self.sstv_tool_button.clicked.connect(self._on_sstv_tool_clicked)
         self.sstv_window = None
+
+        # Opens the per-radio RTTY decode tool (rtty_window.py) -- same
+        # singleton/lazy-construction/enable-on-connect pattern as the
+        # CW/SSTV Tool buttons above.
+        self.rtty_tool_button = QPushButton("RTTY Tool...")
+        self.rtty_tool_button.setEnabled(False)
+        self.rtty_tool_button.clicked.connect(self._on_rtty_tool_clicked)
+        self.rtty_window = None
 
         # Opens the per-radio memory-channel window (memories_window.py)
         # -- same singleton/lazy-construction/enable-on-connect pattern
@@ -459,6 +468,7 @@ class RadioWindow(QWidget):
         left_column.addStretch()
         left_column.addWidget(self.cw_tool_button)
         left_column.addWidget(self.sstv_tool_button)
+        left_column.addWidget(self.rtty_tool_button)
 
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
@@ -517,6 +527,7 @@ class RadioWindow(QWidget):
         self.ptt_button.setEnabled(True)
         self.cw_tool_button.setEnabled(True)
         self.sstv_tool_button.setEnabled(True)
+        self.rtty_tool_button.setEnabled(True)
         self.memories_button.setEnabled(True)
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
@@ -556,6 +567,13 @@ class RadioWindow(QWidget):
         self.sstv_window.show()
         self.sstv_window.raise_()
         self.sstv_window.activateWindow()
+
+    def _on_rtty_tool_clicked(self):
+        if self.rtty_window is None:
+            self.rtty_window = RttyToolWindow(self)
+        self.rtty_window.show()
+        self.rtty_window.raise_()
+        self.rtty_window.activateWindow()
 
     def _on_memories_button_clicked(self):
         if self.memories_window is None:
@@ -1218,6 +1236,8 @@ class RadioWindow(QWidget):
             self.cw_window.closing_for_real()
         if self.sstv_window is not None:
             self.sstv_window.closing_for_real()
+        if self.rtty_window is not None:
+            self.rtty_window.closing_for_real()
         if self.memories_window is not None:
             self.memories_window.closing_for_real()
         self._satellite_session.unregister(self)

@@ -187,6 +187,14 @@ class RadioWorker(QThread):
         # running both simultaneously in practice.
         self._sstv_decode_callback = None
         self._sstv_decode_via_bridge = False
+        # Set by start_rtty_decode()/cleared by stop_rtty_decode() --
+        # structural clone of the CW/SSTV decode fields above (same
+        # AudioBridge-piggyback-or-direct-tap attach/detach logic, see
+        # _attach_rtty_decode). Same single-slot AudioBridge.extra_rx_
+        # callback limitation -- only one of CW/SSTV/RTTY decode can be
+        # attached at once.
+        self._rtty_decode_callback = None
+        self._rtty_decode_via_bridge = False
         # Dual-receiver only: which receiver every receiver-aware
         # getter/setter (see _receiver_kwargs) targets when none is
         # explicitly given. Starts at Main; kept in sync with the
@@ -749,6 +757,74 @@ class RadioWorker(QThread):
             await self.radio.stop_rx()
         except Exception as exc:
             self.error.emit(f"stop_sstv_decode: radio.stop_rx() failed ({exc}).")
+
+    def start_rtty_decode(self, callback):
+        """Thread-safe: call from the GUI thread. Structural clone of
+        start_cw_decode/start_sstv_decode -- `callback` is invoked with
+        raw PCM bytes (int16, mono) each time audio arrives, on
+        RadioWorker's own asyncio-loop thread, not the GUI thread.
+        Raises RuntimeError immediately (still on the calling/GUI
+        thread) only if not connected yet."""
+        if self.loop is None or self.radio is None:
+            raise RuntimeError("start_rtty_decode: not connected yet.")
+        self._rtty_decode_callback = callback
+        asyncio.run_coroutine_threadsafe(self._start_rtty_decode(), self.loop)
+
+    async def _start_rtty_decode(self):
+        await self._attach_rtty_decode()
+
+    async def _attach_rtty_decode(self):
+        """Structural clone of _attach_cw_decode/_attach_sstv_decode --
+        piggybacks on self.audio_bridge's already-flowing RX stream via
+        set_extra_rx_callback() when one exists (has_rx_stream()),
+        otherwise registers its own direct radio.start_rx() tap."""
+        if self.audio_bridge is not None and self.audio_bridge.has_rx_stream():
+            self._rtty_decode_via_bridge = True
+            self.audio_bridge.set_extra_rx_callback(self._on_rtty_decode_frame_from_bridge)
+            return
+        self._rtty_decode_via_bridge = False
+        try:
+            await self.radio.start_rx(self._on_rtty_decode_frame)
+        except Exception as exc:
+            self._rtty_decode_callback = None
+            self.error.emit(f"start_rtty_decode: radio.start_rx() failed ({exc}).")
+
+    def _on_rtty_decode_frame_from_bridge(self, pcm_bytes):
+        """AudioBridge's extra-RX-callback path -- already-extracted/
+        downmixed PCM, no unwrapping needed (see
+        _on_cw_decode_frame_from_bridge)."""
+        if self._rtty_decode_callback is not None:
+            self._rtty_decode_callback(pcm_bytes)
+
+    def _on_rtty_decode_frame(self, packet=None):
+        """Direct-tap path only (see _attach_rtty_decode) -- same
+        calling convention as _on_cw_decode_frame."""
+        pcm_bytes = AudioBridge._extract_pcm_bytes(packet)
+        if pcm_bytes is not None and self._rtty_decode_callback is not None:
+            self._rtty_decode_callback(pcm_bytes)
+
+    def stop_rtty_decode(self):
+        """Thread-safe: call from the GUI thread."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._stop_rtty_decode(), self.loop)
+
+    async def _stop_rtty_decode(self):
+        self._rtty_decode_callback = None
+        await self._detach_rtty_decode()
+
+    async def _detach_rtty_decode(self):
+        """Structural clone of _detach_cw_decode/_detach_sstv_decode --
+        tears down whichever mode _attach_rtty_decode last used."""
+        if self._rtty_decode_via_bridge:
+            if self.audio_bridge is not None:
+                self.audio_bridge.set_extra_rx_callback(None)
+            self._rtty_decode_via_bridge = False
+            return
+        try:
+            await self.radio.stop_rx()
+        except Exception as exc:
+            self.error.emit(f"stop_rtty_decode: radio.stop_rx() failed ({exc}).")
 
     async def _setup_levels(self):
         """Checks whether this radio supports rigplane's LevelsCapable

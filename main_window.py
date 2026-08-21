@@ -443,22 +443,11 @@ class RadioWindow(QWidget):
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
-
-        # PTT gets its own column, directly to the left of the tuning
-        # knob's column and bottom-anchored (via the stretch above it)
-        # so it sits right above the level sliders -- same fixed size
-        # (130 wide, matching the knob, x40 tall) it had back when it
-        # lived inside knob_row, before CW/SSTV moved out of that
-        # column, per explicit instruction.
-        self.ptt_button.setFixedWidth(130)
-        ptt_column = QVBoxLayout()
-        ptt_column.addStretch()
-        ptt_column.addWidget(self.ptt_button)
+        knob_row.addWidget(self.ptt_button)
 
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
         tuning_row.addStretch()
-        tuning_row.addLayout(ptt_column)
         tuning_row.addLayout(knob_row)
 
         layout = QVBoxLayout()

@@ -29,13 +29,35 @@ window happens to be open.
 
 Recall-to-radio (loading a saved entry back into VFO A/B) is
 deliberately NOT included here -- out of scope for what was asked.
+
+Local Repeaters tab: a special auto-populated tab (kind="local_
+repeaters" in the persisted data, vs. plain "manual" tabs) that fetches
+nearby 2m/70cm repeaters from Open Repeater (open_repeater.py) around
+the operator's saved GPS location (same operator_lat/operator_lon
+QSettings ConnectionDialog/ham_dashboard.py already use) and turns each
+into a memory entry -- VFO A (RX) is the repeater's output/downlink,
+VFO B (TX) is input/uplink (output + offset). RepeaterBook was
+considered and NOT used -- its API now requires an approved app token
+and its own docs explicitly say public discovery tools like this
+aren't authorized without written permission (confirmed by reading
+RepeaterBook's own API wiki page directly). Open Repeater's API is
+openly self-service instead (free key, no approval process) -- see
+open_repeater.py's own docstring for the full comparison. Otherwise
+behaves exactly like any other tab (editable, deletable, supports
+manual Add/Delete Memory too) -- only Refresh (re-fetch, replacing
+every entry) is unique to it.
 """
 
 import json
 import pathlib
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QSettings, Signal
 from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QLabel,
+    QLineEdit,
     QWidget,
     QHeaderView,
     QHBoxLayout,
@@ -48,9 +70,34 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+import open_repeater
+
 MEMORIES_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "memories.json"
 
+# Same QSettings org/app every other structured-non-JSON setting in
+# this codebase uses (connection_dialog.py, log_book_window.py, ...).
+_SETTINGS_ORG = "IcomRadioApp"
+_SETTINGS_APP = "RadioControl"
+_OPEN_REPEATER_API_KEY_SETTING = "open_repeater_api_key"
+
 _COLUMNS = ["Name", "VFO A Freq (MHz)", "VFO A Mode", "VFO B Freq (MHz)", "VFO B Mode"]
+
+# Default/typical "local repeater" search radius -- roughly 50 miles,
+# a common rule-of-thumb VHF/UHF repeater search distance. Just a
+# starting value in the radius prompt, not a hard limit -- the operator
+# can type any value 1-500 there.
+_DEFAULT_REPEATER_RADIUS_KM = 80
+
+
+def _repeater_to_entry(repeater):
+    name = repeater["callsign"] or "Repeater"
+    if repeater.get("city"):
+        name = f"{name} ({repeater['city']})"
+    return {
+        "name": name,
+        "vfo_a": {"freq_hz": repeater["output_freq_hz"], "mode": repeater["mode"], "filter": None},
+        "vfo_b": {"freq_hz": repeater["input_freq_hz"], "mode": repeater["mode"], "filter": None},
+    }
 
 
 def _load_memories():
@@ -117,12 +164,21 @@ class MemoryTabPage(QWidget):
         button_row = QHBoxLayout()
         button_row.addWidget(add_button)
         button_row.addWidget(delete_button)
+        for extra_button in self._extra_buttons():
+            button_row.addWidget(extra_button)
         button_row.addStretch()
 
         layout = QVBoxLayout()
         layout.addWidget(self.table)
         layout.addLayout(button_row)
         self.setLayout(layout)
+
+    def _extra_buttons(self):
+        """Hook for subclasses (LocalRepeatersTabPage) to add buttons
+        of their own alongside Add/Delete Memory -- called during
+        __init__, before self.table exists, so subclasses that need it
+        must set up their own state first (see LocalRepeatersTabPage)."""
+        return []
 
     def _reload_rows(self):
         self._populating = True
@@ -200,6 +256,84 @@ class MemoryTabPage(QWidget):
             self.table.removeRow(row)
         self._on_change()
 
+    def replace_entries(self, new_entries):
+        """Wholesale replace -- used by LocalRepeatersTabPage's Refresh
+        (and reusable by anything else that wants a "re-populate this
+        tab from scratch" operation later)."""
+        self._entries[:] = new_entries
+        self._reload_rows()
+        self._on_change()
+
+
+class LocalRepeatersTabPage(MemoryTabPage):
+    """Same table/Add/Delete Memory shape as MemoryTabPage -- entries
+    are just as user-editable/deletable here as in any other tab --
+    plus a Refresh button that re-fetches nearby 2m/70cm repeaters from
+    Open Repeater and replaces this tab's entries wholesale."""
+
+    def __init__(self, entries, on_change, on_refresh):
+        # Set before super().__init__() -- _extra_buttons() (called
+        # from within it) needs this already available.
+        self._on_refresh = on_refresh
+        super().__init__(entries, on_change)
+
+    def _extra_buttons(self):
+        refresh_button = QPushButton("Refresh")
+        refresh_button.setToolTip(
+            "Re-fetches nearby 2m/70cm repeaters from Open Repeater, replacing every entry "
+            "currently in this tab -- any manual edits/additions here are discarded."
+        )
+        refresh_button.clicked.connect(self._on_refresh_clicked)
+        return [refresh_button]
+
+    def _on_refresh_clicked(self):
+        if self._entries:
+            confirm = QMessageBox.question(
+                self, "Refresh Local Repeaters",
+                "This replaces every entry currently in this tab with a fresh fetch. Continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
+        self._on_refresh(self)
+
+
+class OpenRepeaterSettingsDialog(QDialog):
+    """One field: the Open Repeater API key -- free, self-service
+    registration at openrepeater.org (no approval process, unlike
+    RepeaterBook -- see this module's own docstring). Same shape as
+    log_book_window.py's QrzSettingsDialog."""
+
+    def __init__(self, current_key, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Repeaters Settings")
+
+        self.key_input = QLineEdit(current_key)
+        self.key_input.setEchoMode(QLineEdit.Password)
+        self.key_input.setToolTip(
+            "From your free openrepeater.org account (Register -> API key). "
+            "Needed for the Local Repeaters tab's Refresh/create."
+        )
+
+        form = QFormLayout()
+        form.addRow(QLabel(
+            "Get a free API key by registering at openrepeater.org,\n"
+            "then paste it here to enable the Local Repeaters tab."
+        ))
+        form.addRow("API Key:", self.key_input)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def result_api_key(self):
+        return self.key_input.text().strip()
+
 
 class MemoriesWindow(QWidget):
     def __init__(self, radio_window):
@@ -223,12 +357,27 @@ class MemoriesWindow(QWidget):
 
         add_tab_button = QPushButton("+")
         add_tab_button.setFixedWidth(28)
-        add_tab_button.setToolTip("Add a new tab")
+        add_tab_button.setToolTip("Add a new (blank) tab")
         add_tab_button.clicked.connect(self._on_add_tab_clicked)
-        self.tabs.setCornerWidget(add_tab_button)
+
+        add_repeaters_tab_button = QPushButton("+ Local Repeaters")
+        add_repeaters_tab_button.setToolTip("Add a tab auto-populated with nearby 2m/70cm repeaters (Open Repeater)")
+        add_repeaters_tab_button.clicked.connect(self._on_add_local_repeaters_tab_clicked)
+
+        settings_button = QPushButton("Repeaters Settings...")
+        settings_button.setToolTip("Set your Open Repeater API key")
+        settings_button.clicked.connect(self._on_repeater_settings_clicked)
+
+        corner_widget = QWidget()
+        corner_layout = QHBoxLayout(corner_widget)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.addWidget(add_tab_button)
+        corner_layout.addWidget(add_repeaters_tab_button)
+        corner_layout.addWidget(settings_button)
+        self.tabs.setCornerWidget(corner_widget)
 
         for tab in self._data["tabs"]:
-            self._add_tab_page(tab["name"], tab["entries"])
+            self._add_tab_page(tab["name"], tab["entries"], tab.get("kind", "manual"))
 
         layout = QVBoxLayout()
         layout.addWidget(self.tabs)
@@ -236,8 +385,11 @@ class MemoriesWindow(QWidget):
 
         radio_window.worker.memory_snapshot_captured.connect(self._on_memory_snapshot_captured)
 
-    def _add_tab_page(self, name, entries):
-        page = MemoryTabPage(entries, self._save)
+    def _add_tab_page(self, name, entries, kind="manual"):
+        if kind == "local_repeaters":
+            page = LocalRepeatersTabPage(entries, self._save, self._on_refresh_local_repeaters)
+        else:
+            page = MemoryTabPage(entries, self._save)
         page.add_requested.connect(lambda memory_name, p=page: self._on_add_requested(p, memory_name))
         self.tabs.addTab(page, name)
         return page
@@ -255,6 +407,76 @@ class MemoriesWindow(QWidget):
         page = self._add_tab_page(name, entries)
         self.tabs.setCurrentWidget(page)
         self._save()
+
+    # ---- Local Repeaters (Open Repeater) ----
+
+    def _get_open_repeater_api_key(self):
+        return QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(_OPEN_REPEATER_API_KEY_SETTING, "") or ""
+
+    def _on_repeater_settings_clicked(self):
+        dialog = OpenRepeaterSettingsDialog(self._get_open_repeater_api_key(), self)
+        if dialog.exec() == QDialog.Accepted:
+            QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(_OPEN_REPEATER_API_KEY_SETTING, dialog.result_api_key())
+
+    def _fetch_local_repeater_entries(self):
+        """Prompts for a search radius, checks/obtains the API key and
+        saved GPS location, fetches, and returns a list of memory-entry
+        dicts (see _repeater_to_entry) -- or None if the operator
+        cancelled, or a real failure was already reported via
+        QMessageBox. Shared by both "+ Local Repeaters" (new tab) and
+        Refresh (existing tab)."""
+        radius_km, ok = QInputDialog.getInt(
+            self, "Local Repeaters", "Search radius (km):", _DEFAULT_REPEATER_RADIUS_KM, 1, 500
+        )
+        if not ok:
+            return None
+
+        api_key = self._get_open_repeater_api_key()
+        if not api_key:
+            QMessageBox.information(
+                self, "Local Repeaters", "Set your Open Repeater API key first (free registration at openrepeater.org)."
+            )
+            self._on_repeater_settings_clicked()
+            api_key = self._get_open_repeater_api_key()
+            if not api_key:
+                return None
+
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        lat = float(settings.value("operator_lat", 0.0)) or None
+        lon = float(settings.value("operator_lon", 0.0)) or None
+        if lat is None or lon is None:
+            QMessageBox.warning(
+                self, "Local Repeaters",
+                "No GPS location saved yet -- set it in the Connect New Radio dialog first "
+                "(Get GPS Coordinates, or enter it manually).",
+            )
+            return None
+
+        try:
+            repeaters = open_repeater.fetch_nearby_repeaters(api_key, lat, lon, radius_km=radius_km)
+        except Exception as exc:
+            QMessageBox.warning(self, "Local Repeaters", f"Fetch failed: {exc}")
+            return None
+
+        if not repeaters:
+            QMessageBox.information(self, "Local Repeaters", "No 2m/70cm repeaters found within range.")
+        return [_repeater_to_entry(repeater) for repeater in repeaters]
+
+    def _on_add_local_repeaters_tab_clicked(self):
+        entries = self._fetch_local_repeater_entries()
+        if entries is None:
+            return
+        name = "Local Repeaters"
+        self._data["tabs"].append({"name": name, "kind": "local_repeaters", "entries": entries})
+        page = self._add_tab_page(name, entries, kind="local_repeaters")
+        self.tabs.setCurrentWidget(page)
+        self._save()
+
+    def _on_refresh_local_repeaters(self, page):
+        entries = self._fetch_local_repeater_entries()
+        if entries is None:
+            return
+        page.replace_entries(entries)
 
     def _on_tab_double_clicked(self, index):
         if index < 0:

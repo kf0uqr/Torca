@@ -494,6 +494,17 @@ class RadioWindow(QWidget):
             slider.setEnabled(True)
         for widget in self.control_widgets.values():
             widget.setEnabled(True)
+        # Joining mid-pass (e.g. reconnecting a 9700 while satellite
+        # tracking is already running elsewhere in the session) --
+        # _on_tracking_changed only fires on session-wide start/stop, so
+        # a radio that connects while already-tracking would otherwise
+        # never get the linking-disable/scope-follow setup it needs.
+        # See _on_tracking_changed for why this matters.
+        if self._role == "full_duplex" and self.worker.is_dual_receiver and self._satellite_session.is_tracking():
+            self.worker.set_dual_receiver_linking(False)
+            self.worker.select_receiver(RECEIVER_SUB)
+            self.worker.set_scope_receiver(RECEIVER_SUB)
+            self._update_active_receiver_ui(RECEIVER_SUB)
 
     def _on_cw_tool_clicked(self):
         if self.cw_window is None:
@@ -703,6 +714,29 @@ class RadioWindow(QWidget):
 
     def _on_tracking_changed(self, tracking):
         self._sub_vfo_a_selected = False
+        # Dual-receiver ("full_duplex" role) only: restores behavior
+        # dropped in the multi-radio refactor (648221a) -- pre-refactor,
+        # _start_satellite_tracking/_stop_satellite_tracking did exactly
+        # this. Confirmed live on a real 9700 that without disabling the
+        # radio's own dual watch/linked-tuning feature, the active
+        # receiver (and therefore the scope, which follows it) kept
+        # oscillating between Main and Sub on its own regardless of what
+        # this app commanded -- that's the "scope shows the wrong VFO"
+        # bug this restores the fix for. On tracking start: force a
+        # clean from-scratch state (linking off, Sub active/scope). On
+        # stop: restore Main as active/scope so normal (non-satellite)
+        # operation isn't left silently watching Sub.
+        if self._role != "full_duplex" or not self.worker.is_connected() or not self.worker.is_dual_receiver:
+            return
+        if tracking:
+            self.worker.set_dual_receiver_linking(False)
+            self.worker.select_receiver(RECEIVER_SUB)
+            self.worker.set_scope_receiver(RECEIVER_SUB)
+            self._update_active_receiver_ui(RECEIVER_SUB)
+        else:
+            self.worker.select_receiver(RECEIVER_MAIN)
+            self.worker.set_scope_receiver(RECEIVER_MAIN)
+            self._update_active_receiver_ui(RECEIVER_MAIN)
 
     def apply_satellite_tick(self, downlink_hz, downlink_doppler_hz, uplink_hz, uplink_doppler_hz,
                               base_downlink_hz, base_uplink_hz):

@@ -5,9 +5,11 @@ night world map, live clocks, solar-terrestrial data, HF band
 conditions, satellite tracking, and now (see below) radio connection
 management, satellite Doppler control, Virtual Cables, rigctld, and
 WSJT-X launching. Constructed directly by main.py; no radio connects at
-startup any more -- radios are added from here ("Connect New Radio..."),
-each assigned a satellite role (RADIO_ROLES in constants.py) in
-ConnectionDialog, and get their own RadioWindow (main_window.py).
+startup any more -- radios are added from the Radios dialog
+(RadiosDialog, opened via the "Radios" button -- "Connect New
+Radio..." lives there now), each assigned a satellite role
+(RADIO_ROLES in constants.py) in ConnectionDialog, and get their own
+RadioWindow (main_window.py).
 
 Satellite/transponder selection, the Doppler-tracking clock, and per-
 role dispatch to however many radios are currently connected all live
@@ -569,6 +571,46 @@ class PskReporterSettingsDialog(QDialog):
         return pskreporter.DIRECTION_HEARD_YOU
 
 
+class RadiosDialog(QDialog):
+    """The connected-radios list plus "Connect New Radio..." button --
+    per explicit instruction, moved out of the main dashboard's own
+    layout into this dedicated dialog (opened via the dashboard's
+    "Radios" button) so the dashboard itself stays less cluttered.
+
+    Doesn't own connected_radios_list/connect_radio_button itself --
+    HamClockWindow still constructs and owns them (and every method
+    that reads/mutates them, e.g. _on_connect_radio_clicked,
+    _on_radio_window_closed), exactly as before this dialog existed.
+    This just reparents those same widget instances into its own
+    layout, so nothing about the connect/disconnect logic needed to
+    change at all.
+
+    Non-modal (exec() would block the rest of the dashboard while
+    open -- e.g. double-clicking a connected radio in the list to
+    bring its window forward should work without closing this dialog
+    first) -- singleton, hide-not-destroy on close, same pattern as
+    LogBookWindow."""
+
+    def __init__(self, parent_window):
+        super().__init__(parent_window)
+        self.setWindowTitle("Radios")
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Connected Radios:"))
+        header.addStretch()
+        header.addWidget(parent_window.connect_radio_button)
+
+        layout = QVBoxLayout()
+        layout.addLayout(header)
+        layout.addWidget(parent_window.connected_radios_list)
+        self.setLayout(layout)
+        self.resize(480, 220)
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+
+
 class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
     section for what's in scope and why."""
@@ -888,7 +930,11 @@ class HamClockWindow(QWidget):
                 self.qso_band_filter_combo.setCurrentIndex(index)
         self.qso_band_filter_combo.currentIndexChanged.connect(self._on_qso_band_filter_changed)
 
-        # ---- Connected radios ----
+        # ---- Connected radios (list + Connect New Radio... button
+        # live in RadiosDialog, opened via self.radios_button below --
+        # still constructed/owned here since every method that reads/
+        # mutates them (e.g. _on_connect_radio_clicked, _on_radio_
+        # window_closed) is a HamClockWindow method, unchanged) ----
         self.connect_radio_button = QPushButton("Connect New Radio...")
         self.connect_radio_button.setToolTip(
             "Opens the connection dialog for another radio -- pick its "
@@ -896,6 +942,16 @@ class HamClockWindow(QWidget):
             "Non-Sat). Each connected radio gets its own window."
         )
         self.connect_radio_button.clicked.connect(self._on_connect_radio_clicked)
+
+        self.connected_radios_list = QListWidget()
+        self.connected_radios_list.setToolTip("Double-click to bring that radio's window to the front.")
+        self.connected_radios_list.itemDoubleClicked.connect(self._on_connected_radio_item_double_clicked)
+
+        # Singleton, non-modal -- see RadiosDialog's own docstring.
+        self.radios_dialog = RadiosDialog(self)
+        self.radios_button = QPushButton("Radios")
+        self.radios_button.setToolTip("Connect a new radio, or bring an already-connected one's window to the front.")
+        self.radios_button.clicked.connect(self._on_radios_button_clicked)
 
         # Singleton, non-modal, tracked as self.log_book_window rather
         # than a list (unlike RadioWindow, only one is ever open) --
@@ -923,22 +979,12 @@ class HamClockWindow(QWidget):
         self.update_button.setToolTip("Checks GitHub for a newer version of TORCA, and can update in place.")
         self.update_button.clicked.connect(self._on_update_button_clicked)
 
-        self.connected_radios_list = QListWidget()
-        self.connected_radios_list.setToolTip("Double-click to bring that radio's window to the front.")
-        self.connected_radios_list.setFixedHeight(70)
-        self.connected_radios_list.itemDoubleClicked.connect(self._on_connected_radio_item_double_clicked)
-
-        connected_radios_header = QHBoxLayout()
-        connected_radios_header.addWidget(QLabel("Connected Radios:"))
-        connected_radios_header.addWidget(self.connect_radio_button)
-        connected_radios_header.addWidget(self.log_book_button)
-        connected_radios_header.addWidget(self.new_qso_button)
-        connected_radios_header.addWidget(self.update_button)
-        connected_radios_header.addStretch()
-
-        connected_radios_column = QVBoxLayout()
-        connected_radios_column.addLayout(connected_radios_header)
-        connected_radios_column.addWidget(self.connected_radios_list)
+        top_buttons_row = QHBoxLayout()
+        top_buttons_row.addWidget(self.radios_button)
+        top_buttons_row.addWidget(self.log_book_button)
+        top_buttons_row.addWidget(self.new_qso_button)
+        top_buttons_row.addWidget(self.update_button)
+        top_buttons_row.addStretch()
 
         # ---- Satellite tracking controls (moved from RadioWindow --
         # now the single shared control point for however many radios
@@ -1124,7 +1170,7 @@ class HamClockWindow(QWidget):
         layout.addLayout(clocks_row)
         layout.addLayout(map_buttons_row)
         layout.addWidget(self.map_widget)
-        layout.addLayout(connected_radios_column)
+        layout.addLayout(top_buttons_row)
         layout.addLayout(tracking_row)
         layout.addWidget(self.satellite_overlay_label)
         layout.addLayout(external_apps_row)
@@ -1878,7 +1924,7 @@ class HamClockWindow(QWidget):
         if not self._observer_lat and not self._observer_lon:
             QMessageBox.warning(
                 self, "Satellite Tracking",
-                "Set your location in the Connect New Radio dialog first "
+                "Set your location in Radios -> Connect New Radio... first "
                 "(Latitude/Longitude/Elevation) -- satellite tracking needs "
                 "to know where you're observing from."
             )
@@ -2006,6 +2052,11 @@ class HamClockWindow(QWidget):
                     item.setForeground(QColor(255, 255, 255))
 
     # ---- Connected radios ----
+
+    def _on_radios_button_clicked(self):
+        self.radios_dialog.show()
+        self.radios_dialog.raise_()
+        self.radios_dialog.activateWindow()
 
     def _on_connect_radio_clicked(self):
         # Restricts the role combo to whatever still makes sense given

@@ -575,6 +575,14 @@ class HamClockWindow(QWidget):
 
     PASSES_DISPLAY_COUNT = 20
 
+    # How many rows tall the passes table (and the same-height tabbed
+    # section next to it) actually shows before scrolling -- per
+    # explicit instruction, smaller than PASSES_DISPLAY_COUNT (which
+    # still controls how many passes are fetched/listed, just scrolled
+    # to beyond this) so the bottom of the dashboard isn't cut off on
+    # a shorter screen.
+    PASSES_VISIBLE_ROWS = 12
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ham Dashboard")
@@ -733,12 +741,12 @@ class HamClockWindow(QWidget):
         # row as this) isn't constructed yet at this point, so this
         # doesn't reference it -- just uses the same row-count/height
         # shape its own fixed-height calculation does (PASSES_
-        # DISPLAY_COUNT rows worth), plus room for the tab bar itself
+        # VISIBLE_ROWS rows worth), plus room for the tab bar itself
         # and the extra host/port/connect controls row the DX Spots
         # tab has that the other two don't.
         self.band_data_tabs.setFixedHeight(
             self.band_conditions_table.horizontalHeader().height()
-            + self.PASSES_DISPLAY_COUNT * 24 + 4  # table content, matching upcoming_passes_table's own row count
+            + self.PASSES_VISIBLE_ROWS * 24 + 4  # table content, matching upcoming_passes_table's own row count
             + 34   # tab bar
             + 44   # DX Spots tab's extra controls/status rows
         )
@@ -748,7 +756,9 @@ class HamClockWindow(QWidget):
         # (same "selected" scope as the map itself), soonest first. Row
         # count grows/shrinks with however many passes were actually
         # found (never more than PASSES_DISPLAY_COUNT) rather than
-        # padding out to a fixed 10 with blank rows.
+        # padding out to a fixed 10 with blank rows -- beyond
+        # PASSES_VISIBLE_ROWS' fixed height, the extra rows just
+        # scroll rather than growing the table/window further.
         self.upcoming_passes_table = QTableWidget(0, 4)
         self.upcoming_passes_table.setHorizontalHeaderLabels(["Satellite", "Status", "Max El", "Duration"])
         self.upcoming_passes_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -757,7 +767,7 @@ class HamClockWindow(QWidget):
         self.upcoming_passes_table.verticalHeader().setVisible(False)
         self.upcoming_passes_table.setFixedHeight(
             self.upcoming_passes_table.horizontalHeader().height()
-            + self.PASSES_DISPLAY_COUNT * 24 + 4
+            + self.PASSES_VISIBLE_ROWS * 24 + 4
         )
         self.upcoming_passes_table.setToolTip(
             "Click a row to make it the active (highlighted) satellite on the map. "

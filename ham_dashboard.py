@@ -617,9 +617,6 @@ class HamClockWindow(QWidget):
         for label in (self.utc_label, self.local_label, self.sfi_label, self.ssn_label, self.k_index_label):
             label.setStyleSheet("font-size: 18px; font-weight: bold;")
 
-        self.solar_updated_label = QLabel("Solar data: waiting for first update from NOAA...")
-        self.solar_updated_label.setStyleSheet("color: #888; font-size: 11px;")
-
         # Band conditions: rows = the four standard combined band ranges,
         # columns = Day/Night. Colored per condition (green=Good,
         # yellow=Fair, red=Poor/Band Closed) for a quick-glance read,
@@ -994,13 +991,6 @@ class HamClockWindow(QWidget):
         self.update_button.setToolTip("Checks GitHub for a newer version of TORCA, and can update in place.")
         self.update_button.clicked.connect(self._on_update_button_clicked)
 
-        top_buttons_row = QHBoxLayout()
-        top_buttons_row.addWidget(self.radios_button)
-        top_buttons_row.addWidget(self.log_book_button)
-        top_buttons_row.addWidget(self.new_qso_button)
-        top_buttons_row.addWidget(self.update_button)
-        top_buttons_row.addStretch()
-
         # ---- Satellite tracking controls (moved from RadioWindow --
         # now the single shared control point for however many radios
         # are cooperating on one pass, driving SatelliteSession) ----
@@ -1079,10 +1069,16 @@ class HamClockWindow(QWidget):
         self.wsjtx_autolog_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.wsjtx_autolog_button.customContextMenuRequested.connect(self._on_wsjtx_autolog_menu_requested)
 
-        external_apps_row = QHBoxLayout()
-        external_apps_row.addWidget(self.wsjtx_button)
-        external_apps_row.addWidget(self.wsjtx_autolog_button)
-        external_apps_row.addStretch()
+        # Per explicit instruction, both WSJT-X buttons moved here
+        # (between Radios and Log Book) from their own row.
+        top_buttons_row = QHBoxLayout()
+        top_buttons_row.addWidget(self.radios_button)
+        top_buttons_row.addWidget(self.wsjtx_button)
+        top_buttons_row.addWidget(self.wsjtx_autolog_button)
+        top_buttons_row.addWidget(self.log_book_button)
+        top_buttons_row.addWidget(self.new_qso_button)
+        top_buttons_row.addWidget(self.update_button)
+        top_buttons_row.addStretch()
 
         # Stretches BETWEEN each label (not before the first or after
         # the last) rather than one trailing addStretch() -- per
@@ -1140,8 +1136,6 @@ class HamClockWindow(QWidget):
         layout.addLayout(top_buttons_row)
         layout.addLayout(tracking_row)
         layout.addWidget(self.satellite_overlay_label)
-        layout.addLayout(external_apps_row)
-        layout.addWidget(self.solar_updated_label)
         layout.addLayout(bottom_row)
         self.setLayout(layout)
 
@@ -1985,20 +1979,8 @@ class HamClockWindow(QWidget):
             self._update_band_conditions_table(data["band_conditions"])
 
         errors = {k: v for k, v in data.items() if k.endswith("_error")}
-        if errors:
-            # Full detail goes to the console -- easier to copy/paste from
-            # there than out of a small status label -- while the label
-            # itself just shows a short summary.
-            for key, message in errors.items():
-                print(f"[ERROR] Ham Dashboard: {key}: {message}")
-            self.solar_updated_label.setText(
-                f"Solar data: partial update, some values unavailable "
-                f"({', '.join(errors)} -- see console for full detail)"
-            )
-        else:
-            self.solar_updated_label.setText(
-                f"Solar data: updated {datetime.datetime.now().strftime('%H:%M:%S')}"
-            )
+        for key, message in errors.items():
+            print(f"[ERROR] Ham Dashboard: {key}: {message}")
 
     _BAND_CONDITION_COLORS = {
         "good": QColor(40, 130, 60),

@@ -1766,6 +1766,53 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Main/Sub tracking ({'on' if on else 'off'}) failed: {exc}")
 
+    def quick_split(self):
+        """Thread-safe: call from the GUI thread. One-shot split trigger
+        (rigplane's quick_split(), CI-V 0x1A 0x05 0x00 0x33, fire-and-
+        forget -- confirmed via its own docstring/source that it expects
+        no ACK/NAK response). Used by split_dialog.py's Quick Split
+        button."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._quick_split(), self.loop)
+
+    async def _quick_split(self):
+        try:
+            await self.radio.quick_split()
+            self.audio_status.emit("[split] quick_split() OK")
+        except Exception as exc:
+            self.error.emit(f"Quick split failed: {exc}")
+
+    def equalize_main_sub(self):
+        """Thread-safe: call from the GUI thread. Dual-receiver only --
+        copies Main's VFO state (frequency/mode) onto Sub via rigplane's
+        equalize_main_sub(). Used by split_dialog.py's "M=>S" button."""
+        if self.loop is None or self.radio is None or not self.is_dual_receiver:
+            return
+        asyncio.run_coroutine_threadsafe(self._equalize_main_sub(), self.loop)
+
+    async def _equalize_main_sub(self):
+        try:
+            await self.radio.equalize_main_sub()
+            self.audio_status.emit("[dual-rx] equalize_main_sub() OK")
+        except Exception as exc:
+            self.error.emit(f"Equalize Main->Sub failed: {exc}")
+
+    def swap_main_sub(self):
+        """Thread-safe: call from the GUI thread. Dual-receiver only --
+        swaps Main and Sub's VFO frequencies via rigplane's
+        swap_main_sub(). Used by split_dialog.py's "Swap M/S" button."""
+        if self.loop is None or self.radio is None or not self.is_dual_receiver:
+            return
+        asyncio.run_coroutine_threadsafe(self._swap_main_sub(), self.loop)
+
+    async def _swap_main_sub(self):
+        try:
+            await self.radio.swap_main_sub()
+            self.audio_status.emit("[dual-rx] swap_main_sub() OK")
+        except Exception as exc:
+            self.error.emit(f"Swap Main/Sub failed: {exc}")
+
     def set_receiver_frequency(self, receiver: int, freq_hz: int):
         """Thread-safe: call from the GUI thread. Only meaningful on a
         genuine dual-receiver radio (check self.is_dual_receiver first) --

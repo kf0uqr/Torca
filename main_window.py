@@ -43,6 +43,7 @@ from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
 from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
 from satellite_tracking import radio_mode_for_transponder
 from cw_window import CwToolWindow
+from split_dialog import SplitSettingsDialog
 from sstv_window import SstvToolWindow
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
@@ -409,6 +410,13 @@ class RadioWindow(QWidget):
                 widget.toggled.connect(lambda checked, k=key: self._on_control_toggled(k, checked))
                 controls_row.addWidget(widget)
                 controls_row.setAlignment(widget, Qt.AlignTop)
+                if key == "split":
+                    # Right-click opens the full split-configuration
+                    # dialog (split_dialog.py) -- left-click still just
+                    # toggles split on/off directly, same as every other
+                    # plain toggle button here.
+                    widget.setContextMenuPolicy(Qt.CustomContextMenu)
+                    widget.customContextMenuRequested.connect(self._on_split_button_context_menu)
             self.control_widgets[key] = widget
 
         # controls_row (Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO) and the
@@ -583,6 +591,9 @@ class RadioWindow(QWidget):
 
     def _on_control_toggled(self, key, checked):
         self.worker.set_control_value(key, checked)
+
+    def _on_split_button_context_menu(self, pos):
+        SplitSettingsDialog(self).exec()
 
     def _on_ptt_toggled(self, checked):
         self.ptt_button.setText("TRANSMITTING" if checked else "PTT")

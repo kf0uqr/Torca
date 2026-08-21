@@ -148,6 +148,7 @@ class RadioWorker(QThread):
     scope_ready = Signal()               # emitted once enable_scope() actually succeeds -- see is_scope_capable
     key_speed_changed = Signal(int)      # WPM, 6-48, from get_key_speed() polling
     cw_pitch_changed = Signal(int)       # Hz, 300-900, from get_cw_pitch() polling
+    memory_snapshot_captured = Signal(object)  # {"A": {...}, "B": {...}} or None on failure -- see capture_memory_snapshot
     error = Signal(str)
 
     def __init__(self, details, parent=None):
@@ -1870,6 +1871,67 @@ class RadioWorker(QThread):
             self.audio_status.emit(f"[tone] set_repeater_tsql({mode == 'tsql'}) OK")
         except Exception as exc:
             self.error.emit(f"Set repeater TSQL failed: {exc}")
+
+    def capture_memory_snapshot(self):
+        """Thread-safe: call from the GUI thread. Used by memories_
+        window.py's "Add Memory": reads VFO A's and VFO B's frequency
+        and mode for whichever receiver is currently active (Main or
+        Sub on a dual-receiver radio -- there's no separate "which
+        receiver" question on a single-receiver radio), restores
+        whichever VFO slot was originally selected when done, and emits
+        memory_snapshot_captured with the result ({"A": {...}, "B":
+        {...}}, each a {"freq_hz", "mode", "filter"} dict) or None on
+        failure."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._capture_memory_snapshot(), self.loop)
+
+    async def _capture_memory_snapshot(self):
+        if "vfo" not in self._control_methods:
+            self.error.emit("Memories: VFO A/B control not available on this radio/install -- can't capture a snapshot.")
+            self.memory_snapshot_captured.emit(None)
+            return
+        get_name, set_name = self._control_methods["vfo"]
+        getter = getattr(self.radio, get_name)
+        setter = getattr(self.radio, set_name)
+        try:
+            previous_slot = await self._poll_receiver_aware("vfo", getter)
+        except Exception as exc:
+            self.error.emit(f"Memories: couldn't read the current VFO selection ({exc}) -- snapshot cancelled.")
+            self.memory_snapshot_captured.emit(None)
+            return
+
+        snapshot = {}
+        failed = False
+        for slot in ("A", "B"):
+            try:
+                await self._call_receiver_aware("vfo", setter, slot)
+                # Same settle delay used everywhere else in this file
+                # between a VFO-slot select and a read/write that
+                # depends on it having actually landed (see
+                # _set_receiver_control_value's docstring).
+                await asyncio.sleep(0.15)
+                # get_frequency/get_mode's receiver=RECEIVER_MAIN(0)
+                # means "whichever receiver is currently SELECTED", not
+                # literally Main -- same quirk documented at length in
+                # _poll_loop above. So this always reads the genuinely
+                # active receiver's VFO A/B, whether that's really Main
+                # or Sub, with no extra receiver-identity bookkeeping
+                # needed here.
+                freq_hz = await self.radio.get_frequency(receiver=RECEIVER_MAIN)
+                mode_name, filt = await self.radio.get_mode(receiver=RECEIVER_MAIN)
+                snapshot[slot] = {"freq_hz": freq_hz, "mode": mode_name, "filter": filt}
+            except Exception as exc:
+                self.error.emit(f"Memories: failed to capture VFO {slot}: {exc}")
+                failed = True
+                break
+
+        try:
+            await self._call_receiver_aware("vfo", setter, previous_slot)
+        except Exception as exc:
+            self.error.emit(f"Memories: failed to restore the original VFO selection ({previous_slot}): {exc}")
+
+        self.memory_snapshot_captured.emit(None if failed else snapshot)
 
     def set_receiver_frequency(self, receiver: int, freq_hz: int):
         """Thread-safe: call from the GUI thread. Only meaningful on a

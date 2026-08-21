@@ -44,6 +44,7 @@ from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidg
 from satellite_tracking import radio_mode_for_transponder
 from cw_window import CwToolWindow
 from split_dialog import SplitSettingsDialog
+from memories_window import MemoriesWindow
 from sstv_window import SstvToolWindow
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
@@ -234,6 +235,16 @@ class RadioWindow(QWidget):
         self.sstv_tool_button.clicked.connect(self._on_sstv_tool_clicked)
         self.sstv_window = None
 
+        # Opens the per-radio memory-channel window (memories_window.py)
+        # -- same singleton/lazy-construction/enable-on-connect pattern
+        # as the CW/SSTV Tool buttons above. Stacked under Split
+        # (controls_row's construction loop below), not created there
+        # directly, since it's not itself a CONTROL_DEFINITIONS entry.
+        self.memories_button = QPushButton("Memories")
+        self.memories_button.setEnabled(False)
+        self.memories_button.clicked.connect(self._on_memories_button_clicked)
+        self.memories_window = None
+
         # Scope span/reference level/sweep speed -- rigplane's
         # set_scope_span/set_scope_ref/set_scope_speed (radio_worker.py),
         # confirmed real via rigplane's own runtime/_scope_runtime.py and
@@ -414,15 +425,24 @@ class RadioWindow(QWidget):
                     "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
                 )
                 widget.toggled.connect(lambda checked, k=key: self._on_control_toggled(k, checked))
-                controls_row.addWidget(widget)
-                controls_row.setAlignment(widget, Qt.AlignTop)
                 if key == "split":
+                    # Split gets its own column instead of a lone
+                    # controls_row slot -- the Memories button stacks
+                    # directly under it, per explicit instruction.
+                    split_column = QVBoxLayout()
+                    split_column.addWidget(widget)
+                    split_column.addWidget(self.memories_button)
+                    controls_row.addLayout(split_column)
+                    controls_row.setAlignment(split_column, Qt.AlignTop)
                     # Right-click opens the full split-configuration
                     # dialog (split_dialog.py) -- left-click still just
                     # toggles split on/off directly, same as every other
                     # plain toggle button here.
                     widget.setContextMenuPolicy(Qt.CustomContextMenu)
                     widget.customContextMenuRequested.connect(self._on_split_button_context_menu)
+                else:
+                    controls_row.addWidget(widget)
+                    controls_row.setAlignment(widget, Qt.AlignTop)
             self.control_widgets[key] = widget
 
         # controls_row (Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO) and the
@@ -497,6 +517,7 @@ class RadioWindow(QWidget):
         self.ptt_button.setEnabled(True)
         self.cw_tool_button.setEnabled(True)
         self.sstv_tool_button.setEnabled(True)
+        self.memories_button.setEnabled(True)
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
             self.active_receiver_button.setEnabled(True)
@@ -535,6 +556,13 @@ class RadioWindow(QWidget):
         self.sstv_window.show()
         self.sstv_window.raise_()
         self.sstv_window.activateWindow()
+
+    def _on_memories_button_clicked(self):
+        if self.memories_window is None:
+            self.memories_window = MemoriesWindow(self)
+        self.memories_window.show()
+        self.memories_window.raise_()
+        self.memories_window.activateWindow()
 
     @Slot(str)
     def _on_connection_failed(self, message):
@@ -1190,6 +1218,8 @@ class RadioWindow(QWidget):
             self.cw_window.closing_for_real()
         if self.sstv_window is not None:
             self.sstv_window.closing_for_real()
+        if self.memories_window is not None:
+            self.memories_window.closing_for_real()
         self._satellite_session.unregister(self)
         # Emitted BEFORE worker.stop() -- HamClockWindow's handler may
         # still need to call something on this worker (e.g.

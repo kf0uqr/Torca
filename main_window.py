@@ -254,6 +254,25 @@ class RadioWindow(QWidget):
         self.memories_button.clicked.connect(self._on_memories_button_clicked)
         self.memories_window = None
 
+        # RIT (Receiver Incremental Tuning) adjustment -- a relative
+        # rotary encoder, same TuningKnobWidget the main tuning knob
+        # uses, since rigplane's set_rit_frequency() takes an absolute
+        # +-9999 Hz offset with no live "current offset" readback wired
+        # into this app's polling (see radio_worker.py's
+        # set_rit_frequency docstring) -- _rit_offset_hz is tracked
+        # locally, starting at 0 each connection, and each knob step
+        # just sends the new running total. The RIT on/off toggle
+        # itself is a separate, ordinary CONTROL_DEFINITIONS entry
+        # ("rit", constants.py) built by the loop below, redirected
+        # into this same column (rit_column, assembled further down)
+        # alongside the knob.
+        self.rit_knob = TuningKnobWidget()
+        self.rit_knob.setEnabled(False)
+        self.rit_knob.steps_changed.connect(self._on_rit_knob_steps)
+        self._rit_offset_hz = 0
+        self.rit_offset_label = QLabel("RIT: +0 Hz")
+        self.rit_offset_label.setAlignment(Qt.AlignHCenter)
+
         # Scope span/reference level/sweep speed -- rigplane's
         # set_scope_span/set_scope_ref/set_scope_speed (radio_worker.py),
         # confirmed real via rigplane's own runtime/_scope_runtime.py and
@@ -449,6 +468,14 @@ class RadioWindow(QWidget):
                     # plain toggle button here.
                     widget.setContextMenuPolicy(Qt.CustomContextMenu)
                     widget.customContextMenuRequested.connect(self._on_split_button_context_menu)
+                elif key == "rit":
+                    # RIT's on/off toggle doesn't live in controls_row
+                    # at all -- it's assembled into rit_column, next to
+                    # rit_knob, once tuning_row is built further down
+                    # (rit_column sits BETWEEN left_column and knob_row,
+                    # per explicit instruction), not stacked in the top
+                    # controls row like every other toggle here.
+                    self.rit_status_button = widget
                 else:
                     controls_row.addWidget(widget)
                     controls_row.setAlignment(widget, Qt.AlignTop)
@@ -475,8 +502,23 @@ class RadioWindow(QWidget):
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.ptt_button)
 
+        # RIT knob column -- between left_column (ending in the CW/
+        # SSTV/RTTY tool buttons) and knob_row (VFO tuning knob/PTT),
+        # bottom-anchored via the stretch above it so it sits above the
+        # level sliders, roughly level with the tool buttons/PTT --
+        # per explicit instruction ("between the vfo/ptt and the tool
+        # buttons... above the sliders and below the main/sub and
+        # memories buttons", the latter two living up in controls_row).
+        rit_column = QVBoxLayout()
+        rit_column.addStretch()
+        rit_column.addWidget(self.rit_knob, alignment=Qt.AlignHCenter)
+        rit_column.addWidget(self.rit_offset_label, alignment=Qt.AlignHCenter)
+        rit_column.addWidget(self.rit_status_button, alignment=Qt.AlignHCenter)
+
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
+        tuning_row.addStretch()
+        tuning_row.addLayout(rit_column)
         tuning_row.addStretch()
         tuning_row.addLayout(knob_row)
 
@@ -524,6 +566,7 @@ class RadioWindow(QWidget):
     def _on_connected(self):
         self.status_label.setText(f"Connected to {self._connection_label}")
         self.tuning_knob.setEnabled(True)
+        self.rit_knob.setEnabled(True)
         self.ptt_button.setEnabled(True)
         self.cw_tool_button.setEnabled(True)
         self.sstv_tool_button.setEnabled(True)
@@ -1183,6 +1226,21 @@ class RadioWindow(QWidget):
         self._current_freq_hz = new_freq_hz
         self.freq_display.setText(f"{new_freq_hz / 1e6:.6f} MHz")
         self._update_band_button_highlight()
+
+    # 10 Hz/step -- fine enough to be useful for nudging onto a signal,
+    # coarse enough that the full +-9999 Hz range doesn't take an
+    # unreasonable number of knob clicks to reach.
+    _RIT_STEP_HZ = 10
+
+    def _on_rit_knob_steps(self, steps):
+        # Rig-global (no receiver concept at all -- see constants.py's
+        # "rit" entry), so unlike the main tuning knob there's no dual-
+        # receiver targeting to consider here. Offset is tracked
+        # locally (relative encoder, same shape as the main knob) and
+        # clamped to rigplane's own +-9999 Hz range.
+        self._rit_offset_hz = max(-9999, min(9999, self._rit_offset_hz + steps * self._RIT_STEP_HZ))
+        self.rit_offset_label.setText(f"RIT: {self._rit_offset_hz:+d} Hz")
+        self.worker.set_rit_frequency(self._rit_offset_hz)
 
     def _on_scope_clicked(self, freq_hz):
         """Click-to-tune: a left-click on the spectrum scope or

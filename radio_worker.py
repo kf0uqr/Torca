@@ -1948,6 +1948,24 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Set repeater TSQL failed: {exc}")
 
+    def set_rit_frequency(self, offset_hz: int):
+        """Thread-safe: call from the GUI thread. Sets the RIT offset
+        (rigplane's set_rit_frequency(), +-9999 Hz, fire-and-forget) --
+        used by the RIT knob (main_window.py's rit_knob/_on_rit_knob_
+        steps), which tracks the running offset itself (a relative
+        encoder, same shape as the main tuning knob) and just sends the
+        new absolute value here each step, rather than round-tripping a
+        read first."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_rit_frequency(offset_hz), self.loop)
+
+    async def _set_rit_frequency(self, offset_hz: int):
+        try:
+            await self.radio.set_rit_frequency(offset_hz)
+        except Exception as exc:
+            self.error.emit(f"Set RIT frequency ({offset_hz} Hz) failed: {exc}")
+
     def capture_memory_snapshot(self):
         """Thread-safe: call from the GUI thread. Used by memories_
         window.py's "Add Memory": reads VFO A's and VFO B's frequency

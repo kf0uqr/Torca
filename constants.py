@@ -566,6 +566,22 @@ CONTROL_DEFINITIONS = {
         "getter_candidates": ["get_split"],
         "setter_candidates": ["set_split"],
     },
+    "rit": {
+        "label": "RIT",
+        # Plain bool toggle, same shape as "split" -- rigplane's
+        # get_rit_status()/set_rit_status() take no receiver argument
+        # at all (confirmed by reading runtime/radio.py directly),
+        # i.e. RIT is rig-global just like split, not a per-receiver
+        # concept -- no dual-receiver handling needed. The actual RIT
+        # offset itself (set_rit_frequency, +-9999 Hz) isn't part of
+        # this generic on/off control -- it's driven by the RIT knob
+        # (main_window.py's rit_knob) via its own dedicated worker
+        # method instead, the same relative-encoder-to-absolute-value
+        # shape the main tuning knob already uses for frequency.
+        "type": "toggle",
+        "getter_candidates": ["get_rit_status"],
+        "setter_candidates": ["set_rit_status"],
+    },
 }
 
 # Radio-specific control-option exclusions, keyed (radio_model, control

@@ -1971,11 +1971,13 @@ class RadioWorker(QThread):
         window.py's "Add Memory": reads VFO A's and VFO B's frequency
         and mode for whichever receiver is currently active (Main or
         Sub on a dual-receiver radio -- there's no separate "which
-        receiver" question on a single-receiver radio), restores
-        whichever VFO slot was originally selected when done, and emits
-        memory_snapshot_captured with the result ({"A": {...}, "B":
-        {...}}, each a {"freq_hz", "mode", "filter"} dict) or None on
-        failure."""
+        receiver" question on a single-receiver radio) plus the
+        current repeater tone settings, restores whichever VFO slot
+        was originally selected when done, and emits memory_snapshot_
+        captured with the result ({"A": {...}, "B": {...}, "tone":
+        {...}}, "A"/"B" each a {"freq_hz", "mode", "filter"} dict and
+        "tone" a {"mode": "none"/"tone"/"tsql", "freq_hz"} dict) or
+        None on failure."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._capture_memory_snapshot(), self.loop)
@@ -2019,6 +2021,28 @@ class RadioWorker(QThread):
                 self.error.emit(f"Memories: failed to capture VFO {slot}: {exc}")
                 failed = True
                 break
+
+        # Tone read failure is soft -- doesn't invalidate the VFO A/B
+        # capture above, which is the more fundamental data and more
+        # likely to be supported on any given radio/profile. Always
+        # targets Main (same simplification split_dialog.py's own tone
+        # settings already use -- see set_repeater_tone_settings),
+        # since split/repeater-tone-relevant TX only ever happens on
+        # Main on a dual-receiver radio.
+        if not failed:
+            tone = {"mode": "none", "freq_hz": None}
+            try:
+                tone_on = await self.radio.get_repeater_tone(receiver=RECEIVER_MAIN)
+                tsql_on = await self.radio.get_repeater_tsql(receiver=RECEIVER_MAIN)
+                if tsql_on:
+                    tone["mode"] = "tsql"
+                    tone["freq_hz"] = await self.radio.get_tsql_freq(receiver=RECEIVER_MAIN)
+                elif tone_on:
+                    tone["mode"] = "tone"
+                    tone["freq_hz"] = await self.radio.get_tone_freq(receiver=RECEIVER_MAIN)
+            except Exception as exc:
+                self.error.emit(f"Memories: couldn't read repeater tone settings ({exc}) -- memory saved without tone info.")
+            snapshot["tone"] = tone
 
         try:
             await self._call_receiver_aware("vfo", setter, previous_slot)

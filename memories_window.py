@@ -80,7 +80,15 @@ _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
 _OPEN_REPEATER_API_KEY_SETTING = "open_repeater_api_key"
 
-_COLUMNS = ["Name", "VFO A Freq (MHz)", "VFO A Mode", "VFO B Freq (MHz)", "VFO B Mode"]
+_COLUMNS = [
+    "Name", "VFO A Freq (MHz)", "VFO A Mode", "VFO B Freq (MHz)", "VFO B Mode",
+    "Tone Mode", "Tone Freq (Hz)",
+]
+# Tone Mode values, same shape split_dialog.py's Repeater Tone section
+# already uses: "none" (no tone), "tone" (transmit tone only), "tsql"
+# (tone squelch -- transmits AND uses the same frequency as a receive
+# squelch, per wfview's own description, already the convention this
+# app follows for split_dialog.py's Repeater Tone section).
 
 # Default/typical "local repeater" search radius -- roughly 50 miles,
 # a common rule-of-thumb VHF/UHF repeater search distance. Just a
@@ -93,10 +101,18 @@ def _repeater_to_entry(repeater):
     name = repeater["callsign"] or "Repeater"
     if repeater.get("city"):
         name = f"{name} ({repeater['city']})"
+    ctcss_hz = repeater.get("ctcss_hz")
+    # A repeater with a published CTCSS tone almost universally needs
+    # it on transmit to access it -- "tsql" (per wfview's own
+    # description: "a tone is transmitted, and the same tone frequency
+    # is used as a tone squelch") is the same convention split_dialog.py's
+    # Repeater Tone section already uses for "has a tone" in general.
+    tone = {"mode": "tsql", "freq_hz": ctcss_hz} if ctcss_hz else {"mode": "none", "freq_hz": None}
     return {
         "name": name,
         "vfo_a": {"freq_hz": repeater["output_freq_hz"], "mode": repeater["mode"], "filter": None},
         "vfo_b": {"freq_hz": repeater["input_freq_hz"], "mode": repeater["mode"], "filter": None},
+        "tone": tone,
     }
 
 
@@ -129,6 +145,19 @@ def _parse_mhz(text):
         return None
 
 
+def _format_tone_hz(freq_hz):
+    if freq_hz is None:
+        return ""
+    return f"{freq_hz:.1f}"
+
+
+def _parse_tone_hz(text):
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 class MemoryTabPage(QWidget):
     """One tab's contents: a table of memory entries plus Add/Delete
     Memory buttons. `entries` is the actual list object living inside
@@ -156,7 +185,7 @@ class MemoryTabPage(QWidget):
         self._reload_rows()
 
         add_button = QPushButton("Add Memory")
-        add_button.setToolTip("Captures the radio's current VFO A/B frequency and mode into a new, named entry.")
+        add_button.setToolTip("Captures the radio's current VFO A/B frequency/mode and repeater tone into a new, named entry.")
         add_button.clicked.connect(self._on_add_clicked)
         delete_button = QPushButton("Delete Memory")
         delete_button.clicked.connect(self._on_delete_clicked)
@@ -192,12 +221,15 @@ class MemoryTabPage(QWidget):
         self.table.insertRow(row)
         vfo_a = entry.get("vfo_a") or {}
         vfo_b = entry.get("vfo_b") or {}
+        tone = entry.get("tone") or {}
         values = [
             entry.get("name", ""),
             _format_mhz(vfo_a.get("freq_hz")),
             vfo_a.get("mode") or "",
             _format_mhz(vfo_b.get("freq_hz")),
             vfo_b.get("mode") or "",
+            tone.get("mode") or "none",
+            _format_tone_hz(tone.get("freq_hz")),
         ]
         for col, value in enumerate(values):
             self.table.setItem(row, col, QTableWidgetItem(value))
@@ -221,6 +253,10 @@ class MemoryTabPage(QWidget):
             entry.setdefault("vfo_b", {})["freq_hz"] = _parse_mhz(text)
         elif col == 4:
             entry.setdefault("vfo_b", {})["mode"] = text
+        elif col == 5:
+            entry.setdefault("tone", {})["mode"] = text.lower() or "none"
+        elif col == 6:
+            entry.setdefault("tone", {})["freq_hz"] = _parse_tone_hz(text)
         self._on_change()
 
     def _on_add_clicked(self):
@@ -232,7 +268,12 @@ class MemoryTabPage(QWidget):
     def finish_add(self, name, snapshot):
         """Called by MemoriesWindow once the radio capture triggered by
         add_requested actually comes back."""
-        entry = {"name": name, "vfo_a": dict(snapshot["A"]), "vfo_b": dict(snapshot["B"])}
+        entry = {
+            "name": name,
+            "vfo_a": dict(snapshot["A"]),
+            "vfo_b": dict(snapshot["B"]),
+            "tone": dict(snapshot.get("tone") or {"mode": "none", "freq_hz": None}),
+        }
         self._entries.append(entry)
         self._populating = True
         self._append_row(entry)

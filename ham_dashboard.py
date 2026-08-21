@@ -327,10 +327,10 @@ class RigctldDialog(QDialog):
 # selected satellites, ~4s worst case with all 97 in this app's own
 # amateur-satellite list selected at once. A 5-minute refresh keeps that
 # cost rare and pass predictions don't meaningfully change minute to
-# minute anyway; the *displayed* countdown to each pass still updates
-# every second by simple subtraction from the cached absolute times
-# (see _update_passes_countdowns), piggybacked on the existing clock
-# timer rather than a separate one.
+# minute anyway; the *displayed* AOS/LOS times (see
+# _update_passes_countdowns) are cheap to redraw from the cached
+# absolute times and piggyback on the existing 1-second clock timer
+# rather than a separate one.
 PASSES_REFRESH_INTERVAL_MS = 5 * 60 * 1000
 
 # (label, seconds) -- offered in PskReporterSettingsDialog's lookback
@@ -573,7 +573,7 @@ class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
     section for what's in scope and why."""
 
-    PASSES_DISPLAY_COUNT = 10
+    PASSES_DISPLAY_COUNT = 20
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -771,6 +771,16 @@ class HamClockWindow(QWidget):
         self.upcoming_passes_table.cellDoubleClicked.connect(self._on_pass_row_double_clicked)
         self.upcoming_passes_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.upcoming_passes_table.customContextMenuRequested.connect(self._on_passes_table_context_menu)
+
+        # Filters out low, grazing passes (max elevation below this)
+        # from the list above -- per explicit instruction. 0 (default)
+        # means no filtering, same as before this control existed.
+        self.min_elevation_spin = QSpinBox()
+        self.min_elevation_spin.setRange(0, 90)
+        self.min_elevation_spin.setValue(0)
+        self.min_elevation_spin.setSuffix("°")
+        self.min_elevation_spin.setToolTip("Only show upcoming passes reaching at least this maximum elevation")
+        self.min_elevation_spin.valueChanged.connect(self._on_min_elevation_changed)
 
         self.satellites = load_satellite_data()
         self._upcoming_passes = []  # cached results from the last upcoming_passes() call
@@ -1085,8 +1095,14 @@ class HamClockWindow(QWidget):
         map_buttons_row.addWidget(self.qso_band_filter_combo)
         map_buttons_row.addStretch()
 
+        passes_header_row = QHBoxLayout()
+        passes_header_row.addWidget(QLabel("Upcoming Satellite Passes:"))
+        passes_header_row.addStretch()
+        passes_header_row.addWidget(QLabel("Min El:"))
+        passes_header_row.addWidget(self.min_elevation_spin)
+
         upcoming_passes_column = QVBoxLayout()
-        upcoming_passes_column.addWidget(QLabel("Upcoming Satellite Passes:"))
+        upcoming_passes_column.addLayout(passes_header_row)
         upcoming_passes_column.addWidget(self.upcoming_passes_table)
 
         bottom_row = QHBoxLayout()
@@ -1695,7 +1711,7 @@ class HamClockWindow(QWidget):
             observer_elevation_km = self._observer_elevation_m / 1000.0
             self._upcoming_passes = upcoming_passes(
                 selected, now, self._observer_lat, self._observer_lon, observer_elevation_km,
-                count=self.PASSES_DISPLAY_COUNT,
+                count=self.PASSES_DISPLAY_COUNT, min_elevation_deg=self.min_elevation_spin.value(),
             )
 
         self.upcoming_passes_table.setRowCount(len(self._upcoming_passes))
@@ -1710,26 +1726,26 @@ class HamClockWindow(QWidget):
             self.upcoming_passes_table.item(row, 3).setText(format_countdown(pass_info["duration_seconds"]))
         self._update_passes_countdowns()
 
+    def _on_min_elevation_changed(self, value):
+        self._refresh_upcoming_passes()
+
     def _update_passes_countdowns(self):
-        """Refreshes just the "Status" column's text from the cached
-        self._upcoming_passes -- plain subtraction against already-known
-        absolute times, no orbital math, cheap enough to run on the
-        1-second clock timer even though the underlying search only
-        reruns every few minutes. Derived from a live now-vs-aos/los
-        comparison rather than the "active" flag set when the pass was
-        found, so a pass that starts (or ends) between full searches is
-        reflected correctly here too, not just at the next 5-minute
-        refresh."""
+        """Refreshes the "Status" column's text from the cached
+        self._upcoming_passes -- an up arrow next to the AOS (rise)
+        time and a down arrow next to LOS (set), per explicit
+        instruction, both in UTC (matching this dashboard's own UTC
+        clock and how the Contests tab shows its times). Both times
+        are fixed once a pass is found, so this doesn't strictly need
+        re-running every second the way the old live countdown did --
+        still piggybacked on the 1-second clock timer anyway (see
+        _update_clocks) since it's cheap (no orbital math) and simpler
+        than wiring up a separate refresh path just for this."""
         if not self._upcoming_passes:
             return
-        now = datetime.datetime.now(datetime.timezone.utc)
         for row, pass_info in enumerate(self._upcoming_passes):
-            if now < pass_info["aos_time"]:
-                text = f"in {format_countdown((pass_info['aos_time'] - now).total_seconds())}"
-            elif now <= pass_info["los_time"]:
-                text = "ACTIVE"
-            else:
-                text = "passed"  # stale -- _refresh_upcoming_passes will drop it at the next full search
+            aos_text = pass_info["aos_time"].strftime("%H:%M")
+            los_text = pass_info["los_time"].strftime("%H:%M")
+            text = f"↑{aos_text} ↓{los_text}"
             item = self.upcoming_passes_table.item(row, 1)
             if item is not None:
                 item.setText(text)

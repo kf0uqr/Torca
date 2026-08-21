@@ -529,18 +529,31 @@ def find_passes(line1, line2, dt_utc, observer_lat, observer_lon, observer_eleva
     return passes
 
 
-def upcoming_passes(satellites, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0, count=10):
+def upcoming_passes(satellites, dt_utc, observer_lat, observer_lon, observer_elevation_km=0.0, count=10,
+                     min_elevation_deg=0.0):
     """Combines find_passes() across every satellite in `satellites`
     (each a dict with "name"/"line1"/"line2") into one soonest-first
     list of the next `count` passes overall, each tagged with "name".
+    min_elevation_deg discards any pass whose max_elevation_deg falls
+    short -- a low, grazing pass with a wonky signal path isn't
+    "upcoming" in the sense an operator filtering for it usually
+    means.
 
     Asks each satellite for at most a handful of its own passes (not
     `count` from every one of them, which scales badly with satellite
     count for no benefit -- filling a combined top-10 practically never
     needs more than 2-3 upcoming passes from any single satellite,
     unless there's only one or two satellites total, which the max(...)
-    below covers)."""
+    below covers). With a real min_elevation_deg filter active, many
+    of those get discarded, so the cap is widened generously (4x) to
+    still surface `count` genuinely qualifying passes rather than
+    silently returning fewer just because the raw search didn't look
+    far enough ahead -- find_passes() naturally searches further into
+    the future to satisfy a bigger max_passes, so this costs more
+    search time, not more risk."""
     per_satellite_cap = max(3, -(-count // max(1, len(satellites))) + 1)  # ceil(count / n) + 1, floored at 3
+    if min_elevation_deg > 0:
+        per_satellite_cap *= 4
     all_passes = []
     for sat in satellites:
         name = sat.get("name", "?")
@@ -548,6 +561,8 @@ def upcoming_passes(satellites, dt_utc, observer_lat, observer_lon, observer_ele
             sat.get("line1", ""), sat.get("line2", ""), dt_utc,
             observer_lat, observer_lon, observer_elevation_km, max_passes=per_satellite_cap,
         ):
+            if pass_info["max_elevation_deg"] < min_elevation_deg:
+                continue
             pass_info["name"] = name
             all_passes.append(pass_info)
     all_passes.sort(key=lambda p: p["aos_time"])

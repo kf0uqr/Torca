@@ -47,6 +47,7 @@ from split_dialog import SplitSettingsDialog
 from memories_window import MemoriesWindow
 from sstv_window import SstvToolWindow
 from rtty_window import RttyToolWindow
+from aprs_window import AprsToolWindow
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 
@@ -243,6 +244,14 @@ class RadioWindow(QWidget):
         self.rtty_tool_button.setEnabled(False)
         self.rtty_tool_button.clicked.connect(self._on_rtty_tool_clicked)
         self.rtty_window = None
+
+        # Opens the per-radio APRS decode tool (aprs_window.py) -- same
+        # singleton/lazy-construction/enable-on-connect pattern as the
+        # CW/SSTV/RTTY Tool buttons above.
+        self.aprs_tool_button = QPushButton("APRS Tool...")
+        self.aprs_tool_button.setEnabled(False)
+        self.aprs_tool_button.clicked.connect(self._on_aprs_tool_clicked)
+        self.aprs_window = None
 
         # Opens the per-radio memory-channel window (memories_window.py)
         # -- same singleton/lazy-construction/enable-on-connect pattern
@@ -508,6 +517,7 @@ class RadioWindow(QWidget):
         left_column.addWidget(self.cw_tool_button)
         left_column.addWidget(self.sstv_tool_button)
         left_column.addWidget(self.rtty_tool_button)
+        left_column.addWidget(self.aprs_tool_button)
 
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
@@ -583,6 +593,7 @@ class RadioWindow(QWidget):
         self.cw_tool_button.setEnabled(True)
         self.sstv_tool_button.setEnabled(True)
         self.rtty_tool_button.setEnabled(True)
+        self.aprs_tool_button.setEnabled(True)
         self.memories_button.setEnabled(True)
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
@@ -629,6 +640,13 @@ class RadioWindow(QWidget):
         self.rtty_window.show()
         self.rtty_window.raise_()
         self.rtty_window.activateWindow()
+
+    def _on_aprs_tool_clicked(self):
+        if self.aprs_window is None:
+            self.aprs_window = AprsToolWindow(self)
+        self.aprs_window.show()
+        self.aprs_window.raise_()
+        self.aprs_window.activateWindow()
 
     def _on_memories_button_clicked(self):
         if self.memories_window is None:
@@ -1308,6 +1326,8 @@ class RadioWindow(QWidget):
             self.sstv_window.closing_for_real()
         if self.rtty_window is not None:
             self.rtty_window.closing_for_real()
+        if self.aprs_window is not None:
+            self.aprs_window.closing_for_real()
         if self.memories_window is not None:
             self.memories_window.closing_for_real()
         self._satellite_session.unregister(self)

@@ -247,7 +247,7 @@ class RadioWindow(QWidget):
         # Opens the per-radio memory-channel window (memories_window.py)
         # -- same singleton/lazy-construction/enable-on-connect pattern
         # as the CW/SSTV Tool buttons above. Stacked under Split
-        # (controls_row's construction loop below), not created there
+        # (buttons_row's construction loop below), not created there
         # directly, since it's not itself a CONTROL_DEFINITIONS entry.
         self.memories_button = QPushButton("Memories")
         self.memories_button.setEnabled(False)
@@ -387,9 +387,13 @@ class RadioWindow(QWidget):
         # from CONTROL_DEFINITIONS: a combo box ("combo" type), a
         # checkable toggle button ("toggle" type), or a plain click-to-
         # swap button ("vfo_toggle" type). All disabled until
-        # _on_connected() enables them.
+        # _on_connected() enables them. Combos and buttons land in two
+        # SEPARATE rows (dropdowns_row/buttons_row, stacked into
+        # controls_column below) rather than one mixed row, per
+        # explicit instruction.
         self.control_widgets = {}
-        controls_row = QHBoxLayout()
+        dropdowns_row = QHBoxLayout()
+        buttons_row = QHBoxLayout()
         vfo_toggle_column = None  # lazily created; all vfo_toggle-type buttons stack in this one column
         for key, definition in CONTROL_DEFINITIONS.items():
             if definition["type"] == "combo":
@@ -407,13 +411,14 @@ class RadioWindow(QWidget):
                 col = QVBoxLayout()
                 col.addWidget(label, alignment=Qt.AlignHCenter)
                 col.addWidget(widget)
-                # controls_row gets stretched to match the much taller knob
-                # column next to it in tuning_row -- without this stretch,
-                # Qt distributes that extra height by pushing the combo
-                # down away from its label instead of leaving it flush.
+                # dropdowns_row gets stretched to match the much taller
+                # knob column next to it in tuning_row -- without this
+                # stretch, Qt distributes that extra height by pushing
+                # the combo down away from its label instead of leaving
+                # it flush.
                 col.addStretch()
-                controls_row.addLayout(col)
-                controls_row.setAlignment(col, Qt.AlignTop)
+                dropdowns_row.addLayout(col)
+                dropdowns_row.setAlignment(col, Qt.AlignTop)
             elif definition["type"] == "vfo_toggle":
                 # A single button showing the current state, like the real
                 # A/B or V/M button -- click swaps to the other option,
@@ -436,8 +441,8 @@ class RadioWindow(QWidget):
                 widget.clicked.connect(lambda checked=False, k=key: self._on_vfo_toggle_clicked(k))
                 if vfo_toggle_column is None:
                     vfo_toggle_column = QVBoxLayout()
-                    controls_row.addLayout(vfo_toggle_column)
-                    controls_row.setAlignment(vfo_toggle_column, Qt.AlignTop)
+                    buttons_row.addLayout(vfo_toggle_column)
+                    buttons_row.setAlignment(vfo_toggle_column, Qt.AlignTop)
                 vfo_toggle_column.addWidget(widget)
                 if key == "vfo":
                     # active_receiver_button (dual-receiver Main/Sub
@@ -455,13 +460,13 @@ class RadioWindow(QWidget):
                 widget.toggled.connect(lambda checked, k=key: self._on_control_toggled(k, checked))
                 if key == "split":
                     # Split gets its own column instead of a lone
-                    # controls_row slot -- the Memories button stacks
+                    # buttons_row slot -- the Memories button stacks
                     # directly under it, per explicit instruction.
                     split_column = QVBoxLayout()
                     split_column.addWidget(widget)
                     split_column.addWidget(self.memories_button)
-                    controls_row.addLayout(split_column)
-                    controls_row.setAlignment(split_column, Qt.AlignTop)
+                    buttons_row.addLayout(split_column)
+                    buttons_row.setAlignment(split_column, Qt.AlignTop)
                     # Right-click opens the full split-configuration
                     # dialog (split_dialog.py) -- left-click still just
                     # toggles split on/off directly, same as every other
@@ -469,28 +474,35 @@ class RadioWindow(QWidget):
                     widget.setContextMenuPolicy(Qt.CustomContextMenu)
                     widget.customContextMenuRequested.connect(self._on_split_button_context_menu)
                 elif key == "rit":
-                    # RIT's on/off toggle doesn't live in controls_row
-                    # at all -- it's assembled into rit_column, next to
+                    # RIT's on/off toggle doesn't live in buttons_row at
+                    # all -- it's assembled into rit_column, next to
                     # rit_knob, once tuning_row is built further down
                     # (rit_column sits BETWEEN left_column and knob_row,
-                    # per explicit instruction), not stacked in the top
-                    # controls row like every other toggle here.
+                    # per explicit instruction), not stacked in the
+                    # buttons row like every other toggle here.
                     self.rit_status_button = widget
                 else:
-                    controls_row.addWidget(widget)
-                    controls_row.setAlignment(widget, Qt.AlignTop)
+                    buttons_row.addWidget(widget)
+                    buttons_row.setAlignment(widget, Qt.AlignTop)
             self.control_widgets[key] = widget
 
-        # controls_row (Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO) and the
-        # role label stack vertically together, to the left of the tuning
-        # knob -- not mixed into knob_row, which is the knob's own column
-        # on the right. WSJT-X/Rigctld/Virtual Cables all moved to the
-        # Ham Dashboard, which is the one place that makes sense once
-        # multiple radios can be connected at once.
+        # dropdowns_row (Mode/AGC/Preamp/Filter) stacked above
+        # buttons_row (Digital/NR/NB/VFO/Split) -- per explicit
+        # instruction, two separate rows rather than one mixed row.
+        # controls_column and the role label stack vertically together,
+        # to the left of the tuning knob -- not mixed into knob_row,
+        # which is the knob's own column on the right. WSJT-X/Rigctld/
+        # Virtual Cables all moved to the Ham Dashboard, which is the
+        # one place that makes sense once multiple radios can be
+        # connected at once.
         # CW/SSTV tool launchers stack at the bottom of the left column,
         # far left of the window, directly above the level sliders.
+        controls_column = QVBoxLayout()
+        controls_column.addLayout(dropdowns_row)
+        controls_column.addLayout(buttons_row)
+
         left_column = QVBoxLayout()
-        left_column.addLayout(controls_row)
+        left_column.addLayout(controls_column)
         left_column.addWidget(self.role_label)
         left_column.addStretch()
         left_column.addWidget(self.cw_tool_button)
@@ -508,7 +520,7 @@ class RadioWindow(QWidget):
         # level sliders, roughly level with the tool buttons/PTT --
         # per explicit instruction ("between the vfo/ptt and the tool
         # buttons... above the sliders and below the main/sub and
-        # memories buttons", the latter two living up in controls_row).
+        # memories buttons", the latter two living up in buttons_row).
         rit_column = QVBoxLayout()
         rit_column.addStretch()
         rit_column.addWidget(self.rit_knob, alignment=Qt.AlignHCenter)

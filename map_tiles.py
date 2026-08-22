@@ -40,9 +40,10 @@ from PySide6.QtGui import QPixmap
 
 TILE_SIZE_PX = 256
 MIN_TILE_ZOOM = 0
-# City-block-level detail -- plenty for a ham-dashboard "see nearby towns/
-# terrain" need without fetching building-level tiles nobody asked for.
-MAX_TILE_ZOOM = 15
+# 19 is standard tile.openstreetmap.org's own actual max zoom (building/
+# street level) -- per explicit instruction, raised from an initial,
+# more conservative 15 (city-block level).
+MAX_TILE_ZOOM = 19
 TILE_URL_TEMPLATE = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 TILE_CACHE_DIR = pathlib.Path.home() / ".icom_radio_app_cache" / "osm_tiles"
 MAP_ATTRIBUTION = "Map data: © OpenStreetMap contributors"

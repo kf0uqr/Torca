@@ -1,8 +1,8 @@
 """
 The Ham Dashboard's day/night world map: a zoomable OpenStreetMap tile
 background (map_tiles.py -- fetched on demand as the viewport needs them,
-cached locally) with the night hemisphere shaded, a lat/long reference
-grid, the sub-solar point, the operator's own location, and -- when
+cached locally) with the night hemisphere shaded via a smooth terminator
+curve, the sub-solar point, the operator's own location, and -- when
 satellite tracking is on -- satellite markers and their footprint
 polygons, all drawn on top.
 """
@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF, QFont
 from PySide6.QtWidgets import QWidget, QSizePolicy, QToolTip, QPushButton
 
-from solar_data import _solar_subpoint, _solar_elevation
+from solar_data import _solar_subpoint
 import map_tiles
 
 
@@ -23,7 +23,7 @@ class WorldMapWidget(QWidget):
     HamClock's map pane: a zoomable OpenStreetMap tile background
     (map_tiles.py -- fetched on demand, cached locally; unfetched tiles
     draw as a plain placeholder fill until they arrive), with the night
-    hemisphere shaded, a lat/long reference grid, the sub-solar point,
+    hemisphere shaded via a smooth terminator curve, the sub-solar point,
     and the operator's own location if set, drawn on top.
 
     Fills the widget's own natural aspect ratio -- unlike the old static
@@ -65,21 +65,31 @@ class WorldMapWidget(QWidget):
         # without room to scroll into). Content is scaled/panned via a
         # single QPainter transform applied around all the existing
         # drawing code in paintEvent, rather than reworking every
-        # individual _lonlat_to_xy call site -- so the map tiles, grid,
+        # individual _lonlat_to_xy call site -- so the map tiles,
         # terminator shading, and every marker all zoom/pan together for
         # free. _pan_x/_pan_y are offsets, in UNZOOMED map-content
         # pixels, of the view center from the map's true center (self.
         # width()/2, self.height()/2) -- see _clamp_pan for why that unit
         # choice makes the valid range shrink cleanly to {0,0} at zoom=1.
         #
-        # MAX_ZOOM is generous (this is just a QPainter magnification
-        # multiplier, not itself a resolution limit) -- _draw_map_tiles
-        # separately caps how much REAL tile detail ever gets fetched at
-        # map_tiles.MAX_TILE_ZOOM; zooming past that just magnifies the
-        # same highest-detail tiles further, same as any real map app
-        # past its own max zoom.
+        # MAX_ZOOM has to be large enough to actually let effective_zoom
+        # (_draw_map_tiles's own log2(w * self._zoom / TILE_SIZE_PX))
+        # reach map_tiles.MAX_TILE_ZOOM at all -- since effective_zoom
+        # grows with log2(self._zoom), reaching real z19 (building-level)
+        # detail from a whole-world starting view genuinely needs a
+        # self._zoom on the order of hundreds of thousands (2**19 is
+        # already >500,000) -- confirmed by working the formula
+        # backwards; an earlier, much smaller constant here (in the
+        # tens) silently made it impossible to ever zoom in past roughly
+        # z7-9, well short of real street-level tiles, even though
+        # nothing about the tile-fetch/draw code itself was wrong. Sized
+        # generously for realistic dashboard widget widths (not an
+        # exhaustive guarantee at pathologically narrow widths) -- past
+        # map_tiles.MAX_TILE_ZOOM this is still just a QPainter
+        # magnification multiplier on the same highest-detail tiles,
+        # same as any real map app past its own max zoom.
         self.MIN_ZOOM = 1.0
-        self.MAX_ZOOM = 40.0
+        self.MAX_ZOOM = 1_000_000.0
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
@@ -161,8 +171,8 @@ class WorldMapWidget(QWidget):
         self._position_zoom_buttons()
 
     def _advance_path_animation(self):
-        # Only worth repainting (a full paintEvent -- background image
-        # blit, grid, terminator, every satellite) at this fast a cadence
+        # Only worth repainting (a full paintEvent -- map tiles,
+        # terminator, every satellite) at this fast a cadence
         # while there's actually an animated path on screen; otherwise
         # this timer is a cheap no-op every tick.
         if not self._satellite_mode or not any(sat.get("path") for sat in self._satellite_positions):
@@ -192,8 +202,8 @@ class WorldMapWidget(QWidget):
         w, h = self.width(), self.height()
 
         # Zoom/pan transform -- scales/translates everything drawn below
-        # this point (background image, grid, terminator, every
-        # marker), restored before the fixed-position attribution text
+        # this point (map tiles, terminator, every marker), restored
+        # before the fixed-position attribution text
         # so that stays put regardless of zoom. See __init__'s comment
         # on _pan_x/_pan_y's units for why this specific translate/
         # scale/translate order is what makes them "offset from center
@@ -207,45 +217,11 @@ class WorldMapWidget(QWidget):
 
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        # Night-hemisphere shading -- brute-force grid sampling rather
-        # than deriving the terminator's closed-form curve. This redraws
-        # once a minute (see HamClockWindow's map_timer), so the cost is
-        # a non-issue at this grid resolution. Each cell's on-screen rect
-        # is computed from its real corner lat/lon via _lonlat_to_xy
-        # (Mercator, non-uniform pixels-per-degree) rather than assuming
-        # a fixed cell size in pixels -- true only for equirectangular,
-        # which this is no longer.
-        lon_step, lat_step = 4, 4
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 140))
-        for lon in range(-180, 180, lon_step):
-            for lat in range(-90, 90, lat_step):
-                if _solar_elevation(lat + lat_step / 2.0, lon + lon_step / 2.0, now) < 0:
-                    x0, y0 = self._lonlat_to_xy(lat + lat_step, lon, w, h)
-                    x1, y1 = self._lonlat_to_xy(lat, lon + lon_step, w, h)
-                    painter.drawRect(QRectF(x0, y0, x1 - x0 + 1, y1 - y0 + 1))
-
-        # Lat/long grid every 30 degrees, for orientation -- each
-        # gridline's position comes from _lonlat_to_xy too, so latitude
-        # lines correctly converge toward the poles under Mercator
-        # instead of staying evenly spaced (which only equirectangular
-        # would justify).
-        painter.setPen(QPen(QColor(60, 80, 110), 1))
-        for lon in range(-180, 181, 30):
-            x, _ = self._lonlat_to_xy(0, lon, w, h)
-            painter.drawLine(QPointF(x, 0), QPointF(x, h))
-        for lat in range(-90, 91, 30):
-            _, y = self._lonlat_to_xy(lat, 0, w, h)
-            painter.drawLine(QPointF(0, y), QPointF(w, y))
-
-        # Equator/prime meridian, slightly brighter for orientation.
-        painter.setPen(QPen(QColor(90, 110, 140), 1))
-        painter.drawLine(QPointF(w / 2, 0), QPointF(w / 2, h))
-        painter.drawLine(QPointF(0, h / 2), QPointF(w, h / 2))
+        self._draw_terminator(painter, w, h, now)
 
         # Geographic overlays that make sense to zoom WITH the map --
         # coverage circles and ground tracks are real areas/paths over
-        # the earth, same as the grid/terminator above.
+        # the earth, same as the terminator above.
         if self._satellite_mode:
             for sat in self._satellite_positions:
                 self._draw_satellite_footprint(painter, sat, w, h)
@@ -345,8 +321,8 @@ class WorldMapWidget(QWidget):
         around this call magnifies it) -- so a tile's size here is its
         real resolution divided by however far self._zoom has already
         gone, and the outer transform does the rest, exactly like every
-        other geographic overlay drawn in this same transform (grid
-        lines, terminator shading, satellite footprints/paths).
+        other geographic overlay drawn in this same transform (terminator
+        shading, satellite footprints/paths).
 
         effective_zoom combines how much detail the CURRENT widget size
         already implies (log2(w / TILE_SIZE_PX) -- the zoom level whose
@@ -390,6 +366,71 @@ class WorldMapWidget(QWidget):
                     painter.drawPixmap(rect, pixmap, QRectF(pixmap.rect()))
                 else:
                     self._tile_fetcher.request(draw_zoom, tx, ty)
+
+    # Samples the terminator curve every 2 degrees of longitude -- smooth
+    # enough to look like a real curve (not a jagged staircase) at any
+    # sane widget size, cheap enough that redrawing once a minute (see
+    # HamClockWindow's map_timer) is a non-issue, same "cost is a non-
+    # issue at this resolution" reasoning the old per-cell shading used.
+    _TERMINATOR_LON_STEP = 2.0
+
+    def _draw_terminator(self, painter, w, h, now):
+        """Night-hemisphere shading via the terminator's actual closed-
+        form curve (a smooth line, not the old blocky per-cell grid
+        sampling) -- the day/night boundary is exactly the locus of
+        points where solar elevation is 0, which for a FIXED longitude
+        has exactly one latitude solution (solving solar_data.py's own
+        sin(elev) = sin(lat)sin(decl) + cos(lat)cos(decl)cos(hour_angle)
+        for lat when elev=0 gives tan(lat) = -cos(decl)cos(hour_angle) /
+        sin(decl) -- verified numerically against _solar_elevation
+        directly). Draws the curve itself as a grey line, and fills
+        whichever side is night with a translucent overlay -- the pole
+        tilted away from the sun (north when declination is negative,
+        south otherwise, since elevation AT a pole simplifies to exactly
+        the declination) is always entirely night, so the fill polygon
+        is the curve closed off along that pole's own map edge."""
+        decl_deg, sub_lon = _solar_subpoint(now)
+        decl = math.radians(decl_deg)
+        sin_decl = math.sin(decl)
+        cos_decl = math.cos(decl)
+
+        points = []
+        lon = -180.0
+        while lon <= 180.0 + 1e-9:
+            hour_angle = math.radians(lon - sub_lon)
+            if abs(sin_decl) < 1e-6:
+                # Equinox edge case (a couple of days a year) -- the
+                # terminator is a near-vertical meridian pair rather than
+                # a function of longitude; hugging the nearer pole here
+                # is a reasonable degenerate rendering, not a crash.
+                term_lat = 90.0 if math.cos(hour_angle) < 0 else -90.0
+            else:
+                term_lat = math.degrees(math.atan(-cos_decl * math.cos(hour_angle) / sin_decl))
+            points.append(self._lonlat_to_xy(term_lat, lon, w, h))
+            lon += self._TERMINATOR_LON_STEP
+
+        curve_path = QPainterPath()
+        curve_path.moveTo(*points[0])
+        for x, y in points[1:]:
+            curve_path.lineTo(x, y)
+
+        fill_path = QPainterPath(curve_path)
+        if decl_deg < 0:
+            # North pole tilted away from the sun -- it's the night side.
+            fill_path.lineTo(w, 0)
+            fill_path.lineTo(0, 0)
+        else:
+            fill_path.lineTo(w, h)
+            fill_path.lineTo(0, h)
+        fill_path.closeSubpath()
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 140))
+        painter.drawPath(fill_path)
+
+        painter.setPen(QPen(QColor(160, 160, 160, 210), 1.5))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(curve_path)
 
     def set_satellite_mode(self, enabled):
         self._satellite_mode = enabled

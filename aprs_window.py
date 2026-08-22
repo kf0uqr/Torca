@@ -192,6 +192,16 @@ class AprsToolWindow(QWidget):
     # widget directly.
     _packets_ready = Signal(list)
 
+    # Public: one decoded position-report packet, emitted from
+    # _on_packets_ready (already on the GUI thread by the time that
+    # runs, regardless of which decode backend produced it -- see its
+    # own comment). ham_dashboard.py's APRS map overlay is the
+    # consumer -- forwarded through RadioWindow.aprs_packet_decoded
+    # (main_window.py) since this window is only ever constructed
+    # lazily, on demand, not necessarily by the time ham_dashboard.py
+    # wants to connect to it.
+    packet_decoded = Signal(dict)
+
     def __init__(self, radio_window):
         super().__init__()
         self._radio_window = radio_window
@@ -354,6 +364,8 @@ class AprsToolWindow(QWidget):
             ]
             for col, value in enumerate(values):
                 self.table.setItem(row, col, QTableWidgetItem(value))
+            if info is not None and info["type"] == "position":
+                self.packet_decoded.emit(packet)
         self.table.scrollToBottom()
 
     def _on_clear_clicked(self):

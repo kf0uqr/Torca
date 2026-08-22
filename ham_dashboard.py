@@ -876,6 +876,30 @@ class HamClockWindow(QWidget):
         self.pota_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.pota_button.customContextMenuRequested.connect(self._on_pota_menu_requested)
 
+        # ---- APRS station overlay ----
+        # Keyed by source callsign (not appended per-packet) -- APRS
+        # stations beacon repeatedly, so this keeps one marker per
+        # station, updated in place to its latest reported position,
+        # rather than piling up a duplicate dot per retransmit. Fed
+        # live from every connected radio's RadioWindow.
+        # aprs_packet_decoded signal (see _on_connect_radio_clicked),
+        # not fetched -- unlike PSKReporter/POTA there's no polling
+        # worker here, just an always-listening accumulator; the
+        # toggle only controls whether it's DRAWN, not whether it's
+        # collected.
+        self._aprs_stations = {}  # {source_callsign: {"lat", "lon", "tooltip"}}
+        self.aprs_button = QPushButton("APRS: OFF")
+        self.aprs_button.setCheckable(True)
+        self.aprs_button.setStyleSheet(
+            "QPushButton:checked { background-color: #c33; color: white; font-weight: bold; }"
+        )
+        self.aprs_button.setToolTip(
+            "Toggle showing APRS station positions (from any connected "
+            "radio's APRS Tool decoder) on the map, in red. Hover a "
+            "marker for the packet's details."
+        )
+        self.aprs_button.toggled.connect(self._on_aprs_toggled)
+
         # Filters which band's QSOs the map overlay shows -- every band
         # this app knows about (same list/order as HF_6M_BANDS +
         # VHF_UHF_BANDS, already ADIF's own lowercase BAND convention --
@@ -1111,6 +1135,7 @@ class HamClockWindow(QWidget):
         map_buttons_row.addWidget(self.qso_map_button)
         map_buttons_row.addWidget(self.pskreporter_button)
         map_buttons_row.addWidget(self.pota_button)
+        map_buttons_row.addWidget(self.aprs_button)
         map_buttons_row.addWidget(self.qso_band_filter_combo)
         map_buttons_row.addStretch()
 
@@ -1474,6 +1499,46 @@ class HamClockWindow(QWidget):
         if country:
             lines.append(f"Country: {country}")
         lines.append(f"Grid: {spot.get('locator', '?')}")
+        return "\n".join(lines)
+
+    def _on_aprs_toggled(self, checked):
+        self.aprs_button.setText("APRS: ON" if checked else "APRS: OFF")
+        self.map_widget.set_aprs_markers(list(self._aprs_stations.values()) if checked else [])
+
+    def _on_aprs_packet_decoded(self, packet):
+        """Connected to every RadioWindow's aprs_packet_decoded signal
+        (see _on_connect_radio_clicked) -- fires for any connected
+        radio's APRS decode, position reports only (RadioWindow/
+        AprsToolWindow already filter to info["type"] == "position"
+        before emitting). Always updates the accumulator so switching
+        the button on later shows everything heard since startup, not
+        just what arrived while it happened to be checked; only pushes
+        to the map widget while actually visible."""
+        info = packet["info"]
+        self._aprs_stations[packet["source"]] = {
+            "lat": info["lat"],
+            "lon": info["lon"],
+            "tooltip": self._aprs_tooltip_text(packet, info),
+        }
+        if self.aprs_button.isChecked():
+            self.map_widget.set_aprs_markers(list(self._aprs_stations.values()))
+
+    @staticmethod
+    def _aprs_tooltip_text(packet, info):
+        destination = packet.get("destination", "?")
+        digipeaters = packet.get("digipeaters") or []
+        if digipeaters:
+            destination += " via " + ",".join(digipeaters)
+        lines = [
+            packet.get("source", "?"),
+            f"To: {destination}",
+            f"{info['lat']:.5f}, {info['lon']:.5f}",
+        ]
+        symbol = f"{info.get('symbol_table', '')}{info.get('symbol_code', '')}".strip()
+        if symbol:
+            lines.append(f"Symbol: {symbol}")
+        if info.get("comment"):
+            lines.append(info["comment"])
         return "\n".join(lines)
 
     def _on_pota_toggled(self, checked):
@@ -2043,6 +2108,7 @@ class HamClockWindow(QWidget):
 
         window = RadioWindow(details, self.satellite_session)
         window.closed.connect(self._on_radio_window_closed)
+        window.aprs_packet_decoded.connect(self._on_aprs_packet_decoded)
         self._connected_radios.append(window)
 
         item = QListWidgetItem(self._radio_list_base_label(details))

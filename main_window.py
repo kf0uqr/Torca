@@ -54,6 +54,13 @@ _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -
 
 class RadioWindow(QWidget):
     closed = Signal(object)  # emitted at the end of closeEvent, carrying self -- HamClockWindow listens
+    # Passthrough for AprsToolWindow.packet_decoded -- exists on this
+    # object immediately (unlike self.aprs_window, only constructed
+    # lazily on first click of the APRS Tool button), so ham_dashboard.
+    # py can connect to it right after a radio connects, regardless of
+    # whether the operator ever opens the APRS Tool window itself. See
+    # _on_aprs_tool_clicked for where this actually gets forwarded.
+    aprs_packet_decoded = Signal(dict)
 
     def __init__(self, details, satellite_session):
         super().__init__()
@@ -644,6 +651,7 @@ class RadioWindow(QWidget):
     def _on_aprs_tool_clicked(self):
         if self.aprs_window is None:
             self.aprs_window = AprsToolWindow(self)
+            self.aprs_window.packet_decoded.connect(self.aprs_packet_decoded)
         self.aprs_window.show()
         self.aprs_window.raise_()
         self.aprs_window.activateWindow()

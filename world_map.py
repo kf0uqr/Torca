@@ -151,6 +151,7 @@ class WorldMapWidget(QWidget):
         self._qso_markers = []  # list of {"lat", "lon", "band", "time", "callsign"} -- see set_qso_markers
         self._pskreporter_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_pskreporter_markers
         self._pota_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_pota_markers
+        self._aprs_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_aprs_markers
         # Hover tooltip needs mouseMoveEvent to fire without a button
         # held down -- off by default on a plain QWidget.
         self.setMouseTracking(True)
@@ -459,6 +460,18 @@ class WorldMapWidget(QWidget):
                 sx, sy = self._content_to_screen(cx, cy, w, h)
                 painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
 
+        if self._aprs_markers:
+            # Bright red per explicit instruction -- distinguishable from
+            # the operator-location marker (also red) by its smaller
+            # radius and dark, not white, border, same pen/brush pairing
+            # every other spot-category marker above uses.
+            painter.setPen(QPen(QColor(15, 15, 20), 1))
+            painter.setBrush(QColor(230, 30, 30))
+            for spot in self._aprs_markers:
+                cx, cy = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
+                sx, sy = self._content_to_screen(cx, cy, w, h)
+                painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
+
         # Attribution for the background map image, if it loaded (CC BY
         # 4.0 requires this) -- fixed corner label regardless of zoom/pan.
         if self._background_image is not None:
@@ -531,6 +544,18 @@ class WorldMapWidget(QWidget):
         own bag of fields (park name/reference, spotter, comments,
         count, ...) this widget doesn't need to know the shape of."""
         self._pota_markers = markers
+        self.update()
+
+    def set_aprs_markers(self, markers):
+        """markers: list of {"lat", "lon", "tooltip"} -- ham_dashboard.py's
+        APRS map button, one entry per station (keyed/deduplicated by
+        callsign on the caller's side -- this widget just draws whatever
+        list it's given), built directly from decoded APRS position
+        report packets (no grid-square conversion needed, packets carry
+        real lat/lon already). Same pre-built-tooltip shape as
+        set_pskreporter_markers/set_pota_markers. Empty list (the
+        button's own OFF state) just stops drawing/hit-testing them."""
+        self._aprs_markers = markers
         self.update()
 
     # Pixel radius around a QSO marker that still counts as a hover/
@@ -621,6 +646,24 @@ class WorldMapWidget(QWidget):
         hit_radius = self._POTA_HIT_RADIUS_PX / self._zoom
         closest, closest_dist = None, None
         for spot in self._pota_markers:
+            x, y = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
+            dist = math.hypot(x - pos.x(), y - pos.y())
+            if dist <= hit_radius and (closest_dist is None or dist < closest_dist):
+                closest, closest_dist = spot, dist
+        return closest
+
+    # Same screen-pixel-radius reasoning as _QSO_HIT_RADIUS_PX.
+    _APRS_HIT_RADIUS_PX = 8
+
+    def _aprs_marker_at(self, widget_pos):
+        """Same shared hit-test shape as _qso_marker_at, for the APRS
+        station markers."""
+        if not self._aprs_markers:
+            return None
+        pos, w, h = self._widget_pos_to_content(widget_pos)
+        hit_radius = self._APRS_HIT_RADIUS_PX / self._zoom
+        closest, closest_dist = None, None
+        for spot in self._aprs_markers:
             x, y = self._lonlat_to_xy(spot["lat"], spot["lon"], w, h)
             dist = math.hypot(x - pos.x(), y - pos.y())
             if dist <= hit_radius and (closest_dist is None or dist < closest_dist):
@@ -729,6 +772,10 @@ class WorldMapWidget(QWidget):
         pota_spot = self._pota_marker_at(event.position())
         if pota_spot is not None:
             QToolTip.showText(event.globalPosition().toPoint(), pota_spot.get("tooltip", "?"), self)
+            return
+        aprs_spot = self._aprs_marker_at(event.position())
+        if aprs_spot is not None:
+            QToolTip.showText(event.globalPosition().toPoint(), aprs_spot.get("tooltip", "?"), self)
         else:
             QToolTip.hideText()
 
@@ -753,12 +800,13 @@ class WorldMapWidget(QWidget):
                 self._qso_marker_at(event.position()) is None
                 and self._pskreporter_marker_at(event.position()) is None
                 and self._pota_marker_at(event.position()) is None
+                and self._aprs_marker_at(event.position()) is None
             ):
                 # Right-clicking genuinely empty map (no satellite, no
-                # QSO/PSKReporter/POTA marker under the cursor) resets
-                # the view -- the only reset affordance this needs,
-                # since scrolling back out to MIN_ZOOM is otherwise the
-                # only way back once zoomed/panned in.
+                # QSO/PSKReporter/POTA/APRS marker under the cursor)
+                # resets the view -- the only reset affordance this
+                # needs, since scrolling back out to MIN_ZOOM is
+                # otherwise the only way back once zoomed/panned in.
                 self._zoom = self.MIN_ZOOM
                 self._pan_x = 0.0
                 self._pan_y = 0.0
@@ -786,6 +834,10 @@ class WorldMapWidget(QWidget):
         pota_spot = self._pota_marker_at(event.position())
         if pota_spot is not None:
             QToolTip.showText(event.globalPosition().toPoint(), pota_spot.get("tooltip", "?"), self)
+            return
+        aprs_spot = self._aprs_marker_at(event.position())
+        if aprs_spot is not None:
+            QToolTip.showText(event.globalPosition().toPoint(), aprs_spot.get("tooltip", "?"), self)
             return
         closest_name = self._satellite_at(event.position())
         if closest_name is not None:

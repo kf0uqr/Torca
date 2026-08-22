@@ -205,6 +205,13 @@ class _HdlcDeframer:
         usable_len = len(bits) - (len(bits) % 8)
         if usable_len < 8 * 18:  # 2 addresses (14) + control (1) + PID (1) + FCS (2), minimum
             return None
+        frame = _HdlcDeframer._decode_frame_bits(bits, usable_len)
+        if frame is not None:
+            return frame
+        return _HdlcDeframer._try_fix_one_bit(bits, usable_len)
+
+    @staticmethod
+    def _decode_frame_bits(bits, usable_len):
         raw = bytearray()
         for i in range(0, usable_len, 8):
             byte = 0
@@ -219,6 +226,39 @@ class _HdlcDeframer:
         if _crc16_x25(payload) != received_fcs:
             return None
         return payload
+
+    @staticmethod
+    def _try_fix_one_bit(bits, usable_len):
+        """Single-bit error correction ("fix bits" -- the same
+        technique real TNCs, including direwolf, use; its own
+        documentation credits this as a significant factor in
+        decoding frames a naive CRC-reject-on-any-mismatch decoder
+        would just discard). A marginal/noisy signal often corrupts
+        only one bit out of an entire packet, and CRC-16 (16 bits of
+        redundancy protecting a payload almost always well under 300
+        bits) makes an ACCIDENTALLY-matching wrong single-bit
+        correction astronomically unlikely -- confirmed via test_aprs.
+        py's own test_noise_never_produces_garbage, which still passes
+        with this enabled (a full second of random noise, run through
+        this same single-bit search on every candidate frame it
+        produces, never once falsely validates).
+
+        Tries flipping each bit position in the frame in turn (not
+        also every PAIR of positions -- direwolf itself only enables
+        that heavier O(n^2) search as a non-default, higher "fix bits"
+        level, citing a real false-positive risk once you're
+        correcting more than one bit against a comparatively short
+        CRC) and keeps the first flip whose CRC actually checks out.
+        `bits` is mutated in place during the search but always
+        restored before returning -- safe regardless of whether the
+        caller's own list is reused afterward."""
+        for i in range(usable_len):
+            bits[i] = not bits[i]
+            frame = _HdlcDeframer._decode_frame_bits(bits, usable_len)
+            bits[i] = not bits[i]
+            if frame is not None:
+                return frame
+        return None
 
 
 # ---- AX.25 address / APRS info-field parsing ------------------------------

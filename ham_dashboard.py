@@ -340,6 +340,80 @@ class PotaWorker(QThread):
         self.spots_ready.emit(spots)
 
 
+class PotaProgramsWorker(QThread):
+    """One-shot fetch off the GUI thread, same shape as PotaWorker --
+    populates the Parks tab's program (country/region) combo box.
+    Auto-started once at startup (see the end of __init__), same "just
+    load it" treatment as Contests -- read-only reference data, not a
+    live overlay."""
+
+    programs_ready = Signal(list)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            programs = pota.fetch_pota_programs()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.programs_ready.emit(programs)
+
+
+class ParksWorker(QThread):
+    """One-shot fetch of a single POTA program's full park directory --
+    same shape as PotaWorker, but scoped to one program_prefix (there's
+    no "all parks on Earth" endpoint -- see pota.py's own module
+    docstring). Checks the on-disk cache (pota.load_cached_program_
+    parks) before hitting the network at all."""
+
+    parks_ready = Signal(list, bool)  # parks, from_cache
+    failed = Signal(str)
+
+    def __init__(self, program_prefix, parent=None):
+        super().__init__(parent)
+        self._program_prefix = program_prefix
+
+    def run(self):
+        cached = pota.load_cached_program_parks(self._program_prefix)
+        if cached is not None:
+            self.parks_ready.emit(cached, True)
+            return
+        try:
+            parks = pota.fetch_program_parks(self._program_prefix)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        try:
+            pota.save_program_parks_cache(self._program_prefix, parks)
+        except OSError:
+            pass  # cache write failure isn't fatal -- just means next open refetches too
+        self.parks_ready.emit(parks, False)
+
+
+class ParkDetailsWorker(QThread):
+    """One-shot fetch of one park's richer detail fields (park type,
+    access methods, managing agency, first activation, ...) -- opened
+    alongside ParkDetailsDialog (which shows what's already known from
+    the list row immediately, then fills in these fields once this
+    lands, only if the dialog is still open -- see _on_park_row_double_
+    clicked)."""
+
+    details_ready = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, reference, parent=None):
+        super().__init__(parent)
+        self._reference = reference
+
+    def run(self):
+        try:
+            details = pota.fetch_park_details(self._reference)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.details_ready.emit(details)
+
+
 class ContestsWorker(QThread):
     """One-shot fetch off the GUI thread, same shape as PotaWorker --
     the contest calendar feed is ~5MB (years of history, see
@@ -406,6 +480,93 @@ class ContestDetailsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
         self.setLayout(layout)
+
+
+class ParkDetailsDialog(QDialog):
+    """Opened by double-clicking a row in the Parks tab. Shows what's
+    already known from the list row (reference, location, grid,
+    activation counts) immediately -- no waiting on a second fetch just
+    to see basic info -- then apply_details() fills in the richer
+    fields (park type, access/activation methods, managing agency,
+    first activation, a clickable park/agency website link) once
+    ParkDetailsWorker's fetch lands, same "show what you have, enrich
+    when the rest arrives" shape as ContestDetailsDialog's own link
+    handling."""
+
+    def __init__(self, park, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"POTA Park -- {park.get('reference', '?')}")
+        self.setMinimumWidth(420)
+
+        name_label = QLabel(park.get("name") or park.get("reference", "?"))
+        name_label.setWordWrap(True)
+        name_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+
+        self._form = QFormLayout()
+        self._form.addRow("Reference:", QLabel(park.get("reference", "?")))
+        if park.get("location_desc"):
+            self._form.addRow("Location:", QLabel(park["location_desc"]))
+        if park.get("grid"):
+            self._form.addRow("Grid:", QLabel(park["grid"]))
+        if park.get("lat") is not None and park.get("lon") is not None:
+            self._form.addRow("Coordinates:", QLabel(f"{park['lat']:.5f}, {park['lon']:.5f}"))
+        if park.get("attempts") is not None:
+            self._form.addRow("Activation Attempts:", QLabel(str(park["attempts"])))
+        if park.get("activations") is not None:
+            self._form.addRow("Successful Activations:", QLabel(str(park["activations"])))
+        if park.get("qsos") is not None:
+            self._form.addRow("Total QSOs:", QLabel(str(park["qsos"])))
+
+        self.status_label = QLabel("Loading more details...")
+        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+
+        self._link_layout = QVBoxLayout()  # populated once apply_details() lands, if a URL is present
+
+        layout = QVBoxLayout()
+        layout.addWidget(name_label)
+        layout.addLayout(self._form)
+        layout.addWidget(self.status_label)
+        layout.addLayout(self._link_layout)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def apply_details(self, details):
+        """Called once ParkDetailsWorker's fetch lands -- caller
+        (_on_park_details_ready) only calls this if this dialog is
+        still the one currently open for that same park reference."""
+        self.status_label.setText("")
+        if details.get("park_type"):
+            self._form.addRow("Type:", QLabel(details["park_type"]))
+        if details.get("entity_name"):
+            self._form.addRow("Entity:", QLabel(details["entity_name"]))
+        if details.get("access_methods"):
+            self._form.addRow("Access:", QLabel(details["access_methods"]))
+        if details.get("activation_methods"):
+            self._form.addRow("Activation:", QLabel(details["activation_methods"]))
+        if details.get("agencies"):
+            self._form.addRow("Managed by:", QLabel(details["agencies"]))
+        if details.get("first_activator"):
+            first = details["first_activator"]
+            if details.get("first_activation_date"):
+                first += f" ({details['first_activation_date']})"
+            self._form.addRow("First Activated:", QLabel(first))
+        if details.get("comments"):
+            comment_label = QLabel(details["comments"])
+            comment_label.setWordWrap(True)
+            self._form.addRow("Comments:", comment_label)
+        url = details.get("park_url") or details.get("agency_url")
+        if url:
+            link_label = QLabel(f'<a href="{url}">{url}</a>')
+            link_label.setOpenExternalLinks(True)
+            link_label.setWordWrap(True)
+            self._link_layout.addWidget(link_label)
+
+    def apply_details_failed(self, message):
+        self.status_label.setText(f"Couldn't load more details: {message}")
 
 
 def _format_duration(delta: datetime.timedelta) -> str:
@@ -726,6 +887,60 @@ class HamClockWindow(QWidget):
         dx_spots_tab_layout.addWidget(self.dx_spots_table)
         dx_spots_tab.setLayout(dx_spots_tab_layout)
 
+        # ---- Parks tab -- searchable directory of every POTA park (not
+        # just currently-active spots, unlike the map's own POTA button/
+        # overlay above, which stays a separate, still-live thing).
+        # There's no "all parks on Earth" endpoint (see pota.py's own
+        # module docstring) -- parks_program_combo scopes the fetch to
+        # one country/region ("program", POTA's own term) at a time,
+        # remembered across restarts via QSettings so re-opening the
+        # dashboard doesn't require re-picking it every time. Populated
+        # once at startup (see the end of __init__), same auto-load
+        # treatment as Contests.
+        self._parks_all = []  # every park in the CURRENTLY LOADED program, unfiltered -- see _apply_parks_filter
+        self._parks_radius_km = None  # None = no radius filter active -- see _on_parks_filter_within_radius
+        self._parks_programs_worker = None
+        self._parks_worker = None
+        self._park_details_worker = None
+        self._park_details_dialog = None
+        self._park_details_dialog_reference = None  # which park the currently-open dialog is for
+        self.parks_program_combo = QComboBox()
+        self.parks_program_combo.setToolTip(
+            "POTA has no single \"all parks\" list -- pick a country/region "
+            "(POTA's own \"program\") to load its park directory."
+        )
+        self.parks_program_combo.currentIndexChanged.connect(self._on_parks_program_changed)
+        self.parks_search_edit = QLineEdit()
+        self.parks_search_edit.setPlaceholderText("Search by name or reference...")
+        self.parks_search_edit.textChanged.connect(self._on_parks_search_changed)
+        self._parks_search_debounce = QTimer(self)
+        self._parks_search_debounce.setSingleShot(True)
+        self._parks_search_debounce.timeout.connect(self._apply_parks_filter)
+        self.parks_filter_button = QPushButton("Filter...")
+        self.parks_filter_button.setToolTip("Filter to parks within a chosen radius of your saved GPS location.")
+        self.parks_filter_button.clicked.connect(self._on_parks_filter_button_clicked)
+        parks_controls_row = QHBoxLayout()
+        parks_controls_row.addWidget(self.parks_program_combo)
+        parks_controls_row.addWidget(self.parks_search_edit, 1)
+        parks_controls_row.addWidget(self.parks_filter_button)
+        self.parks_status_label = QLabel("Loading program list...")
+        self.parks_status_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.parks_table = QTableWidget(0, 4)
+        self.parks_table.setHorizontalHeaderLabels(["Reference", "Name", "Location", "Activations"])
+        self.parks_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.parks_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.parks_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.parks_table.verticalHeader().setVisible(False)
+        self.parks_table.cellClicked.connect(self._on_park_row_clicked)
+        self.parks_table.cellDoubleClicked.connect(self._on_park_row_double_clicked)
+        parks_tab = QWidget()
+        parks_tab_layout = QVBoxLayout()
+        parks_tab_layout.setContentsMargins(4, 4, 4, 4)
+        parks_tab_layout.addLayout(parks_controls_row)
+        parks_tab_layout.addWidget(self.parks_status_label)
+        parks_tab_layout.addWidget(self.parks_table)
+        parks_tab.setLayout(parks_tab_layout)
+
         # ---- Tabbed container -- per explicit instruction, replaces
         # the old single-purpose "HF Band Conditions" area with a
         # general one that can hold whatever other data sets get added
@@ -737,13 +952,16 @@ class HamClockWindow(QWidget):
         self.band_data_tabs.addTab(self.band_conditions_table, "Band Conditions")
         self.band_data_tabs.addTab(contests_tab, "Contests")
         self.band_data_tabs.addTab(dx_spots_tab, "DX Spots")
+        self.band_data_tabs.addTab(parks_tab, "Parks")
         # upcoming_passes_table (built further down in __init__, same
         # row as this) isn't constructed yet at this point, so this
         # doesn't reference it -- just uses the same row-count/height
         # shape its own fixed-height calculation does (PASSES_
         # VISIBLE_ROWS rows worth), plus room for the tab bar itself
         # and the extra host/port/connect controls row the DX Spots
-        # tab has that the other two don't.
+        # tab has that the other two don't (Parks' own extra controls
+        # row + status label is the same shape/height, so no separate
+        # allowance needed for it).
         self.band_data_tabs.setFixedHeight(
             self.band_conditions_table.horizontalHeader().height()
             + self.PASSES_VISIBLE_ROWS * 24 + 4  # table content, matching upcoming_passes_table's own row count
@@ -1230,6 +1448,12 @@ class HamClockWindow(QWidget):
         # (unlike DX Spots' persistent connection).
         self._start_contests_fetch()
 
+        # Parks tab: the program (country/region) list, same auto-load
+        # treatment -- the actual park directory for whichever program
+        # ends up selected is fetched separately (_on_parks_program_
+        # changed), not here.
+        self._start_parks_programs_fetch()
+
     def _ensure_operator_callsign(self):
         """Prompts for the operator's own callsign immediately on first
         launch ever (per explicit instruction) -- PSKReporter queries
@@ -1607,6 +1831,198 @@ class HamClockWindow(QWidget):
             lines.append(f"Comment: {spot['comments']}")
         lines.append(f"Spotted by: {spot.get('spotter', '?')}")
         return "\n".join(lines)
+
+    # ---- Parks tab ----
+
+    def _start_parks_programs_fetch(self):
+        if self._parks_programs_worker is not None and self._parks_programs_worker.isRunning():
+            return
+        worker = PotaProgramsWorker(self)
+        worker.programs_ready.connect(self._on_parks_programs_ready)
+        worker.failed.connect(self._on_parks_programs_failed)
+        self._parks_programs_worker = worker
+        worker.start()
+
+    def _on_parks_programs_ready(self, programs):
+        self.parks_program_combo.blockSignals(True)
+        self.parks_program_combo.clear()
+        for program in programs:
+            self.parks_program_combo.addItem(program["name"], program["prefix"])
+        self.parks_program_combo.blockSignals(False)
+
+        # Restore the last-used program (if any) and load it -- QSettings
+        # here (not the shared `settings` variable used elsewhere in
+        # __init__) since this runs from a signal handler, well after
+        # __init__ has returned, same reasoning dx_host_input's own
+        # local QSettings instance documents for itself.
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        last_prefix = settings.value("pota_parks_program", "") or None
+        if last_prefix:
+            index = self.parks_program_combo.findData(last_prefix)
+            if index != -1:
+                self.parks_program_combo.setCurrentIndex(index)  # triggers _on_parks_program_changed
+                return
+        self.parks_status_label.setText(f"{len(programs)} programs loaded -- pick one to load its parks.")
+
+    def _on_parks_programs_failed(self, message):
+        self.parks_status_label.setText(f"Couldn't load program list: {message}")
+
+    def _on_parks_program_changed(self, _index):
+        program_prefix = self.parks_program_combo.currentData()
+        if not program_prefix:
+            return
+        QSettings("IcomRadioApp", "RadioControl").setValue("pota_parks_program", program_prefix)
+        self._start_parks_fetch(program_prefix)
+
+    def _start_parks_fetch(self, program_prefix):
+        if self._parks_worker is not None and self._parks_worker.isRunning():
+            return  # a fetch is already in flight -- let it finish
+        self.parks_status_label.setText(f"Loading parks for {self.parks_program_combo.currentText()}...")
+        self.parks_table.setRowCount(0)
+        self._parks_all = []
+        worker = ParksWorker(program_prefix, self)
+        worker.parks_ready.connect(self._on_parks_ready)
+        worker.failed.connect(self._on_parks_fetch_failed)
+        self._parks_worker = worker
+        worker.start()
+
+    def _on_parks_ready(self, parks, from_cache):
+        self._parks_all = parks
+        source = "cached" if from_cache else "freshly fetched"
+        self.parks_status_label.setText(f"{len(parks)} parks loaded ({source}).")
+        self._apply_parks_filter()
+
+    def _on_parks_fetch_failed(self, message):
+        self.parks_status_label.setText(f"Couldn't load parks: {message}")
+
+    def _on_parks_search_changed(self, _text):
+        # Debounced -- rebuilding the table (potentially thousands of
+        # rows for a big program) on every single keystroke would be
+        # wasteful; 250ms comfortably absorbs normal typing speed
+        # without feeling laggy once it does fire.
+        self._parks_search_debounce.start(250)
+
+    def _on_parks_filter_button_clicked(self):
+        menu = QMenu(self)
+        menu.addAction("Within radius of my location...").triggered.connect(self._on_parks_filter_within_radius)
+        clear_action = menu.addAction("Clear radius filter")
+        clear_action.setEnabled(self._parks_radius_km is not None)
+        clear_action.triggered.connect(self._on_parks_clear_radius_filter)
+        menu.exec(self.parks_filter_button.mapToGlobal(self.parks_filter_button.rect().bottomLeft()))
+
+    def _on_parks_filter_within_radius(self):
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        lat = float(settings.value("operator_lat", 0.0)) or None
+        lon = float(settings.value("operator_lon", 0.0)) or None
+        if lat is None or lon is None:
+            QMessageBox.warning(
+                self, "Parks",
+                "No GPS location saved yet -- set it in the Connect New Radio dialog first "
+                "(Get GPS Coordinates, or enter it manually).",
+            )
+            return
+        radius_km, ok = QInputDialog.getInt(self, "Parks", "Search radius (km):", 50, 1, 20000)
+        if not ok:
+            return
+        self._parks_radius_km = radius_km
+        self._apply_parks_filter()
+
+    def _on_parks_clear_radius_filter(self):
+        self._parks_radius_km = None
+        self._apply_parks_filter()
+
+    def _apply_parks_filter(self):
+        """Rebuilds parks_table from self._parks_all, filtered by the
+        search text and (if active) the radius filter -- both filters
+        run client-side against the already-fetched program (POTA's
+        park-directory API has neither a search nor a radius
+        parameter). setUpdatesEnabled(False) around the rebuild avoids
+        a visible flicker/redraw-per-row on a large program (the US
+        alone is ~13,000 parks)."""
+        search_text = self.parks_search_edit.text().strip().lower()
+        parks = self._parks_all
+        if search_text:
+            parks = [
+                p for p in parks
+                if search_text in p["name"].lower() or search_text in p["reference"].lower()
+            ]
+        if self._parks_radius_km is not None:
+            settings = QSettings("IcomRadioApp", "RadioControl")
+            lat = float(settings.value("operator_lat", 0.0)) or None
+            lon = float(settings.value("operator_lon", 0.0)) or None
+            if lat is not None and lon is not None:
+                parks = [
+                    p for p in parks
+                    if pota.haversine_km(lat, lon, p["lat"], p["lon"]) <= self._parks_radius_km
+                ]
+
+        self.parks_table.setUpdatesEnabled(False)
+        self.parks_table.setRowCount(len(parks))
+        for row, park in enumerate(parks):
+            values = [
+                park["reference"],
+                park["name"],
+                park.get("location_desc") or "",
+                str(park["activations"]) if park.get("activations") is not None else "",
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, park)
+                self.parks_table.setItem(row, col, item)
+        self.parks_table.setUpdatesEnabled(True)
+
+        if self._parks_radius_km is not None or search_text:
+            self.parks_status_label.setText(f"{len(parks)} of {len(self._parks_all)} parks shown.")
+        else:
+            self.parks_status_label.setText(f"{len(parks)} parks loaded.")
+
+    def _on_park_row_clicked(self, row, _column):
+        item = self.parks_table.item(row, 0)
+        if item is None:
+            return
+        park = item.data(Qt.UserRole)
+        self.map_widget.set_selected_park_marker({"lat": park["lat"], "lon": park["lon"]})
+        self.map_widget.center_on(park["lat"], park["lon"])
+
+    def _on_park_row_double_clicked(self, row, _column):
+        item = self.parks_table.item(row, 0)
+        if item is None:
+            return
+        park = item.data(Qt.UserRole)
+        dialog = ParkDetailsDialog(park, self)
+        self._park_details_dialog = dialog
+        self._park_details_dialog_reference = park["reference"]
+        dialog.finished.connect(self._on_park_details_dialog_finished)
+        dialog.show()
+
+        # If an earlier double-click's fetch is still in flight, this
+        # just replaces the tracked reference -- the old worker keeps
+        # running to completion in the background rather than being
+        # cancelled (this app has no in-flight-HTTP-cancellation idiom;
+        # see map_tiles.py's own docstring for the same limitation), but
+        # _on_park_details_ready's reference check discards its result
+        # harmlessly once it does land, since _park_details_dialog_
+        # reference will have moved on to this new park by then.
+        worker = ParkDetailsWorker(park["reference"], self)
+        worker.details_ready.connect(self._on_park_details_ready)
+        worker.failed.connect(self._on_park_details_failed)
+        self._park_details_worker = worker
+        worker.start()
+
+    def _on_park_details_dialog_finished(self, _result):
+        self._park_details_dialog = None
+        self._park_details_dialog_reference = None
+
+    def _on_park_details_ready(self, details):
+        # Only apply if the dialog that requested this is STILL the one
+        # open (the operator could have closed it, or double-clicked a
+        # different row, while the fetch was in flight).
+        if self._park_details_dialog is not None and self._park_details_dialog_reference == details["reference"]:
+            self._park_details_dialog.apply_details(details)
+
+    def _on_park_details_failed(self, message):
+        if self._park_details_dialog is not None:
+            self._park_details_dialog.apply_details_failed(message)
 
     def _start_contests_fetch(self):
         if self._contests_worker is not None and self._contests_worker.isRunning():
@@ -2662,6 +3078,9 @@ class HamClockWindow(QWidget):
             (self._pskreporter_worker, 15000),
             (self._pota_worker, 15000),
             (self._contests_worker, 20000),
+            (self._parks_programs_worker, 15000),
+            (self._parks_worker, 30000),  # a full program's park list can be several MB
+            (self._park_details_worker, 15000),
             (self._update_check_worker, 15000),
             (self._update_perform_worker, 300000),
         ):

@@ -55,6 +55,7 @@ class WorldMapWidget(QWidget):
         self._pskreporter_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_pskreporter_markers
         self._pota_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_pota_markers
         self._aprs_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_aprs_markers
+        self._selected_park_marker = None  # {"lat", "lon"} or None -- see set_selected_park_marker
         # Hover tooltip needs mouseMoveEvent to fire without a button
         # held down -- off by default on a plain QWidget.
         self.setMouseTracking(True)
@@ -307,6 +308,23 @@ class WorldMapWidget(QWidget):
                 sx, sy = self._content_to_screen(cx, cy, w, h)
                 painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
 
+        if self._selected_park_marker is not None:
+            # A distinct gold "target reticle" (ring + center dot),
+            # drawn last so it's always on top -- highlights ONE park
+            # from ham_dashboard.py's Parks tab (a row click), separate
+            # from the live POTA spot overlay (_pota_markers) above,
+            # which can be on at the same time.
+            cx, cy = self._lonlat_to_xy(
+                self._selected_park_marker["lat"], self._selected_park_marker["lon"], w, h
+            )
+            sx, sy = self._content_to_screen(cx, cy, w, h)
+            painter.setPen(QPen(QColor(255, 215, 0), 2.5))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(sx, sy), 10, 10)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 215, 0))
+            painter.drawEllipse(QPointF(sx, sy), 3, 3)
+
         # Attribution -- required by the OSM Tile Usage Policy, must stay
         # visible unconditionally (not gated on a successful fetch, since
         # tiles are always the background now, not an optional extra).
@@ -486,6 +504,40 @@ class WorldMapWidget(QWidget):
         set_pskreporter_markers/set_pota_markers. Empty list (the
         button's own OFF state) just stops drawing/hit-testing them."""
         self._aprs_markers = markers
+        self.update()
+
+    def set_selected_park_marker(self, marker):
+        """marker: {"lat", "lon"} or None -- ham_dashboard.py's Parks
+        tab, highlighting the currently-clicked row. Unlike every other
+        marker category there's at most one at a time, and it's drawn
+        as a distinct gold ring (see paintEvent) rather than a filled
+        dot, so it stays visually separate from the live POTA spot
+        overlay (set_pota_markers), which can be on simultaneously."""
+        self._selected_park_marker = marker
+        self.update()
+
+    # A "center on X" call needs SOME zoom -- at MIN_ZOOM (whole-world
+    # fit), _clamp_pan forces pan back to exactly (0,0) unconditionally
+    # (there's nowhere to pan to without room to scroll into), so
+    # centering from a zoomed-all-the-way-out view would otherwise have
+    # no visible effect at all. This ensures at least a "country-level"
+    # view (see center_on) without forcibly zooming OUT if the operator
+    # is already zoomed in further than this.
+    _CENTER_ON_MIN_ZOOM = 20.0
+
+    def center_on(self, lat, lon):
+        """Recenters the view on lat/lon, at the current zoom level (or
+        _CENTER_ON_MIN_ZOOM, whichever is more zoomed in) -- used by
+        ham_dashboard.py's Parks tab so clicking a row's highlight is
+        actually visible on screen, not just marked somewhere off in
+        unpanned space."""
+        if self._zoom < self._CENTER_ON_MIN_ZOOM:
+            self._zoom = self._CENTER_ON_MIN_ZOOM
+        w, h = self.width(), self.height()
+        cx, cy = self._lonlat_to_xy(lat, lon, w, h)
+        self._pan_x = cx - w / 2.0
+        self._pan_y = cy - h / 2.0
+        self._clamp_pan()
         self.update()
 
     # Pixel radius around a QSO marker that still counts as a hover/

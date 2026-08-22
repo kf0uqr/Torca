@@ -2,12 +2,27 @@
 Parses a RepeaterBook CSV export into memory-entry-ready repeater
 dicts for memories_window.py's Local Repeaters tab (_repeater_to_entry,
 LocalRepeatersTabPage) -- {"callsign", "output_freq_hz",
-"input_freq_hz", "mode", "ctcss_hz", "city"}. Imports every row in the
-file that has a usable frequency, unfiltered -- per explicit
-instruction, no band restriction and no location/radius filtering at
-all; the operator's own CSV (already whatever they chose to export
-from RepeaterBook -- one state, one band, a search radius already
-applied there, etc.) is trusted as-is.
+"input_freq_hz", "mode", "modes", "location", "ctcss_hz"}. Imports
+every row in the file that has a usable frequency, unfiltered -- per
+explicit instruction, no band restriction and no location/radius
+filtering at all; the operator's own CSV (already whatever they chose
+to export from RepeaterBook -- one state, one band, a search radius
+already applied there, etc.) is trusted as-is.
+
+Header aliases below are confirmed against a REAL RepeaterBook.com
+CSV export's own header row (an operator pasted it directly): "Output
+Freq, Input Freq, Offset, Uplink Tone, Downlink Tone, Call, Location,
+County, State, Modes, Digital Access" -- notably NOT the field names
+RepeaterBook's own Export API documentation uses (e.g. API docs say
+"PL/CTCSS Uplink"; the actual downloadable CSV says "Uplink Tone") --
+the earlier version of this module was tuned to the API's documented
+names and silently never matched the real file's tone column at all.
+Only "Uplink Tone" is used for ctcss_hz -- the tone the OPERATOR
+transmits to access the repeater, which is what this app's single
+tone/mode setting is for (see _repeater_to_entry's own comment);
+"Downlink Tone" (what the repeater itself transmits back) isn't
+currently modeled anywhere in this app's tone handling, so it's read
+but not used.
 
 This is the ONLY repeater data source in the app -- deliberately not
 an API integration of any kind. RepeaterBook's own Export API requires
@@ -32,15 +47,19 @@ still has a fair chance of working, without being the design target.
 import csv
 
 # {internal field: [acceptable header names, case-insensitive]} --
-# first match wins per field.
+# first match wins per field. Each list's first entries are the
+# confirmed-real RepeaterBook CSV header text (see module docstring);
+# later entries are best-effort fallbacks for other formats/sources.
 _HEADER_ALIASES = {
-    "callsign": ["callsign", "call sign", "repeater call sign", "call"],
-    "output_freq_mhz": ["frequency", "freq", "output frequency", "downlink", "dl freq", "output freq"],
-    "input_freq_mhz": ["input frequency", "uplink", "input freq"],
+    "callsign": ["call", "callsign", "call sign", "repeater call sign"],
+    "output_freq_mhz": ["output freq", "frequency", "freq", "output frequency", "downlink", "dl freq"],
+    "input_freq_mhz": ["input freq", "input frequency", "uplink"],
     "offset_mhz": ["offset"],
     "dup": ["dup", "duplex"],
-    "ctcss_hz": ["pl", "ctcss", "tone", "pl/ctcss uplink", "repeater tone", "pl tone"],
-    "city": ["city", "location/nearest city", "landmark", "name"],
+    "ctcss_hz": ["uplink tone", "pl", "ctcss", "tone", "pl/ctcss uplink", "repeater tone", "pl tone"],
+    "location": ["location", "city", "location/nearest city", "landmark", "name"],
+    "state": ["state", "sub name"],
+    "modes": ["modes"],
     "mode": ["mode", "operating mode"],
 }
 
@@ -72,12 +91,23 @@ def _parse_float(text):
         return None
 
 
+def _column_text(row, column_map, field):
+    return (row.get(column_map.get(field, ""), "") or "").strip()
+
+
 def parse_repeater_csv(path):
     """Reads a RepeaterBook CSV export (or any similarly-labeled
     repeater CSV -- see this module's own docstring) and returns a
     list of {"callsign", "output_freq_hz", "input_freq_hz", "mode",
-    "city", "ctcss_hz"} for every row with a usable frequency --
-    unfiltered by band or location, the entire file.
+    "modes", "location", "ctcss_hz"} for every row with a usable
+    frequency -- unfiltered by band or location, the entire file.
+
+    "location" combines the CSV's own Location and State columns (e.g.
+    "Wichita, KS") when both are present, just the one that's present
+    otherwise, or "" if neither is. "modes" is RepeaterBook's own
+    free-text capability list column (e.g. "FM, DMR") passed through
+    as-is -- distinct from "mode", a single value (defaulting to "FM")
+    used for the memory entry's own VFO mode.
 
     Raises OSError/csv.Error on a genuinely unreadable file; a file
     that opens fine but has no recognizable frequency column at all
@@ -116,12 +146,17 @@ def parse_repeater_csv(path):
             if input_mhz is None:
                 input_mhz = output_mhz
 
+            city = _column_text(row, column_map, "location")
+            state = _column_text(row, column_map, "state")
+            location = f"{city}, {state}" if city and state else (city or state)
+
             repeaters.append({
-                "callsign": (row.get(column_map.get("callsign", ""), "") or "").strip(),
+                "callsign": _column_text(row, column_map, "callsign"),
                 "output_freq_hz": round(output_mhz * 1e6),
                 "input_freq_hz": round(input_mhz * 1e6),
-                "mode": (row.get(column_map.get("mode", ""), "") or "FM").strip() or "FM",
-                "city": (row.get(column_map.get("city", ""), "") or "").strip(),
+                "mode": _column_text(row, column_map, "mode") or "FM",
+                "modes": _column_text(row, column_map, "modes"),
+                "location": location,
                 "ctcss_hz": _parse_float(row.get(column_map["ctcss_hz"])) if "ctcss_hz" in column_map else None,
             })
         return repeaters

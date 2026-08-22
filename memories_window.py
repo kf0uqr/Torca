@@ -75,7 +75,7 @@ MEMORIES_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "memories.json"
 
 _COLUMNS = [
     "Name", "VFO A Freq (MHz)", "VFO A Mode", "VFO B Freq (MHz)", "VFO B Mode",
-    "Tone Mode", "Tone Freq (Hz)",
+    "Tone Mode", "Tone Freq (Hz)", "Location", "Modes",
 ]
 # Tone Mode values, same shape split_dialog.py's Repeater Tone section
 # already uses: "none" (no tone), "tone" (transmit tone only), "tsql"
@@ -87,20 +87,24 @@ _COLUMNS = [
 
 def _repeater_to_entry(repeater):
     name = repeater["callsign"] or "Repeater"
-    if repeater.get("city"):
-        name = f"{name} ({repeater['city']})"
     ctcss_hz = repeater.get("ctcss_hz")
     # A repeater with a published CTCSS tone almost universally needs
     # it on transmit to access it -- "tsql" (per wfview's own
     # description: "a tone is transmitted, and the same tone frequency
     # is used as a tone squelch") is the same convention split_dialog.py's
     # Repeater Tone section already uses for "has a tone" in general.
+    # ctcss_hz itself is specifically the UPLINK tone (what the
+    # operator transmits to access the repeater) -- see
+    # repeater_import.py's own docstring for why that's the one used
+    # here, not the repeater's own downlink tone.
     tone = {"mode": "tsql", "freq_hz": ctcss_hz} if ctcss_hz else {"mode": "none", "freq_hz": None}
     return {
         "name": name,
         "vfo_a": {"freq_hz": repeater["output_freq_hz"], "mode": repeater["mode"], "filter": None},
         "vfo_b": {"freq_hz": repeater["input_freq_hz"], "mode": repeater["mode"], "filter": None},
         "tone": tone,
+        "location": repeater.get("location") or "",
+        "modes": repeater.get("modes") or "",
     }
 
 
@@ -243,6 +247,8 @@ class MemoryTabPage(QWidget):
             vfo_b.get("mode") or "",
             tone.get("mode") or "none",
             _format_tone_hz(tone.get("freq_hz")),
+            entry.get("location", ""),
+            entry.get("modes", ""),
         ]
         for col, value in enumerate(values):
             self.table.setItem(row, col, QTableWidgetItem(value))
@@ -270,6 +276,10 @@ class MemoryTabPage(QWidget):
             entry.setdefault("tone", {})["mode"] = text.lower() or "none"
         elif col == 6:
             entry.setdefault("tone", {})["freq_hz"] = _parse_tone_hz(text)
+        elif col == 7:
+            entry["location"] = text
+        elif col == 8:
+            entry["modes"] = text
         self._on_change()
 
     def _on_add_clicked(self):

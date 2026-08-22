@@ -1743,9 +1743,20 @@ class HamClockWindow(QWidget):
         before emitting). Always updates the accumulator so switching
         the button on later shows everything heard since startup, not
         just what arrived while it happened to be checked; only pushes
-        to the map widget while actually visible."""
+        to the map widget while actually visible.
+
+        Keyed by the packet's ACTUAL originating station, not always
+        packet["source"] -- for a Third-Party/Network-Tunneled packet
+        (aprs.py's "}" unwrap), packet["source"] is the IGate/relay
+        station's own AX.25 source, the SAME for every station it
+        relays. Keying on that collided every relayed station onto one
+        map entry, so each new station heard via a given IGate
+        overwrote (and appeared to erase) whichever station's marker
+        was there before. info["third_party_source"] (present only on
+        unwrapped packets) is the real originating callsign instead."""
         info = packet["info"]
-        self._aprs_stations[packet["source"]] = {
+        station_key = info.get("third_party_source") or packet["source"]
+        self._aprs_stations[station_key] = {
             "lat": info["lat"],
             "lon": info["lon"],
             "tooltip": self._aprs_tooltip_text(packet, info),
@@ -1759,11 +1770,17 @@ class HamClockWindow(QWidget):
         digipeaters = packet.get("digipeaters") or []
         if digipeaters:
             destination += " via " + ",".join(digipeaters)
-        lines = [
-            packet.get("source", "?"),
-            f"To: {destination}",
-            f"{info['lat']:.5f}, {info['lon']:.5f}",
-        ]
+        third_party_source = info.get("third_party_source")
+        station_line = third_party_source or packet.get("source", "?")
+        lines = [station_line]
+        if third_party_source:
+            # Distinguish the real originating station (used above) from
+            # the IGate/relay station that actually transmitted this
+            # copy of the packet -- both are useful, but conflating them
+            # is what caused the marker-collision bug this key fixes.
+            lines.append(f"via IGate {packet.get('source', '?')}")
+        lines.append(f"To: {destination}")
+        lines.append(f"{info['lat']:.5f}, {info['lon']:.5f}")
         symbol = f"{info.get('symbol_table', '')}{info.get('symbol_code', '')}".strip()
         if symbol:
             lines.append(f"Symbol: {symbol}")

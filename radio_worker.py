@@ -1389,6 +1389,29 @@ class RadioWorker(QThread):
                     "'raw_255') -- defaulting to raw-scale math; watch the reading for sanity."
                 )
 
+            # Root-caused a real "shows ~55W, radio's actually at ~5W"
+            # report to METER_DEFINITIONS' hardcoded display_max=100 --
+            # correct for a 100W-class rig (IC-7300/7610/9700 all have
+            # [power] max_watts=100 in their own rigplane profile TOML,
+            # confirmed by reading rigs/*.toml directly) but wrong for a
+            # QRP-max radio: the IC-705's own profile says max_watts=10
+            # (rigs/ic705.toml, [power] section), so the SAME raw meter
+            # byte that means "~50% of this radio's real max" was being
+            # read against a scale ten times too wide. get_power_meter()
+            # has no per-model calibration table in this rigplane
+            # version (confirmed -- unlike get_swr, nothing in runtime/
+            # radio.py runs it through interpolate_meter), so this is
+            # still a linear raw/255 approximation, not a true
+            # calibrated curve -- but scaled against the CORRECT ceiling
+            # for this specific radio instead of a one-size-fits-all
+            # 100W guess. Only applies to the "linear" (raw_255) kind --
+            # a "direct"/native-watts reading needs no display_max at
+            # all (already real watts).
+            if self._meter_definitions["power"]["kind"] == "linear":
+                max_watts = getattr(getattr(self.radio, "profile", None), "max_watts", None)
+                if max_watts:
+                    self._meter_definitions["power"]["display_max"] = max_watts
+
         # SWR's METER_DEFINITIONS entry defaults to "direct" (get_swr's
         # already-calibrated ratio) -- but if this radio/backend only
         # exposes get_swr_meter (the raw, uncalibrated byte -- see that

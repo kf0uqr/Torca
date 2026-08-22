@@ -322,7 +322,16 @@ METER_DEFINITIONS = {
         "kind": "linear",
         "unit": "W",
         "raw_max": 255,
-        "display_max": 100,  # typical full-scale for Icom HF/VHF rigs
+        # Fallback only, for a radio/profile with no max_watts of its
+        # own (100W matches most non-QRP Icom HF/VHF rigs) -- normally
+        # overridden per-connected-radio from the rigplane profile's
+        # own [power] max_watts (e.g. 10 for an IC-705) by RadioWorker.
+        # _setup_meters(), which is the actual source of truth for a
+        # real connected radio. Root-caused a real "shows ~55W, radio's
+        # actually at ~5W" report on an IC-705 to this flat 100W
+        # default going unused there -- see _setup_meters()'s own
+        # comment for the full story.
+        "display_max": 100,
     },
     "swr": {
         "label": "SWR",

@@ -138,6 +138,14 @@ class RadioWorker(QThread):
     connection_failed = Signal(str)
     frequency_updated = Signal(int)      # Hz
     meter_updated = Signal(str, int)     # (meter_type key, raw value)
+    # Emitted once _setup_meters() finishes building this connection's
+    # own corrected METER_DEFINITIONS copy (dict), carrying that dict --
+    # main_window.py pushes it into every MeterWidget via set_
+    # definitions() so the UI actually uses the per-radio-corrected
+    # scaling (e.g. the power meter's real display_max) instead of
+    # quietly falling back to the unmodified module-level constant. See
+    # widgets.py's MeterWidget class docstring for the bug this fixes.
+    meters_ready = Signal(dict)
     control_updated = Signal(str, object)  # (control key, current value)
     scope_frame_received = Signal(object)  # rigplane.scope.ScopeFrame
     audio_status = Signal(str)           # informational, not an error
@@ -1292,6 +1300,7 @@ class RadioWorker(QThread):
             await self._setup_audio()
             await self._setup_levels()
             self._setup_meters()
+            self.meters_ready.emit(self._meter_definitions)
             self._setup_controls()
 
             # Scope data arrives unsolicited over CI-V; register a

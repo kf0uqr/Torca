@@ -8,6 +8,14 @@ takes display_max from the connected radio's own rigplane profile
 (radio.profile.max_watts) when the power meter is in "linear" (raw_255)
 mode, instead of the one-size-fits-all constants.py default.
 
+Also covers the FOLLOW-UP bug the first fix alone didn't actually
+solve: widgets.py's MeterWidget.paintEvent read straight from the
+module-level METER_DEFINITIONS constant, never from _setup_meters()'s
+own corrected copy -- so the corrected display_max above never reached
+the screen at all. test_meter_widget_reflects_set_definitions below
+exercises that path directly (needs a real QApplication, so it's kept
+separate from the plain-Python tests above it).
+
 Run directly: ./bin/python3 test_radio_worker_meters.py
 """
 
@@ -91,6 +99,36 @@ def test_missing_max_watts_falls_back_to_original_default():
     assert worker._meter_definitions["power"]["display_max"] == 100
 
 
+def test_meter_widget_reflects_set_definitions():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from widgets import MeterWidget
+    import constants
+
+    app = QApplication.instance() or QApplication([])
+
+    widget = MeterWidget(meter_type="power")
+    widget.set_value(140)  # the same raw byte from the bug report
+
+    # Before set_definitions(): falls back to the plain module-level
+    # constant (display_max=100) -- the OLD, wrong-for-an-IC-705 value.
+    old_label = widget._linear_label(widget._definitions["power"])
+    assert old_label == "54.9W", old_label
+
+    worker = make_worker("raw_255", 10)
+    worker._setup_meters()
+    widget.set_definitions(worker._meter_definitions)
+
+    new_label = widget._linear_label(widget._definitions["power"])
+    assert new_label == "5.5W", new_label
+
+    # Widget-level constant must stay untouched by the per-instance
+    # override -- other not-yet-updated widgets (or a second radio's
+    # own widgets) must not see this one's correction.
+    assert constants.METER_DEFINITIONS["power"]["display_max"] == 100
+
+
 if __name__ == "__main__":
     tests = [
         test_ic705_style_radio_gets_10w_display_max,
@@ -98,6 +136,7 @@ if __name__ == "__main__":
         test_raw_140_of_255_now_reads_close_to_5_5w_on_a_10w_radio,
         test_direct_native_watts_radio_is_untouched,
         test_missing_max_watts_falls_back_to_original_default,
+        test_meter_widget_reflects_set_definitions,
     ]
     for test in tests:
         test()

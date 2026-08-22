@@ -443,7 +443,22 @@ class BandPlanOverlayWidget(QWidget):
 class MeterWidget(QWidget):
     """Segmented bargraph meter, styled after the LCD meter dock on the
     IC-7300 / IC-9700 / IC-705 touchscreen. Double-click to switch which
-    reading it displays (see METER_DEFINITIONS)."""
+    reading it displays (see METER_DEFINITIONS).
+
+    Reads scaling (kind/raw_max/display_max/...) from self._definitions,
+    NOT the module-level METER_DEFINITIONS constant directly -- that
+    constant is only ever the pre-connection fallback (set here as the
+    initial value, before any real radio has connected). Once connected,
+    RadioWorker._setup_meters() builds its own per-radio-corrected copy
+    (e.g. the power meter's display_max scaled to THIS radio's actual
+    rated output, not a generic guess -- see that method's own comment)
+    and main_window.py pushes it into every MeterWidget via
+    set_definitions(). Root-caused a real "fixed _setup_meters() but the
+    displayed power reading didn't change at all" report to this widget
+    quietly reading the untouched global constant the whole time instead
+    of the corrected per-connection copy it was never given -- the two
+    dicts have identical keys, so nothing about that bug was visible
+    from a quick read of either side alone."""
 
     NUM_SEGMENTS = 32
     S_TICKS = [("S1", 0.072), ("S3", 0.217), ("S5", 0.361), ("S7", 0.506), ("S9", S_METER_S9_FRACTION)]
@@ -458,13 +473,21 @@ class MeterWidget(QWidget):
         self.setToolTip("Double-click to change meter")
         self._raw_value = 0
         self._meter_type = meter_type
+        self._definitions = METER_DEFINITIONS  # pre-connection fallback -- see class docstring
 
     @property
     def meter_type(self):
         return self._meter_type
 
+    def set_definitions(self, definitions):
+        """Swaps in RadioWorker._setup_meters()'s per-connection-
+        corrected METER_DEFINITIONS copy -- called once per widget right
+        after a radio connects (main_window.py's _on_meters_ready)."""
+        self._definitions = definitions
+        self.update()
+
     def set_meter_type(self, meter_type):
-        if meter_type not in METER_DEFINITIONS:
+        if meter_type not in self._definitions:
             return
         self._meter_type = meter_type
         self._raw_value = 0
@@ -476,7 +499,7 @@ class MeterWidget(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         menu = QMenu(self)
-        for key, definition in METER_DEFINITIONS.items():
+        for key, definition in self._definitions.items():
             action = menu.addAction(definition["label"])
             action.setCheckable(True)
             action.setChecked(key == self._meter_type)
@@ -536,7 +559,7 @@ class MeterWidget(QWidget):
         return f"{self._raw_value:.1f}{definition['unit']}"
 
     def paintEvent(self, event):
-        definition = METER_DEFINITIONS[self._meter_type]
+        definition = self._definitions[self._meter_type]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()

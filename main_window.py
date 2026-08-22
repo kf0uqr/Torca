@@ -604,6 +604,7 @@ class RadioWindow(QWidget):
         self.worker.scope_ref_changed.connect(self._on_scope_ref_changed)
         self.worker.scope_speed_changed.connect(self._on_scope_speed_changed)
         self.worker.scope_ready.connect(self._on_scope_ready)
+        self.worker.meters_ready.connect(self._on_meters_ready)
         self.worker.start()
 
         # Feeds the band-plan overlay's memory-channel tick marks --
@@ -735,6 +736,17 @@ class RadioWindow(QWidget):
         for widget in self.meter_widgets:
             if widget.meter_type == meter_type:
                 widget.set_value(level)
+
+    @Slot(dict)
+    def _on_meters_ready(self, definitions):
+        # Pushes RadioWorker._setup_meters()'s per-connection-corrected
+        # METER_DEFINITIONS copy into every meter widget -- see widgets.
+        # py's MeterWidget class docstring for why this is needed at all
+        # (without it, every widget silently keeps reading the
+        # unmodified module-level constant forever, regardless of
+        # anything _setup_meters() computed for this specific radio).
+        for widget in self.meter_widgets:
+            widget.set_definitions(definitions)
 
     def _refresh_memory_markers(self):
         self.band_plan_widget.set_memories(all_memory_markers())

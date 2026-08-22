@@ -1844,6 +1844,13 @@ class HamClockWindow(QWidget):
         worker.start()
 
     def _on_parks_programs_ready(self, programs):
+        # blockSignals around the whole populate loop -- Qt fires
+        # currentIndexChanged the moment the FIRST item lands in a
+        # previously-empty combo (currentIndex jumps from -1 to 0), and
+        # that would otherwise race _on_parks_program_changed against
+        # this method's own restore-last-used-program logic below,
+        # firing a fetch for whatever program happens to be
+        # alphabetically first before the real target is known.
         self.parks_program_combo.blockSignals(True)
         self.parks_program_combo.clear()
         for program in programs:
@@ -1862,7 +1869,15 @@ class HamClockWindow(QWidget):
             if index != -1:
                 self.parks_program_combo.setCurrentIndex(index)  # triggers _on_parks_program_changed
                 return
-        self.parks_status_label.setText(f"{len(programs)} programs loaded -- pick one to load its parks.")
+        # No remembered program -- blockSignals above means Qt's own
+        # currentIndexChanged never fired for the index-0 default it
+        # picked, so nothing has actually been fetched yet even though
+        # the combo shows a program name selected (confirmed live: this
+        # previously left the tab looking like a program was loaded
+        # while self._parks_all stayed empty, making the radius filter
+        # silently show zero results with no indication why). Trigger
+        # the fetch explicitly for whatever ended up selected.
+        self._on_parks_program_changed(self.parks_program_combo.currentIndex())
 
     def _on_parks_programs_failed(self, message):
         self.parks_status_label.setText(f"Couldn't load program list: {message}")
@@ -1972,7 +1987,21 @@ class HamClockWindow(QWidget):
         self.parks_table.setUpdatesEnabled(True)
 
         if self._parks_radius_km is not None or search_text:
-            self.parks_status_label.setText(f"{len(parks)} of {len(self._parks_all)} parks shown.")
+            message = f"{len(parks)} of {len(self._parks_all)} parks shown."
+            if self._parks_radius_km is not None and len(parks) == 0 and self._parks_all:
+                # The radius filter only ever searches the CURRENTLY
+                # LOADED program's own park list (POTA's API has no
+                # cross-country radius search) -- zero results here
+                # usually means the wrong Program is loaded for the
+                # operator's actual location, not that there's truly
+                # nothing nearby. Spelled out explicitly since this is
+                # easy to misread as "no parks near me at all."
+                message += (
+                    f" No parks within {self._parks_radius_km}km in "
+                    f"{self.parks_program_combo.currentText()} -- pick a different "
+                    "Program if that's not where you are."
+                )
+            self.parks_status_label.setText(message)
         else:
             self.parks_status_label.setText(f"{len(parks)} parks loaded.")
 

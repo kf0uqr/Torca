@@ -6,7 +6,10 @@ the decoded text comes back out."""
 import math
 import struct
 
-from rtty import RttyDecoder, MARK_HZ, SPACE_HZ, BIT_MS, STOP_BITS, _LETTERS, _FIGURES
+from rtty import (
+    RttyDecoder, MARK_HZ, SPACE_HZ, BIT_MS, STOP_BITS, _LETTERS, _FIGURES,
+    build_rtty_pcm, text_to_baudot_codes, FIGS_CODE, LTRS_CODE,
+)
 
 SAMPLE_RATE = 8000
 
@@ -121,9 +124,51 @@ def test_back_to_back_messages():
     assert decoded2 == "SECOND MSG"
 
 
+# ---- Production encoder (rtty.py's own build_rtty_pcm) tests --
+# independent of the test-only encoder above, which exists solely to
+# validate the DECODER without depending on the code under test for
+# the send side too. These instead validate the real send path used by
+# rtty_window.py.
+
+
+def test_production_encoder_round_trips_through_production_decoder():
+    text = "CQ CQ DE N0CALL K 73 & TEST/123"
+    pcm = build_rtty_pcm(text, sample_rate=SAMPLE_RATE)
+    decoder = RttyDecoder(SAMPLE_RATE)
+    decoded = _feed_in_chunks(decoder, pcm, [37, 512, 91, 1000, 5000, 200])
+    assert decoded == text, f"expected {text!r}, got {decoded!r}"
+
+
+def test_text_to_baudot_codes_skips_unsupported_and_shifts_correctly():
+    # "A" (LTRS), "1" (FIGS), "B" (LTRS) -- must shift FIGS->LTRS between
+    # the digit and the following letter, and skip "~" entirely (no
+    # Baudot mapping for it).
+    codes = text_to_baudot_codes("A1~B")
+    assert LTRS_CODE not in codes[:1]  # starts directly in LTRS, no redundant leading shift
+    assert FIGS_CODE in codes
+    assert LTRS_CODE in codes
+    # Decode it back through the real decoder as the real end-to-end check.
+    pcm = build_rtty_pcm("A1~B", sample_rate=SAMPLE_RATE)
+    decoder = RttyDecoder(SAMPLE_RATE)
+    decoded = _feed_in_chunks(decoder, pcm, [200])
+    assert decoded == "A1B", f"expected 'A1B' (~ skipped), got {decoded!r}"
+
+
+def test_empty_or_unsendable_text_raises():
+    try:
+        build_rtty_pcm("~~~", sample_rate=SAMPLE_RATE)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for text with no sendable characters")
+
+
 if __name__ == "__main__":
     test_basic_letters()
     test_figures_shift()
     test_noise_never_produces_garbage()
     test_back_to_back_messages()
+    test_production_encoder_round_trips_through_production_decoder()
+    test_text_to_baudot_codes_skips_unsupported_and_shifts_correctly()
+    test_empty_or_unsendable_text_raises()
     print("All rtty tests passed.")

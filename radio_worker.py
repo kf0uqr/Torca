@@ -249,6 +249,7 @@ class RadioWorker(QThread):
         self._radio_cm = None
         self._stop_requested = False
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
+        self._tx_audio_future = None  # concurrent.futures.Future for the in-flight send_tx_audio_pcm coroutine, if any -- see stop_tx_audio_send
         # Which receiver's audio the RX virtual cable carries ("mix"/
         # "main"/"sub", see audio._downmix_stereo_to_mono) -- a user
         # preference for feeding an external decoder (e.g. WSJT-X on a
@@ -598,7 +599,25 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             self.error.emit("Send TX audio: not connected yet.")
             return
-        asyncio.run_coroutine_threadsafe(self._send_tx_audio_pcm(pcm_bytes), self.loop)
+        self._tx_audio_future = asyncio.run_coroutine_threadsafe(self._send_tx_audio_pcm(pcm_bytes), self.loop)
+
+    def stop_tx_audio_send(self):
+        """Thread-safe: call from the GUI thread. Aborts an in-progress
+        send_tx_audio_pcm() send (e.g. a long RTTY message the operator
+        wants to cut short) -- cancels the underlying asyncio task via
+        its concurrent.futures.Future (run_coroutine_threadsafe's
+        documented cross-thread cancellation mechanism: .cancel() posts
+        the cancel request onto the worker's own event loop rather than
+        touching asyncio state from this thread directly). _send_tx_
+        audio_pcm's try/finally still runs after cancellation (asyncio
+        raises CancelledError at the next await point inside the try,
+        which the bare `except Exception` does NOT catch -- CancelledError
+        isn't an Exception subclass since Python 3.8 -- so it passes
+        through untouched into finally), so PTT still gets unkeyed
+        properly instead of being left stuck on. A no-op if nothing is
+        currently sending."""
+        if self._tx_audio_future is not None and not self._tx_audio_future.done():
+            self._tx_audio_future.cancel()
 
     async def _send_tx_audio_pcm(self, pcm_bytes: bytes):
         push_name = find_method_name(self.radio, ["push_audio_tx_pcm", "push_tx"])
@@ -631,6 +650,9 @@ class RadioWorker(QThread):
             if stop_name:
                 await getattr(self.radio, stop_name)()
             self.audio_status.emit(f"Send TX audio: sent {len(pcm_bytes)} bytes via {push_name}().")
+        except asyncio.CancelledError:
+            self.audio_status.emit("Send TX audio: cancelled.")
+            raise
         except Exception as exc:
             self.error.emit(f"Send TX audio: {exc}")
         finally:

@@ -1,9 +1,14 @@
 """
-RTTY (radioteletype) decoder: 45.45-baud Baudot/ITA2 FSK, the standard
-amateur-radio RTTY configuration. Decode only -- no send -- since
-sending RTTY needs AFSK tone generation played over the radio's TX
-audio path, infrastructure this app doesn't have for any mode yet (the
-same reason sstv.py is decode-only).
+RTTY (radioteletype) decode AND send: 45.45-baud Baudot/ITA2 FSK, the
+standard amateur-radio RTTY configuration.
+
+Send: build_rtty_pcm(text, sample_rate) synthesizes continuous-phase
+mark/space AFSK PCM (same technique as aprs.py's build_position_packet_
+pcm -- cumulative-target-sample-count rounding so per-bit rounding
+error doesn't accumulate into real drift over a long message), handed
+to RadioWorker.send_tx_audio_pcm -- the same generic PTT-key/push-PCM/
+unkey primitive APRS send already uses; nothing here is APRS-specific,
+this module just became its second consumer.
 
 Demodulation: a quadrature (IQ) FM discriminator -- the same standard
 DSP technique sstv.py's FmDemodulator already uses for its continuous
@@ -34,6 +39,9 @@ framing. Baudot/ITA2 code table (US-TTY figures variant) per Wikipedia's
 "Baudot code" article.
 """
 
+import math
+import struct
+
 import numpy as np
 
 MARK_HZ = 2125.0
@@ -61,6 +69,18 @@ _FIGURES = [
     "5", '"', ")", "2", "#", "6", "0", "1",
     "9", "?", "&", "FIGS", ".", "/", ";", "LTRS",
 ]
+
+# Reverse lookup for encode (send) -- character -> 5-bit code. FIGS/
+# LTRS are excluded here (they're control codes, inserted by
+# text_to_baudot_codes as needed, never looked up directly). Note
+# space/CR/LF sit at the SAME index in both _LETTERS and _FIGURES
+# (indices 4/8/2), so they're transmittable without a shift either
+# way -- confirmed by inspection of the two tables above, not
+# incidental.
+_LETTERS_REV = {ch: i for i, ch in enumerate(_LETTERS) if ch not in (None, "FIGS", "LTRS")}
+_FIGURES_REV = {ch: i for i, ch in enumerate(_FIGURES) if ch not in (None, "FIGS", "LTRS")}
+FIGS_CODE = _LETTERS.index("FIGS")  # 27 -- same value in both tables (control codes, not shift-dependent)
+LTRS_CODE = _LETTERS.index("LTRS")  # 31
 
 
 class _FmDiscriminator:
@@ -283,3 +303,99 @@ class RttyDecoder:
             self._shift = "FIGS"
             return ""
         return symbol or ""
+
+
+# ---- Send (encode) ----
+#
+# Idle-mark padding before/after the real character frames -- NOT part
+# of the RTTY protocol itself, purely a settling margin so the
+# receiving terminal unit/decoder has steady mark tone to lock onto
+# before real data starts, and so the transmission doesn't end exactly
+# as the last real bit does. Same reasoning as aprs.py's
+# preamble_flags/postamble_flags (see its own docstring) -- a
+# reasonable convention, not a verified protocol constant.
+_PREAMBLE_MS = 300.0
+_POSTAMBLE_MS = 200.0
+
+# Peak amplitude for synthesized tones -- matches aprs.py's own
+# build_position_packet_pcm (12000 of int16's 32767 max, comfortable
+# headroom against clipping).
+_AMPLITUDE = 12000
+
+
+def text_to_baudot_codes(text: str) -> list:
+    """Converts `text` to a list of 5-bit Baudot/ITA2 codes (0-31),
+    inserting FIGS_CODE/LTRS_CODE shift codes wherever the current
+    shift state doesn't already cover the next character. Characters
+    with no Baudot mapping (lowercase is uppercased first; anything
+    still unmapped -- e.g. most non-ASCII input) are silently skipped,
+    same "skip what the table doesn't cover" convention cw.
+    estimate_cw_send_duration_ms already uses for unsupported
+    punctuation. Starts (and, if any shift codes were emitted, doesn't
+    necessarily end) in LTRS, matching RttyDecoder.reset()'s own
+    self._shift = "LTRS" starting assumption."""
+    codes = []
+    shift = "LTRS"
+    for char in text.upper():
+        in_letters = char in _LETTERS_REV
+        in_figures = char in _FIGURES_REV
+        if not in_letters and not in_figures:
+            continue
+        if in_letters and in_figures:
+            # Same code in both tables (space/CR/LF) -- no shift needed.
+            codes.append(_LETTERS_REV[char])
+            continue
+        required_shift = "LTRS" if in_letters else "FIGS"
+        if required_shift != shift:
+            codes.append(LTRS_CODE if required_shift == "LTRS" else FIGS_CODE)
+            shift = required_shift
+        codes.append(_LETTERS_REV[char] if in_letters else _FIGURES_REV[char])
+    return codes
+
+
+def _synthesize_fsk_pcm(units: list, sample_rate: int) -> bytes:
+    """units: list of (is_mark: bool, duration_units: float) -- one
+    entry per bit-equivalent segment, duration in BAUD unit-periods
+    (1.0 = one bit, 1.5 for the stop-bit segment). Continuous-phase
+    synthesis with cumulative-target-sample-count rounding (tracks
+    total elapsed units, not a fresh round() per segment) so per-
+    segment rounding error doesn't accumulate into real drift over a
+    long message -- same technique, same reason, as aprs.py's
+    _synthesize_afsk_pcm."""
+    samples_per_unit = sample_rate / BAUD
+    phase = 0.0
+    out = []
+    emitted = 0.0
+    cumulative_units = 0.0
+    for is_mark, duration_units in units:
+        freq = MARK_HZ if is_mark else SPACE_HZ
+        cumulative_units += duration_units
+        target_total = cumulative_units * samples_per_unit
+        n = round(target_total - emitted)
+        emitted += n
+        angular = 2.0 * math.pi * freq / sample_rate
+        for _ in range(n):
+            out.append(int(round(_AMPLITUDE * math.sin(phase))))
+            phase += angular
+    return struct.pack(f"<{len(out)}h", *out)
+
+
+def build_rtty_pcm(text: str, sample_rate: int) -> bytes:
+    """Top-level convenience: builds complete, ready-to-transmit AFSK
+    PCM (int16 mono) for `text` -- idle-mark preamble, one start+5-
+    data+1.5-stop-bit frame per Baudot code (mark=1/space=0 per bit,
+    matching RttyDecoder._decode_frame's own bit-value convention),
+    idle-mark postamble. Raises ValueError if `text` contains nothing
+    with a Baudot mapping (nothing useful to send)."""
+    codes = text_to_baudot_codes(text)
+    if not codes:
+        raise ValueError("No sendable characters (Baudot/ITA2 has no mapping for this text).")
+    units = [(True, _PREAMBLE_MS / BIT_MS)]
+    for code in codes:
+        units.append((False, 1.0))  # start bit: always space
+        for bit_index in range(5):
+            bit = (code >> bit_index) & 1
+            units.append((bool(bit), 1.0))  # LSB-first, mark=1/space=0
+        units.append((True, STOP_BITS))  # stop: always mark
+    units.append((True, _POSTAMBLE_MS / BIT_MS))
+    return _synthesize_fsk_pcm(units, sample_rate)

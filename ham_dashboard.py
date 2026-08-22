@@ -69,6 +69,7 @@ from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
 from theme import position_on_screen_half
 from world_map import WorldMapWidget
 from connection_dialog import ConnectionDialog
+from operator_profile import OperatorProfileDialog
 from main_window import RadioWindow
 from satellite_session import SatelliteSession
 from log_book_window import LogBookWindow
@@ -749,15 +750,16 @@ class HamClockWindow(QWidget):
         self.setWindowTitle("Ham Dashboard")
         position_on_screen_half(self, "right")
 
+        # main.py's OperatorProfileDialog already ran before this window
+        # was even constructed, so operator_callsign/operator_lat/
+        # operator_lon are normally already set by the time either of
+        # these runs -- both are still kept as a fallback (a genuinely
+        # first-ever run where that dialog was cancelled with nothing
+        # saved yet, or an old QSettings file from before profiles
+        # existed at all). Re-read after the operator reopens the
+        # Profile dialog later too (_on_profile_button_clicked), in
+        # case it changed.
         self._ensure_operator_callsign()
-
-        # No radio connects at startup any more -- this window is the
-        # first thing that opens, so observer location (for Doppler
-        # correction and the map marker) comes straight from QSettings
-        # (the same keys ConnectionDialog itself reads/writes) instead
-        # of from a RadioWindow's connection details. Re-read after each
-        # successful new-radio connection too (_on_connect_radio_clicked),
-        # in case that dialog updated it.
         self._load_observer_location()
 
         self.satellite_session = SatelliteSession(self)
@@ -1217,6 +1219,16 @@ class HamClockWindow(QWidget):
         )
         self.rigctld_button.clicked.connect(self._on_rigctld_button_clicked)
 
+        # Reopens the same startup operator-profile dialog (callsign +
+        # location, save/load/delete by name) -- see operator_profile.py's
+        # own docstring for why this lives here instead of the radio
+        # connection dialog. Useful for a shared club station switching
+        # operators, or one operator switching between a home and
+        # portable/POTA location, without reconnecting any radio.
+        self.profile_button = QPushButton("Profile...")
+        self.profile_button.setToolTip("Set your callsign and location, or switch to a saved profile.")
+        self.profile_button.clicked.connect(self._on_profile_button_clicked)
+
         # Singleton, non-modal -- see RadiosDialog's own docstring.
         self.radios_dialog = RadiosDialog(self)
         self.radios_button = QPushButton("Radios")
@@ -1330,6 +1342,7 @@ class HamClockWindow(QWidget):
         # Per explicit instruction, both WSJT-X buttons moved here
         # (between Radios and Log Book) from their own row.
         top_buttons_row = QHBoxLayout()
+        top_buttons_row.addWidget(self.profile_button)
         top_buttons_row.addWidget(self.radios_button)
         top_buttons_row.addWidget(self.wsjtx_button)
         top_buttons_row.addWidget(self.wsjtx_autolog_button)
@@ -1484,12 +1497,12 @@ class HamClockWindow(QWidget):
             settings.setValue("operator_callsign", callsign)
 
     def _load_observer_location(self):
-        """Reads observer_lat/lon/elevation from QSettings -- the same
-        keys ConnectionDialog itself reads/writes on every accept -- so
+        """Reads operator_lat/lon/elevation from QSettings -- the same
+        keys OperatorProfileDialog reads/writes on every accept -- so
         the map marker and Doppler correction have a location without
         needing a radio connected first. Called once at startup and
-        again after each successful new-radio connection, in case that
-        dialog just updated it."""
+        again whenever the operator reopens the Profile dialog
+        (_on_profile_button_clicked), in case it changed."""
         settings = QSettings("IcomRadioApp", "RadioControl")
         self._observer_lat = float(settings.value("operator_lat", 0.0)) or None
         self._observer_lon = float(settings.value("operator_lon", 0.0)) or None
@@ -1955,7 +1968,7 @@ class HamClockWindow(QWidget):
         if lat is None or lon is None:
             QMessageBox.warning(
                 self, "Parks",
-                "No GPS location saved yet -- set it in the Connect New Radio dialog first "
+                "No GPS location saved yet -- set it in Profile... first "
                 "(Get GPS Coordinates, or enter it manually).",
             )
             return
@@ -2438,7 +2451,7 @@ class HamClockWindow(QWidget):
         if not self._observer_lat and not self._observer_lon:
             QMessageBox.warning(
                 self, "Satellite Tracking",
-                "Set your location in Radios -> Connect New Radio... first "
+                "Set your location in Profile... first "
                 "(Latitude/Longitude/Elevation) -- satellite tracking needs "
                 "to know where you're observing from."
             )
@@ -2560,6 +2573,27 @@ class HamClockWindow(QWidget):
         self.radios_dialog.raise_()
         self.radios_dialog.activateWindow()
 
+    def _on_profile_button_clicked(self):
+        OperatorProfileDialog.run(self)
+        # Cheap either way (accepted or cancelled) -- just re-reads
+        # QSettings and re-pushes to whatever already consumes it, same
+        # "always just re-read" approach _load_observer_location's own
+        # docstring already takes. Refreshes self._operator_callsign
+        # too, in case the profile dialog changed it (a plain re-read
+        # here is simpler than threading a signal out of a dialog whose
+        # whole job is a QSettings side effect -- see its own docstring).
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        self._operator_callsign = settings.value("operator_callsign", "") or ""
+        self._load_observer_location()
+        self.satellite_session.set_observer_location(
+            self._observer_lat, self._observer_lon, self._observer_elevation_m
+        )
+        if self._observer_lat is not None and self._observer_lon is not None:
+            self.map_widget.set_operator_location(
+                self._observer_lat, self._observer_lon,
+                f"{self._observer_lat:.3f}, {self._observer_lon:.3f}",
+            )
+
     def _on_connect_radio_clicked(self):
         # Restricts the role combo to whatever still makes sense given
         # already-connected radios (e.g. Downlink/Uplink hidden once a
@@ -2570,19 +2604,6 @@ class HamClockWindow(QWidget):
         if dialog.exec() != QDialog.Accepted:
             return
         details = dialog.details
-
-        # ConnectionDialog may have just updated the saved location --
-        # re-read and push it to the map/session so it's not stuck on
-        # whatever was there (or nothing) at startup.
-        self._load_observer_location()
-        self.satellite_session.set_observer_location(
-            self._observer_lat, self._observer_lon, self._observer_elevation_m
-        )
-        if self._observer_lat is not None and self._observer_lon is not None:
-            self.map_widget.set_operator_location(
-                self._observer_lat, self._observer_lon,
-                f"{self._observer_lat:.3f}, {self._observer_lon:.3f}",
-            )
 
         window = RadioWindow(details, self.satellite_session)
         window.closed.connect(self._on_radio_window_closed)

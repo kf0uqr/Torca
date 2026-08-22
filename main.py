@@ -51,6 +51,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from ham_dashboard import HamClockWindow
+from operator_profile import OperatorProfileDialog
 from theme import apply_dark_theme
 
 # Diagnostic only -- TORCA_DEBUG_RIGPLANE=1 python3 main.py. Surfaces
@@ -68,6 +69,15 @@ if os.environ.get("TORCA_DEBUG_RIGPLANE"):
 def main():
     app = QApplication(sys.argv)
     apply_dark_theme(app)
+
+    # First thing on every launch: who's operating, and from where.
+    # Purely a QSettings side effect (operator_callsign/operator_lat/
+    # operator_lon/operator_elevation_m) -- see operator_profile.py's
+    # own docstring. Cancelling just proceeds with whatever was already
+    # saved (or blank, on a genuinely first-ever run) rather than
+    # blocking startup -- same non-blocking precedent as this app's
+    # older single-field callsign prompt.
+    OperatorProfileDialog.run()
 
     window = HamClockWindow()
     window.show()

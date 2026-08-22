@@ -6,7 +6,7 @@ import math
 
 from map_tiles import (
     content_y_to_lat, lat_to_tile_y, tile_y_to_lat, _tile_cache_path,
-    MERCATOR_LAT_LIMIT, TILE_CACHE_DIR,
+    MERCATOR_LAT_LIMIT, TILE_CACHE_DIR, _TILE_CACHE_DIRS,
 )
 
 
@@ -62,13 +62,23 @@ def test_tile_y_to_lat_zero_row_is_near_top():
 
 
 def test_tile_cache_path_scheme():
-    path = _tile_cache_path(7, 3, 5)
+    path = _tile_cache_path("osm", 7, 3, 5)
     assert path == TILE_CACHE_DIR / "7" / "3" / "5.png"
 
 
 def test_tile_cache_path_unique_per_coordinate():
-    paths = {_tile_cache_path(z, x, y) for z, x, y in [(1, 0, 0), (1, 1, 0), (1, 0, 1), (2, 0, 0)]}
+    paths = {_tile_cache_path("osm", z, x, y) for z, x, y in [(1, 0, 0), (1, 1, 0), (1, 0, 1), (2, 0, 0)]}
     assert len(paths) == 4
+
+
+def test_tile_cache_path_unique_per_layer():
+    # Same (z, x, y) but different layers must not collide onto the
+    # same on-disk file -- they're two entirely different images.
+    osm_path = _tile_cache_path("osm", 5, 2, 3)
+    sat_path = _tile_cache_path("satellite", 5, 2, 3)
+    assert osm_path != sat_path
+    assert osm_path.parent.parent.parent == _TILE_CACHE_DIRS["osm"]
+    assert sat_path.parent.parent.parent == _TILE_CACHE_DIRS["satellite"]
 
 
 if __name__ == "__main__":
@@ -81,6 +91,7 @@ if __name__ == "__main__":
         test_tile_y_to_lat_zero_row_is_near_top,
         test_tile_cache_path_scheme,
         test_tile_cache_path_unique_per_coordinate,
+        test_tile_cache_path_unique_per_layer,
     ]
     for test in tests:
         test()

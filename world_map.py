@@ -49,6 +49,7 @@ class WorldMapWidget(QWidget):
         self._tile_cache = map_tiles.TileCache()
         self._tile_fetcher = map_tiles.TileFetcher(self)
         self._tile_fetcher.tile_ready.connect(self._on_tile_ready)
+        self._map_layer = map_tiles.DEFAULT_LAYER  # "osm" or "satellite" -- see _on_satellite_layer_toggled
         self._satellite_mode = False
         self._satellite_positions = []  # list of {"name", "lat", "lon", "altitude_km", "footprint"}
         self._qso_markers = []  # list of {"lat", "lon", "band", "time", "callsign"} -- see set_qso_markers
@@ -142,6 +143,26 @@ class WorldMapWidget(QWidget):
         self.zoom_out_button.setStyleSheet(button_style)
         self.zoom_out_button.setToolTip("Zoom out")
         self.zoom_out_button.clicked.connect(self._on_zoom_out_clicked)
+
+        # Satellite-imagery layer toggle -- a separate, wider button
+        # below the two zoom buttons (checkable, so its own pressed
+        # style doubles as the "currently on" indicator, same idiom as
+        # ham_dashboard.py's own toggle buttons e.g. aprs_button). Labeled
+        # "Sat" per explicit instruction -- the tooltip ("Toggle
+        # satellite imagery") is what actually disambiguates it from the
+        # UNRELATED satellite TRACKING feature (self._satellite_mode)
+        # elsewhere in this same widget.
+        toggle_button_style = button_style + (
+            "QPushButton:checked { background-color: rgba(70, 120, 200, 220); }"
+        )
+        self._LAYER_BUTTON_WIDTH = 40
+        self.satellite_layer_button = QPushButton("Sat", self)
+        self.satellite_layer_button.setFixedSize(self._LAYER_BUTTON_WIDTH, self._ZOOM_BUTTON_SIZE)
+        self.satellite_layer_button.setStyleSheet(toggle_button_style)
+        self.satellite_layer_button.setToolTip("Toggle satellite imagery")
+        self.satellite_layer_button.setCheckable(True)
+        self.satellite_layer_button.toggled.connect(self._on_satellite_layer_toggled)
+
         self._position_zoom_buttons()
 
     def shutdown_tile_fetcher(self):
@@ -166,6 +187,11 @@ class WorldMapWidget(QWidget):
         y = self._ZOOM_BUTTON_MARGIN
         self.zoom_in_button.move(x, y)
         self.zoom_out_button.move(x, y + self._ZOOM_BUTTON_SIZE + 4)
+        self.satellite_layer_button.move(x, y + 2 * (self._ZOOM_BUTTON_SIZE + 4))
+
+    def _on_satellite_layer_toggled(self, checked):
+        self._map_layer = "satellite" if checked else "osm"
+        self.update()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -181,12 +207,15 @@ class WorldMapWidget(QWidget):
         self._path_animation_progress = (self._path_animation_progress + self._PATH_ANIMATION_SPEED) % 1.0
         self.update()
 
-    def _on_tile_ready(self, z, x, y, path):
+    def _on_tile_ready(self, layer, z, x, y, path):
         # Just triggers a repaint -- _draw_map_tiles re-checks
         # self._tile_cache.get(...) itself next paintEvent (which now
         # finds this tile decoded and ready, having just been written to
         # disk by the fetch worker), rather than this handler pushing the
-        # pixmap in directly.
+        # pixmap in directly. Repaints even for a tile from the layer
+        # NOT currently shown (a background fetch that was in flight
+        # when the operator toggled layers) -- harmless, just an extra
+        # paintEvent, simpler than filtering by self._map_layer here.
         self.update()
 
     def set_operator_location(self, lat, lon, label=""):
@@ -325,12 +354,13 @@ class WorldMapWidget(QWidget):
             painter.setBrush(QColor(255, 215, 0))
             painter.drawEllipse(QPointF(sx, sy), 3, 3)
 
-        # Attribution -- required by the OSM Tile Usage Policy, must stay
-        # visible unconditionally (not gated on a successful fetch, since
-        # tiles are always the background now, not an optional extra).
-        # Fixed corner label regardless of zoom/pan.
+        # Attribution -- required by both tile sources' own usage terms,
+        # must stay visible unconditionally (not gated on a successful
+        # fetch, since tiles are always the background now, not an
+        # optional extra) and swap to match whichever layer is actually
+        # showing. Fixed corner label regardless of zoom/pan.
         painter.setPen(QColor(200, 200, 200, 180))
-        painter.drawText(QPointF(6, h - 6), map_tiles.MAP_ATTRIBUTION)
+        painter.drawText(QPointF(6, h - 6), map_tiles.attribution_for(self._map_layer))
 
     def _draw_map_tiles(self, painter, w, h):
         """Draws every OSM tile overlapping the currently-visible content-
@@ -379,11 +409,11 @@ class WorldMapWidget(QWidget):
             y_bottom = self._lonlat_to_xy(lat_bottom_row, 0, w, h)[1]
             for tx in range(x0, x1 + 1):
                 rect = QRectF(tx * tile_w, y_top, tile_w, y_bottom - y_top)
-                pixmap = self._tile_cache.get(draw_zoom, tx, ty)
+                pixmap = self._tile_cache.get(self._map_layer, draw_zoom, tx, ty)
                 if pixmap is not None:
                     painter.drawPixmap(rect, pixmap, QRectF(pixmap.rect()))
                 else:
-                    self._tile_fetcher.request(draw_zoom, tx, ty)
+                    self._tile_fetcher.request(self._map_layer, draw_zoom, tx, ty)
 
     # Samples the terminator curve every 2 degrees of longitude -- smooth
     # enough to look like a real curve (not a jagged staircase) at any

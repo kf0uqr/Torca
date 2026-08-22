@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
 )
 
 from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
-from aprs import AprsDecoder, build_position_packet_pcm
+from aprs import AprsDecoder, build_position_packet_pcm, symbol_description
 from direwolf_backend import DirewolfBackend, direwolf_available
 
 _COLUMNS = ["Time", "Source", "Destination", "Type", "Details"]
@@ -61,7 +61,16 @@ def _format_packet_details(info):
     if info is None:
         return "(no info field)"
     if info["type"] == "position":
-        details = f"{info['lat']:.5f}, {info['lon']:.5f}  [{info['symbol_table']}{info['symbol_code']}]"
+        # Translates the raw two-character symbol table/code (e.g.
+        # "/-") into its official human-readable name (e.g. "House QTH
+        # (VHF)") via aprs.py's SYMBOL_TABLE_PRIMARY/ALTERNATE -- the
+        # raw code is still shown alongside it in brackets, both for
+        # operators who already know the codes by heart and as a
+        # fallback for symbols the table doesn't have a name for.
+        symbol_name = symbol_description(info["symbol_table"], info["symbol_code"])
+        symbol_code = f"{info['symbol_table']}{info['symbol_code']}"
+        symbol_part = f"{symbol_name} [{symbol_code}]" if symbol_name else f"[{symbol_code}]"
+        details = f"{info['lat']:.5f}, {info['lon']:.5f}  {symbol_part}"
         if info["comment"]:
             details += f"  {info['comment']}"
         return details

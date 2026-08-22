@@ -279,6 +279,90 @@ def _parse_longitude(text):
     return -value if text[8] == "W" else value
 
 
+# Official APRS symbol table -- public reference, not project-specific
+# (same "public standard, not project-specific" framing cw.py's own
+# MORSE_CODE_TABLE and rtty.py's Baudot table document for themselves),
+# transcribed directly from aprs.org/symbols/symbolsX.txt (Bob
+# Bruninga WB4APR, the APRS protocol's own originator -- THE master
+# symbol list). Two tables of 94 printable-ASCII symbol codes each
+# ("!" through "~"), selected by the position report's own table
+# character ("/" = primary, "\" = alternate -- see parse_aprs_info).
+# Codes the source document itself marks unassigned/reserved/"TBD"/
+# "AVAIL" are simply absent here (symbol_description() below returns
+# None for those, same "no entry -- nothing to translate" convention
+# CwDecoder uses for an unmapped mark/space sequence) rather than
+# guessing a name for something the spec itself doesn't define yet.
+SYMBOL_TABLE_PRIMARY = {
+    "!": "Police, Sheriff", "#": "Digipeater", "$": "Phone", "%": "DX Cluster",
+    "&": "HF Gateway", "'": "Small Aircraft", "(": "Mobile Satellite Station",
+    ")": "Wheelchair (Handicapped)", "*": "Snowmobile", "+": "Red Cross",
+    ",": "Boy Scouts", "-": "House QTH (VHF)", ".": "X", "/": "Red Dot",
+    ":": "Fire", ";": "Campground (Portable Ops)", "<": "Motorcycle",
+    "=": "Railroad Engine", ">": "Car", "?": "Server for Files",
+    "@": "Hurricane Predicted Track", "A": "Aid Station", "B": "BBS or PBBS",
+    "C": "Canoe", "E": "Eyeball (Events, etc)", "F": "Farm Vehicle (Tractor)",
+    "G": "Grid Square (6 digit)", "H": "Hotel", "I": "TCP/IP on Air Network Station",
+    "K": "School", "L": "PC User", "M": "MacAPRS", "N": "NTS Station",
+    "O": "Balloon", "P": "Police", "R": "Recreational Vehicle", "S": "Shuttle",
+    "T": "SSTV", "U": "Bus", "V": "ATV", "W": "National WX Service Site",
+    "X": "Helicopter", "Y": "Yacht (Sail)", "Z": "WinAPRS", "[": "Human/Person",
+    "\\": "Triangle (DF Station)", "]": "Mail/Post Office", "^": "Large Aircraft",
+    "_": "Weather Station", "`": "Dish Antenna",
+    "a": "Ambulance", "b": "Bike", "c": "Incident Command Post",
+    "d": "Fire Department", "e": "Horse (Equestrian)", "f": "Fire Truck",
+    "g": "Glider", "h": "Hospital", "i": "IOTA (Islands on the Air)",
+    "j": "Jeep", "k": "Truck", "l": "Laptop", "m": "Mic-E Repeater",
+    "n": "Node (Black Bulls-eye)", "o": "EOC", "p": "Rover (Dog)",
+    "q": "Grid Square Shown Above 128m", "r": "Repeater", "s": "Ship (Power Boat)",
+    "t": "Truck Stop", "u": "Truck (18 Wheeler)", "v": "Van", "w": "Water Station",
+    "x": "xAPRS (Unix)", "y": "Yagi @ QTH", "|": "TNC Stream Switch",
+    "~": "TNC Stream Switch",
+}
+SYMBOL_TABLE_ALTERNATE = {
+    "!": "Emergency", "#": "Overlay Digipeater (Green Star)", "$": "Bank or ATM",
+    "%": "Power Plant (with Overlay)", "&": "Gateway", "'": "Crash / Incident Site",
+    "(": "Cloudy", ")": "Firenet MEO, MODIS Earth Observation", "+": "Church",
+    ",": "Girl Scouts", "-": "House", ".": "Ambiguous (Big Question Mark)",
+    "/": "Waypoint Destination", "0": "Circle (IRLP/Echolink/WIRES)",
+    "8": "802.11 or Other Network Node", "9": "Gas Station", ";": "Park/Picnic",
+    "<": "Advisory (Single WX Flag)", ">": "Overlayed Car/Vehicle",
+    "?": "Info Kiosk", "@": "Hurricane/Tropical Storm",
+    "A": "Overlay Box: DTMF, RFID, XO", "C": "Coast Guard", "D": "Depots",
+    "E": "Smoke (& Other Visibility Codes)", "H": "Haze (& Overlay Hazards)",
+    "I": "Rain Shower", "K": "Kenwood HT", "L": "Lighthouse",
+    "M": "MARS (Army/Navy/Air Force)", "N": "Navigation Buoy",
+    "O": "Overlay Balloon (Rocket)", "P": "Parking", "Q": "Earthquake",
+    "R": "Restaurant", "S": "Satellite/Pacsat", "T": "Thunderstorm", "U": "Sunny",
+    "V": "VORTAC Nav Aid", "W": "NWS Site", "X": "Pharmacy (Rx)",
+    "Y": "Radios and Devices", "[": "W. Cloud (& Humans with Overlay)",
+    "\\": "New Overlayable GPS Symbol", "^": "Aircraft (with Overlay)",
+    "_": "WX Site (Green Digi)", "`": "Rain (All Types, with Overlay)",
+    "a": "ARRL, ARES, WinLINK, D-STAR, etc", "c": "CD Triangle: RACES/SATERN/etc",
+    "d": "DX Spot by Callsign", "e": "Sleet", "f": "Funnel Cloud", "g": "Gale Flags",
+    "h": "Store / Hamfest", "i": "Box or Points of Interest",
+    "j": "Work Zone (Steam Shovel)", "k": "Special Vehicle (SUV, ATV, 4x4)",
+    "l": "Area (Box, Circle, etc)", "m": "Value Sign (3-digit Display)",
+    "n": "Overlay Triangle", "o": "Small Circle", "r": "Restrooms",
+    "s": "Overlay Ship/Boat", "t": "Tornado", "u": "Overlayed Truck",
+    "v": "Overlayed Van", "w": "Flooding (Avalanches/Slides)",
+    "x": "Wreck or Obstruction", "y": "Skywarn", "z": "Overlayed Shelter",
+    "|": "TNC Stream Switch", "~": "TNC Stream Switch",
+}
+
+
+def symbol_description(symbol_table: str, symbol_code: str):
+    """Human-readable name for a decoded position report's symbol_
+    table/symbol_code pair (e.g. "/" + "-" -> "House QTH (VHF)"), or
+    None if that combination isn't in the official symbol set above
+    (either genuinely unassigned in the spec, or an overlay-table digit/
+    letter '0'-'9'/'A'-'Z' selecting an alphanumeric OVERLAY on the
+    alternate table rather than one of the two base tables themselves --
+    APRS101's own overlay mechanism, not something with a single fixed
+    name to report)."""
+    table = SYMBOL_TABLE_PRIMARY if symbol_table == "/" else SYMBOL_TABLE_ALTERNATE
+    return table.get(symbol_code)
+
+
 def parse_aprs_info(info_bytes: bytes):
     """Parses an APRS info field. Full structured support for
     uncompressed position reports (data type '!'/'='/'/'/'@' -- format

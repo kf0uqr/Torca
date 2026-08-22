@@ -122,7 +122,13 @@ async def _try_recall_band_stack(radio, band_code, register=BAND_STACKING_REGIST
     if freq_hz is None:
         return None, f"get_bsr returned no frequency_hz (result={result!r})"
     try:
-        await radio.set_frequency(freq_hz)
+        # Explicit receiver=RECEIVER_MAIN -- see RadioWorker._set_
+        # frequency's own comment for why a bare call here isn't
+        # reliable (it depends on Main genuinely being the radio's
+        # currently-active receiver, which isn't guaranteed at this
+        # point -- e.g. right after a band-conflict resolution moved
+        # Sub out of the way).
+        await radio.set_frequency(freq_hz, receiver=RECEIVER_MAIN)
     except Exception as exc:
         return None, f"set_frequency({freq_hz}) failed: {exc}"
     return freq_hz, None
@@ -1865,7 +1871,26 @@ class RadioWorker(QThread):
         if check_conflict:
             await self._resolve_receiver_band_conflict(RECEIVER_MAIN, freq_hz)
         try:
-            await self.radio.set_frequency(freq_hz)
+            # Explicit receiver=RECEIVER_MAIN, not a bare call -- per
+            # rigplane's own set_freq() source (runtime/radio.py),
+            # receiver=RECEIVER_MAIN(0) always routes straight to its
+            # internal _set_frequency_main(), a DIFFERENT, unconditional
+            # code path from the receiver=SUB branch (which goes through
+            # cmd29/fallback addressing instead) -- it does not depend
+            # on which receiver the radio currently considers "active" at
+            # all. A bare call (previously here) relies on select_
+            # receiver_band_conflict having correctly restored Main as
+            # active moments earlier, on real hardware, before this next
+            # await even runs -- confirmed live on a real 9700 that this
+            # was NOT reliable (a real "Main still doesn't reach the band
+            # Sub was on" report persisted even after that restore was
+            # added), the same "separately-dispatched receiver-state-
+            # dependent commands aren't guaranteed to land in order"
+            # class of bug already documented at length elsewhere in this
+            # file (see select_vfo_and_set_frequency's own docstring).
+            # Addressing Main explicitly sidesteps the ordering question
+            # entirely instead of trying to win the race.
+            await self.radio.set_frequency(freq_hz, receiver=RECEIVER_MAIN)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -2867,7 +2892,9 @@ class RadioWorker(QThread):
             return
 
         try:
-            await self.radio.set_frequency(low_edge_hz)
+            # Explicit receiver=RECEIVER_MAIN -- see _set_frequency's
+            # own comment for why a bare call isn't reliable here.
+            await self.radio.set_frequency(low_edge_hz, receiver=RECEIVER_MAIN)
         except Exception as exc:
             self.error.emit(f"Band: setting frequency failed ({exc}).")
 

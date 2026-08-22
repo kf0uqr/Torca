@@ -6,7 +6,7 @@ comes back out correctly."""
 import math
 import struct
 
-from aprs import AprsDecoder, MARK_HZ, SPACE_HZ, BAUD, FLAG_BYTE, _crc16_x25
+from aprs import AprsDecoder, MARK_HZ, SPACE_HZ, BAUD, FLAG_BYTE, _crc16_x25, build_position_packet_pcm
 
 SAMPLE_RATE = 22050
 
@@ -185,9 +185,34 @@ def test_back_to_back_packets():
     assert len(packets2) == 1 and packets2[0]["source"] == "W2BBB"
 
 
+def test_production_encoder_round_trips_through_production_decoder():
+    """Unlike the tests above (which use THIS FILE's own independent
+    encoder to validate the decoder), this exercises aprs.py's real
+    send-side encoder (build_position_packet_pcm, used by aprs_window.py's
+    Send Packet dialog) against aprs.py's real decoder -- the actual
+    code path an operator sending a packet from this app would use."""
+    pcm = build_position_packet_pcm(
+        "N0CALL-9", "APRS", 49.058333, -72.029167, "/", "-", "Test 001234",
+        sample_rate=SAMPLE_RATE, digipeaters=["WIDE1-1", "WIDE2-1"],
+    )
+    decoder = AprsDecoder(SAMPLE_RATE)
+    packets = _feed_in_chunks(decoder, pcm, [37, 101, 512, 1200])
+    assert len(packets) == 1, packets
+    packet = packets[0]
+    assert packet["source"] == "N0CALL-9", packet
+    assert packet["destination"] == "APRS", packet
+    assert packet["digipeaters"] == ["WIDE1-1", "WIDE2-1"], packet
+    info = packet["info"]
+    assert info["type"] == "position", info
+    assert abs(info["lat"] - 49.058333) < 1e-3, info
+    assert abs(info["lon"] - (-72.029167)) < 1e-3, info
+    assert info["comment"] == "Test 001234", info
+
+
 if __name__ == "__main__":
     test_basic_position_report()
     test_with_ssid_and_digipeaters()
     test_noise_never_produces_garbage()
     test_back_to_back_packets()
+    test_production_encoder_round_trips_through_production_decoder()
     print("All aprs tests passed.")

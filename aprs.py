@@ -1,10 +1,17 @@
 """
-APRS (Automatic Packet Reporting System) decoder: 1200-baud Bell 202
-AFSK over AX.25/HDLC framing, the standard VHF packet configuration
-(144.390 MHz in North America). Decode only -- no transmit -- for the
-same reason cw.py/rtty.py's decode-only siblings are: sending needs
-AFSK tone generation over the radio's TX audio path, infrastructure
-this app doesn't have for any mode yet.
+APRS (Automatic Packet Reporting System) decoder/encoder: 1200-baud
+Bell 202 AFSK over AX.25/HDLC framing, the standard VHF packet
+configuration (144.390 MHz in North America).
+
+Send support (position reports only, matching the decode side's own
+scope) was added after confirming this app DOES have a working path to
+push arbitrary synthesized PCM into a real radio's TX audio input --
+rigplane's push_audio_tx_pcm()/push_tx() family (see radio_worker.py's
+send_tx_audio_pcm, a generic "key PTT, stream this PCM, unkey"
+primitive not specific to APRS) -- unlike cw.py's send (the radio's
+own built-in keyer, no audio at all) and rtty.py/sstv.py's still-
+decode-only siblings (not yet wired up to this same TX audio path,
+though nothing about it is APRS-specific).
 
 Standard parameters (verified against public references, not guessed --
 same "public standard, not project-specific" reasoning cw.py's
@@ -45,6 +52,9 @@ _AfskBitSync) rather than two separate stages, precisely because each
 bit's Goertzel window has to be sample-aligned to that bit's own
 boundaries to mean anything.
 """
+
+import math
+import struct
 
 from cw import GoertzelDetector
 
@@ -221,7 +231,7 @@ def _decode_address(raw7):
     return (f"{chars}-{ssid}" if ssid else chars), is_last
 
 
-def _parse_ax25_frame(payload: bytes):
+def parse_ax25_frame(payload: bytes):
     """Parses address/control/PID/info out of a CRC-verified AX.25
     frame payload (no FCS). Returns None if the address field or
     control/PID bytes don't look like a valid AX.25 UI frame."""
@@ -320,6 +330,178 @@ def parse_aprs_info(info_bytes: bytes):
     return {"type": "other", "raw": text}
 
 
+# ---- Encoding (send) -------------------------------------------------
+
+def _format_latitude(lat: float) -> str:
+    """Inverse of _parse_latitude -- ddmm.hhN/S, per APRS101.PDF
+    Chapter 8 (see parse_aprs_info's own docstring)."""
+    if not -90.0 <= lat <= 90.0:
+        raise ValueError(f"Latitude out of range: {lat}")
+    hemisphere = "N" if lat >= 0 else "S"
+    lat = abs(lat)
+    degrees = int(lat)
+    minutes = (lat - degrees) * 60.0
+    return f"{degrees:02d}{minutes:05.2f}{hemisphere}"
+
+
+def _format_longitude(lon: float) -> str:
+    """Inverse of _parse_longitude -- dddmm.hhE/W."""
+    if not -180.0 <= lon <= 180.0:
+        raise ValueError(f"Longitude out of range: {lon}")
+    hemisphere = "E" if lon >= 0 else "W"
+    lon = abs(lon)
+    degrees = int(lon)
+    minutes = (lon - degrees) * 60.0
+    return f"{degrees:03d}{minutes:05.2f}{hemisphere}"
+
+
+def encode_position_info(lat: float, lon: float, symbol_table: str, symbol_code: str, comment: str = "") -> bytes:
+    """Builds an APRS info field for an uncompressed position report
+    without a timestamp ('!', no APRS messaging capability declared --
+    matches this app's own scope, which never sends/receives APRS
+    messages, only position reports). Inverse of parse_aprs_info's
+    "!"/"=" branch. Comment is truncated to APRS101.PDF's own stated
+    43-character max for this field."""
+    text = "!" + _format_latitude(lat) + symbol_table + _format_longitude(lon) + symbol_code + comment[:43]
+    return text.encode("ascii", errors="replace")
+
+
+def _encode_address(callsign: str, is_last: bool) -> bytes:
+    """One 7-byte AX.25 address field -- inverse of _decode_address.
+    `callsign` may include a "-N" SSID suffix (e.g. "N0CALL-9"); bare
+    callsigns get SSID 0. Bits 7-5 of the SSID byte are set to 1
+    (reserved/C-bit, matching what real TNCs transmit and what
+    _decode_address already ignores on receive), bit 0 is the last-
+    address flag."""
+    if "-" in callsign:
+        call, ssid_text = callsign.split("-", 1)
+        ssid = int(ssid_text)
+    else:
+        call, ssid = callsign, 0
+    if not 0 <= ssid <= 15:
+        raise ValueError(f"SSID out of range 0-15: {ssid}")
+    call = call.upper().ljust(6)[:6]
+    raw = bytearray(b << 1 for b in call.encode("ascii"))
+    raw.append(0b01100000 | (ssid << 1) | (1 if is_last else 0))
+    return bytes(raw)
+
+
+def _bit_stuff(bits: list) -> list:
+    """Inserts a 0 after every 5 consecutive 1s -- inverse of the
+    destuffing _HdlcDeframer.process() does on receive."""
+    out = []
+    ones_run = 0
+    for bit in bits:
+        out.append(bit)
+        if bit:
+            ones_run += 1
+            if ones_run == 5:
+                out.append(False)
+                ones_run = 0
+        else:
+            ones_run = 0
+    return out
+
+
+def _byte_to_bits(byte: int) -> list:
+    """LSB-first bit order -- the wire order every other byte in an
+    AX.25 frame uses too (see _HdlcDeframer._bits_to_frame's own
+    LSB-first unpacking on receive)."""
+    return [bool((byte >> i) & 1) for i in range(8)]
+
+
+def _bytes_to_bits(data: bytes) -> list:
+    bits = []
+    for byte in data:
+        bits.extend(_byte_to_bits(byte))
+    return bits
+
+
+def _nrzi_encode(bits: list) -> list:
+    """NRZI: a "1" bit is no tone change, a "0" bit toggles the tone.
+    Starts on mark (True), matching the idle-line convention this
+    module's own docstring documents. Returns one bool (True=mark) per
+    input bit."""
+    tones = []
+    current = True
+    for bit in bits:
+        if not bit:
+            current = not current
+        tones.append(current)
+    return tones
+
+
+def _synthesize_afsk_pcm(tones: list, sample_rate: int) -> bytes:
+    """Continuous-phase Bell 202 AFSK audio (int16 mono PCM bytes) for
+    a sequence of per-bit tone booleans (True=mark/1200Hz, False=
+    space/2200Hz). Tracks cumulative ideal sample count (not a fixed
+    round() per bit) so per-bit rounding error doesn't accumulate into
+    real drift over a long packet -- confirmed necessary via
+    test_aprs.py's own encoder, which had exactly this bug until
+    fixed."""
+    samples_per_bit = sample_rate / BAUD
+    phase = 0.0
+    out = []
+    emitted = 0.0
+    for i, tone in enumerate(tones):
+        freq = MARK_HZ if tone else SPACE_HZ
+        target_total = (i + 1) * samples_per_bit
+        n = round(target_total - emitted)
+        emitted += n
+        angular = 2.0 * math.pi * freq / sample_rate
+        for _ in range(n):
+            out.append(int(round(12000 * math.sin(phase))))
+            phase += angular
+    return struct.pack(f"<{len(out)}h", *out)
+
+
+def build_ax25_ui_frame_bits(source: str, destination: str, info: bytes, digipeaters=(),
+                              preamble_flags: int = 50, postamble_flags: int = 3) -> list:
+    """Builds the complete bit sequence (preamble flags + bit-stuffed
+    address/control/PID/info/FCS + postamble flags) for one AX.25 UI
+    frame, ready for _nrzi_encode/_synthesize_afsk_pcm. `source`/
+    `destination`/each entry in `digipeaters` may include a "-N" SSID
+    suffix. Control=0x03/PID=0xF0 (UI frame, no layer 3) and the CRC-16/
+    X-25 FCS are the same verified values parse_ax25_frame/_crc16_x25
+    check for on receive.
+
+    preamble_flags/postamble_flags: NOT part of the AX.25/APRS
+    protocol itself -- purely a settling margin so the receiving
+    radio/TNC's own PLL and squelch have time to lock before real data
+    starts (and so the transmission doesn't end exactly as the last
+    real bit does). 50 preamble flags is roughly 333ms at 1200 baud,
+    in the same ballpark as common real-world TNC TXDELAY defaults
+    (e.g. Direwolf's own default is 300ms) -- a reasonable convention,
+    not a verified protocol constant, and callers are free to pass a
+    different value."""
+    addresses = [_encode_address(destination, False)]
+    chain = [source] + list(digipeaters)
+    for i, callsign in enumerate(chain):
+        addresses.append(_encode_address(callsign, i == len(chain) - 1))
+    payload = b"".join(addresses) + bytes([0x03, 0xF0]) + info
+    crc = _crc16_x25(payload)
+    fcs = bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+    full_payload = payload + fcs
+
+    flag_bits = _byte_to_bits(FLAG_BYTE)
+    data_bits = _bit_stuff(_bytes_to_bits(full_payload))
+    return flag_bits * preamble_flags + data_bits + flag_bits * postamble_flags
+
+
+def build_position_packet_pcm(source: str, destination: str, lat: float, lon: float,
+                               symbol_table: str, symbol_code: str, comment: str,
+                               sample_rate: int, digipeaters=()) -> bytes:
+    """Top-level convenience: builds a complete, ready-to-transmit AFSK
+    PCM byte string for one APRS position report. Used by aprs_window.py's
+    Send Packet dialog via RadioWorker.send_tx_audio_pcm (radio_worker.py),
+    which handles the actual PTT-key/push/unkey sequencing -- this
+    function only produces audio bytes, it never touches a radio."""
+    info = encode_position_info(lat, lon, symbol_table, symbol_code, comment)
+    bits = build_ax25_ui_frame_bits(source, destination, info, digipeaters)
+    tones = _nrzi_encode(bits)
+    return _synthesize_afsk_pcm(tones, sample_rate)
+
+
 class AprsDecoder:
     """Feed it raw PCM audio (int16, mono, `sample_rate` Hz) via
     .feed(pcm_bytes) -- returns a list of newly-decoded packets from
@@ -350,7 +532,7 @@ class AprsDecoder:
 
         packets = []
         for raw in raw_frames:
-            parsed = _parse_ax25_frame(raw)
+            parsed = parse_ax25_frame(raw)
             if parsed is None:
                 continue
             parsed["info"] = parse_aprs_info(parsed["info"]) if parsed["info"] else None

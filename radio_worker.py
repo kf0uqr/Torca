@@ -88,6 +88,7 @@ from constants import (
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
     AUDIO_DEVICE_SYSTEM_DEFAULT,
+    AUDIO_TX_PCM_FRAME_BYTES,
 )
 from rig_discovery import find_method_name
 from audio import AudioBridge
@@ -566,6 +567,81 @@ class RadioWorker(QThread):
                 f"PTT: radio.set_ptt(False) FAILED ({exc}) -- radio may still be keyed! "
                 "Check the radio directly."
             )
+
+    def send_tx_audio_pcm(self, pcm_bytes: bytes):
+        """Thread-safe: call from the GUI thread. Generic "key PTT,
+        stream this pre-synthesized PCM out to the radio, unkey"
+        primitive -- not specific to any one mode. First consumer:
+        aprs_window.py's Send Packet (AFSK audio built by aprs.py's
+        build_position_packet_pcm), but nothing here is APRS-specific;
+        rtty.py/sstv.py could use this same method for their own send
+        sides later.
+
+        Deliberately does NOT go through self.audio_bridge (which only
+        ever forwards audio actually captured from a real microphone,
+        see audio.py's own docstring) -- resolves and calls the same
+        underlying rigplane TX-audio methods AudioBridge does
+        (start_audio_tx_pcm/push_audio_tx_pcm/stop_audio_tx_pcm, or the
+        generic start_tx/push_tx/stop_tx fallback) directly on
+        self.radio, confirmed via reading rigplane's own backends
+        (Icom serial/USB, Yaesu CAT, LAN) that push_audio_tx_pcm()
+        just writes raw PCM bytes to a TX audio stream/queue with no
+        microphone involved anywhere in that path -- so a program can
+        feed it synthesized audio exactly the same way. pcm_bytes must
+        already be at AUDIO_TX_PCM_SAMPLE_RATE (48000 Hz, mono,
+        s16le) -- confirmed via a real push_audio_tx_pcm() runtime
+        error ("PCM frame size mismatch: expected 1920 bytes (20ms at
+        48000Hz, 1ch s16le)") that this format is a hard requirement,
+        not just this app's own RX convention -- callers (aprs.py's
+        encoder) generate audio at that rate directly rather than
+        resampling."""
+        if self.loop is None or self.radio is None:
+            self.error.emit("Send TX audio: not connected yet.")
+            return
+        asyncio.run_coroutine_threadsafe(self._send_tx_audio_pcm(pcm_bytes), self.loop)
+
+    async def _send_tx_audio_pcm(self, pcm_bytes: bytes):
+        push_name = find_method_name(self.radio, ["push_audio_tx_pcm", "push_tx"])
+        if push_name is None:
+            self.error.emit("Send TX audio: this radio/connection has no TX audio push method available.")
+            return
+        start_name = find_method_name(self.radio, ["start_audio_tx_pcm", "start_tx"])
+        stop_name = find_method_name(self.radio, ["stop_audio_tx_pcm", "stop_tx"])
+
+        try:
+            await self.radio.set_ptt(True)
+            self.audio_status.emit("Send TX audio: radio.set_ptt(True) succeeded.")
+        except Exception as exc:
+            self.error.emit(f"Send TX audio: PTT keying failed ({exc}) -- aborting send.")
+            return
+
+        try:
+            if start_name:
+                await getattr(self.radio, start_name)()
+            # Pad to a whole number of AUDIO_TX_PCM_FRAME_BYTES-sized
+            # frames with trailing silence -- push_audio_tx_pcm()
+            # rejects any frame that isn't exactly that size (see this
+            # method's own docstring).
+            padded = pcm_bytes
+            remainder = len(padded) % AUDIO_TX_PCM_FRAME_BYTES
+            if remainder:
+                padded += b"\x00" * (AUDIO_TX_PCM_FRAME_BYTES - remainder)
+            for i in range(0, len(padded), AUDIO_TX_PCM_FRAME_BYTES):
+                await getattr(self.radio, push_name)(padded[i:i + AUDIO_TX_PCM_FRAME_BYTES])
+            if stop_name:
+                await getattr(self.radio, stop_name)()
+            self.audio_status.emit(f"Send TX audio: sent {len(pcm_bytes)} bytes via {push_name}().")
+        except Exception as exc:
+            self.error.emit(f"Send TX audio: {exc}")
+        finally:
+            try:
+                await self.radio.set_ptt(False)
+                self.audio_status.emit("Send TX audio: radio.set_ptt(False) succeeded.")
+            except Exception as exc:
+                self.error.emit(
+                    f"Send TX audio: radio.set_ptt(False) FAILED ({exc}) -- radio may still be keyed! "
+                    "Check the radio directly."
+                )
 
     def send_cw_text(self, text: str):
         """Thread-safe: call from the GUI thread. Sends `text` via the

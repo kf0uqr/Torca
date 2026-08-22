@@ -10,12 +10,13 @@ import math
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QImage, QRadialGradient
-from PySide6.QtWidgets import QWidget, QMenu
+from PySide6.QtWidgets import QWidget, QMenu, QToolTip
 
 from constants import (
     METER_DEFINITIONS, S_METER_RAW_S9, S_METER_RAW_MAX, S_METER_S9_FRACTION, DEGREES_PER_KNOB_STEP,
     WATERFALL_ROWS, MODE_BANDWIDTH_HZ,
 )
+import band_plan
 
 # Amplitude (0-160, per ScopeFrame.pixels) -> color, modeled on rigplane's
 # own "classic" scope theme: dark blue (noise floor) through cyan and
@@ -273,6 +274,170 @@ class WaterfallWidget(QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for scope data...")
             return
         painter.drawImage(self.rect(), self._image, self._image.rect())
+
+
+class BandPlanOverlayWidget(QWidget):
+    """A thin strip drawn directly under WaterfallWidget, sharing its
+    exact same x-axis (frequency-to-pixel mapping) so a CW/data/phone
+    segment boundary lines up pixel-for-pixel with whatever's actually
+    on the waterfall above it. Three layers, back to front:
+
+    1. Colored fill per band_plan.py segment (CW-only/CW+data/phone/
+       all-modes -- see band_plan.MODE_COLORS), with the minimum
+       license class as a short abbreviation ("T"/"G"/"A"/"E") drawn
+       centered in each segment wide enough to hold it.
+    2. A thin darker band-name label strip along the very top edge
+       ("40m", "20m", ...) wherever a band boundary makes room for one.
+    3. Small triangular tick marks for every saved memory-channel
+       frequency (memories_window.py's all_memory_markers()) that
+       falls within the visible span, main_window.py's own job to keep
+       fed via set_memories() -- this widget has no memories.json
+       access of its own, matching this whole module's "no rigplane/
+       asyncio dependency, only ever receives already-computed values"
+       contract (see the module's own docstring).
+
+    Frequency-to-pixel mapping is deliberately duplicated from
+    SpectrumWidget/WaterfallWidget rather than shared via inheritance
+    or a mixin -- three near-identical 4-line methods is simpler to
+    follow than a shared base class for a mapping this small, and
+    matches how those two widgets already relate to each other (no
+    shared base between them either)."""
+
+    _HEIGHT_PX = 26
+    _MEMORY_MARKER_HALF_WIDTH_PX = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(self._HEIGHT_PX)
+        self.setMouseTracking(True)
+        self._frame = None
+        self._memories = []  # [{"name", "freq_hz"}, ...] -- see set_memories
+
+    def set_frame(self, frame):
+        self._frame = frame
+        self.update()
+
+    def set_memories(self, memories):
+        self._memories = memories
+        self.update()
+
+    def _freq_to_x(self, freq_hz, w):
+        if self._frame is None:
+            return None
+        start, end = self._frame.start_freq_hz, self._frame.end_freq_hz
+        if start == end:
+            return None
+        return (freq_hz - start) / (end - start) * w
+
+    def _x_to_freq(self, x, w):
+        if self._frame is None or w <= 0:
+            return None
+        start, end = self._frame.start_freq_hz, self._frame.end_freq_hz
+        return start + (x / w) * (end - start)
+
+    def _segment_at(self, x, w):
+        """The band_plan segment tuple under widget-x `x`, or None --
+        used by mouseMoveEvent for the hover tooltip. A plain linear
+        rescan of segments_in_range's own (small, span-bounded) result
+        is plenty cheap for a mouse-move handler; no spatial index
+        needed at this data size."""
+        freq_hz = self._x_to_freq(x, w)
+        if freq_hz is None:
+            return None
+        for band_name, seg_start, seg_end, mode, min_license in band_plan.segments_in_range(freq_hz, freq_hz):
+            if seg_start <= freq_hz <= seg_end:
+                return band_name, seg_start, seg_end, mode, min_license
+        return None
+
+    def _memory_at(self, x, w):
+        """The nearest memory marker within _MEMORY_MARKER_HALF_WIDTH_PX
+        of widget-x `x`, or None -- checked first in mouseMoveEvent
+        since the markers are drawn on top of the segment fill and
+        should take hover priority over whatever's underneath them."""
+        for memory in self._memories:
+            mx = self._freq_to_x(memory["freq_hz"], w)
+            if mx is not None and abs(mx - x) <= self._MEMORY_MARKER_HALF_WIDTH_PX:
+                return memory
+        return None
+
+    def mouseMoveEvent(self, event):
+        w = self.width()
+        x = event.position().x()
+        memory = self._memory_at(x, w)
+        if memory is not None:
+            QToolTip.showText(
+                event.globalPosition().toPoint(),
+                f"{memory['name']}\n{memory['freq_hz'] / 1e6:.4f} MHz",
+                self,
+            )
+            super().mouseMoveEvent(event)
+            return
+
+        hit = self._segment_at(x, w)
+        if hit is None:
+            QToolTip.hideText()
+        else:
+            band_name, seg_start, seg_end, mode, min_license = hit
+            text = (
+                f"{band_name}: {seg_start / 1e6:.4f}-{seg_end / 1e6:.4f} MHz\n"
+                f"{band_plan.MODE_LABELS[mode]} -- {min_license} class and above"
+            )
+            QToolTip.showText(event.globalPosition().toPoint(), text, self)
+        super().mouseMoveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        w, h = self.width(), self.height()
+        painter.fillRect(self.rect(), QColor(20, 20, 24))
+
+        if self._frame is None:
+            return
+
+        start_hz, end_hz = self._frame.start_freq_hz, self._frame.end_freq_hz
+        if start_hz == end_hz:
+            return
+
+        for band_name, seg_start, seg_end, mode, min_license in band_plan.segments_in_range(start_hz, end_hz):
+            x0 = self._freq_to_x(max(seg_start, min(start_hz, end_hz)), w)
+            x1 = self._freq_to_x(min(seg_end, max(start_hz, end_hz)), w)
+            if x0 is None or x1 is None:
+                continue
+            x0, x1 = sorted((x0, x1))
+            x0 = max(0.0, x0)
+            x1 = min(float(w), x1)
+            if x1 <= x0:
+                continue
+            r, g, b = band_plan.MODE_COLORS[mode]
+            painter.fillRect(QRectF(x0, 0, x1 - x0, h), QColor(r, g, b, 200))
+            painter.setPen(QPen(QColor(10, 10, 12), 1))
+            painter.drawLine(QPointF(x0, 0), QPointF(x0, h))
+
+            # License-class abbreviation, only if there's realistically
+            # room for it -- an unreadably squashed single letter in a
+            # 3px-wide sliver is worse than omitting it.
+            if x1 - x0 >= 12:
+                painter.setPen(QColor(15, 15, 15))
+                font = painter.font()
+                font.setPointSize(8)
+                font.setBold(True)
+                painter.setFont(font)
+                painter.drawText(QRectF(x0, 0, x1 - x0, h), Qt.AlignCenter, min_license[0])
+
+        # Memory-channel tick marks, drawn last so they always read
+        # clearly on top of whatever segment color is underneath.
+        painter.setPen(QPen(QColor(15, 15, 20), 1))
+        painter.setBrush(QColor(255, 215, 0))
+        for memory in self._memories:
+            x = self._freq_to_x(memory["freq_hz"], w)
+            if x is None or not (0 <= x <= w):
+                continue
+            half = self._MEMORY_MARKER_HALF_WIDTH_PX
+            triangle = QPainterPath()
+            triangle.moveTo(x, 0)
+            triangle.lineTo(x - half, half * 2)
+            triangle.lineTo(x + half, half * 2)
+            triangle.closeSubpath()
+            painter.drawPath(triangle)
 
 
 class MeterWidget(QWidget):

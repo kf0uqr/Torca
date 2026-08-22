@@ -132,6 +132,31 @@ def _save_memories(data):
     MEMORIES_PATH.write_text(json.dumps(data, indent=2))
 
 
+def all_memory_markers():
+    """Every saved memory entry's own frequency, flattened across every
+    tab, for widgets.py's BandPlanOverlayWidget to draw as tick marks
+    on the band-plan strip. Reads MEMORIES_PATH directly (same as
+    _load_memories) rather than requiring a live MemoriesWindow
+    instance -- the overlay needs this on every RadioWindow regardless
+    of whether the operator has ever opened the Memories window in
+    this session at all.
+
+    Only VFO A (the RX frequency) is surfaced -- VFO B only differs for
+    repeater-style split entries, and "where does this memory sit in
+    the band" is naturally a receive-frequency question. Returns
+    [{"name", "freq_hz"}, ...], skipping any entry with no VFO A
+    frequency recorded (a freshly added-but-uncaptured entry, or a bad
+    hand edit of memories.json)."""
+    data = _load_memories()
+    markers = []
+    for tab in data.get("tabs", []):
+        for entry in tab.get("entries", []):
+            freq_hz = (entry.get("vfo_a") or {}).get("freq_hz")
+            if freq_hz:
+                markers.append({"name": entry.get("name") or "(unnamed)", "freq_hz": freq_hz})
+    return markers
+
+
 def _format_mhz(freq_hz):
     if freq_hz is None:
         return ""

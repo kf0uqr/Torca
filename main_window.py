@@ -15,7 +15,7 @@ radio does with the shared Doppler state depending on its role.
 
 import sys
 
-from PySide6.QtCore import Qt, Slot, Signal
+from PySide6.QtCore import Qt, Slot, Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -41,14 +41,22 @@ from constants import (
     SCOPE_SPEED_LABELS,
 )
 from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
-from widgets import SpectrumWidget, WaterfallWidget, MeterWidget, TuningKnobWidget
+from widgets import SpectrumWidget, WaterfallWidget, BandPlanOverlayWidget, MeterWidget, TuningKnobWidget
 from satellite_tracking import radio_mode_for_transponder
 from cw_window import CwToolWindow
 from split_dialog import SplitSettingsDialog
-from memories_window import MemoriesWindow
+from memories_window import MemoriesWindow, all_memory_markers
 from sstv_window import SstvToolWindow
 from rtty_window import RttyToolWindow
 from aprs_window import AprsToolWindow
+
+# How often the band-plan overlay's memory-channel tick marks are
+# refreshed from memories.json -- memories_window.py has no "changed"
+# signal of its own (its own edits are saved straight to disk), so
+# polling on a slow timer is simpler than threading a notification
+# through every add/edit/delete call site there. Cheap either way: a
+# small on-disk JSON file, read a few times a minute, not per frame.
+_MEMORY_MARKER_REFRESH_MS = 5000
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 
@@ -182,6 +190,7 @@ class RadioWindow(QWidget):
         self.spectrum_widget.frequency_clicked.connect(self._on_scope_clicked)
         self.waterfall_widget = WaterfallWidget()
         self.waterfall_widget.frequency_clicked.connect(self._on_scope_clicked)
+        self.band_plan_widget = BandPlanOverlayWidget()
 
         self.tuning_knob = TuningKnobWidget()
         self.tuning_knob.setEnabled(False)
@@ -571,6 +580,7 @@ class RadioWindow(QWidget):
         layout.addLayout(scope_controls_row)
         layout.addWidget(self.spectrum_widget)
         layout.addWidget(self.waterfall_widget)
+        layout.addWidget(self.band_plan_widget)
         layout.addLayout(self.meters_row)
         layout.addLayout(self.meters_row_2)
         layout.addLayout(self.band_buttons_row)
@@ -595,6 +605,16 @@ class RadioWindow(QWidget):
         self.worker.scope_speed_changed.connect(self._on_scope_speed_changed)
         self.worker.scope_ready.connect(self._on_scope_ready)
         self.worker.start()
+
+        # Feeds the band-plan overlay's memory-channel tick marks --
+        # see _MEMORY_MARKER_REFRESH_MS's own comment for why this is a
+        # slow poll rather than a change-notification signal. Runs once
+        # immediately (not just on the timer's first firing 5s later)
+        # so markers are already showing on first paint.
+        self._memory_marker_timer = QTimer(self)
+        self._memory_marker_timer.timeout.connect(self._refresh_memory_markers)
+        self._memory_marker_timer.start(_MEMORY_MARKER_REFRESH_MS)
+        self._refresh_memory_markers()
 
         # Registers with the shared satellite session so this radio
         # starts participating in Doppler tracking per its role -- see
@@ -716,10 +736,14 @@ class RadioWindow(QWidget):
             if widget.meter_type == meter_type:
                 widget.set_value(level)
 
+    def _refresh_memory_markers(self):
+        self.band_plan_widget.set_memories(all_memory_markers())
+
     @Slot(object)
     def _on_scope_frame(self, frame):
         self.spectrum_widget.set_frame(frame)
         self.waterfall_widget.set_frame(frame)
+        self.band_plan_widget.set_frame(frame)
 
     @Slot(str)
     def _on_error(self, message):

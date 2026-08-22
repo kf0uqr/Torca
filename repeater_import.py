@@ -2,8 +2,12 @@
 Parses a RepeaterBook CSV export into memory-entry-ready repeater
 dicts for memories_window.py's Local Repeaters tab (_repeater_to_entry,
 LocalRepeatersTabPage) -- {"callsign", "output_freq_hz",
-"input_freq_hz", "mode", "band", "city", "ctcss_hz", "lat", "lon"},
-then filter_by_distance() narrows that down to "near me".
+"input_freq_hz", "mode", "ctcss_hz", "city"}. Imports every row in the
+file that has a usable frequency, unfiltered -- per explicit
+instruction, no band restriction and no location/radius filtering at
+all; the operator's own CSV (already whatever they chose to export
+from RepeaterBook -- one state, one band, a search radius already
+applied there, etc.) is trusted as-is.
 
 This is the ONLY repeater data source in the app -- deliberately not
 an API integration of any kind. RepeaterBook's own Export API requires
@@ -27,8 +31,6 @@ still has a fair chance of working, without being the design target.
 
 import csv
 
-from pota import haversine_km
-
 # {internal field: [acceptable header names, case-insensitive]} --
 # first match wins per field.
 _HEADER_ALIASES = {
@@ -40,21 +42,7 @@ _HEADER_ALIASES = {
     "ctcss_hz": ["pl", "ctcss", "tone", "pl/ctcss uplink", "repeater tone", "pl tone"],
     "city": ["city", "location/nearest city", "landmark", "name"],
     "mode": ["mode", "operating mode"],
-    "lat": ["latitude", "lat"],
-    "lon": ["longitude", "lon", "long"],
 }
-
-# 2m/70cm only -- not 23cm, not digital-only bands -- expressed here as
-# frequency ranges instead of a pre-labeled "band" column, since not
-# every CSV source labels band explicitly.
-LOCAL_REPEATER_BANDS_MHZ = {"2m": (144.0, 148.0), "70cm": (420.0, 450.0)}
-
-
-def _band_for_freq(freq_mhz):
-    for band, (low, high) in LOCAL_REPEATER_BANDS_MHZ.items():
-        if low <= freq_mhz <= high:
-            return band
-    return None
 
 
 def _build_column_map(fieldnames):
@@ -88,16 +76,13 @@ def parse_repeater_csv(path):
     """Reads a RepeaterBook CSV export (or any similarly-labeled
     repeater CSV -- see this module's own docstring) and returns a
     list of {"callsign", "output_freq_hz", "input_freq_hz", "mode",
-    "band", "city", "ctcss_hz", "lat", "lon"} -- lat/lon are needed
-    here (unlike a server-side radius search) since nothing has
-    filtered this file down to "nearby" yet; see filter_by_distance.
+    "city", "ctcss_hz"} for every row with a usable frequency --
+    unfiltered by band or location, the entire file.
 
-    Entries with no usable output frequency, or a frequency outside
-    the 2m/70cm ham bands, are skipped. Raises OSError/csv.Error on a
-    genuinely unreadable file; a file that opens fine but has no
-    recognizable frequency column at all returns an empty list rather
-    than raising (same "no results" outcome as a search that just
-    didn't find anything)."""
+    Raises OSError/csv.Error on a genuinely unreadable file; a file
+    that opens fine but has no recognizable frequency column at all
+    returns an empty list rather than raising (same "no results"
+    outcome as a search that just didn't find anything)."""
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
@@ -110,9 +95,6 @@ def parse_repeater_csv(path):
         for row in reader:
             output_mhz = _parse_float(row.get(column_map["output_freq_mhz"]))
             if output_mhz is None:
-                continue
-            band = _band_for_freq(output_mhz)
-            if band is None:
                 continue
 
             input_mhz = None
@@ -139,28 +121,7 @@ def parse_repeater_csv(path):
                 "output_freq_hz": round(output_mhz * 1e6),
                 "input_freq_hz": round(input_mhz * 1e6),
                 "mode": (row.get(column_map.get("mode", ""), "") or "FM").strip() or "FM",
-                "band": band,
                 "city": (row.get(column_map.get("city", ""), "") or "").strip(),
                 "ctcss_hz": _parse_float(row.get(column_map["ctcss_hz"])) if "ctcss_hz" in column_map else None,
-                "lat": _parse_float(row.get(column_map["lat"])) if "lat" in column_map else None,
-                "lon": _parse_float(row.get(column_map["lon"])) if "lon" in column_map else None,
             })
         return repeaters
-
-
-def filter_by_distance(repeaters, lat, lon, radius_km):
-    """Keeps only entries within radius_km of (lat, lon) -- entries
-    with no lat/lon at all (a source file that didn't include them)
-    are dropped rather than guessed at being "close enough", since
-    there's no way to tell. Strips "lat"/"lon" off the returned dicts,
-    since memories_window.py's _repeater_to_entry doesn't expect
-    those keys."""
-    kept = []
-    for repeater in repeaters:
-        entry_lat, entry_lon = repeater.get("lat"), repeater.get("lon")
-        if entry_lat is None or entry_lon is None:
-            continue
-        if haversine_km(lat, lon, entry_lat, entry_lon) > radius_km:
-            continue
-        kept.append({k: v for k, v in repeater.items() if k not in ("lat", "lon")})
-    return kept

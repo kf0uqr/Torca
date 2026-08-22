@@ -30,14 +30,14 @@ window happens to be open.
 Recall-to-radio (loading a saved entry back into VFO A/B) is
 deliberately NOT included here -- out of scope for what was asked.
 
-Local Repeaters tab: a special auto-populated tab (kind="local_
-repeaters" in the persisted data, vs. plain "manual" tabs) that imports
-nearby 2m/70cm repeaters from a RepeaterBook CSV export the operator
-downloads themselves (repeater_import.py -- no API call, no key, see
-its own docstring for why), filtered by distance from the operator's
-saved GPS location (same operator_lat/operator_lon QSettings
-OperatorProfileDialog/ham_dashboard.py already use), and turns each
-into a memory entry -- VFO A (RX) is the repeater's output/downlink,
+Local Repeaters tab ("+ CSV"): a special auto-populated tab (kind=
+"local_repeaters" in the persisted data, vs. plain "manual" tabs) that
+imports an ENTIRE repeater-list CSV export the operator downloads
+themselves (repeater_import.py -- no API call, no key, see its own
+docstring for why), unfiltered by band or location -- per explicit
+instruction, the operator's own CSV (already whatever they chose to
+export) is trusted as-is -- and turns each row into a memory entry --
+VFO A (RX) is the repeater's output/downlink,
 VFO B (TX) is input/uplink (output + offset). This app previously
 queried a couple of live repeater-directory APIs directly (first
 RepeaterBook, then Open Repeater after RepeaterBook's terms turned out
@@ -54,13 +54,8 @@ Refresh (re-import, replacing every entry) is unique to it.
 import json
 import pathlib
 
-from PySide6.QtCore import Qt, QSettings, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QLabel,
-    QLineEdit,
     QWidget,
     QHeaderView,
     QHBoxLayout,
@@ -78,11 +73,6 @@ import repeater_import
 
 MEMORIES_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "memories.json"
 
-# Same QSettings org/app every other structured-non-JSON setting in
-# this codebase uses (connection_dialog.py, log_book_window.py, ...).
-_SETTINGS_ORG = "IcomRadioApp"
-_SETTINGS_APP = "RadioControl"
-
 _COLUMNS = [
     "Name", "VFO A Freq (MHz)", "VFO A Mode", "VFO B Freq (MHz)", "VFO B Mode",
     "Tone Mode", "Tone Freq (Hz)",
@@ -93,11 +83,6 @@ _COLUMNS = [
 # squelch, per wfview's own description, already the convention this
 # app follows for split_dialog.py's Repeater Tone section).
 
-# Default/typical "local repeater" search radius -- roughly 50 miles,
-# a common rule-of-thumb VHF/UHF repeater search distance. Just a
-# starting value in the radius prompt, not a hard limit -- the operator
-# can type any value 1-500 there.
-_DEFAULT_REPEATER_RADIUS_KM = 80
 
 
 def _repeater_to_entry(repeater):
@@ -337,9 +322,9 @@ class MemoryTabPage(QWidget):
 class LocalRepeatersTabPage(MemoryTabPage):
     """Same table/Add/Delete Memory shape as MemoryTabPage -- entries
     are just as user-editable/deletable here as in any other tab --
-    plus a Refresh button that re-imports nearby 2m/70cm repeaters from
-    a RepeaterBook CSV export (see MemoriesWindow._fetch_local_repeater_
-    entries) and replaces this tab's entries wholesale."""
+    plus a Refresh button that re-imports a repeater-list CSV file (see
+    MemoriesWindow._fetch_local_repeater_entries) and replaces this
+    tab's entries wholesale."""
 
     def __init__(self, entries, on_change, on_refresh):
         # Set before super().__init__() -- _extra_buttons() (called
@@ -350,9 +335,8 @@ class LocalRepeatersTabPage(MemoryTabPage):
     def _extra_buttons(self):
         refresh_button = QPushButton("Refresh")
         refresh_button.setToolTip(
-            "Re-imports nearby 2m/70cm repeaters from a RepeaterBook CSV export you pick, "
-            "replacing every entry currently in this tab -- any manual edits/additions here "
-            "are discarded."
+            "Re-imports a repeater-list CSV file you pick, replacing every entry currently in "
+            "this tab -- any manual edits/additions here are discarded."
         )
         refresh_button.clicked.connect(self._on_refresh_clicked)
         return [refresh_button]
@@ -394,11 +378,10 @@ class MemoriesWindow(QWidget):
         add_tab_button.setToolTip("Add a new (blank) tab")
         add_tab_button.clicked.connect(self._on_add_tab_clicked)
 
-        add_repeaters_tab_button = QPushButton("+ Local Repeaters")
+        add_repeaters_tab_button = QPushButton("+ CSV")
         add_repeaters_tab_button.setToolTip(
-            "Add a tab auto-populated with nearby 2m/70cm repeaters, imported from a "
-            "RepeaterBook CSV export you already have (download one from RepeaterBook.com's "
-            "own search results page, then pick it here -- no API key or account needed)."
+            "Add a tab populated by importing an entire repeater-list CSV file you already "
+            "have (e.g. a RepeaterBook.com export) -- no API key or account needed."
         )
         add_repeaters_tab_button.clicked.connect(self._on_add_local_repeaters_tab_clicked)
 
@@ -444,41 +427,26 @@ class MemoriesWindow(QWidget):
     # ---- Local Repeaters (RepeaterBook CSV import) ----
 
     def _fetch_local_repeater_entries(self):
-        """Prompts for a search radius and a CSV file, imports it, and
+        """Prompts for a CSV file, imports the ENTIRE file unfiltered
+        (per explicit instruction -- no band restriction, no location/
+        radius filtering; the operator's own CSV is trusted as-is) and
         returns a list of memory-entry dicts (see _repeater_to_entry)
         -- or None if the operator cancelled, or a real failure was
-        already reported via QMessageBox. Shared by both "+ Local
-        Repeaters" (new tab) and Refresh (existing tab).
+        already reported via QMessageBox. Shared by both "+ CSV" (new
+        tab) and Refresh (existing tab).
 
         No API/network access at all -- the operator downloads a CSV
         export themselves from RepeaterBook.com's own search results
         page (their own personal, manual, one-time use of the site,
         same as browsing it in any other tab) and this just reads
-        whatever's already on disk, then filters it to "near me"
-        locally. This app deliberately never calls RepeaterBook's own
-        API directly -- their current published terms explicitly
-        disallow exactly this kind of automated "nearby repeater
-        discovery tool" without separate written approval (see
-        repeater_import.py's own docstring for the full citation)."""
-        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-        lat = float(settings.value("operator_lat", 0.0)) or None
-        lon = float(settings.value("operator_lon", 0.0)) or None
-        if lat is None or lon is None:
-            QMessageBox.warning(
-                self, "Local Repeaters",
-                "No GPS location saved yet -- set it in Profile... first "
-                "(Get GPS Coordinates, or enter it manually).",
-            )
-            return None
-
-        radius_km, ok = QInputDialog.getInt(
-            self, "Local Repeaters", "Search radius (km):", _DEFAULT_REPEATER_RADIUS_KM, 1, 500
-        )
-        if not ok:
-            return None
-
+        whatever's already on disk. This app deliberately never calls
+        RepeaterBook's own API directly -- their current published
+        terms explicitly disallow exactly this kind of automated
+        "nearby repeater discovery tool" without separate written
+        approval (see repeater_import.py's own docstring for the full
+        citation)."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import RepeaterBook CSV", "", "CSV files (*.csv);;All files (*)"
+            self, "Import Repeater CSV", "", "CSV files (*.csv);;All files (*)"
         )
         if not path:
             return None
@@ -487,17 +455,16 @@ class MemoriesWindow(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Local Repeaters", f"Couldn't read that file: {exc}")
             return None
-        repeaters = repeater_import.filter_by_distance(repeaters, lat, lon, radius_km)
 
         if not repeaters:
-            QMessageBox.information(self, "Local Repeaters", "No 2m/70cm repeaters found within range.")
+            QMessageBox.information(self, "Local Repeaters", "No usable repeater rows found in that file.")
         return [_repeater_to_entry(repeater) for repeater in repeaters]
 
     def _on_add_local_repeaters_tab_clicked(self):
         entries = self._fetch_local_repeater_entries()
         if entries is None:
             return
-        name = "Local Repeaters"
+        name = "CSV"
         self._data["tabs"].append({"name": name, "kind": "local_repeaters", "entries": entries})
         page = self._add_tab_page(name, entries, kind="local_repeaters")
         self.tabs.setCurrentWidget(page)

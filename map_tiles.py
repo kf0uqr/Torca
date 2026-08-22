@@ -32,7 +32,7 @@ and never needs to go through this module at all.
 
 Networking follows this app's one and only established idiom (confirmed
 by reading every other network-fetching class in this codebase -- pota.py,
-pskreporter.py, open_repeater.py, qrz_logbook.py, world_map.py's own former
+pskreporter.py, qrz_logbook.py, world_map.py's own former
 WorldMapImageFetcher): a QThread subclass doing a plain blocking
 urllib.request.urlopen() call. No `requests`, no QNetworkAccessManager
 anywhere in this app -- TileFetcher below is the same idiom, just wrapped

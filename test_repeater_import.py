@@ -1,11 +1,12 @@
-"""Tests for repeater_import.py -- both against a real excerpt of
-Icom's own official D-STAR repeater list download (test_fixtures/
-icom_repeater_sample.csv, two rows taken verbatim from the real file
-fetched from icomjapan.com/support/firmware_driver/3709/, not
-synthesized) and a synthetic RepeaterBook-style export (that provider's
-exact CSV column names weren't independently verified against a real
-downloaded file, unlike the Icom fixture, so this covers the alias-
-matching logic rather than claiming byte-exact provider fidelity)."""
+"""Tests for repeater_import.py -- primarily a synthetic RepeaterBook-
+style export (that provider's exact downloadable-CSV column names
+weren't independently verified against a real downloaded file, so this
+covers the alias-matching logic rather than claiming byte-exact
+provider fidelity), plus a real-data regression case (test_fixtures/
+icom_repeater_sample.csv, two rows taken verbatim from Icom's own
+official D-STAR repeater list download, not synthesized) confirming
+the alias-based column matching also tolerates a differently-shaped
+CSV without being the design target."""
 
 import pathlib
 import tempfile
@@ -109,7 +110,7 @@ def test_filter_by_distance_keeps_near_drops_far():
     nearby = repeater_import.filter_by_distance(repeaters, 36.32, -95.63, radius_km=10)
     assert len(nearby) == 1
     assert "AE5ME" in nearby[0]["callsign"]
-    # "lat"/"lon" must be stripped -- back to open_repeater.py's exact shape.
+    # "lat"/"lon" must be stripped -- memories_window.py's _repeater_to_entry doesn't expect them.
     assert "lat" not in nearby[0] and "lon" not in nearby[0]
 
 

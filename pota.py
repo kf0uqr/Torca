@@ -223,8 +223,10 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     """Great-circle distance in km between two lat/lon points -- standard
     haversine formula. Used for the Parks tab's "within X km of my
     location" filter -- the park-directory API has no server-side radius
-    parameter (unlike e.g. open_repeater.py's search), so this filtering
-    has to happen client-side against an already-fetched park list."""
+    parameter, so this filtering has to happen client-side against an
+    already-fetched park list. Also reused by repeater_import.py's own
+    filter_by_distance for the same reason (a CSV file has no radius
+    parameter at all)."""
     lat1_r, lon1_r, lat2_r, lon2_r = (math.radians(v) for v in (lat1, lon1, lat2, lon2))
     dlat = lat2_r - lat1_r
     dlon = lon2_r - lon1_r

@@ -1,40 +1,28 @@
 """
-Parses a repeater list from a CSV file into the exact same shape
-open_repeater.py's fetch_nearby_repeaters() returns (plus lat/lon --
-see filter_by_distance), so memories_window.py's existing Local
-Repeaters plumbing (_repeater_to_entry, LocalRepeatersTabPage) works
-unchanged regardless of which source populated a tab.
+Parses a RepeaterBook CSV export into memory-entry-ready repeater
+dicts for memories_window.py's Local Repeaters tab (_repeater_to_entry,
+LocalRepeatersTabPage) -- {"callsign", "output_freq_hz",
+"input_freq_hz", "mode", "band", "city", "ctcss_hz", "lat", "lon"},
+then filter_by_distance() narrows that down to "near me".
 
-Added as a key-less alternative after Open Repeater's own free
-self-service signup didn't work out for one operator -- no online API
-is queried here at all; the operator downloads a CSV themselves (their
-own personal, manual, one-time choice of provider) and this just reads
-whatever's already on disk. Two sources this was actually verified
-against:
+This is the ONLY repeater data source in the app -- deliberately not
+an API integration of any kind. RepeaterBook's own Export API requires
+approval and a per-app/per-user token, and its current published terms
+(repeaterbook.com/wiki/doku.php?id=api, "What Is Less Likely To Be
+Approved") explicitly list "nearby repeater discovery tools" and
+"standalone export/download services" as generally NOT authorized
+without separate written permission -- exactly what a "Local
+Repeaters" feature is. A CSV the operator has already downloaded
+themselves, through their own manual browsing of RepeaterBook.com's
+own search-results page, carries no such restriction -- it's their own
+personal use of data they already have in hand, and this module never
+talks to RepeaterBook's servers at all.
 
-- Icom's own official repeater list download (e.g.
-  https://www.icomjapan.com/support/firmware_driver/3709/ for the
-  IC-705) -- a D-STAR-only, worldwide, static CSV snapshot, confirmed
-  by downloading and inspecting the real file directly. Header row:
-  "Group No,Group Name,Name,Sub Name,Repeater Call Sign,Gateway Call
-  Sign,Frequency,Dup,Offset,Mode,TONE,Repeater Tone,RPT1USE,Position,
-  Latitude,Longitude,UTC Offset". Its Latitude/Longitude columns are
-  what make a static global file usable here at all -- filtered down
-  to "near me" locally instead of server-side.
-- RepeaterBook's own website search-results CSV export -- a manual,
-  personal, one-time download through the operator's own browser
-  session, NOT this app calling RepeaterBook's API (which, per its
-  current published terms, explicitly disallows exactly this kind of
-  automated "nearby repeater discovery tool" without separate written
-  approval -- see open_repeater.py's own docstring for the earlier-
-  confirmed restriction on RepeaterBook specifically). A CSV file the
-  operator already has in hand from their own manual browsing carries
-  no such restriction.
-
-Column matching is alias-based and case-insensitive rather than tied
-to one provider's exact header spelling, so any other reasonably-
-labeled CSV (an ARRL/club-published list, etc.) has a fair chance of
-working too, not just the two sources above.
+Column matching is alias-based and case-insensitive rather than locked
+to one exact header spelling, so a differently-formatted RepeaterBook
+export (or, incidentally, any other reasonably-labeled repeater CSV --
+an ARRL/club-published list, Icom's own repeater-list download, etc.)
+still has a fair chance of working, without being the design target.
 """
 
 import csv
@@ -56,10 +44,9 @@ _HEADER_ALIASES = {
     "lon": ["longitude", "lon", "long"],
 }
 
-# Same 2m/70cm-only scope as open_repeater.py's own LOCAL_REPEATER_BANDS
-# (per that module's own comment: not 23cm, not digital-only bands) --
-# expressed here as frequency ranges instead of a pre-labeled "band"
-# column, since not every CSV source labels band explicitly.
+# 2m/70cm only -- not 23cm, not digital-only bands -- expressed here as
+# frequency ranges instead of a pre-labeled "band" column, since not
+# every CSV source labels band explicitly.
 LOCAL_REPEATER_BANDS_MHZ = {"2m": (144.0, 148.0), "70cm": (420.0, 450.0)}
 
 
@@ -98,21 +85,19 @@ def _parse_float(text):
 
 
 def parse_repeater_csv(path):
-    """Reads a repeater-list CSV (any of the formats this module's own
-    docstring describes) and returns a list of {"callsign",
-    "output_freq_hz", "input_freq_hz", "mode", "band", "city",
-    "ctcss_hz", "lat", "lon"} -- open_repeater.py's own output shape,
-    plus "lat"/"lon" (that API-based path doesn't need to return those
-    per-entry, since the server already did the radius filtering; a
-    CSV file hasn't, so filter_by_distance needs them here).
+    """Reads a RepeaterBook CSV export (or any similarly-labeled
+    repeater CSV -- see this module's own docstring) and returns a
+    list of {"callsign", "output_freq_hz", "input_freq_hz", "mode",
+    "band", "city", "ctcss_hz", "lat", "lon"} -- lat/lon are needed
+    here (unlike a server-side radius search) since nothing has
+    filtered this file down to "nearby" yet; see filter_by_distance.
 
     Entries with no usable output frequency, or a frequency outside
-    the 2m/70cm ham bands, are skipped -- same scope open_repeater.py's
-    own LOCAL_REPEATER_BANDS filter already applies. Raises OSError/
-    csv.Error on a genuinely unreadable file; a file that opens fine
-    but has no recognizable frequency column at all returns an empty
-    list rather than raising (same "no results" outcome as an Open
-    Repeater search that just didn't find anything)."""
+    the 2m/70cm ham bands, are skipped. Raises OSError/csv.Error on a
+    genuinely unreadable file; a file that opens fine but has no
+    recognizable frequency column at all returns an empty list rather
+    than raising (same "no results" outcome as a search that just
+    didn't find anything)."""
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
@@ -167,9 +152,9 @@ def filter_by_distance(repeaters, lat, lon, radius_km):
     """Keeps only entries within radius_km of (lat, lon) -- entries
     with no lat/lon at all (a source file that didn't include them)
     are dropped rather than guessed at being "close enough", since
-    there's no way to tell. Strips "lat"/"lon" off the returned dicts
-    -- back to open_repeater.py's own exact output shape, since
-    memories_window.py's _repeater_to_entry doesn't expect those keys."""
+    there's no way to tell. Strips "lat"/"lon" off the returned dicts,
+    since memories_window.py's _repeater_to_entry doesn't expect
+    those keys."""
     kept = []
     for repeater in repeaters:
         entry_lat, entry_lon = repeater.get("lat"), repeater.get("lon")

@@ -31,21 +31,24 @@ Recall-to-radio (loading a saved entry back into VFO A/B) is
 deliberately NOT included here -- out of scope for what was asked.
 
 Local Repeaters tab: a special auto-populated tab (kind="local_
-repeaters" in the persisted data, vs. plain "manual" tabs) that fetches
-nearby 2m/70cm repeaters from Open Repeater (open_repeater.py) around
-the operator's saved GPS location (same operator_lat/operator_lon
-QSettings ConnectionDialog/ham_dashboard.py already use) and turns each
+repeaters" in the persisted data, vs. plain "manual" tabs) that imports
+nearby 2m/70cm repeaters from a RepeaterBook CSV export the operator
+downloads themselves (repeater_import.py -- no API call, no key, see
+its own docstring for why), filtered by distance from the operator's
+saved GPS location (same operator_lat/operator_lon QSettings
+OperatorProfileDialog/ham_dashboard.py already use), and turns each
 into a memory entry -- VFO A (RX) is the repeater's output/downlink,
-VFO B (TX) is input/uplink (output + offset). RepeaterBook was
-considered and NOT used -- its API now requires an approved app token
-and its own docs explicitly say public discovery tools like this
-aren't authorized without written permission (confirmed by reading
-RepeaterBook's own API wiki page directly). Open Repeater's API is
-openly self-service instead (free key, no approval process) -- see
-open_repeater.py's own docstring for the full comparison. Otherwise
-behaves exactly like any other tab (editable, deletable, supports
-manual Add/Delete Memory too) -- only Refresh (re-fetch, replacing
-every entry) is unique to it.
+VFO B (TX) is input/uplink (output + offset). This app previously
+queried a couple of live repeater-directory APIs directly (first
+RepeaterBook, then Open Repeater after RepeaterBook's terms turned out
+to disallow exactly this use case) -- both abandoned: RepeaterBook's
+API requires an approved app token and its own docs explicitly say
+"nearby repeater discovery tools" aren't authorized without written
+permission, and Open Repeater's free-tier signup didn't work out for a
+real operator using this app. A manually-downloaded CSV sidesteps both
+problems at once. Otherwise behaves exactly like any other tab
+(editable, deletable, supports manual Add/Delete Memory too) -- only
+Refresh (re-import, replacing every entry) is unique to it.
 """
 
 import json
@@ -71,7 +74,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 
-import open_repeater
 import repeater_import
 
 MEMORIES_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "memories.json"
@@ -80,7 +82,6 @@ MEMORIES_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "memories.json"
 # this codebase uses (connection_dialog.py, log_book_window.py, ...).
 _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
-_OPEN_REPEATER_API_KEY_SETTING = "open_repeater_api_key"
 
 _COLUMNS = [
     "Name", "VFO A Freq (MHz)", "VFO A Mode", "VFO B Freq (MHz)", "VFO B Mode",
@@ -336,9 +337,8 @@ class MemoryTabPage(QWidget):
 class LocalRepeatersTabPage(MemoryTabPage):
     """Same table/Add/Delete Memory shape as MemoryTabPage -- entries
     are just as user-editable/deletable here as in any other tab --
-    plus a Refresh button that re-fetches nearby 2m/70cm repeaters
-    (from Open Repeater, or a locally-imported CSV -- the operator
-    picks which each time, see MemoriesWindow._fetch_local_repeater_
+    plus a Refresh button that re-imports nearby 2m/70cm repeaters from
+    a RepeaterBook CSV export (see MemoriesWindow._fetch_local_repeater_
     entries) and replaces this tab's entries wholesale."""
 
     def __init__(self, entries, on_change, on_refresh):
@@ -350,9 +350,9 @@ class LocalRepeatersTabPage(MemoryTabPage):
     def _extra_buttons(self):
         refresh_button = QPushButton("Refresh")
         refresh_button.setToolTip(
-            "Re-fetches nearby 2m/70cm repeaters (Open Repeater API, or an imported CSV file "
-            "-- asks which each time), replacing every entry currently in this tab -- any "
-            "manual edits/additions here are discarded."
+            "Re-imports nearby 2m/70cm repeaters from a RepeaterBook CSV export you pick, "
+            "replacing every entry currently in this tab -- any manual edits/additions here "
+            "are discarded."
         )
         refresh_button.clicked.connect(self._on_refresh_clicked)
         return [refresh_button]
@@ -361,49 +361,12 @@ class LocalRepeatersTabPage(MemoryTabPage):
         if self._entries:
             confirm = QMessageBox.question(
                 self, "Refresh Local Repeaters",
-                "This replaces every entry currently in this tab with a fresh fetch. Continue?",
+                "This replaces every entry currently in this tab with a fresh import. Continue?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if confirm != QMessageBox.Yes:
                 return
         self._on_refresh(self)
-
-
-class OpenRepeaterSettingsDialog(QDialog):
-    """One field: the Open Repeater API key -- free, self-service
-    registration at openrepeater.org (no approval process, unlike
-    RepeaterBook -- see this module's own docstring). Same shape as
-    log_book_window.py's QrzSettingsDialog."""
-
-    def __init__(self, current_key, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Repeaters Settings")
-
-        self.key_input = QLineEdit(current_key)
-        self.key_input.setEchoMode(QLineEdit.Password)
-        self.key_input.setToolTip(
-            "From your free openrepeater.org account (Register -> API key). "
-            "Needed for the Local Repeaters tab's Refresh/create."
-        )
-
-        form = QFormLayout()
-        form.addRow(QLabel(
-            "Get a free API key by registering at openrepeater.org,\n"
-            "then paste it here to enable the Local Repeaters tab."
-        ))
-        form.addRow("API Key:", self.key_input)
-
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-
-        layout = QVBoxLayout()
-        layout.addLayout(form)
-        layout.addWidget(button_box)
-        self.setLayout(layout)
-
-    def result_api_key(self):
-        return self.key_input.text().strip()
 
 
 class MemoriesWindow(QWidget):
@@ -433,23 +396,17 @@ class MemoriesWindow(QWidget):
 
         add_repeaters_tab_button = QPushButton("+ Local Repeaters")
         add_repeaters_tab_button.setToolTip(
-            "Add a tab auto-populated with nearby 2m/70cm repeaters -- from the Open Repeater "
-            "API (needs a free API key), or from a repeater-list CSV file you already have "
-            "(no key needed -- e.g. Icom's own official repeater list download, or a manual "
-            "export from RepeaterBook's website)."
+            "Add a tab auto-populated with nearby 2m/70cm repeaters, imported from a "
+            "RepeaterBook CSV export you already have (download one from RepeaterBook.com's "
+            "own search results page, then pick it here -- no API key or account needed)."
         )
         add_repeaters_tab_button.clicked.connect(self._on_add_local_repeaters_tab_clicked)
-
-        settings_button = QPushButton("Repeaters Settings...")
-        settings_button.setToolTip("Set your Open Repeater API key (only needed for that source)")
-        settings_button.clicked.connect(self._on_repeater_settings_clicked)
 
         corner_widget = QWidget()
         corner_layout = QHBoxLayout(corner_widget)
         corner_layout.setContentsMargins(0, 0, 0, 0)
         corner_layout.addWidget(add_tab_button)
         corner_layout.addWidget(add_repeaters_tab_button)
-        corner_layout.addWidget(settings_button)
         self.tabs.setCornerWidget(corner_widget)
 
         for tab in self._data["tabs"]:
@@ -484,44 +441,25 @@ class MemoriesWindow(QWidget):
         self.tabs.setCurrentWidget(page)
         self._save()
 
-    # ---- Local Repeaters (Open Repeater) ----
-
-    def _get_open_repeater_api_key(self):
-        return QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(_OPEN_REPEATER_API_KEY_SETTING, "") or ""
-
-    def _on_repeater_settings_clicked(self):
-        dialog = OpenRepeaterSettingsDialog(self._get_open_repeater_api_key(), self)
-        if dialog.exec() == QDialog.Accepted:
-            QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(_OPEN_REPEATER_API_KEY_SETTING, dialog.result_api_key())
-
-    _SOURCE_OPEN_REPEATER = "Open Repeater API (needs a free key)"
-    _SOURCE_CSV_IMPORT = "Import from CSV file (no key needed)"
+    # ---- Local Repeaters (RepeaterBook CSV import) ----
 
     def _fetch_local_repeater_entries(self):
-        """Asks which source to use, prompts for a search radius,
-        checks/obtains whatever that source needs (API key, or a CSV
-        file), fetches, and returns a list of memory-entry dicts (see
-        _repeater_to_entry) -- or None if the operator cancelled, or a
-        real failure was already reported via QMessageBox. Shared by
-        both "+ Local Repeaters" (new tab) and Refresh (existing tab).
+        """Prompts for a search radius and a CSV file, imports it, and
+        returns a list of memory-entry dicts (see _repeater_to_entry)
+        -- or None if the operator cancelled, or a real failure was
+        already reported via QMessageBox. Shared by both "+ Local
+        Repeaters" (new tab) and Refresh (existing tab).
 
-        The CSV path exists because Open Repeater's free-tier signup
-        doesn't work out for everyone (confirmed live: a real operator
-        was never able to obtain a key) -- see repeater_import.py's
-        own docstring for exactly which sources were verified against
-        it (Icom's own official repeater list download, a manual
-        RepeaterBook website export) and why it doesn't call
-        RepeaterBook's own API directly (that's explicitly restricted
-        for a "nearby repeater discovery tool" like this one -- see
-        open_repeater.py's own docstring)."""
-        source, ok = QInputDialog.getItem(
-            self, "Local Repeaters", "Source:",
-            [self._SOURCE_OPEN_REPEATER, self._SOURCE_CSV_IMPORT],
-            0, False,
-        )
-        if not ok:
-            return None
-
+        No API/network access at all -- the operator downloads a CSV
+        export themselves from RepeaterBook.com's own search results
+        page (their own personal, manual, one-time use of the site,
+        same as browsing it in any other tab) and this just reads
+        whatever's already on disk, then filters it to "near me"
+        locally. This app deliberately never calls RepeaterBook's own
+        API directly -- their current published terms explicitly
+        disallow exactly this kind of automated "nearby repeater
+        discovery tool" without separate written approval (see
+        repeater_import.py's own docstring for the full citation)."""
         settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         lat = float(settings.value("operator_lat", 0.0)) or None
         lon = float(settings.value("operator_lon", 0.0)) or None
@@ -539,33 +477,17 @@ class MemoriesWindow(QWidget):
         if not ok:
             return None
 
-        if source == self._SOURCE_CSV_IMPORT:
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Import Repeater List", "", "CSV files (*.csv);;All files (*)"
-            )
-            if not path:
-                return None
-            try:
-                repeaters = repeater_import.parse_repeater_csv(path)
-            except Exception as exc:
-                QMessageBox.warning(self, "Local Repeaters", f"Couldn't read that file: {exc}")
-                return None
-            repeaters = repeater_import.filter_by_distance(repeaters, lat, lon, radius_km)
-        else:
-            api_key = self._get_open_repeater_api_key()
-            if not api_key:
-                QMessageBox.information(
-                    self, "Local Repeaters", "Set your Open Repeater API key first (free registration at openrepeater.org)."
-                )
-                self._on_repeater_settings_clicked()
-                api_key = self._get_open_repeater_api_key()
-                if not api_key:
-                    return None
-            try:
-                repeaters = open_repeater.fetch_nearby_repeaters(api_key, lat, lon, radius_km=radius_km)
-            except Exception as exc:
-                QMessageBox.warning(self, "Local Repeaters", f"Fetch failed: {exc}")
-                return None
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import RepeaterBook CSV", "", "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return None
+        try:
+            repeaters = repeater_import.parse_repeater_csv(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Local Repeaters", f"Couldn't read that file: {exc}")
+            return None
+        repeaters = repeater_import.filter_by_distance(repeaters, lat, lon, radius_km)
 
         if not repeaters:
             QMessageBox.information(self, "Local Repeaters", "No 2m/70cm repeaters found within range.")

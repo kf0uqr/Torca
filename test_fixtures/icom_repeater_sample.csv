@@ -1,0 +1,3 @@
+Group No,Group Name,Name,Sub Name,Repeater Call Sign,Gateway Call Sign,Frequency,Dup,Offset,Mode,TONE,Repeater Tone,RPT1USE,Position,Latitude,Longitude,UTC Offset
+17,USA Midwest,Claremore,Oklahoma,AE5ME  B,AE5ME  G,444.350000,DUP+,5.000000,DV,,,YES,Approximate,36.320000,-95.630000,-6:00
+17,USA Midwest,Altus,Oklahoma,AJ5Q   B,AJ5Q   G,442.225000,DUP+,5.000000,DV,,,YES,Approximate,34.670000,-99.330000,-6:00

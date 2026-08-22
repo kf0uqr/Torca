@@ -1318,7 +1318,7 @@ class SatelliteInfoDialog(QDialog):
         passes_table.setSelectionMode(QTableWidget.NoSelection)
         passes_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         if not observer_lat and not observer_lon:
-            passes_label_text = "Upcoming Passes: set your location (Connect New Radio dialog) to see these."
+            passes_label_text = "Upcoming Passes: set your location (Profile...) to see these."
         elif not SGP4_AVAILABLE:
             passes_label_text = "Upcoming Passes: needs the 'sgp4' package for orbital propagation, which isn't installed."
         else:

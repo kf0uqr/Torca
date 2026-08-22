@@ -2488,7 +2488,29 @@ class RadioWorker(QThread):
         which pair is now colliding instead of resolving anything. No-
         op if there's no conflict, freq_hz doesn't land in any known
         band, or this radio model has fewer than 3 bands available
-        (nowhere uninvolved to park the other receiver)."""
+        (nowhere uninvolved to park the other receiver).
+
+        Always leaves `receiver` (not `other_receiver`) selected as the
+        real radio's active receiver before returning, whenever it
+        actually moved other_receiver out of the way -- root-caused a
+        real "tuning Main's knob flips the radio to Sub and starts
+        tuning Sub instead" report to this NOT happening previously:
+        parking the other receiver requires select_receiver(other_
+        receiver) first (rigplane has no way to write another
+        receiver's VFO/frequency without making it active), and every
+        caller of this method (the knob's Main-frequency path, band-
+        button clicks) then goes on to write its OWN intended frequency
+        via a BARE set_frequency call with no receiver kwarg -- which
+        always lands on whichever receiver is genuinely active on the
+        real radio right then. Left on other_receiver, that bare write
+        silently retuned Sub while Main's own target frequency was
+        never actually written at all -- looking exactly like "the
+        knob switched me to Sub", because that's precisely what
+        happened. self._active_receiver itself is deliberately left
+        untouched here (this method never changes it) -- restoring the
+        real hardware to match what that Python-side state already
+        believes is what fixes the mismatch, not changing the belief
+        itself."""
         if not self.is_dual_receiver:
             return
         target_band = self._find_band(freq_hz)
@@ -2531,6 +2553,15 @@ class RadioWorker(QThread):
             await self.radio.set_frequency(safe_low_hz, receiver=other_receiver)
         except Exception as exc:
             self.error.emit(f"Moving receiver {other_receiver} to {safe_label} failed: {exc}")
+        finally:
+            # Restore `receiver` as the real radio's active receiver --
+            # see this method's own docstring for the exact bug this
+            # fixes (a bare frequency write, right after this returns,
+            # otherwise silently lands on other_receiver instead).
+            try:
+                await self.radio.select_receiver(receiver)
+            except Exception as exc:
+                self.error.emit(f"Restoring active receiver ({receiver}) after band-conflict resolution failed: {exc}")
 
     async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int, check_conflict: bool = True):
         if check_conflict:

@@ -252,10 +252,10 @@ def _apply_pulled_records(fetched, qsos, existing_logids, page_cursor):
 
 
 class QrzSyncWorker(QThread):
-    """Runs sync_with_qrz() off the GUI thread -- one-shot, matching
-    world_map.py's WorldMapImageFetcher shape (a small dedicated
-    QThread per operation, not the persistent-connection RadioWorker
-    pattern -- QRZ sync has no ongoing connection to maintain)."""
+    """Runs sync_with_qrz() off the GUI thread -- one-shot, this app's
+    usual small-dedicated-QThread-per-operation shape (not the
+    persistent-connection RadioWorker pattern -- QRZ sync has no
+    ongoing connection to maintain)."""
 
     # Named finished_sync, not finished -- QThread already has its own
     # built-in finished signal (emitted when run() returns); reusing

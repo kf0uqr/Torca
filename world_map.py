@@ -1,127 +1,39 @@
 """
-The Ham Dashboard's day/night world map: a background coastline image
-(downloaded once from Wikimedia Commons and cached locally, falling back
-to a plain dark fill if that ever fails) with the night hemisphere
-shaded, a lat/long reference grid, the sub-solar point, the operator's
-own location, and -- when satellite tracking is on -- satellite markers
-and their footprint polygons, all drawn on top.
+The Ham Dashboard's day/night world map: a zoomable OpenStreetMap tile
+background (map_tiles.py -- fetched on demand as the viewport needs them,
+cached locally) with the night hemisphere shaded, a lat/long reference
+grid, the sub-solar point, the operator's own location, and -- when
+satellite tracking is on -- satellite markers and their footprint
+polygons, all drawn on top.
 """
 
 import datetime
 import math
-import pathlib
-import urllib.error
-import urllib.request
 
-from PySide6.QtCore import Qt, QRect, QRectF, QPointF, Signal, QThread, QTimer
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF, QImage, QFont
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF, QFont
 from PySide6.QtWidgets import QWidget, QSizePolicy, QToolTip, QPushButton
 
 from solar_data import _solar_subpoint, _solar_elevation
-
-
-# Background world map image for WorldMapWidget -- a real equirectangular
-# coastline map, downloaded once and cached locally, rather than embedded
-# in the source (impractical at any reasonable resolution) or fetched
-# fresh every run. Wikimedia's Special:FilePath is a stable redirect to
-# whatever the current version of a named file is, so this doesn't depend
-# on guessing an internal upload-hash path. CC BY 4.0 -- attributed in
-# the map's own corner (see WorldMapWidget.paintEvent).
-WORLD_MAP_IMAGE_URL = (
-    "https://commons.wikimedia.org/wiki/Special:FilePath/"
-    "Blank_Map_of_The_World_Equirectangular_Projection.png"
-)
-WORLD_MAP_CACHE_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "world_map.png"
-WORLD_MAP_ATTRIBUTION = "Map: Wikimedia Commons (CC BY 4.0)"
-
-# Despite its filename/description, the actual fetched file (7194x3386
-# as of this writing) is NOT a true pole-to-pole -90..+90 equirectangular
-# render -- confirmed empirically by cross-referencing known ruler-
-# straight political borders at fixed latitudes against their real
-# pixel rows in this specific file: the 49th-parallel US/Canada border
-# (its Lake of the Woods "Northwest Angle" notch is unmistakable) sits
-# at row 680, and the Egypt-Sudan border (dead straight at 22N, with
-# its Halaib Triangle corner) sits at row 1203 -- not the rows a naive
-# full -90/+90 span would predict (771 and 1279 respectively, ~90px/
-# ~5deg off). Fitting a line through those two points gives this
-# image's TRUE top/bottom latitude bounds: row 0 is actually about
-# +84.1 (missing the northernmost polar cap entirely) and its last row
-# overshoots to about -90.6 (a few rows of plain ocean fill past the
-# real South Pole, not real geography). Horizontal (longitude)
-# placement WAS confirmed correct (land reaches to within a couple
-# pixels of both the left and right edges, as a genuine -180/+180 span
-# should) -- only vertical placement needed correcting.
-#
-# _draw_background_image below uses this to draw the image at its
-# actual position/scale instead of naively stretching it to fill the
-# full latitude range -- everything else (the grid, terminator,
-# satellite/QSO markers, operator location) was already using the
-# correct/real -180..180 / -90..90 math the whole time; it was only
-# ever this raster image that didn't line up with it. Guarded by an
-# exact pixel-dimension match so a differently-sized image (e.g. if
-# Wikimedia ever serves an edited/replaced file at that same URL, per
-# WORLD_MAP_IMAGE_URL's own docstring about it being a "stable
-# redirect to whatever the CURRENT version is") falls back to the
-# naive full -90/+90 assumption instead of applying a now-wrong
-# correction blindly.
-_CALIBRATED_IMAGE_SIZE = (7194, 3386)
-_CALIBRATED_LAT_TOP = 84.109
-_CALIBRATED_LAT_BOTTOM = -90.647
-
-
-class WorldMapImageFetcher(QThread):
-    """Downloads the background map image once, if not already cached
-    locally -- after that, never touches the network again. Runs on its
-    own thread since it's a one-time blocking HTTP fetch; the map widget
-    itself keeps working (grid-only look, same as before this feature
-    existed) regardless of whether this succeeds."""
-
-    image_ready = Signal(str)   # local file path
-    failed = Signal(str)
-
-    def run(self):
-        if WORLD_MAP_CACHE_PATH.exists():
-            self.image_ready.emit(str(WORLD_MAP_CACHE_PATH))
-            return
-        try:
-            WORLD_MAP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            # Confirmed via a live 403 Forbidden: Wikimedia rejects
-            # requests using Python's default urllib User-Agent as a
-            # bot-prevention measure. They document requiring a
-            # descriptive one instead (meta.wikimedia.org/wiki/
-            # User-Agent_policy) -- a plain identifying string is enough
-            # to get past this, no API key/registration needed.
-            request = urllib.request.Request(
-                WORLD_MAP_IMAGE_URL,
-                headers={"User-Agent": "IcomRadioControlApp/1.0 (desktop ham radio control application)"},
-            )
-            with urllib.request.urlopen(request, timeout=20) as response:
-                data = response.read()
-            WORLD_MAP_CACHE_PATH.write_bytes(data)
-            self.image_ready.emit(str(WORLD_MAP_CACHE_PATH))
-        except Exception as exc:
-            self.failed.emit(str(exc))
+import map_tiles
 
 
 class WorldMapWidget(QWidget):
     """A day/night map in the spirit of (not a reimplementation of)
-    HamClock's map pane: a real equirectangular coastline map as the
-    background (downloaded once via WorldMapImageFetcher, cached
-    locally; falls back to a plain dark background if that ever fails,
-    e.g. no internet on first run), with the night hemisphere shaded,
-    a lat/long reference grid, the sub-solar point, and the operator's
-    own location if set, drawn on top."""
+    HamClock's map pane: a zoomable OpenStreetMap tile background
+    (map_tiles.py -- fetched on demand, cached locally; unfetched tiles
+    draw as a plain placeholder fill until they arrive), with the night
+    hemisphere shaded, a lat/long reference grid, the sub-solar point,
+    and the operator's own location if set, drawn on top.
+
+    Fills the widget's own natural aspect ratio -- unlike the old static
+    equirectangular image (which had to be letterboxed to a fixed 2:1 box
+    to avoid visibly distorting it), a real map has no such constraint;
+    every other map app just fills its container."""
 
     satellite_double_clicked = Signal(str)  # satellite name, from the positions passed to set_satellite_positions
     satellite_right_clicked = Signal(str)   # satellite name -- opens Satellite Info (ham_dashboard.py)
     satellite_left_clicked = Signal(str)    # satellite name -- sets the "active" map-highlighted satellite
-
-    # The background image (and the whole lat/lon grid it's drawn
-    # against) is a standard equirectangular projection: 2:1 width:height.
-    # Stretching the widget to some other ratio would distort it, so the
-    # actual map content is always letterboxed to this ratio within
-    # whatever box the widget is given -- see _map_rect().
-    MAP_ASPECT_RATIO = 2.0
 
     # Path direction-arrow animation -- see _advance_path_animation.
     _PATH_ANIMATION_INTERVAL_MS = 60
@@ -130,22 +42,13 @@ class WorldMapWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(220)
-        # Expanding/Preferred, not Expanding/Expanding -- the old
-        # Expanding/Expanding + a stretch factor of 1 in HamClockWindow's
-        # layout (the only stretchy item there) meant this widget grabbed
-        # *all* extra vertical space in the window, which severely
-        # distorted the map once HamClockWindow started occupying a tall/
-        # narrow half-screen region (e.g. 960x1200) rather than a wider
-        # squarer window -- a naturally 2:1 map stretched to nearly 2:2.5.
-        # heightForWidth (below) lets layouts that respect it size this
-        # proportionally in the first place; _map_rect()'s letterboxing
-        # in paintEvent is the actual guarantee regardless of whether a
-        # given layout honors that.
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._operator_lat = None
         self._operator_lon = None
         self._operator_label = ""
-        self._background_image = None  # QImage, once loaded (or None -- falls back to a plain fill)
+        self._tile_cache = map_tiles.TileCache()
+        self._tile_fetcher = map_tiles.TileFetcher(self)
+        self._tile_fetcher.tile_ready.connect(self._on_tile_ready)
         self._satellite_mode = False
         self._satellite_positions = []  # list of {"name", "lat", "lon", "altitude_km", "footprint"}
         self._qso_markers = []  # list of {"lat", "lon", "band", "time", "callsign"} -- see set_qso_markers
@@ -162,15 +65,21 @@ class WorldMapWidget(QWidget):
         # without room to scroll into). Content is scaled/panned via a
         # single QPainter transform applied around all the existing
         # drawing code in paintEvent, rather than reworking every
-        # individual _lonlat_to_xy call site -- so the background image,
-        # grid, terminator shading, and every marker all zoom/pan
-        # together for free. _pan_x/_pan_y are offsets, in UNZOOMED
-        # map-content pixels, of the view center from the map's true
-        # center (map_rect's own w/2, h/2) -- see _clamp_pan for why
-        # that unit choice makes the valid range shrink cleanly to
-        # {0,0} at zoom=1.
+        # individual _lonlat_to_xy call site -- so the map tiles, grid,
+        # terminator shading, and every marker all zoom/pan together for
+        # free. _pan_x/_pan_y are offsets, in UNZOOMED map-content
+        # pixels, of the view center from the map's true center (self.
+        # width()/2, self.height()/2) -- see _clamp_pan for why that unit
+        # choice makes the valid range shrink cleanly to {0,0} at zoom=1.
+        #
+        # MAX_ZOOM is generous (this is just a QPainter magnification
+        # multiplier, not itself a resolution limit) -- _draw_map_tiles
+        # separately caps how much REAL tile detail ever gets fetched at
+        # map_tiles.MAX_TILE_ZOOM; zooming past that just magnifies the
+        # same highest-detail tiles further, same as any real map app
+        # past its own max zoom.
         self.MIN_ZOOM = 1.0
-        self.MAX_ZOOM = 12.0
+        self.MAX_ZOOM = 40.0
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
@@ -198,18 +107,10 @@ class WorldMapWidget(QWidget):
         self._path_animation_timer.timeout.connect(self._advance_path_animation)
         self._path_animation_timer.start(self._PATH_ANIMATION_INTERVAL_MS)
 
-        self._image_fetcher = WorldMapImageFetcher()
-        self._image_fetcher.image_ready.connect(self._on_image_ready)
-        self._image_fetcher.failed.connect(self._on_image_failed)
-        self._image_fetcher.start()
-
         # ---- +/- zoom buttons ----
         # Plain child QWidgets positioned by hand (not a layout -- they
-        # need to float in the map's own top-left corner, tracking
-        # _map_rect() rather than the widget's own rect, since letterbox
-        # bars mean those aren't the same point whenever the widget's
-        # box isn't exactly MAP_ASPECT_RATIO) -- repositioned in
-        # resizeEvent below. A semi-opaque dark background keeps them
+        # need to float in the map's own top-left corner) -- repositioned
+        # in resizeEvent below. A semi-opaque dark background keeps them
         # legible over either the day or night hemisphere.
         button_style = (
             "QPushButton { background-color: rgba(30, 30, 34, 200); color: white; "
@@ -232,31 +133,26 @@ class WorldMapWidget(QWidget):
         self.zoom_out_button.clicked.connect(self._on_zoom_out_clicked)
         self._position_zoom_buttons()
 
-    def wait_for_pending_image_fetch(self, timeout_ms=21000):
-        """Call from the owning window's closeEvent before it returns
-        -- _image_fetcher is a one-shot QThread with no interruption
-        support at all (nothing to check between steps: it's cache-hit-
-        instant, or one single blocking urllib call up to its own 20s
-        timeout, never a loop), so unlike SolarDataWorker there's no
-        cooperative flag to set here, only waiting it out. Only matters
-        on a fresh install/cache miss -- once WORLD_MAP_CACHE_PATH
-        exists (true after the very first successful run), this
-        returns instantly every time after. Default timeout covers
-        that one urllib call's own 20s bound with a small margin."""
-        self._image_fetcher.wait(timeout_ms)
+    def shutdown_tile_fetcher(self):
+        """Call from the owning window's closeEvent before it returns --
+        the tile fetcher's worker threads are PERSISTENT (unlike the old
+        one-shot image fetcher), so they need an explicit stop, not just
+        a wait: destroying a still-running QThread aborts the process,
+        the same "QThread destroyed while still running" crash this app
+        already fixed for every other background worker."""
+        self._tile_fetcher.shutdown()
 
     _ZOOM_BUTTON_FACTOR = 1.4  # per-click step -- a bigger jump than one wheel notch (_ZOOM_STEP), since a click is discrete
 
     def _on_zoom_in_clicked(self):
-        self._zoom_at(self._map_rect().center(), self._ZOOM_BUTTON_FACTOR)
+        self._zoom_at(QPointF(self.width() / 2.0, self.height() / 2.0), self._ZOOM_BUTTON_FACTOR)
 
     def _on_zoom_out_clicked(self):
-        self._zoom_at(self._map_rect().center(), 1.0 / self._ZOOM_BUTTON_FACTOR)
+        self._zoom_at(QPointF(self.width() / 2.0, self.height() / 2.0), 1.0 / self._ZOOM_BUTTON_FACTOR)
 
     def _position_zoom_buttons(self):
-        map_rect = self._map_rect()
-        x = int(map_rect.x()) + self._ZOOM_BUTTON_MARGIN
-        y = int(map_rect.y()) + self._ZOOM_BUTTON_MARGIN
+        x = self._ZOOM_BUTTON_MARGIN
+        y = self._ZOOM_BUTTON_MARGIN
         self.zoom_in_button.move(x, y)
         self.zoom_out_button.move(x, y + self._ZOOM_BUTTON_SIZE + 4)
 
@@ -274,14 +170,12 @@ class WorldMapWidget(QWidget):
         self._path_animation_progress = (self._path_animation_progress + self._PATH_ANIMATION_SPEED) % 1.0
         self.update()
 
-    def _on_image_ready(self, path):
-        image = QImage(path)
-        if not image.isNull():
-            self._background_image = image
-        self.update()
-
-    def _on_image_failed(self, error):
-        print(f"[ERROR] Ham Dashboard: world map image download failed ({error}) -- using plain background instead.")
+    def _on_tile_ready(self, z, x, y, path):
+        # Just triggers a repaint -- _draw_map_tiles re-checks
+        # self._tile_cache.get(...) itself next paintEvent (which now
+        # finds this tile decoded and ready, having just been written to
+        # disk by the fetch worker), rather than this handler pushing the
+        # pixmap in directly.
         self.update()
 
     def set_operator_location(self, lat, lon, label=""):
@@ -290,52 +184,12 @@ class WorldMapWidget(QWidget):
         self._operator_label = label
         self.update()
 
-    def hasHeightForWidth(self):
-        return True
-
-    def heightForWidth(self, width):
-        return max(self.minimumHeight(), int(width / self.MAP_ASPECT_RATIO))
-
-    def _map_rect(self):
-        """The largest MAP_ASPECT_RATIO-shaped rect that fits centered
-        within the widget's current size -- everything actually drawn
-        (background image, grid, satellites, etc.) goes inside this, not
-        the raw self.rect(), so the map itself is never stretched out of
-        proportion regardless of what box the surrounding layout ends up
-        giving the widget."""
-        w, h = self.width(), self.height()
-        if w <= 0 or h <= 0:
-            return QRect(0, 0, w, h)
-        if w / self.MAP_ASPECT_RATIO <= h:
-            map_w, map_h = w, w / self.MAP_ASPECT_RATIO
-        else:
-            map_w, map_h = h * self.MAP_ASPECT_RATIO, h
-        x0 = (w - map_w) / 2.0
-        y0 = (h - map_h) / 2.0
-        return QRectF(x0, y0, map_w, map_h)
-
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # Letterbox bars (if the widget's actual box isn't exactly
-        # MAP_ASPECT_RATIO) in a neutral color matching the rest of the
-        # app's dark theme, rather than an unstyled stark black -- then
-        # translate into the letterboxed rect's own coordinate space so
-        # everything below this can keep using plain (0,0)-origin math
-        # against just mw/mh, same as it did against the whole widget
-        # before letterboxing existed.
         painter.fillRect(self.rect(), QColor(45, 45, 48))
-        map_rect = self._map_rect()
-        painter.save()
-        painter.translate(map_rect.x(), map_rect.y())
-        w, h = map_rect.width(), map_rect.height()
-        # Clip to the letterboxed map rect itself (not just the widget's
-        # own rect, already the default) -- without this, zoomed-in
-        # content spills into the letterbox bars whenever the widget's
-        # box isn't exactly MAP_ASPECT_RATIO, since the zoom transform
-        # below can make drawn content larger than map_rect.
-        painter.setClipRect(QRectF(0, 0, w, h))
+        w, h = self.width(), self.height()
 
         # Zoom/pan transform -- scales/translates everything drawn below
         # this point (background image, grid, terminator, every
@@ -349,34 +203,39 @@ class WorldMapWidget(QWidget):
         painter.scale(self._zoom, self._zoom)
         painter.translate(-(w / 2.0 + self._pan_x), -(h / 2.0 + self._pan_y))
 
-        if self._background_image is not None:
-            self._draw_background_image(painter, w, h)
-        else:
-            painter.fillRect(QRectF(0, 0, w, h), QColor(10, 20, 40))
+        self._draw_map_tiles(painter, w, h)
 
         now = datetime.datetime.now(datetime.timezone.utc)
 
         # Night-hemisphere shading -- brute-force grid sampling rather
         # than deriving the terminator's closed-form curve. This redraws
         # once a minute (see HamClockWindow's map_timer), so the cost is
-        # a non-issue at this grid resolution.
+        # a non-issue at this grid resolution. Each cell's on-screen rect
+        # is computed from its real corner lat/lon via _lonlat_to_xy
+        # (Mercator, non-uniform pixels-per-degree) rather than assuming
+        # a fixed cell size in pixels -- true only for equirectangular,
+        # which this is no longer.
         lon_step, lat_step = 4, 4
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 0, 0, 140))
         for lon in range(-180, 180, lon_step):
             for lat in range(-90, 90, lat_step):
                 if _solar_elevation(lat + lat_step / 2.0, lon + lon_step / 2.0, now) < 0:
-                    x = (lon + 180) / 360.0 * w
-                    y = (90 - (lat + lat_step)) / 180.0 * h
-                    painter.drawRect(QRectF(x, y, lon_step / 360.0 * w + 1, lat_step / 180.0 * h + 1))
+                    x0, y0 = self._lonlat_to_xy(lat + lat_step, lon, w, h)
+                    x1, y1 = self._lonlat_to_xy(lat, lon + lon_step, w, h)
+                    painter.drawRect(QRectF(x0, y0, x1 - x0 + 1, y1 - y0 + 1))
 
-        # Lat/long grid every 30 degrees, for orientation.
+        # Lat/long grid every 30 degrees, for orientation -- each
+        # gridline's position comes from _lonlat_to_xy too, so latitude
+        # lines correctly converge toward the poles under Mercator
+        # instead of staying evenly spaced (which only equirectangular
+        # would justify).
         painter.setPen(QPen(QColor(60, 80, 110), 1))
         for lon in range(-180, 181, 30):
-            x = (lon + 180) / 360.0 * w
+            x, _ = self._lonlat_to_xy(0, lon, w, h)
             painter.drawLine(QPointF(x, 0), QPointF(x, h))
         for lat in range(-90, 91, 30):
-            y = (90 - lat) / 180.0 * h
+            _, y = self._lonlat_to_xy(lat, 0, w, h)
             painter.drawLine(QPointF(0, y), QPointF(w, y))
 
         # Equator/prime meridian, slightly brighter for orientation.
@@ -472,35 +331,65 @@ class WorldMapWidget(QWidget):
                 sx, sy = self._content_to_screen(cx, cy, w, h)
                 painter.drawEllipse(QPointF(sx, sy), 3.5, 3.5)
 
-        # Attribution for the background map image, if it loaded (CC BY
-        # 4.0 requires this) -- fixed corner label regardless of zoom/pan.
-        if self._background_image is not None:
-            painter.setPen(QColor(200, 200, 200, 180))
-            painter.drawText(QPointF(6, h - 6), WORLD_MAP_ATTRIBUTION)
+        # Attribution -- required by the OSM Tile Usage Policy, must stay
+        # visible unconditionally (not gated on a successful fetch, since
+        # tiles are always the background now, not an optional extra).
+        # Fixed corner label regardless of zoom/pan.
+        painter.setPen(QColor(200, 200, 200, 180))
+        painter.drawText(QPointF(6, h - 6), map_tiles.MAP_ATTRIBUTION)
 
-        painter.restore()
+    def _draw_map_tiles(self, painter, w, h):
+        """Draws every OSM tile overlapping the currently-visible content-
+        space rect at the best-available zoom, in CONTENT space (i.e.
+        BEFORE the self._zoom painter.scale() transform already active
+        around this call magnifies it) -- so a tile's size here is its
+        real resolution divided by however far self._zoom has already
+        gone, and the outer transform does the rest, exactly like every
+        other geographic overlay drawn in this same transform (grid
+        lines, terminator shading, satellite footprints/paths).
 
-    def _draw_background_image(self, painter, w, h):
-        """Draws self._background_image into the (0,0,w,h) content
-        rect -- but at the image's OWN true lat/lon bounds (see
-        _CALIBRATED_LAT_TOP/_CALIBRATED_LAT_BOTTOM's module-level
-        comment) rather than naively stretching it to fill the full
-        -90..+90 range, which left it visibly misaligned from the grid
-        and every marker (all of which already use the correct/real
-        latitude math). A solid ocean-color base fill covers the small
-        gap this leaves near the North Pole (this image's content
-        doesn't reach that far), which otherwise would have shown
-        whatever's behind the map (the widget's own dark background)
-        instead of more ocean."""
-        image = self._background_image
-        if (image.width(), image.height()) == _CALIBRATED_IMAGE_SIZE:
-            lat_top, lat_bottom = _CALIBRATED_LAT_TOP, _CALIBRATED_LAT_BOTTOM
-        else:
-            lat_top, lat_bottom = 90.0, -90.0
-        y0 = (90.0 - lat_top) / 180.0 * h
-        y1 = (90.0 - lat_bottom) / 180.0 * h
-        painter.fillRect(QRectF(0, 0, w, h), QColor(72, 114, 255))
-        painter.drawImage(QRectF(0, y0, w, y1 - y0), image)
+        effective_zoom combines how much detail the CURRENT widget size
+        already implies (log2(w / TILE_SIZE_PX) -- the zoom level whose
+        native tile grid matches content space's own w-pixels-per-360-
+        longitude scale) with how far the operator has scaled in beyond
+        that (log2(self._zoom)) -- fetching progressively higher-
+        resolution tiles as either grows, rather than just letting
+        QPainter blur-magnify a fixed-resolution tile set (the exact
+        problem this whole feature replaces)."""
+        effective_zoom = math.log2(max(w, 1) * self._zoom / map_tiles.TILE_SIZE_PX)
+        draw_zoom = int(round(max(map_tiles.MIN_TILE_ZOOM, min(map_tiles.MAX_TILE_ZOOM, effective_zoom))))
+        tiles_per_side = 2 ** draw_zoom
+        tile_w = w / tiles_per_side
+
+        # Visible content-space rect, inverting the zoom/pan transform via
+        # the same helper hit-testing uses -- keeps tile requests/draws
+        # limited to what's actually on screen (plus a 1-tile margin for
+        # smooth panning) instead of the whole world.
+        top_left, _, _ = self._widget_pos_to_content(QPointF(0, 0))
+        bottom_right, _, _ = self._widget_pos_to_content(QPointF(self.width(), self.height()))
+
+        x0 = max(0, int(top_left.x() / tile_w) - 1)
+        x1 = min(tiles_per_side - 1, int(bottom_right.x() / tile_w) + 1)
+        lat_top = map_tiles.content_y_to_lat(top_left.y(), h)
+        lat_bottom = map_tiles.content_y_to_lat(bottom_right.y(), h)
+        y0 = max(0, map_tiles.lat_to_tile_y(lat_top, draw_zoom) - 1)
+        y1 = min(tiles_per_side - 1, map_tiles.lat_to_tile_y(lat_bottom, draw_zoom) + 1)
+        if x1 < x0 or y1 < y0:
+            return
+
+        painter.fillRect(QRectF(0, 0, w, h), QColor(30, 34, 40))
+        for ty in range(y0, y1 + 1):
+            lat_top_row = map_tiles.tile_y_to_lat(ty, draw_zoom)
+            lat_bottom_row = map_tiles.tile_y_to_lat(ty + 1, draw_zoom)
+            y_top = self._lonlat_to_xy(lat_top_row, 0, w, h)[1]
+            y_bottom = self._lonlat_to_xy(lat_bottom_row, 0, w, h)[1]
+            for tx in range(x0, x1 + 1):
+                rect = QRectF(tx * tile_w, y_top, tile_w, y_bottom - y_top)
+                pixmap = self._tile_cache.get(draw_zoom, tx, ty)
+                if pixmap is not None:
+                    painter.drawPixmap(rect, pixmap, QRectF(pixmap.rect()))
+                else:
+                    self._tile_fetcher.request(draw_zoom, tx, ty)
 
     def set_satellite_mode(self, enabled):
         self._satellite_mode = enabled
@@ -575,11 +464,9 @@ class WorldMapWidget(QWidget):
         rather than transforming each marker's position individually,
         since there's only ever one cursor position to convert per
         hit-test call. Returns (content_pos, w, h)."""
-        map_rect = self._map_rect()
-        local = widget_pos - map_rect.topLeft()
-        w, h = map_rect.width(), map_rect.height()
-        cx = (local.x() - w / 2.0) / self._zoom + w / 2.0 + self._pan_x
-        cy = (local.y() - h / 2.0) / self._zoom + h / 2.0 + self._pan_y
+        w, h = self.width(), self.height()
+        cx = (widget_pos.x() - w / 2.0) / self._zoom + w / 2.0 + self._pan_x
+        cy = (widget_pos.y() - h / 2.0) / self._zoom + h / 2.0 + self._pan_y
         return QPointF(cx, cy), w, h
 
     def _content_to_screen(self, cx, cy, w, h):
@@ -701,10 +588,8 @@ class WorldMapWidget(QWidget):
         widens as zoom increases (more of the oversized content is
         available to scroll to). Without this, dragging or zooming near
         an edge could push the visible viewport off the map entirely
-        (blank space and/or the background image sliding fully out of
-        the clip rect)."""
-        map_rect = self._map_rect()
-        w, h = map_rect.width(), map_rect.height()
+        (blank space and/or the map tiles sliding fully out of view)."""
+        w, h = self.width(), self.height()
         if self._zoom <= 1.0:
             self._pan_x = 0.0
             self._pan_y = 0.0
@@ -725,11 +610,9 @@ class WorldMapWidget(QWidget):
         new_zoom = max(self.MIN_ZOOM, min(self.MAX_ZOOM, self._zoom * factor))
         if new_zoom == self._zoom:
             return
-        map_rect = self._map_rect()
-        local = widget_pos - map_rect.topLeft()
         self._zoom = new_zoom
-        self._pan_x = content_pos.x() - w / 2.0 - (local.x() - w / 2.0) / new_zoom
-        self._pan_y = content_pos.y() - h / 2.0 - (local.y() - h / 2.0) / new_zoom
+        self._pan_x = content_pos.x() - w / 2.0 - (widget_pos.x() - w / 2.0) / new_zoom
+        self._pan_y = content_pos.y() - h / 2.0 - (widget_pos.y() - h / 2.0) / new_zoom
         self._clamp_pan()
         self.update()
 
@@ -849,7 +732,24 @@ class WorldMapWidget(QWidget):
 
     @staticmethod
     def _lonlat_to_xy(lat, lon, w, h):
-        return (lon + 180) / 360.0 * w, (90 - lat) / 180.0 * h
+        """Web Mercator, NOT naive equirectangular linear latitude --
+        x stays a plain lon-to-w linear scale (longitude IS linear in
+        Mercator too), but y now uses Mercator's lat-to-fraction formula,
+        scaled to h. Deliberately NOT true square/conformal Mercator (x
+        scaled by w, y independently by h, same as the old equirect
+        code's own per-axis-independent structure) -- a real textbook
+        Mercator projection is square (the same w would drive both axes),
+        which would visibly stretch/squash content whenever the widget
+        itself isn't square. This is a pragmatic simplification (a
+        non-square widget mildly deviates from true-conformal as a
+        result) that keeps every zoom/pan/hit-test method in this class
+        completely projection-agnostic -- see map_tiles.py's own
+        docstring for the fuller reasoning."""
+        lat = max(-map_tiles.MERCATOR_LAT_LIMIT, min(map_tiles.MERCATOR_LAT_LIMIT, lat))
+        x = (lon + 180.0) / 360.0 * w
+        lat_rad = math.radians(lat)
+        y = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * h
+        return x, y
 
     def _draw_satellite_footprint(self, painter, sat, w, h):
         points = sat.get("footprint") or []

@@ -36,9 +36,9 @@ import adif
 PSKREPORTER_QUERY_URL = "https://retrieve.pskreporter.info/query"
 
 # Same identifying-User-Agent convention used for every other external
-# fetch in this app (world_map.py's WorldMapImageFetcher, satellite_
-# tracking.py's fetch_transponders/fetch_amateur_tles) -- PSKReporter's
-# own docs ask API consumers to identify themselves.
+# fetch in this app (map_tiles.py's tile fetcher, satellite_tracking.py's
+# fetch_transponders/fetch_amateur_tles) -- PSKReporter's own docs ask
+# API consumers to identify themselves.
 _USER_AGENT = "TORCA/1.0 (desktop ham radio control application)"
 
 # PSKReporter's own documented cap on flowStartSeconds -- confirmed via

@@ -296,10 +296,10 @@ PSKREPORTER_LOOKBACK_OPTIONS = [
 
 
 class PskReporterWorker(QThread):
-    """One-shot fetch off the GUI thread -- same shape as world_map.py's
-    WorldMapImageFetcher (a single blocking urllib call, not the full
-    persistent-connection RadioWorker machinery). Never runs on a
-    timer -- only ever started by an explicit user action (toggling the
+    """One-shot fetch off the GUI thread -- this app's usual small-
+    dedicated-QThread-per-operation shape (a single blocking urllib
+    call, not the full persistent-connection RadioWorker machinery).
+    Never runs on a timer -- only ever started by an explicit user action (toggling the
     PSKReporter button on, or changing its settings while already on) --
     PSKReporter's own usage guidance asks clients not to poll
     frequently."""
@@ -2639,13 +2639,13 @@ class HamClockWindow(QWidget):
         # in practice since most real network failures fail fast rather
         # than hanging silently for the full duration).
         self.solar_worker.wait(15000)
-        # Only ever actually waits on a fresh install/cache miss -- see
-        # its own docstring. Discovered the same way as the solar_
-        # worker fix above: this fetcher had NO shutdown handling at
-        # all (not even a too-short wait like solar_worker's old one),
-        # so closing during the one-time map image download reliably
-        # hit the same QThread-destroyed-while-running abort.
-        self.map_widget.wait_for_pending_image_fetch()
+        # The map tile fetcher's worker threads are PERSISTENT for the
+        # widget's whole lifetime (unlike the old one-shot map-image
+        # fetcher this replaced), so this always has something real to
+        # stop, not just on a fresh install/cache miss -- same class of
+        # QThread-destroyed-while-running abort as every other worker
+        # here if skipped.
+        self.map_widget.shutdown_tile_fetcher()
         # Same class of bug again, found via the same headless-testing
         # process: every other one-shot fetch this window can have in
         # flight needs waiting out too, not just solar data and the map

@@ -966,36 +966,94 @@ def _parse_telemetry(text):
 #
 # Piggyback on an already-parsed position report whose symbol is the
 # Weather Station symbol ('_', in either table) -- see the call site in
-# parse_aprs_info. The comment's own leading 7-byte Data Extension slot
-# (already parsed as course/speed by parse_comment_extensions) is
-# reinterpreted as WIND direction/speed instead (same "ddd/sss" byte
-# shape, aprs101.txt:3363-3370); the rest of the comment is scanned for
-# the documented single-letter+fixed-width fields, in any order,
-# stopping at the first unrecognized byte (leftover software-type/
-# unit-type/free text, shown verbatim as part of the still-unmodified
-# raw comment, not further decoded). Verified against the spec's own
-# example: "_10090556c220s004g005t077r000p000P000h50b09900wRSW".
+# parse_aprs_info. The comment's own leading 7-byte slot is WIND
+# direction/speed (same "ddd/sss" byte shape as course/speed,
+# aprs101.txt:3363-3370, parsed independently here rather than reusing
+# parse_comment_extensions's own course_deg/speed_knots -- see
+# _parse_weather_wind's own docstring for why); the rest of the
+# comment is scanned for the documented single-letter+fixed-width
+# fields, in any order. EVERY field (the wind slot and each letter-
+# coded field) tolerates the spec's own documented "unknown/not
+# available" placeholder -- a run of '.' or ' ' in place of digits
+# (aprs101.txt:3311-3327: "Where an item of weather data is unknown or
+# irrelevant, its value may be expressed as a series of dots or
+# spaces... c...s...g...") -- confirmed live against a real received
+# packet (a WX0U-2/W0BZN-digipeated report from "AUBURN") that this
+# convention is genuinely common, not a spec curiosity: it had a
+# missing wind speed, gust, temperature, and rain-since-midnight
+# sensor, all reported as dots. A field with an unknown value is
+# skipped (no key added) but the scan still advances past it and keeps
+# reading the fields that follow -- earlier code stopped the whole
+# scan dead at the first unparseable byte, silently losing every real
+# reading after it (confirmed live: it lost rain-last-hour, rain-24hr,
+# and barometric pressure, all present with real values, just because
+# an earlier gust/temp field happened to be reported unknown).
+# Verified against the spec's own example:
+# "_10090556c220s004g005t077r000p000P000h50b09900wRSW".
+
+_WIND_RE = re.compile(r"^([\d. ]{3})/([\d. ]{3})")
+
+
+def _parse_weather_value(text):
+    """A weather field's digit-or-placeholder value -- int if text
+    parses as one (str.isdigit() alone won't do here: temperature is
+    the one field allowed a leading '-', and isdigit() doesn't accept
+    that -- confirmed live that using it broke negative temperatures
+    entirely), None if it's the spec's own "unknown" placeholder (any
+    mix of '.'/' ', confirmed live to appear as plain '...' in real
+    traffic) rather than a real reading."""
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _parse_weather_wind(comment):
+    """comment starts at the wind direction/speed slot (the position
+    report's own leading 7 comment bytes, for a Weather Station symbol
+    -- same "ddd/sss" shape parse_comment_extensions's course_deg/
+    speed_knots already parses, but re-parsed independently here since
+    that function requires strict digits on BOTH sides and simply
+    doesn't match at all (returning {}, no course_deg key) the moment
+    either side is the "unknown" dot placeholder -- confirmed live
+    against a real packet with wind speed reported as "..." while
+    direction was a real "000". Returns (wind_deg_or_None,
+    wind_speed_mph_or_None, consumed_length) -- consumed_length is 7
+    if the slot matched the ddd/sss shape at all (even if one or both
+    sides turned out to be "unknown"), 0 if the comment doesn't start
+    with that shape (e.g. no wind sensor at all, not even placeholder
+    dots, for a positionless-turned-Complete report)."""
+    match = _WIND_RE.match(comment)
+    if not match:
+        return None, None, 0
+    direction_text, speed_text = match.groups()
+    return _parse_weather_value(direction_text), _parse_weather_value(speed_text), 7
+
 
 _WEATHER_FIELD_RE = re.compile(
-    r"(?:g(?P<gust>\d{3}))|"
-    r"(?:t(?P<temp>-?\d{1,3}))|"
-    r"(?:r(?P<rain_hr>\d{3}))|"
-    r"(?:p(?P<rain_24h>\d{3}))|"
-    r"(?:P(?P<rain_midnight>\d{3}))|"
-    r"(?:h(?P<humidity>\d{2}))|"
-    r"(?:b(?P<pressure>\d{5}))|"
-    r"(?:L(?P<lum_low>\d{3}))|"
-    r"(?:l(?P<lum_high>\d{3}))|"
-    r"(?:s(?P<snow>\d{3}))"
+    r"(?:g(?P<gust>[\d.]{3}))|"
+    r"(?:t(?P<temp>[-\d.][\d.]{1,2}))|"
+    r"(?:r(?P<rain_hr>[\d.]{3}))|"
+    r"(?:p(?P<rain_24h>[\d.]{3}))|"
+    r"(?:P(?P<rain_midnight>[\d.]{3}))|"
+    r"(?:h(?P<humidity>[\d.]{2}))|"
+    r"(?:b(?P<pressure>[\d.]{5}))|"
+    r"(?:L(?P<lum_low>[\d.]{3}))|"
+    r"(?:l(?P<lum_high>[\d.]{3}))|"
+    r"(?:s(?P<snow>[\d.]{3}))"
 )
 
 
 def _parse_weather_fields(comment):
-    """Scans comment (a position report's own comment text, AFTER any
-    leading Data Extension bytes) for the documented weather fields,
-    consuming consecutive matches from the start and stopping at the
-    first byte that isn't a recognized field (leftover software-type/
-    unit-type codes or free text -- not parsed further)."""
+    """Scans comment (a position report's own comment text, AFTER the
+    leading wind direction/speed bytes) for the documented weather
+    fields, consuming consecutive matches from the start. A field
+    whose value is the "unknown" dot/space placeholder is skipped (no
+    key added) WITHOUT stopping the scan -- see this section's own
+    module-level comment for why that matters. The scan does stop at
+    the first byte that isn't a recognized field AT ALL (not even as
+    an unknown-value placeholder) -- leftover software-type/unit-type
+    codes or free text, not parsed further."""
     fields = {}
     pos = 0
     while pos < len(comment):
@@ -1004,7 +1062,9 @@ def _parse_weather_fields(comment):
             break
         for name, value in match.groupdict().items():
             if value is not None:
-                fields[name] = int(value)
+                parsed = _parse_weather_value(value)
+                if parsed is not None:
+                    fields[name] = parsed
         pos = match.end()
     if not fields:
         return None
@@ -1030,33 +1090,60 @@ def _parse_weather_fields(comment):
 
 def _attach_weather_if_present(position_dict):
     """Mutates position_dict in place, adding a "weather" key if its
-    symbol is the Weather Station symbol and its comment contains
-    recognizable weather fields -- called from every position-report
-    code path in parse_aprs_info (plain, compressed, Mic-E, Object,
-    Item) so weather-carrying positions from any of them get
-    translated the same way, regardless of which wire format carried
-    them."""
+    symbol is the Weather Station symbol -- called from every
+    position-report code path in parse_aprs_info (plain, compressed,
+    Mic-E, Object, Item) so weather-carrying positions from any of
+    them get translated the same way, regardless of which wire format
+    carried them. Always attaches a "weather" key (possibly {}) for a
+    Weather Station symbol, even with zero recognized fields -- the
+    symbol itself already told the operator this is a weather report;
+    an empty dict is still meaningful information (nothing readable),
+    not a reason to hide the fact it's weather-shaped at all."""
     if position_dict.get("symbol_code") != "_":
         return position_dict
-    ext = position_dict.get("comment_extension") or {}
-    wind_deg, wind_speed = ext.get("course_deg"), ext.get("speed_knots")
     comment = position_dict.get("comment", "")
-    # The wind ddd/sss slot occupies the SAME leading 7 comment bytes
-    # parse_comment_extensions already consumed to produce course_deg/
-    # speed_knots above -- skip past it before scanning for the
-    # letter-coded fields, or the scan starts mid-digit-string and
-    # matches nothing (confirmed live: without this it silently found
-    # zero fields on the spec's own worked example).
-    field_text = comment[7:] if wind_deg is not None else comment
-    weather = _parse_weather_fields(field_text)
-    if wind_deg is None and weather is None:
-        return position_dict
-    weather = dict(weather) if weather else {}
-    if wind_deg is not None:
+    wind_deg, wind_speed, consumed = _parse_weather_wind(comment)
+    weather = _parse_weather_fields(comment[consumed:]) or {}
+    if consumed:
         weather["wind_deg"] = wind_deg
         weather["wind_speed_mph"] = wind_speed  # wind speed's own unit is mph, not knots, despite reusing the course/speed byte shape
     position_dict["weather"] = weather
     return position_dict
+
+
+def _parse_third_party(text):
+    """Unwraps a Third-Party Header (Chapter 17: Network Tunneling and
+    Third-Party Digipeating, data type '}') -- confirmed against
+    APRS101.PDF's own "TNC-2" format description and worked example
+    (aprs101.txt ~4340-4400): 'WB4APR-14>APRS,RELAY,TCPIP,G9RXG*:...',
+    i.e. a plain-text 'SOURCE>DEST,PATH,...:payload' header (the same
+    shape as a TNC2-monitor line) prepended ahead of another station's
+    own info-field payload -- produced by an IGate relaying a packet
+    between RF and the Internet. The embedded payload is recursively
+    parsed via parse_aprs_info itself, so any format already handled
+    there (position, weather, status, ...) is decoded here too, not
+    just shown as raw text. Returns None if the header:payload split
+    or the SOURCE>DEST parse fails (malformed header)."""
+    if ":" not in text:
+        return None
+    header, payload = text.split(":", 1)
+    if ">" not in header:
+        return None
+    source, path_text = header.split(">", 1)
+    path = path_text.split(",") if path_text else []
+    destination = path[0] if path else ""
+    digipeaters = path[1:]
+    inner = parse_aprs_info(payload.encode("ascii", errors="replace"))
+    if inner is None:
+        return None
+    result = dict(inner)
+    result["third_party"] = True
+    result["third_party_source"] = source
+    result["third_party_destination"] = destination
+    result["third_party_path"] = digipeaters
+    if "source_format" not in result:
+        result["source_format"] = "third_party"
+    return result
 
 
 def parse_aprs_info(info_bytes: bytes, destination_raw: str = None):
@@ -1065,10 +1152,12 @@ def parse_aprs_info(info_bytes: bytes, destination_raw: str = None):
     position reports (data type '`'/"'" -- needs destination_raw, the
     UN-rstripped AX.25 destination address chars, see parse_ax25_frame),
     Object/Item reports (';'/')'),  status reports ('>'), messages/acks/
-    rejects/telemetry-definitions (':'), telemetry ('T'), and Complete
-    Weather Reports (any position whose symbol is Weather Station '_').
-    Everything else (raw/positionless weather station dumps, capability
-    queries, third-party/tunneled packets, user-defined data -- see
+    rejects/telemetry-definitions (':'), telemetry ('T'), Third-Party/
+    tunneled packets ('}' -- unwrapped and recursively parsed, see
+    _parse_third_party), and Complete Weather Reports (any position
+    whose symbol is Weather Station '_'). Everything else (raw/
+    positionless weather station dumps, capability queries, user-
+    defined data -- see
     aprs.py's own module docstring for the deliberate scope decision on
     each) comes back as {"type": "other", "raw": <decoded text>} rather
     than guessing an unverified layout.
@@ -1169,6 +1258,10 @@ def parse_aprs_info(info_bytes: bytes, destination_raw: str = None):
             telemetry = _parse_telemetry(text[1:])
             if telemetry is not None:
                 return telemetry
+        if data_type == "}":
+            third_party = _parse_third_party(text[1:])
+            if third_party is not None:
+                return third_party
     except (ValueError, IndexError):
         pass  # malformed -- fall through to the generic raw-text form
     return {"type": "other", "raw": text}

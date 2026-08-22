@@ -96,7 +96,17 @@ def _format_weather(weather):
         return ""
     parts = []
     if "wind_deg" in weather:
-        parts.append(f"wind {weather['wind_deg']}°@{weather['wind_speed_mph']}mph")
+        # Either side can be None -- the station reported this slot as
+        # present but with an unknown reading (the spec's own "..."
+        # placeholder convention, confirmed live to appear on real
+        # traffic -- see aprs.py's _parse_weather_wind docstring), not
+        # missing outright.
+        wind_deg = weather["wind_deg"]
+        wind_speed = weather["wind_speed_mph"]
+        if wind_deg is not None or wind_speed is not None:
+            deg_text = f"{wind_deg}°" if wind_deg is not None else "?"
+            speed_text = f"{wind_speed}mph" if wind_speed is not None else "?"
+            parts.append(f"wind {deg_text}@{speed_text}")
     if "gust_mph" in weather:
         parts.append(f"gust {weather['gust_mph']}mph")
     if "temp_f" in weather:
@@ -128,6 +138,14 @@ def _format_packet_details(info):
     if info is None:
         return "(no info field)"
 
+    third_party_prefix = ""
+    if info.get("third_party"):
+        third_party_prefix = f"[3rd-Party via {info['third_party_source']}] "
+
+    return third_party_prefix + _format_packet_details_inner(info)
+
+
+def _format_packet_details_inner(info):
     if info["type"] == "position":
         # Translates the raw two-character symbol table/code (e.g.
         # "/-") into its official human-readable name (e.g. "House QTH

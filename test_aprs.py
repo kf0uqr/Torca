@@ -487,6 +487,87 @@ def test_non_weather_position_has_no_weather_key():
     assert "weather" not in info
 
 
+def test_weather_report_with_dot_placeholder_fields():
+    # A REAL packet received live (WX0U-2/W0BZN-digipeated, station
+    # "AUBURN") -- several sensors reported as the spec's own "unknown"
+    # dot-placeholder convention (aprs101.txt:3311-3327), not a
+    # synthetic edge case. Before the fix, the field scanner stopped
+    # dead at the first dot-placeholder field (the missing gust
+    # sensor), silently losing every REAL reading after it (rain-last-
+    # hour, rain-24hr, and barometric pressure, all present with real
+    # values) -- this asserts they're recovered.
+    info_bytes = (
+        b"@220531z3858.35N/09548.96W_000/...g...t...r000p000P...h..b09803"
+        b"Auburn KS   WX from TV25 Tower"
+    )
+    info = aprs.parse_aprs_info(info_bytes)
+    assert info["type"] == "position"
+    weather = info["weather"]
+    assert weather["wind_deg"] == 0, weather  # "000" -- a real (if ambiguous-per-spec) reading, not a placeholder
+    assert weather["wind_speed_mph"] is None, weather  # "..." -- genuinely unknown
+    assert "gust_mph" not in weather, weather  # "g..." -- unknown, correctly absent
+    assert "temp_f" not in weather, weather  # "t..." -- unknown, correctly absent
+    assert weather["rain_last_hr_in"] == 0.0, weather  # "r000" -- REAL value, must survive the earlier dot fields
+    assert weather["rain_24hr_in"] == 0.0, weather  # "p000" -- REAL value
+    assert "rain_since_midnight_in" not in weather, weather  # "P..." -- unknown
+    assert "humidity_pct" not in weather, weather  # "h.." -- unknown
+    assert weather["pressure_mbar"] == 980.3, weather  # "b09803" -- REAL value, furthest from the start
+
+
+def test_third_party_no_timestamp_position():
+    # A REAL packet received live (IGate KD0EZS-11, station "TRIBUN")
+    # -- a plain position report (no timestamp) wrapped in a Third-
+    # Party Header (Chapter 17). Before this fix it fell all the way
+    # through to {"type": "other", "raw": <whole line>}. The embedded
+    # position uses a legitimate alternate-symbol-table OVERLAY
+    # character ('S', an uppercase letter) in the symbol-table slot --
+    # not malformed data -- which the existing position parser already
+    # handles fine since it never validates that byte.
+    info_bytes = (
+        b"}TRIBUN>APN391,TCPIP,KD0EZS-11*:!3827.55NS10154.57W#PHG5130/W3,"
+        b"KSn Tribune, KS - Info:aprs@k0ham.com"
+    )
+    info = aprs.parse_aprs_info(info_bytes)
+    assert info["type"] == "position", info
+    assert info["has_timestamp"] is False
+    assert round(info["lat"], 2) == 38.46, info
+    assert round(info["lon"], 2) == -101.91, info
+    assert info["symbol_table"] == "S"
+    assert info["symbol_code"] == "#"
+    assert info["third_party"] is True
+    assert info["third_party_source"] == "TRIBUN"
+    assert info["third_party_destination"] == "APN391"
+    assert info["third_party_path"] == ["TCPIP", "KD0EZS-11*"]
+    assert info["comment_extension"]["phg"]["power_w"] == 25, info["comment_extension"]  # PHG '5' -> 5**2
+
+
+def test_third_party_with_timestamp_position():
+    # A REAL packet received live (IGate W1GUU-10, station "BASHOR")
+    # -- same Third-Party wrapping, but the embedded payload has a
+    # DHMz timestamp ('@'), exercising the other position-report data
+    # type through the same unwrap-and-recurse path.
+    info_bytes = (
+        b"}BASHOR>APMI01,TCPIP,W1GUU-10*:@220540z3905.51NS09456.72W# "
+        b"aprs@K0HAM.com"
+    )
+    info = aprs.parse_aprs_info(info_bytes)
+    assert info["type"] == "position", info
+    assert info["has_timestamp"] is True
+    assert round(info["lat"], 2) == 39.09, info
+    assert round(info["lon"], 2) == -94.95, info
+    assert info["symbol_table"] == "S"
+    assert info["symbol_code"] == "#"
+    assert info["third_party_source"] == "BASHOR"
+    assert info["third_party_destination"] == "APMI01"
+    assert info["comment"] == " aprs@K0HAM.com"
+
+
+def test_third_party_malformed_falls_back_to_other():
+    info = aprs.parse_aprs_info(b"}no colon or bracket here")
+    assert info["type"] == "other"
+    assert info["raw"] == "}no colon or bracket here"
+
+
 if __name__ == "__main__":
     test_basic_position_report()
     test_with_ssid_and_digipeaters()
@@ -523,4 +604,8 @@ if __name__ == "__main__":
     test_weather_report_spec_example()
     test_weather_report_negative_temperature()
     test_non_weather_position_has_no_weather_key()
+    test_weather_report_with_dot_placeholder_fields()
+    test_third_party_no_timestamp_position()
+    test_third_party_with_timestamp_position()
+    test_third_party_malformed_falls_back_to_other()
     print("All aprs tests passed.")

@@ -6,6 +6,7 @@ comes back out correctly."""
 import math
 import struct
 
+import aprs
 from aprs import AprsDecoder, MARK_HZ, SPACE_HZ, BAUD, FLAG_BYTE, _crc16_x25, build_position_packet_pcm
 
 SAMPLE_RATE = 22050
@@ -209,10 +210,90 @@ def test_production_encoder_round_trips_through_production_decoder():
     assert info["comment"] == "Test 001234", info
 
 
+# ---- Comment "Data Extensions" (APRS101.PDF Chapter 7) -- worked
+# examples taken verbatim from the spec itself (verified via pdftotext
+# extraction of the real PDF, not guessed), not synthetic test data.
+
+
+def test_comment_extension_phg_spec_example():
+    # "PHG5132 means a power of 25 watts, an antenna height of 20 feet
+    # above the average local terrain, an antenna gain of 3 dB, and
+    # maximum gain due east." -- APRS101.PDF Chapter 7's own example.
+    ext = aprs.parse_comment_extensions("PHG5132")
+    assert ext == {"phg": {"power_w": 25, "height_ft": 20, "gain_db": 3, "directivity_deg": 90}}, ext
+
+
+def test_comment_extension_rng_spec_example():
+    # "RNG0050 indicates a radio range of 50 miles." -- spec's own example.
+    ext = aprs.parse_comment_extensions("RNG0050")
+    assert ext == {"range_miles": 50}, ext
+
+
+def test_comment_extension_course_speed_spec_example():
+    # "088/036 represents a course 88 degrees, traveling at 36 knots." -- spec's own example.
+    ext = aprs.parse_comment_extensions("088/036")
+    assert ext == {"course_deg": 88, "speed_knots": 36}, ext
+
+
+def test_comment_extension_altitude_spec_example():
+    # "/A=001234" -- spec's own example, altitude = 1234 ft.
+    ext = aprs.parse_comment_extensions("Test /A=001234")
+    assert ext == {"altitude_ft": 1234}, ext
+
+
+def test_comment_extension_altitude_found_anywhere_in_comment():
+    # Per the spec, altitude "may appear anywhere in the comment" --
+    # unlike course/speed/PHG/RNG/DFS, which only ever occupy the
+    # fixed leading 7 bytes.
+    ext = aprs.parse_comment_extensions("some text before /A=005000 and after")
+    assert ext == {"altitude_ft": 5000}, ext
+
+
+def test_comment_extension_course_speed_and_altitude_together():
+    ext = aprs.parse_comment_extensions("088/036/A=001234 moving")
+    assert ext["course_deg"] == 88
+    assert ext["speed_knots"] == 36
+    assert ext["altitude_ft"] == 1234
+
+
+def test_comment_extension_dfs_spec_example():
+    # "DFS2230/comments" -- weak signal (2), 3dB gain, 40ft, omni --
+    # spec's own worked example for the Omni-DF format.
+    ext = aprs.parse_comment_extensions("DFS2230/comments")
+    assert ext == {"df": {"strength_s": 2, "height_ft": 40, "gain_db": 3, "directivity_deg": None}}, ext
+
+
+def test_comment_extension_none_for_ordinary_comment():
+    assert aprs.parse_comment_extensions("Just a normal comment, nothing structured here") == {}
+
+
+def test_comment_extension_height_code_beyond_9():
+    # "the Height character may be any ASCII character 0-9 and above...
+    # : is the height code for 10240 feet" -- spec's own example.
+    ext = aprs.parse_comment_extensions("PHG5:32")
+    assert ext["phg"]["height_ft"] == 10240, ext
+
+
+def test_parse_aprs_info_includes_comment_extension():
+    info = aprs.parse_aprs_info(b"!4903.50N/07201.75W#PHG5132 test")
+    assert info["comment"] == "PHG5132 test"
+    assert info["comment_extension"]["phg"]["power_w"] == 25
+
+
 if __name__ == "__main__":
     test_basic_position_report()
     test_with_ssid_and_digipeaters()
     test_noise_never_produces_garbage()
     test_back_to_back_packets()
     test_production_encoder_round_trips_through_production_decoder()
+    test_comment_extension_phg_spec_example()
+    test_comment_extension_rng_spec_example()
+    test_comment_extension_course_speed_spec_example()
+    test_comment_extension_altitude_spec_example()
+    test_comment_extension_altitude_found_anywhere_in_comment()
+    test_comment_extension_course_speed_and_altitude_together()
+    test_comment_extension_dfs_spec_example()
+    test_comment_extension_none_for_ordinary_comment()
+    test_comment_extension_height_code_beyond_9()
+    test_parse_aprs_info_includes_comment_extension()
     print("All aprs tests passed.")

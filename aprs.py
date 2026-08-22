@@ -54,6 +54,7 @@ boundaries to mean anything.
 """
 
 import math
+import re
 import struct
 
 from cw import GoertzelDetector
@@ -363,6 +364,108 @@ def symbol_description(symbol_table: str, symbol_code: str):
     return table.get(symbol_code)
 
 
+# ---- Comment "Data Extensions" (APRS101.PDF Chapter 7) --------------
+#
+# A position report's comment text MAY start with one of several
+# mutually-exclusive fixed-length 7-byte structured sub-fields (course/
+# speed, PHG, RNG, or DFS -- quoted directly from the spec, verified via
+# pdftotext extraction of the real PDF, not guessed/summarized), plus
+# altitude ("/A=aaaaaa"), which unlike the other four may appear
+# ANYWHERE in the comment rather than only at that fixed leading
+# position. This never modifies/consumes info["comment"] itself -- it's
+# purely additive, parsed out separately for callers (aprs_window.py's
+# packet list) that want to show a translated summary alongside the
+# still-shown-verbatim raw comment.
+
+_ALTITUDE_RE = re.compile(r"/A=(\d{6})")
+
+# Shared PHG/DFS code table (APRS101.PDF's own "PHG Codes"/"DFS Codes"
+# tables, identical shape for both -- height/gain/directivity use the
+# same encoding either way, only the first code letter's meaning
+# differs: transmitter power for PHG, relative signal strength for
+# DFS). Directivity 0 = omni (no offset direction); 1-8 step clockwise
+# from NE in 45-degree increments (spec table: 45=NE, 90=E, 135=SE,
+# 180=S, 225=SW, 270=W, 315=NW, 360=N); 9 is undefined in the spec's
+# own table (not listed), so is deliberately left out of this mapping.
+_DIRECTIVITY_DEG = {0: None, 1: 45, 2: 90, 3: 135, 4: 180, 5: 225, 6: 270, 7: 315, 8: 360}
+
+
+def _phg_code_value(char):
+    """'0'-'9' -> 0-9, and beyond (the spec explicitly allows any ASCII
+    character 0-9-and-above for the HEIGHT code specifically, so taller
+    heights for balloons/aircraft/satellites can be represented -- e.g.
+    ':' = 10, giving 10*2**10 = 10240ft)."""
+    return ord(char) - 0x30  # ord('0') == 0x30
+
+
+def _parse_phg_or_dfs(first_code, height_c, gain_c, dir_c):
+    """Shared decode for the PHGphgd/DFSshgd Data Extensions' last 3
+    code characters (height/gain/directivity) plus the caller-supplied
+    first code (power for PHG, signal strength for DFS -- same 0-9
+    code range either way). Returns None if any code character isn't a
+    plain digit 0-9 (a malformed/corrupted extension, not a real one --
+    height's extended ASCII range only applies to that one field, per
+    the spec, not to power/strength/gain/directivity)."""
+    if not (first_code.isdigit() and gain_c.isdigit() and dir_c.isdigit()):
+        return None
+    dir_value = _phg_code_value(dir_c)
+    if dir_value not in _DIRECTIVITY_DEG:
+        return None
+    return {
+        "height_ft": 10 * (2 ** _phg_code_value(height_c)),
+        "gain_db": _phg_code_value(gain_c),
+        "directivity_deg": _DIRECTIVITY_DEG[dir_value],
+        "_first_code": _phg_code_value(first_code),
+    }
+
+
+def parse_comment_extensions(comment: str) -> dict:
+    """Parses the optional Data Extension sub-fields documented above
+    out of a position report's comment text. Returns a dict with only
+    the keys actually found -- {} for an ordinary free-text comment
+    with none of these:
+
+    - {"course_deg": int, "speed_knots": int} -- CSE/SPD extension
+    - {"phg": {"power_w", "height_ft", "gain_db", "directivity_deg"}}
+    - {"df": {"strength_s", "height_ft", "gain_db", "directivity_deg"}}
+    - {"range_miles": int} -- RNG extension
+    - {"altitude_ft": int} -- "/A=aaaaaa", found independently of the
+      four above since it can appear anywhere in the comment, not just
+      the fixed leading 7 bytes those share."""
+    result = {}
+    head = comment[:7]
+    if len(head) == 7:
+        if head[:3] == "PHG":
+            phg = _parse_phg_or_dfs(head[3], head[4], head[5], head[6])
+            if phg is not None:
+                result["phg"] = {
+                    "power_w": phg["_first_code"] ** 2,
+                    "height_ft": phg["height_ft"],
+                    "gain_db": phg["gain_db"],
+                    "directivity_deg": phg["directivity_deg"],
+                }
+        elif head[:3] == "RNG" and head[3:7].isdigit():
+            result["range_miles"] = int(head[3:7])
+        elif head[:3] == "DFS":
+            dfs = _parse_phg_or_dfs(head[3], head[4], head[5], head[6])
+            if dfs is not None:
+                result["df"] = {
+                    "strength_s": dfs["_first_code"],
+                    "height_ft": dfs["height_ft"],
+                    "gain_db": dfs["gain_db"],
+                    "directivity_deg": dfs["directivity_deg"],
+                }
+        elif head[:3].isdigit() and head[3] == "/" and head[4:7].isdigit():
+            result["course_deg"] = int(head[:3])
+            result["speed_knots"] = int(head[4:7])
+
+    altitude_match = _ALTITUDE_RE.search(comment)
+    if altitude_match:
+        result["altitude_ft"] = int(altitude_match.group(1))
+
+    return result
+
+
 def parse_aprs_info(info_bytes: bytes):
     """Parses an APRS info field. Full structured support for
     uncompressed position reports (data type '!'/'='/'/'/'@' -- format
@@ -374,8 +477,11 @@ def parse_aprs_info(info_bytes: bytes):
 
     Position report dict: {"type": "position", "has_timestamp": bool,
     "lat": float, "lon": float, "symbol_table": str, "symbol_code":
-    str, "comment": str}. Returns None if info_bytes is empty or not
-    decodable as text at all."""
+    str, "comment": str, "comment_extension": dict}. comment_extension
+    is parse_comment_extensions(comment)'s own return -- see its
+    docstring; comment itself always stays the full, untouched raw
+    text regardless of what was found. Returns None if info_bytes is
+    empty or not decodable as text at all."""
     if not info_bytes:
         return None
     try:
@@ -396,6 +502,7 @@ def parse_aprs_info(info_bytes: bytes):
                 "lat": lat, "lon": lon,
                 "symbol_table": sym_table, "symbol_code": sym_code,
                 "comment": comment,
+                "comment_extension": parse_comment_extensions(comment),
             }
         if data_type in ("/", "@"):
             lat = _parse_latitude(text[8:16])
@@ -408,6 +515,7 @@ def parse_aprs_info(info_bytes: bytes):
                 "lat": lat, "lon": lon,
                 "symbol_table": sym_table, "symbol_code": sym_code,
                 "comment": comment,
+                "comment_extension": parse_comment_extensions(comment),
             }
     except (ValueError, IndexError):
         pass  # malformed -- fall through to the generic raw-text form

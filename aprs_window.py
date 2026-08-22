@@ -57,6 +57,38 @@ _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
 
 
+def _format_comment_extension(ext):
+    """Human-readable translation of aprs.parse_comment_extensions()'s
+    output -- the structured Data Extension sub-fields (APRS101.PDF
+    Chapter 7) a position report's comment MAY start with (course/
+    speed, PHG, RNG, or DFS -- mutually exclusive, at most one present)
+    plus altitude (independent of those four -- can appear anywhere in
+    the comment). Returns "" if ext is empty/None (an ordinary comment
+    with none of these)."""
+    if not ext:
+        return ""
+    parts = []
+    if "course_deg" in ext:
+        parts.append(f"course {ext['course_deg']}° @ {ext['speed_knots']}kt")
+    if "phg" in ext:
+        phg = ext["phg"]
+        direction = f"{phg['directivity_deg']}°" if phg["directivity_deg"] is not None else "omni"
+        parts.append(
+            f"{phg['power_w']}W @ {phg['height_ft']}ft AAT, {phg['gain_db']}dB gain, {direction}"
+        )
+    if "df" in ext:
+        df = ext["df"]
+        direction = f"{df['directivity_deg']}°" if df["directivity_deg"] is not None else "omni"
+        parts.append(
+            f"DF strength S{df['strength_s']} @ {df['height_ft']}ft AAT, {df['gain_db']}dB gain, {direction}"
+        )
+    if "range_miles" in ext:
+        parts.append(f"range {ext['range_miles']}mi")
+    if "altitude_ft" in ext:
+        parts.append(f"altitude {ext['altitude_ft']}ft")
+    return ", ".join(parts)
+
+
 def _format_packet_details(info):
     if info is None:
         return "(no info field)"
@@ -73,6 +105,14 @@ def _format_packet_details(info):
         details = f"{info['lat']:.5f}, {info['lon']:.5f}  {symbol_part}"
         if info["comment"]:
             details += f"  {info['comment']}"
+        # Structured Data Extensions parsed out of that same comment
+        # (course/speed, PHG, RNG, DFS, altitude) -- shown as an
+        # additional translated summary, not in place of the raw
+        # comment text above, same "translate alongside, don't replace"
+        # approach the symbol name takes with its own raw code.
+        extension_text = _format_comment_extension(info.get("comment_extension"))
+        if extension_text:
+            details += f"  ({extension_text})"
         return details
     return info["raw"]
 

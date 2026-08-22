@@ -2259,6 +2259,68 @@ class RadioWorker(QThread):
 
         self.memory_snapshot_captured.emit(None if failed else snapshot)
 
+    def recall_memory_snapshot(self, snapshot):
+        """Thread-safe: call from the GUI thread. The inverse of
+        capture_memory_snapshot() -- writes a previously-captured (or
+        CSV-imported) {"A": {"freq_hz", "mode", "filter"}, "B": {...},
+        "tone": {"mode", "freq_hz"}} snapshot back to the radio: VFO
+        A's and VFO B's frequency/mode, then the repeater tone
+        settings, then leaves VFO A selected (the normal operating
+        VFO) when done. Used by memories_window.py's "Recall" button.
+
+        Deliberately as simple/symmetric as capture_memory_snapshot
+        itself -- same "whichever receiver is currently active" scope
+        (RECEIVER_MAIN meaning "currently selected", not literally
+        Main -- see that method's own docstring), no receiver-band-
+        conflict resolution (capture doesn't need any either, since it
+        only ever reads/writes the already-active receiver). A slot
+        with no freq_hz at all (an entry that was never really
+        captured, or a hand-edited memories.json) is skipped rather
+        than writing a frequency of None -- for the same reason,
+        VFO B for a manually-added non-repeater memory (no real split)
+        is skipped too, if it was left blank."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._recall_memory_snapshot(snapshot), self.loop)
+
+    async def _recall_memory_snapshot(self, snapshot):
+        if "vfo" not in self._control_methods:
+            self.error.emit("Memories: VFO A/B control not available on this radio/install -- can't recall.")
+            return
+        _get_name, set_name = self._control_methods["vfo"]
+        setter = getattr(self.radio, set_name)
+
+        for slot in ("A", "B"):
+            data = snapshot.get(slot) or {}
+            freq_hz = data.get("freq_hz")
+            if freq_hz is None:
+                continue
+            try:
+                await self._call_receiver_aware("vfo", setter, slot)
+                # Same settle delay used everywhere else in this file
+                # between a VFO-slot select and a write that depends on
+                # it having actually landed (see capture_memory_
+                # snapshot's own identical wait, and _set_receiver_
+                # control_value's docstring).
+                await asyncio.sleep(0.15)
+                await self.radio.set_frequency(freq_hz, receiver=RECEIVER_MAIN)
+                if data.get("mode"):
+                    await self.radio.set_mode(data["mode"], data.get("filter"), receiver=RECEIVER_MAIN)
+            except Exception as exc:
+                self.error.emit(f"Memories: failed to recall VFO {slot}: {exc}")
+
+        tone = snapshot.get("tone")
+        if tone:
+            try:
+                await self._set_repeater_tone_settings(tone.get("mode") or "none", tone.get("freq_hz"))
+            except Exception as exc:
+                self.error.emit(f"Memories: failed to recall repeater tone settings ({exc}).")
+
+        try:
+            await self._call_receiver_aware("vfo", setter, "A")
+        except Exception as exc:
+            self.error.emit(f"Memories: failed to reselect VFO A after recall: {exc}")
+
     def set_receiver_frequency(self, receiver: int, freq_hz: int):
         """Thread-safe: call from the GUI thread. Only meaningful on a
         genuine dual-receiver radio (check self.is_dual_receiver first) --

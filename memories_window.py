@@ -188,10 +188,11 @@ class MemoryTabPage(QWidget):
     # result when it's ready".
     add_requested = Signal(str)
 
-    def __init__(self, entries, on_change):
+    def __init__(self, entries, on_change, on_recall):
         super().__init__()
         self._entries = entries
         self._on_change = on_change
+        self._on_recall = on_recall
         self._populating = False  # guards against itemChanged firing while rows are built programmatically
 
         self.table = QTableWidget(0, len(_COLUMNS))
@@ -206,10 +207,17 @@ class MemoryTabPage(QWidget):
         add_button.clicked.connect(self._on_add_clicked)
         delete_button = QPushButton("Delete Memory")
         delete_button.clicked.connect(self._on_delete_clicked)
+        recall_button = QPushButton("Recall")
+        recall_button.setToolTip(
+            "Tunes the radio to the selected memory's VFO A/B frequency and mode, and applies "
+            "its repeater tone setting."
+        )
+        recall_button.clicked.connect(self._on_recall_clicked)
 
         button_row = QHBoxLayout()
         button_row.addWidget(add_button)
         button_row.addWidget(delete_button)
+        button_row.addWidget(recall_button)
         for extra_button in self._extra_buttons():
             button_row.addWidget(extra_button)
         button_row.addStretch()
@@ -303,6 +311,14 @@ class MemoryTabPage(QWidget):
         self._populating = False
         self._on_change()
 
+    def _on_recall_clicked(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if len(rows) != 1:
+            QMessageBox.information(self, "Recall Memory", "Select exactly one memory to recall.")
+            return
+        entry = self._entries[rows[0]]
+        self._on_recall(entry)
+
     def _on_delete_clicked(self):
         rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
         if not rows:
@@ -336,11 +352,11 @@ class LocalRepeatersTabPage(MemoryTabPage):
     MemoriesWindow._fetch_local_repeater_entries) and replaces this
     tab's entries wholesale."""
 
-    def __init__(self, entries, on_change, on_refresh):
+    def __init__(self, entries, on_change, on_recall, on_refresh):
         # Set before super().__init__() -- _extra_buttons() (called
         # from within it) needs this already available.
         self._on_refresh = on_refresh
-        super().__init__(entries, on_change)
+        super().__init__(entries, on_change, on_recall)
 
     def _extra_buttons(self):
         refresh_button = QPushButton("Refresh")
@@ -413,12 +429,29 @@ class MemoriesWindow(QWidget):
 
     def _add_tab_page(self, name, entries, kind="manual"):
         if kind == "local_repeaters":
-            page = LocalRepeatersTabPage(entries, self._save, self._on_refresh_local_repeaters)
+            page = LocalRepeatersTabPage(entries, self._save, self._on_recall_clicked, self._on_refresh_local_repeaters)
         else:
-            page = MemoryTabPage(entries, self._save)
+            page = MemoryTabPage(entries, self._save, self._on_recall_clicked)
         page.add_requested.connect(lambda memory_name, p=page: self._on_add_requested(p, memory_name))
         self.tabs.addTab(page, name)
         return page
+
+    def _on_recall_clicked(self, entry):
+        """Tunes the radio to `entry`'s VFO A/B frequency/mode and
+        repeater tone -- the inverse of the capture RadioWorker.
+        capture_memory_snapshot() already does for "Add Memory". Fire-
+        and-forget from here (same as every other RadioWorker command
+        this window issues) -- RadioWorker.recall_memory_snapshot()
+        reports its own failures via the worker's existing error
+        signal (already connected to this radio's status handling),
+        so there's nothing for this method itself to wait on or
+        report."""
+        snapshot = {
+            "A": entry.get("vfo_a") or {},
+            "B": entry.get("vfo_b") or {},
+            "tone": entry.get("tone") or {},
+        }
+        self._radio_window.worker.recall_memory_snapshot(snapshot)
 
     def _save(self):
         _save_memories(self._data)

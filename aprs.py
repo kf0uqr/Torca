@@ -256,9 +256,18 @@ def parse_ax25_frame(payload: bytes):
     info = payload[offset + 2:]
     destination, source = addresses[0], addresses[1]
     digipeaters = addresses[2:]
+    # Un-rstripped destination callsign chars -- ONLY needed for Mic-E
+    # (parse_mic_e below), where the destination address field isn't a
+    # real callsign at all but 6 digit-substitution-encoded bytes, and
+    # a trailing space IS meaningful data (e.g. the Mic-E destination
+    # table's own "K space = 1(Custom)" row) that _decode_address's
+    # ordinary .rstrip(" ") -- correct for real callsigns -- would
+    # otherwise destroy. Every other caller just ignores this key.
+    destination_raw = "".join(chr(b >> 1) for b in payload[0:6])
     return {
         "source": source,
         "destination": destination,
+        "destination_raw": destination_raw,
         "digipeaters": digipeaters,
         "info": info,
     }
@@ -466,22 +475,615 @@ def parse_comment_extensions(comment: str) -> dict:
     return result
 
 
-def parse_aprs_info(info_bytes: bytes):
-    """Parses an APRS info field. Full structured support for
-    uncompressed position reports (data type '!'/'='/'/'/'@' -- format
-    quoted directly from APRS101.PDF Chapter 8, the only format
-    implemented here); everything else (messages ':', objects ';',
-    status '>', Mic-E, compressed positions, weather, telemetry, ...)
-    comes back as {"type": "other", "raw": <decoded text>} rather than
-    guessing an unverified layout.
+# ---- Compressed position reports (APRS101.PDF Chapter 9) ------------
+#
+# An alternative to the plain DDMM.mm lat/lon format, used in place of
+# it anywhere a position can appear (plain position reports, Objects,
+# Items, weather). Distinguished from plain format by checking whether
+# the byte right after the data-type identifier (or after the 7-byte
+# timestamp, for '/'/'@') is a digit/space (plain) or '/'/'\' (a
+# compressed report's own Symbol Table Identifier standing in that
+# position instead) -- the safe, universally-used disambiguation (a
+# fuller check also allowing digit/letter overlay characters there
+# would be ambiguous with plain format's own leading latitude digit).
+#
+# Base-91: subtract 33 from each ASCII code. Verified against the
+# spec's own full worked example end-to-end: "/5L!!<*e7>7P[" decodes to
+# lat 49*30'00"N, lon 72*45'00"W, speed 36.2kt, course 88 degrees,
+# symbol '>' (Car) -- see test_aprs.py's test_compressed_position_
+# spec_example.
 
-    Position report dict: {"type": "position", "has_timestamp": bool,
-    "lat": float, "lon": float, "symbol_table": str, "symbol_code":
-    str, "comment": str, "comment_extension": dict}. comment_extension
-    is parse_comment_extensions(comment)'s own return -- see its
-    docstring; comment itself always stays the full, untouched raw
-    text regardless of what was found. Returns None if info_bytes is
-    empty or not decodable as text at all."""
+def _base91_decode(chars):
+    value = 0
+    for ch in chars:
+        value = value * 91 + (ord(ch) - 33)
+    return value
+
+
+def _parse_compressed_position(text):
+    """text starts at the Symbol Table Identifier ('/' or '\\'),
+    exactly the 13-byte compressed field: table_id + 4-char lat +
+    4-char lon + symbol_code + 2-char cs + 1-byte T. Returns
+    (lat, lon, symbol_table, symbol_code, course_deg_or_None,
+    speed_knots_or_None, range_miles_or_None, altitude_ft_or_None,
+    consumed_length) or None if text is too short/malformed."""
+    if len(text) < 13:
+        return None
+    sym_table = text[0]
+    lat = 90.0 - _base91_decode(text[1:5]) / 380926.0
+    lon = -180.0 + _base91_decode(text[5:9]) / 190463.0
+    sym_code = text[9]
+    c_char, s_char = text[10], text[11]
+    t_char = text[12]
+
+    course_deg = speed_knots = range_miles = altitude_ft = None
+    if c_char != " ":
+        c_val = ord(c_char) - 33
+        s_val = ord(s_char) - 33
+        if c_char == "{":
+            range_miles = 2.0 * (1.08 ** s_val)
+        else:
+            t_val = ord(t_char) - 33
+            # GPS Fix=bit2(0x04 of the 6-bit T value), NMEA Source bits
+            # 3-2 (0x18); source==GGA (0b10) carries altitude in cs
+            # instead of course/speed, per the spec's own T-byte table.
+            nmea_source = (t_val >> 3) & 0x03
+            if nmea_source == 0b10:
+                altitude_ft = 1.002 ** (c_val * 91 + s_val)
+            elif 0 <= c_val <= 89:
+                course_deg = c_val * 4
+                speed_knots = (1.08 ** s_val) - 1.0
+
+    return sym_table, lat, lon, sym_code, course_deg, speed_knots, range_miles, altitude_ft, 13
+
+
+def _position_from_compressed(course_deg, speed_knots, range_miles, altitude_ft):
+    """Builds a comment_extension-shaped dict from a compressed
+    position's own decoded course/speed/range/altitude -- same field
+    names parse_comment_extensions() uses for plain-format positions,
+    so aprs_window.py's formatting code needs no branch for which
+    format produced them."""
+    ext = {}
+    if course_deg is not None:
+        ext["course_deg"] = round(course_deg)
+        ext["speed_knots"] = round(speed_knots, 1)
+    if range_miles is not None:
+        ext["range_miles"] = round(range_miles)
+    if altitude_ft is not None:
+        ext["altitude_ft"] = round(altitude_ft)
+    return ext
+
+
+# ---- Mic-E (APRS101.PDF Chapter 10) ----------------------------------
+#
+# Position/course/speed/message-type packed into the AX.25 DESTINATION
+# ADDRESS field (6 digit-substitution-encoded bytes, decoded via
+# _MIC_E_DEST_TABLE below -- transcribed directly from the spec's own
+# table, aprs101.txt lines ~2288-2318) plus the info field (longitude/
+# speed/course/symbol via a +28 byte-offset encoding, decoded per the
+# spec's own documented algorithm, not just its encoding table).
+# Verified against the spec's own full worked example end-to-end:
+# destination "T4SQZZ" (lat 33*25.64'N, standard message 1/0/0) + info
+# bytes "'(_f n \"Oj/" decodes to lon 112*7.74'W, speed 20kt, course
+# 251 degrees, symbol "/j" (Jeep) -- see test_aprs.py's
+# test_mic_e_spec_example.
+
+# char: (digit_or_None, message_bit, message_kind, ns_or_None, long_offset_or_None, we_or_None)
+# digit_or_None is None for the "space" (ambiguous-digit) rows.
+_MIC_E_DEST_TABLE = {}
+for _i, _c in enumerate("0123456789"):
+    _MIC_E_DEST_TABLE[_c] = (_i, 0, None, "S", 0, "E")
+for _i, _c in enumerate("ABCDEFGHIJ"):
+    _MIC_E_DEST_TABLE[_c] = (_i, 1, "custom", None, None, None)
+_MIC_E_DEST_TABLE["K"] = (None, 1, "custom", None, None, None)
+_MIC_E_DEST_TABLE["L"] = (None, 0, None, "S", 0, "E")
+for _i, _c in enumerate("PQRSTUVWXY"):
+    _MIC_E_DEST_TABLE[_c] = (_i, 1, "std", "N", 100, "W")
+_MIC_E_DEST_TABLE["Z"] = (None, 1, "std", "N", 100, "W")
+del _i, _c
+
+# (bitA, bitB, bitC) -> (standard code, standard name, custom code, custom name)
+_MIC_E_MESSAGE_TYPES = {
+    (1, 1, 1): ("M0", "Off Duty", "C0", "Custom-0"),
+    (1, 1, 0): ("M1", "En Route", "C1", "Custom-1"),
+    (1, 0, 1): ("M2", "In Service", "C2", "Custom-2"),
+    (1, 0, 0): ("M3", "Returning", "C3", "Custom-3"),
+    (0, 1, 1): ("M4", "Committed", "C4", "Custom-4"),
+    (0, 1, 0): ("M5", "Special", "C5", "Custom-5"),
+    (0, 0, 1): ("M6", "Priority", "C6", "Custom-6"),
+}
+
+_MAIDENHEAD_RE = re.compile(r"^([A-Ra-r]{2}[0-9]{2}(?:[A-Xa-x]{2})?)(?=\s|$)")
+_MIC_E_ALTITUDE_RE = re.compile(r"([!-~]{3})\}")
+
+
+def _mic_e_message_type(bits, kinds):
+    if bits == (0, 0, 0):
+        return "Emergency"
+    entry = _MIC_E_MESSAGE_TYPES.get(bits)
+    if entry is None:
+        return "Unknown"
+    std_code, std_name, custom_code, custom_name = entry
+    kinds_used = {k for k, b in zip(kinds, bits) if b}
+    if kinds_used == {"std"}:
+        return f"{std_code}: {std_name}"
+    if kinds_used == {"custom"}:
+        return f"{custom_code}: {custom_name}"
+    return "Unknown"  # a mixture of Standard 1s and Custom 1s -- spec's own "unknown" case
+
+
+def _decode_mic_e_destination(destination_raw):
+    """destination_raw: the UN-rstripped 6 chars of the AX.25
+    destination address (see parse_ax25_frame's own docstring for why
+    rstripped won't do). Returns (lat, message_type_str, long_offset,
+    we) or None if any of the 6 chars isn't in the Mic-E table at all
+    (not a real Mic-E frame) or the position-defining bytes 4-6 came
+    back ambiguous in a way that leaves N/S, longitude offset, or E/W
+    undetermined."""
+    if len(destination_raw) < 6:
+        return None
+    rows = []
+    for ch in destination_raw[:6].upper():
+        entry = _MIC_E_DEST_TABLE.get(ch)
+        if entry is None:
+            return None
+        rows.append(entry)
+    digits = [row[0] for row in rows]
+    bits = tuple(row[1] for row in rows[:3])
+    kinds = tuple(row[2] for row in rows[:3])
+    ns, long_offset, we = rows[3][3], rows[4][4], rows[5][5]
+    if ns is None or long_offset is None or we is None:
+        return None
+    message_type = _mic_e_message_type(bits, kinds)
+    lat_digit_str = "".join(str(d) if d is not None else "0" for d in digits)
+    lat = int(lat_digit_str[0:2]) + float(f"{lat_digit_str[2:4]}.{lat_digit_str[4:6]}") / 60.0
+    if ns == "S":
+        lat = -lat
+    return lat, message_type, long_offset, we
+
+
+def _decode_mic_e_longitude(d_char, m_char, h_char, long_offset, we):
+    d = ord(d_char) - 28
+    if long_offset == 100:
+        d += 100
+    if 180 <= d <= 189:
+        d -= 80
+    elif 190 <= d <= 199:
+        d -= 190
+    m = ord(m_char) - 28
+    if m >= 60:
+        m -= 60
+    hundredths = ord(h_char) - 28
+    lon = d + (m + hundredths / 100.0) / 60.0
+    return -lon if we == "W" else lon
+
+
+def _decode_mic_e_speed_course(sp_char, dc_char, se_char):
+    sp = ord(sp_char) - 28
+    dc = ord(dc_char) - 28
+    se = ord(se_char) - 28
+    speed = sp * 10 + dc // 10
+    course = (dc % 10) * 100 + se
+    if speed >= 800:
+        speed -= 800
+    if course >= 400:
+        course -= 400
+    return speed, course
+
+
+def _parse_mic_e_telemetry(rest):
+    """rest starts at the Telemetry Flag byte (the byte right after
+    the Symbol Table Identifier). Returns {"channels": {1: v, ...}} or
+    None if the flag/body don't match one of the spec's 3 documented
+    shapes."""
+    if not rest:
+        return None
+    flag = rest[0]
+    body = rest[1:]
+    try:
+        if flag == "`" and len(body) >= 4:
+            return {"channels": {1: int(body[0:2], 16), 3: int(body[2:4], 16)}}
+        if flag == "'" and len(body) >= 10:
+            values = [int(body[i:i + 2], 16) for i in range(0, 10, 2)]
+            return {"channels": {i + 1: v for i, v in enumerate(values)}}
+        if flag == "\x1d" and len(body) >= 5:
+            return {"channels": {i + 1: ord(c) for i, c in enumerate(body[:5])}}
+    except ValueError:
+        pass
+    return None
+
+
+def _parse_mic_e_status_text(rest):
+    """Everything after byte 9 (when it's not telemetry, per parse_mic_e)
+    -- plain status text, optionally carrying a Kenwood device-type
+    marker as its first char, a Maidenhead locator, and/or an altitude
+    ("xxx}", base-91-in-3-chars relative to 10km below sea level -- a
+    DIFFERENT encoding from parse_comment_extensions's own plain-feet
+    "/A=nnnnnn", since Mic-E's info field is byte-offset-encoded
+    throughout, not free text). Returns (comment_text, device_or_None,
+    grid_square_or_None, altitude_ft_or_None)."""
+    device = None
+    if rest[:1] == ">":
+        device, rest = "Kenwood TH-D7", rest[1:]
+    elif rest[:1] == "]":
+        device, rest = "Kenwood TM-D700", rest[1:]
+
+    grid_square = None
+    grid_match = _MAIDENHEAD_RE.match(rest)
+    if grid_match:
+        grid_square = grid_match.group(1).upper()
+
+    altitude_ft = None
+    alt_match = _MIC_E_ALTITUDE_RE.search(rest)
+    if alt_match:
+        alt_m = _base91_decode(alt_match.group(1)) - 10000
+        altitude_ft = round(alt_m * 3.28084)
+
+    return rest, device, grid_square, altitude_ft
+
+
+def parse_mic_e(destination_raw: str, info_bytes: bytes):
+    """Decodes a Mic-E position report. See this section's own module-
+    level comment for the verified worked example. Returns a dict
+    shaped exactly like a plain position report (same "type": "position"
+    -- so it automatically gets symbol-name translation, map plotting,
+    and Details formatting with no changes anywhere else) plus
+    "source_format": "mic_e" and "mic_e_message_type". Returns None if
+    destination_raw/info_bytes don't decode as valid Mic-E data."""
+    dest = _decode_mic_e_destination(destination_raw)
+    if dest is None:
+        return None
+    lat, message_type, long_offset, we = dest
+
+    try:
+        text = info_bytes.decode("latin-1")  # some Mic-E info bytes are non-ASCII offset values, not plain text
+    except Exception:
+        return None
+    # Spec: "if the Information field appears to be less than 9 bytes
+    # long, the packet must be ignored."
+    if len(text) < 9 or text[0] not in ("'", "`", "\x1c", "\x1d"):
+        return None
+
+    try:
+        lon = _decode_mic_e_longitude(text[1], text[2], text[3], long_offset, we)
+        speed_knots, course_deg = _decode_mic_e_speed_course(text[4], text[5], text[6])
+        sym_code, sym_table = text[7], text[8]
+    except (ValueError, IndexError):
+        return None
+
+    rest = text[9:]
+    telemetry = None
+    comment = ""
+    device = grid_square = None
+    mic_e_altitude_ft = None
+    if rest:
+        if rest[0] in ("`", "'", "\x1d"):
+            telemetry = _parse_mic_e_telemetry(rest)
+        if telemetry is None:
+            comment, device, grid_square, mic_e_altitude_ft = _parse_mic_e_status_text(rest)
+
+    comment_extension = {"course_deg": course_deg, "speed_knots": speed_knots}
+    if mic_e_altitude_ft is not None:
+        comment_extension["altitude_ft"] = mic_e_altitude_ft
+
+    result = {
+        "type": "position", "has_timestamp": False,
+        "lat": lat, "lon": lon,
+        "symbol_table": sym_table, "symbol_code": sym_code,
+        "comment": comment,
+        "comment_extension": comment_extension,
+        "source_format": "mic_e",
+        "mic_e_message_type": message_type,
+    }
+    if device is not None:
+        result["mic_e_device"] = device
+    if grid_square is not None:
+        result["mic_e_grid_square"] = grid_square
+    if telemetry is not None:
+        result["mic_e_telemetry"] = telemetry
+    return result
+
+
+# ---- Status reports (APRS101.PDF Chapter 16) -------------------------
+
+# H code (heading/10) -> degrees: '0'-'9' = 0-90 in 10-degree steps,
+# then 'A'-'Z' = 100-350 in 10-degree steps (aprs101.txt:4192-4200).
+_BEAM_HEADING_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# ERP code -> watts (aprs101.txt:4202-4218), transcribed directly from
+# the spec's own table.
+_ERP_TABLE = {
+    "1": 10, "2": 40, "3": 90, "4": 160, "5": 250, "6": 360, "7": 490, "8": 640, "9": 810,
+    ":": 1000, ";": 1210, "<": 1440, "=": 1690, ">": 1960, "?": 2250, "@": 2560, "A": 2890,
+    "B": 3240, "C": 3610, "D": 4000, "E": 4410, "F": 4840, "G": 5290, "H": 5760, "I": 6250,
+    "J": 6760, "K": 7290,
+}
+_BEAM_HEADING_RE = re.compile(r"\^([0-9A-Za-z])([1-9:-K])$")
+
+
+def _parse_status_report(text):
+    """text starts right after the '>' data type identifier."""
+    timestamp = None
+    body = text
+    # A DHMz timestamp is 7 bytes ending in 'z' -- position reports use
+    # the same shape (see _parse_latitude's callers), reused here.
+    if len(text) >= 7 and text[6] == "z" and text[0:6].isdigit():
+        timestamp, body = text[0:7], text[7:]
+
+    beam_heading_deg = erp_watts = None
+    match = _BEAM_HEADING_RE.search(body)
+    if match:
+        heading_char, erp_char = match.group(1).upper(), match.group(2)
+        if heading_char in _BEAM_HEADING_CHARS and erp_char in _ERP_TABLE:
+            beam_heading_deg = _BEAM_HEADING_CHARS.index(heading_char) * 10
+            erp_watts = _ERP_TABLE[erp_char]
+
+    return {
+        "type": "status", "timestamp": timestamp, "text": body,
+        "beam_heading_deg": beam_heading_deg, "erp_watts": erp_watts,
+    }
+
+
+# ---- Object / Item reports (APRS101.PDF Chapter 11) ------------------
+
+def _parse_position_and_comment(text):
+    """text starts right at either a plain position's latitude digits
+    or a compressed position's Symbol Table Identifier -- shared by
+    Object/Item report parsing (which embed exactly this shape after
+    their own name/live-kill/timestamp header) and could equally serve
+    plain position parsing, though that stays inline in parse_aprs_info
+    for its own existing, already-tested call sites. Returns (lat, lon,
+    symbol_table, symbol_code, comment, comment_extension) or None."""
+    if not text:
+        return None
+    if text[0] in ("/", "\\"):
+        parsed = _parse_compressed_position(text)
+        if parsed is None:
+            return None
+        sym_table, lat, lon, sym_code, course, speed, rng, alt, consumed = parsed
+        comment = text[consumed:]
+        ext = _position_from_compressed(course, speed, rng, alt)
+        ext.update(parse_comment_extensions(comment))  # a compressed position's own comment can ALSO carry e.g. /A=
+        return lat, lon, sym_table, sym_code, comment, ext
+    if len(text) < 19:
+        return None
+    try:
+        lat = _parse_latitude(text[0:8])
+        sym_table = text[8]
+        lon = _parse_longitude(text[9:18])
+        sym_code = text[18]
+    except (ValueError, IndexError):
+        return None
+    comment = text[19:]
+    return lat, lon, sym_table, sym_code, comment, parse_comment_extensions(comment)
+
+
+def _parse_object_report(text):
+    """text starts right after the ';' data type identifier."""
+    if len(text) < 18:
+        return None
+    name = text[0:9]
+    live_char = text[9]
+    if live_char not in ("*", "_"):
+        return None
+    timestamp = text[10:17]
+    position = _parse_position_and_comment(text[17:])
+    if position is None:
+        return None
+    lat, lon, sym_table, sym_code, comment, ext = position
+    return {
+        "type": "position", "has_timestamp": True,
+        "lat": lat, "lon": lon,
+        "symbol_table": sym_table, "symbol_code": sym_code,
+        "comment": comment, "comment_extension": ext,
+        "source_format": "object",
+        "object_name": name.rstrip(), "object_live": live_char == "*",
+        "object_timestamp": timestamp,
+    }
+
+
+def _parse_item_report(text):
+    """text starts right after the ')' data type identifier. Unlike
+    Object names (fixed 9 chars), Item names are 3-9 variable-length
+    chars, terminated by the live/kill marker itself -- so the marker
+    has to be searched for rather than read from a fixed offset."""
+    for end in range(3, min(10, len(text))):
+        if text[end] in ("!", "_"):
+            name, live_char = text[:end], text[end]
+            position = _parse_position_and_comment(text[end + 1:])
+            if position is None:
+                return None
+            lat, lon, sym_table, sym_code, comment, ext = position
+            return {
+                "type": "position", "has_timestamp": False,
+                "lat": lat, "lon": lon,
+                "symbol_table": sym_table, "symbol_code": sym_code,
+                "comment": comment, "comment_extension": ext,
+                "source_format": "item",
+                "object_name": name, "object_live": live_char == "!",
+            }
+    return None
+
+
+# ---- Messages (APRS101.PDF Chapter 14) --------------------------------
+
+_TELEMETRY_DEFINITION_PREFIXES = {
+    "PARM.": "parameter_names", "UNIT.": "units_labels",
+    "EQNS.": "equation_coefficients", "BITS.": "bit_sense",
+}
+
+
+def _parse_message(text):
+    """text starts right after the ':' data type identifier."""
+    if len(text) < 10 or text[9] != ":":
+        return None
+    addressee = text[0:9].rstrip()
+    body = text[10:]
+
+    if body[:3] == "ack" and body[3:8].strip():
+        return {"type": "message_ack", "addressee": addressee, "message_id": body[3:8].strip()}
+    if body[:3] == "rej" and body[3:8].strip():
+        return {"type": "message_reject", "addressee": addressee, "message_id": body[3:8].strip()}
+
+    for prefix, kind in _TELEMETRY_DEFINITION_PREFIXES.items():
+        if body.startswith(prefix):
+            fields = body[len(prefix):].split(",")
+            return {
+                "type": "telemetry_definition", "kind": kind,
+                "addressee": addressee, "raw_fields": fields,
+            }
+
+    message_id = None
+    if "{" in body:
+        text_part, _, id_part = body.rpartition("{")
+        if 1 <= len(id_part) <= 5 and id_part.isalnum():
+            body, message_id = text_part, id_part
+    return {"type": "message", "addressee": addressee, "text": body, "message_id": message_id}
+
+
+# ---- Telemetry (APRS101.PDF Chapter 13) -------------------------------
+
+def _parse_telemetry(text):
+    """text starts right after the 'T' data type identifier."""
+    if len(text) < 5 or text[0] != "#":
+        return None
+    sequence = text[1:4]
+    rest = text[4:].lstrip(",")
+    fields = rest.split(",")
+    if len(fields) < 6:
+        return None
+    try:
+        analog = [int(fields[i]) for i in range(5)]
+    except ValueError:
+        return None
+    digital_str = fields[5][:8]
+    if len(digital_str) < 8 or not all(c in "01" for c in digital_str):
+        return None
+    digital = [c == "1" for c in digital_str]
+    return {"type": "telemetry", "sequence": sequence, "analog": analog, "digital": digital}
+
+
+# ---- Complete Weather Reports (APRS101.PDF Chapter 12) ----------------
+#
+# Piggyback on an already-parsed position report whose symbol is the
+# Weather Station symbol ('_', in either table) -- see the call site in
+# parse_aprs_info. The comment's own leading 7-byte Data Extension slot
+# (already parsed as course/speed by parse_comment_extensions) is
+# reinterpreted as WIND direction/speed instead (same "ddd/sss" byte
+# shape, aprs101.txt:3363-3370); the rest of the comment is scanned for
+# the documented single-letter+fixed-width fields, in any order,
+# stopping at the first unrecognized byte (leftover software-type/
+# unit-type/free text, shown verbatim as part of the still-unmodified
+# raw comment, not further decoded). Verified against the spec's own
+# example: "_10090556c220s004g005t077r000p000P000h50b09900wRSW".
+
+_WEATHER_FIELD_RE = re.compile(
+    r"(?:g(?P<gust>\d{3}))|"
+    r"(?:t(?P<temp>-?\d{1,3}))|"
+    r"(?:r(?P<rain_hr>\d{3}))|"
+    r"(?:p(?P<rain_24h>\d{3}))|"
+    r"(?:P(?P<rain_midnight>\d{3}))|"
+    r"(?:h(?P<humidity>\d{2}))|"
+    r"(?:b(?P<pressure>\d{5}))|"
+    r"(?:L(?P<lum_low>\d{3}))|"
+    r"(?:l(?P<lum_high>\d{3}))|"
+    r"(?:s(?P<snow>\d{3}))"
+)
+
+
+def _parse_weather_fields(comment):
+    """Scans comment (a position report's own comment text, AFTER any
+    leading Data Extension bytes) for the documented weather fields,
+    consuming consecutive matches from the start and stopping at the
+    first byte that isn't a recognized field (leftover software-type/
+    unit-type codes or free text -- not parsed further)."""
+    fields = {}
+    pos = 0
+    while pos < len(comment):
+        match = _WEATHER_FIELD_RE.match(comment, pos)
+        if not match:
+            break
+        for name, value in match.groupdict().items():
+            if value is not None:
+                fields[name] = int(value)
+        pos = match.end()
+    if not fields:
+        return None
+    result = {}
+    if "gust" in fields:
+        result["gust_mph"] = fields["gust"]
+    if "temp" in fields:
+        result["temp_f"] = fields["temp"]
+    if "rain_hr" in fields:
+        result["rain_last_hr_in"] = fields["rain_hr"] / 100.0
+    if "rain_24h" in fields:
+        result["rain_24hr_in"] = fields["rain_24h"] / 100.0
+    if "rain_midnight" in fields:
+        result["rain_since_midnight_in"] = fields["rain_midnight"] / 100.0
+    if "humidity" in fields:
+        result["humidity_pct"] = 100 if fields["humidity"] == 0 else fields["humidity"]
+    if "pressure" in fields:
+        result["pressure_mbar"] = fields["pressure"] / 10.0
+    if "snow" in fields:
+        result["snow_24hr_in"] = fields["snow"]
+    return result
+
+
+def _attach_weather_if_present(position_dict):
+    """Mutates position_dict in place, adding a "weather" key if its
+    symbol is the Weather Station symbol and its comment contains
+    recognizable weather fields -- called from every position-report
+    code path in parse_aprs_info (plain, compressed, Mic-E, Object,
+    Item) so weather-carrying positions from any of them get
+    translated the same way, regardless of which wire format carried
+    them."""
+    if position_dict.get("symbol_code") != "_":
+        return position_dict
+    ext = position_dict.get("comment_extension") or {}
+    wind_deg, wind_speed = ext.get("course_deg"), ext.get("speed_knots")
+    comment = position_dict.get("comment", "")
+    # The wind ddd/sss slot occupies the SAME leading 7 comment bytes
+    # parse_comment_extensions already consumed to produce course_deg/
+    # speed_knots above -- skip past it before scanning for the
+    # letter-coded fields, or the scan starts mid-digit-string and
+    # matches nothing (confirmed live: without this it silently found
+    # zero fields on the spec's own worked example).
+    field_text = comment[7:] if wind_deg is not None else comment
+    weather = _parse_weather_fields(field_text)
+    if wind_deg is None and weather is None:
+        return position_dict
+    weather = dict(weather) if weather else {}
+    if wind_deg is not None:
+        weather["wind_deg"] = wind_deg
+        weather["wind_speed_mph"] = wind_speed  # wind speed's own unit is mph, not knots, despite reusing the course/speed byte shape
+    position_dict["weather"] = weather
+    return position_dict
+
+
+def parse_aprs_info(info_bytes: bytes, destination_raw: str = None):
+    """Parses an APRS info field. Structured support for: plain and
+    compressed position reports (data type '!'/'='/'/'/'@'), Mic-E
+    position reports (data type '`'/"'" -- needs destination_raw, the
+    UN-rstripped AX.25 destination address chars, see parse_ax25_frame),
+    Object/Item reports (';'/')'),  status reports ('>'), messages/acks/
+    rejects/telemetry-definitions (':'), telemetry ('T'), and Complete
+    Weather Reports (any position whose symbol is Weather Station '_').
+    Everything else (raw/positionless weather station dumps, capability
+    queries, third-party/tunneled packets, user-defined data -- see
+    aprs.py's own module docstring for the deliberate scope decision on
+    each) comes back as {"type": "other", "raw": <decoded text>} rather
+    than guessing an unverified layout.
+
+    Position report dict (from ANY of the position-shaped sources
+    above): {"type": "position", "has_timestamp": bool, "lat": float,
+    "lon": float, "symbol_table": str, "symbol_code": str, "comment":
+    str, "comment_extension": dict, "weather": dict|absent}. Non-plain
+    sources add "source_format" ("mic_e"/"object"/"item") plus their
+    own extra fields (see parse_mic_e/_parse_object_report/_parse_item_
+    report's own docstrings). comment_extension is parse_comment_
+    extensions(comment)'s own return for plain-format positions (see
+    its docstring); comment itself always stays the full, untouched
+    raw text regardless of what was found. Returns None if info_bytes
+    is empty or not decodable as text at all."""
     if not info_bytes:
         return None
     try:
@@ -492,31 +1094,81 @@ def parse_aprs_info(info_bytes: bytes):
     data_type = text[0]
     try:
         if data_type in ("!", "="):
+            if len(text) > 1 and text[1] in ("/", "\\"):
+                parsed = _parse_compressed_position(text[1:])
+                if parsed is not None:
+                    sym_table, lat, lon, sym_code, course, speed, rng, alt, consumed = parsed
+                    comment = text[1 + consumed:]
+                    ext = _position_from_compressed(course, speed, rng, alt)
+                    ext.update(parse_comment_extensions(comment))
+                    return _attach_weather_if_present({
+                        "type": "position", "has_timestamp": False,
+                        "lat": lat, "lon": lon,
+                        "symbol_table": sym_table, "symbol_code": sym_code,
+                        "comment": comment, "comment_extension": ext,
+                        "source_format": "compressed",
+                    })
             lat = _parse_latitude(text[1:9])
             sym_table = text[9]
             lon = _parse_longitude(text[10:19])
             sym_code = text[19]
             comment = text[20:]
-            return {
+            return _attach_weather_if_present({
                 "type": "position", "has_timestamp": False,
                 "lat": lat, "lon": lon,
                 "symbol_table": sym_table, "symbol_code": sym_code,
                 "comment": comment,
                 "comment_extension": parse_comment_extensions(comment),
-            }
+            })
         if data_type in ("/", "@"):
+            if len(text) > 8 and text[8] in ("/", "\\"):
+                parsed = _parse_compressed_position(text[8:])
+                if parsed is not None:
+                    sym_table, lat, lon, sym_code, course, speed, rng, alt, consumed = parsed
+                    comment = text[8 + consumed:]
+                    ext = _position_from_compressed(course, speed, rng, alt)
+                    ext.update(parse_comment_extensions(comment))
+                    return _attach_weather_if_present({
+                        "type": "position", "has_timestamp": True,
+                        "lat": lat, "lon": lon,
+                        "symbol_table": sym_table, "symbol_code": sym_code,
+                        "comment": comment, "comment_extension": ext,
+                        "source_format": "compressed",
+                    })
             lat = _parse_latitude(text[8:16])
             sym_table = text[16]
             lon = _parse_longitude(text[17:26])
             sym_code = text[26]
             comment = text[27:]
-            return {
+            return _attach_weather_if_present({
                 "type": "position", "has_timestamp": True,
                 "lat": lat, "lon": lon,
                 "symbol_table": sym_table, "symbol_code": sym_code,
                 "comment": comment,
                 "comment_extension": parse_comment_extensions(comment),
-            }
+            })
+        if data_type in ("`", "'") and destination_raw:
+            mic_e = parse_mic_e(destination_raw, info_bytes)
+            if mic_e is not None:
+                return _attach_weather_if_present(mic_e)
+        if data_type == ">":
+            return _parse_status_report(text[1:])
+        if data_type == ";":
+            obj = _parse_object_report(text[1:])
+            if obj is not None:
+                return _attach_weather_if_present(obj)
+        if data_type == ")":
+            item = _parse_item_report(text[1:])
+            if item is not None:
+                return _attach_weather_if_present(item)
+        if data_type == ":":
+            message = _parse_message(text[1:])
+            if message is not None:
+                return message
+        if data_type == "T":
+            telemetry = _parse_telemetry(text[1:])
+            if telemetry is not None:
+                return telemetry
     except (ValueError, IndexError):
         pass  # malformed -- fall through to the generic raw-text form
     return {"type": "other", "raw": text}
@@ -727,7 +1379,10 @@ class AprsDecoder:
             parsed = parse_ax25_frame(raw)
             if parsed is None:
                 continue
-            parsed["info"] = parse_aprs_info(parsed["info"]) if parsed["info"] else None
+            parsed["info"] = (
+                parse_aprs_info(parsed["info"], parsed.get("destination_raw"))
+                if parsed["info"] else None
+            )
             packets.append(parsed)
         return packets
 

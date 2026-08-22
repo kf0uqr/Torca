@@ -89,9 +89,43 @@ def _format_comment_extension(ext):
     return ", ".join(parts)
 
 
+def _format_weather(weather):
+    if not weather:
+        return ""
+    parts = []
+    if "wind_deg" in weather:
+        parts.append(f"wind {weather['wind_deg']}°@{weather['wind_speed_mph']}mph")
+    if "gust_mph" in weather:
+        parts.append(f"gust {weather['gust_mph']}mph")
+    if "temp_f" in weather:
+        parts.append(f"{weather['temp_f']}°F")
+    if "humidity_pct" in weather:
+        parts.append(f"humidity {weather['humidity_pct']}%")
+    if "pressure_mbar" in weather:
+        parts.append(f"{weather['pressure_mbar']:.1f}mbar")
+    if "rain_last_hr_in" in weather:
+        parts.append(f"rain(1h) {weather['rain_last_hr_in']:.2f}in")
+    if "rain_24hr_in" in weather:
+        parts.append(f"rain(24h) {weather['rain_24hr_in']:.2f}in")
+    if "rain_since_midnight_in" in weather:
+        parts.append(f"rain(today) {weather['rain_since_midnight_in']:.2f}in")
+    if "snow_24hr_in" in weather:
+        parts.append(f"snow(24h) {weather['snow_24hr_in']}in")
+    return ", ".join(parts)
+
+
+# Human-readable tag per non-plain position source -- shown as a prefix
+# on the Details text so an operator can tell which wire format
+# actually produced a given translated row (all of them decode to the
+# exact same "type": "position" shape internally, so nothing else in
+# this table would otherwise distinguish them).
+_SOURCE_FORMAT_LABELS = {"mic_e": "Mic-E", "compressed": "Compressed"}
+
+
 def _format_packet_details(info):
     if info is None:
         return "(no info field)"
+
     if info["type"] == "position":
         # Translates the raw two-character symbol table/code (e.g.
         # "/-") into its official human-readable name (e.g. "House QTH
@@ -102,18 +136,85 @@ def _format_packet_details(info):
         symbol_name = symbol_description(info["symbol_table"], info["symbol_code"])
         symbol_code = f"{info['symbol_table']}{info['symbol_code']}"
         symbol_part = f"{symbol_name} [{symbol_code}]" if symbol_name else f"[{symbol_code}]"
-        details = f"{info['lat']:.5f}, {info['lon']:.5f}  {symbol_part}"
+
+        prefix = ""
+        source_format = info.get("source_format")
+        if source_format in _SOURCE_FORMAT_LABELS:
+            prefix = f"[{_SOURCE_FORMAT_LABELS[source_format]}] "
+        if info.get("object_name"):
+            kind = "Item" if source_format == "item" else "Object"
+            live = "" if info.get("object_live", True) else " KILLED"
+            prefix = f"[{kind}: {info['object_name']}{live}] "
+
+        details = f"{prefix}{info['lat']:.5f}, {info['lon']:.5f}  {symbol_part}"
+        if info.get("mic_e_message_type"):
+            details += f"  ({info['mic_e_message_type']})"
+        if info.get("mic_e_device"):
+            details += f"  [{info['mic_e_device']}]"
+        if info.get("mic_e_grid_square"):
+            details += f"  Grid: {info['mic_e_grid_square']}"
         if info["comment"]:
             details += f"  {info['comment']}"
         # Structured Data Extensions parsed out of that same comment
         # (course/speed, PHG, RNG, DFS, altitude) -- shown as an
         # additional translated summary, not in place of the raw
         # comment text above, same "translate alongside, don't replace"
-        # approach the symbol name takes with its own raw code.
-        extension_text = _format_comment_extension(info.get("comment_extension"))
+        # approach the symbol name takes with its own raw code. For a
+        # weather report, the SAME leading 7 comment bytes were already
+        # reinterpreted as wind direction/speed (mph, not knots) by
+        # _attach_weather_if_present -- the Weather line below already
+        # shows that correctly labeled, so skip the (course .../...kt)
+        # extension line here to avoid double-showing the same number
+        # under a wrong unit.
+        weather = info.get("weather")
+        extension = info.get("comment_extension")
+        if weather and "wind_deg" in weather and extension and "course_deg" in extension:
+            extension = {k: v for k, v in extension.items() if k not in ("course_deg", "speed_knots")}
+        extension_text = _format_comment_extension(extension)
         if extension_text:
             details += f"  ({extension_text})"
+        weather_text = _format_weather(weather)
+        if weather_text:
+            details += f"  Weather: {weather_text}"
+        if info.get("mic_e_telemetry"):
+            channels = info["mic_e_telemetry"]["channels"]
+            details += "  Telemetry: " + ", ".join(f"ch{k}={v}" for k, v in sorted(channels.items()))
         return details
+
+    if info["type"] == "status":
+        parts = []
+        if info.get("timestamp"):
+            parts.append(f"[{info['timestamp']}]")
+        parts.append(info["text"])
+        if info.get("beam_heading_deg") is not None:
+            parts.append(f"(beam {info['beam_heading_deg']}°, {info['erp_watts']}W ERP)")
+        return " ".join(parts)
+
+    if info["type"] == "message":
+        details = f"To {info['addressee']}: {info['text']}"
+        if info.get("message_id"):
+            details += f"  (msg #{info['message_id']}, ack requested)"
+        return details
+
+    if info["type"] == "message_ack":
+        return f"To {info['addressee']}: ACK for message #{info['message_id']}"
+
+    if info["type"] == "message_reject":
+        return f"To {info['addressee']}: REJECTED message #{info['message_id']}"
+
+    if info["type"] == "telemetry":
+        analog = ", ".join(f"A{i + 1}={v}" for i, v in enumerate(info["analog"]))
+        digital = "".join("1" if b else "0" for b in info["digital"])
+        return f"Seq {info['sequence']}: {analog}, digital={digital}"
+
+    if info["type"] == "telemetry_definition":
+        kind_labels = {
+            "parameter_names": "Parameter Names", "units_labels": "Units/Labels",
+            "equation_coefficients": "Equation Coefficients", "bit_sense": "Bit Sense/Project",
+        }
+        label = kind_labels.get(info["kind"], info["kind"])
+        return f"To {info['addressee']}: Telemetry {label}: {', '.join(info['raw_fields'])}"
+
     return info["raw"]
 
 

@@ -280,6 +280,213 @@ def test_parse_aprs_info_includes_comment_extension():
     assert info["comment_extension"]["phg"]["power_w"] == 25
 
 
+# ---- New packet formats -- verified against APRS101.PDF's own worked
+# examples wherever the spec provides one (fetched via curl,
+# extracted via `pdftotext -layout`, not summarized/guessed). Two
+# spec examples print padding as a literal "V" character for print
+# visibility (same convention Chapter 7's own "VVV/VVV" unknown-
+# course/speed marker uses) rather than real space bytes -- those
+# tests use real spaces instead, noted inline.
+
+
+def test_compressed_position_spec_example():
+    # Spec's own full worked example: "the complete 13-character
+    # compressed location field is transmitted as: /5L!!<*e7>7P[" for
+    # lat 49*30'00"N, lon 72*45'00"W, speed 36.2kt, course 88 degrees,
+    # symbol Car, real-time fix -- prefixed with '!' per the spec's own
+    # "New Trackers... use the ! Data Type Indicator" guidance.
+    info = aprs.parse_aprs_info(b"!/5L!!<*e7>7P[")
+    assert info["type"] == "position"
+    assert info["source_format"] == "compressed"
+    assert abs(info["lat"] - 49.5) < 0.001, info
+    assert abs(info["lon"] - (-72.75)) < 0.001, info
+    assert info["symbol_table"] == "/" and info["symbol_code"] == ">"
+    assert info["comment_extension"]["course_deg"] == 88
+    assert abs(info["comment_extension"]["speed_knots"] - 36.2) < 0.1
+
+
+def test_compressed_position_with_timestamp():
+    info = aprs.parse_aprs_info(b"/092345z/5L!!<*e7>7P[")
+    assert info["type"] == "position"
+    assert info["has_timestamp"] is True
+    assert abs(info["lat"] - 49.5) < 0.001
+
+
+def test_compressed_position_range():
+    # Spec's own range example: cs bytes "{?" -> ~20 miles (c='{' is
+    # the range indicator, replacing the course/speed cs bytes from
+    # the main worked example above -- same table/lat/lon/symbol/T
+    # bytes, just a different cs pair).
+    text = "/5L!!<*e7>" + "{?" + "["
+    sym_table, lat, lon, sym_code, course, speed, rng, alt, consumed = aprs._parse_compressed_position(text)
+    assert course is None and speed is None
+    assert abs(rng - 20.0) < 1.0, rng
+
+
+def test_mic_e_destination_spec_example():
+    # Spec's own worked example: lat 33*25.64'N, western hemisphere,
+    # +0 longitude offset, standard message 1/0/0 -> "S32U6T".
+    lat, message_type, long_offset, we = aprs._decode_mic_e_destination("S32U6T")
+    assert abs(lat - (33 + 25.64 / 60.0)) < 0.001, lat
+    assert message_type == "M3: Returning", message_type
+    assert long_offset == 0
+    assert we == "W"
+
+
+def test_mic_e_full_spec_example():
+    # Spec's own byte-by-byte worked example for the info field: lon
+    # 112*7.74'W, speed 20kt, course 251 degrees, symbol /j (Jeep), for
+    # a station in the western hemisphere with +100 longitude offset
+    # (destination T4SQZZ). The spec's own printed example has a
+    # spurious space (a pdftotext/PDF-kerning artifact, confirmed by
+    # cross-checking the spec's own bullet-by-bullet byte walkthrough,
+    # which lists exactly 9 bytes with none of them a space) --
+    # reconstructed here without it.
+    info_bytes = "`(_fn\"Oj/".encode("latin-1")
+    result = aprs.parse_mic_e("T4SQZZ", info_bytes)
+    assert result["type"] == "position"
+    assert result["source_format"] == "mic_e"
+    assert abs(result["lon"] - (-(112 + 7.74 / 60.0))) < 0.001, result
+    assert result["comment_extension"]["speed_knots"] == 20
+    assert result["comment_extension"]["course_deg"] == 251
+    assert result["symbol_table"] == "/" and result["symbol_code"] == "j"
+
+
+def test_mic_e_via_parse_aprs_info():
+    info_bytes = "`(_fn\"Oj/".encode("latin-1")
+    result = aprs.parse_aprs_info(info_bytes, "T4SQZZ")
+    assert result["type"] == "position"
+    assert result["source_format"] == "mic_e"
+
+
+def test_mic_e_emergency_message():
+    # All-zero message bits -> Emergency, per the spec's own table.
+    lat, message_type, _, _ = aprs._decode_mic_e_destination("234567")
+    assert message_type == "Emergency", message_type
+
+
+def test_mic_e_malformed_falls_back_to_other():
+    assert aprs.parse_aprs_info(b"`(_fn\"Oj/", "NOTVALID!") == {"type": "other", "raw": "`(_fn\"Oj/"}
+    assert aprs.parse_aprs_info(b"`(_fn\"Oj/")["type"] == "other"  # no destination_raw at all
+
+
+def test_status_report_examples():
+    # Spec's own examples.
+    assert aprs.parse_aprs_info(b">Net Control Center") == {
+        "type": "status", "timestamp": None, "text": "Net Control Center",
+        "beam_heading_deg": None, "erp_watts": None,
+    }
+    with_ts = aprs.parse_aprs_info(b">092345zNet Control Center")
+    assert with_ts["timestamp"] == "092345z"
+    assert with_ts["text"] == "Net Control Center"
+
+
+def test_status_report_beam_heading_erp():
+    # Spec's own example: "^B7 means a beam heading of 110 degrees and an ERP of 490 watts."
+    result = aprs.parse_aprs_info(b">Meteor scatter ^B7")
+    assert result["beam_heading_deg"] == 110, result
+    assert result["erp_watts"] == 490, result
+
+
+def test_object_report_spec_example():
+    info = aprs.parse_aprs_info(b";LEADERVVV*092345z4903.50N/07201.75W>088/036")
+    assert info["type"] == "position"
+    assert info["source_format"] == "object"
+    assert info["object_name"] == "LEADERVVV"  # spec's own literal 9-char name, not padding
+    assert info["object_live"] is True
+    assert abs(info["lat"] - 49.058333) < 0.001
+    assert info["comment_extension"]["course_deg"] == 88
+    assert info["comment_extension"]["speed_knots"] == 36
+
+
+def test_object_report_killed():
+    info = aprs.parse_aprs_info(b";LEADERVVV_092345z4903.50N/07201.75W>088/036")
+    assert info["object_live"] is False
+
+
+def test_item_report_spec_examples():
+    live = aprs.parse_aprs_info(b")AIDV#2!4903.50N/07201.75WA")
+    assert live["type"] == "position"
+    assert live["source_format"] == "item"
+    assert live["object_name"] == "AIDV#2"
+    assert live["object_live"] is True
+    assert live["symbol_code"] == "A"
+
+    killed = aprs.parse_aprs_info(b")AIDV#2_4903.50N/07201.75WA")
+    assert killed["object_live"] is False
+
+
+def test_message_spec_examples():
+    # Real space padding used here, not the spec's own print-only "V" padding marker.
+    plain = aprs.parse_aprs_info(b":WU2Z     :Testing")
+    assert plain == {"type": "message", "addressee": "WU2Z", "text": "Testing", "message_id": None}
+
+    with_id = aprs.parse_aprs_info(b":WU2Z     :Testing{003")
+    assert with_id == {"type": "message", "addressee": "WU2Z", "text": "Testing", "message_id": "003"}
+
+
+def test_message_ack_and_reject_spec_examples():
+    assert aprs.parse_aprs_info(b":KB2ICI-14:ack003") == {
+        "type": "message_ack", "addressee": "KB2ICI-14", "message_id": "003",
+    }
+    assert aprs.parse_aprs_info(b":KB2ICI-14:rej003") == {
+        "type": "message_reject", "addressee": "KB2ICI-14", "message_id": "003",
+    }
+
+
+def test_telemetry_definition_messages_spec_examples():
+    parm = aprs.parse_aprs_info(b":N0QBF-11V:PARM.Battery,Btemp,ATemp,Pres,Alt,Camra,Chut,Sun,10m,ATV")
+    assert parm["type"] == "telemetry_definition"
+    assert parm["kind"] == "parameter_names"
+    assert parm["raw_fields"][0] == "Battery"
+
+    eqns = aprs.parse_aprs_info(b":N0QBF-11V:EQNS.0,5.2,0,0,.53,-32,3,4.39,49,-32,3,18,1,2,3")
+    assert eqns["kind"] == "equation_coefficients"
+
+    bits = aprs.parse_aprs_info(":N0QBF-11V:BITS.10110000,N0QBF's Big Balloon".encode("ascii"))
+    assert bits["kind"] == "bit_sense"
+
+
+def test_telemetry_report_spec_examples():
+    numeric = aprs.parse_aprs_info(b"T#005,199,000,255,073,123,01101001")
+    assert numeric == {
+        "type": "telemetry", "sequence": "005",
+        "analog": [199, 0, 255, 73, 123],
+        "digital": [False, True, True, False, True, False, False, True],
+    }
+    mic = aprs.parse_aprs_info(b"T#MIC199,000,255,073,123,01101001")
+    assert mic["sequence"] == "MIC"
+    assert mic["analog"] == [199, 0, 255, 73, 123]
+
+
+def test_weather_report_spec_example():
+    # Spec's own example: "!4903.50N/07201.75W_220/004g005t077r000p000P000h50b09900wRSW"
+    info = aprs.parse_aprs_info(b"!4903.50N/07201.75W_220/004g005t077r000p000P000h50b09900wRSW")
+    assert info["type"] == "position"
+    weather = info["weather"]
+    assert weather["wind_deg"] == 220, weather
+    assert weather["wind_speed_mph"] == 4, weather
+    assert weather["gust_mph"] == 5, weather
+    assert weather["temp_f"] == 77, weather
+    assert weather["rain_last_hr_in"] == 0.0, weather
+    assert weather["rain_24hr_in"] == 0.0, weather
+    assert weather["rain_since_midnight_in"] == 0.0, weather
+    assert weather["humidity_pct"] == 50, weather
+    assert weather["pressure_mbar"] == 990.0, weather
+
+
+def test_weather_report_negative_temperature():
+    info = aprs.parse_aprs_info(
+        b"@092345z4903.50N/07201.75W_220/004g005t-07r000p000P000h50b09900wRSW"
+    )
+    assert info["weather"]["temp_f"] == -7, info["weather"]
+
+
+def test_non_weather_position_has_no_weather_key():
+    info = aprs.parse_aprs_info(b"!4903.50N/07201.75W-Test comment")
+    assert "weather" not in info
+
+
 if __name__ == "__main__":
     test_basic_position_report()
     test_with_ssid_and_digipeaters()
@@ -296,4 +503,24 @@ if __name__ == "__main__":
     test_comment_extension_none_for_ordinary_comment()
     test_comment_extension_height_code_beyond_9()
     test_parse_aprs_info_includes_comment_extension()
+    test_compressed_position_spec_example()
+    test_compressed_position_with_timestamp()
+    test_compressed_position_range()
+    test_mic_e_destination_spec_example()
+    test_mic_e_full_spec_example()
+    test_mic_e_via_parse_aprs_info()
+    test_mic_e_emergency_message()
+    test_mic_e_malformed_falls_back_to_other()
+    test_status_report_examples()
+    test_status_report_beam_heading_erp()
+    test_object_report_spec_example()
+    test_object_report_killed()
+    test_item_report_spec_examples()
+    test_message_spec_examples()
+    test_message_ack_and_reject_spec_examples()
+    test_telemetry_definition_messages_spec_examples()
+    test_telemetry_report_spec_examples()
+    test_weather_report_spec_example()
+    test_weather_report_negative_temperature()
+    test_non_weather_position_has_no_weather_key()
     print("All aprs tests passed.")

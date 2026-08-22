@@ -279,10 +279,9 @@ class DirewolfBackend(QObject):
         parsed = parse_ax25_frame(ax25_frame)
         if parsed is None:
             return
-        parsed["info"] = (
-            parse_aprs_info(parsed["info"], parsed.get("destination_raw"))
-            if parsed["info"] else None
-        )
+        info_raw = parsed["info"]
+        parsed["info"] = parse_aprs_info(info_raw, parsed.get("destination_raw")) if info_raw else None
+        parsed["info_raw"] = info_raw if info_raw else None
         self.packet_received.emit(parsed)
 
     def stop(self):

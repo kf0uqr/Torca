@@ -29,7 +29,8 @@ its own docstring in radio_worker.py), not itself APRS-specific.
 
 import datetime
 
-from PySide6.QtCore import QSettings, Signal
+from PySide6.QtCore import Qt, QSettings, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QWidget,
     QDialog,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QMenu,
 )
 
 from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
@@ -400,6 +402,8 @@ class AprsToolWindow(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
 
         layout = QVBoxLayout()
         layout.addLayout(buttons_row)
@@ -513,13 +517,67 @@ class AprsToolWindow(QWidget):
                 _format_packet_details(info),
             ]
             for col, value in enumerate(values):
-                self.table.setItem(row, col, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    # The full packet dict (including info_raw, the
+                    # original undecoded info-field bytes) lives on
+                    # column 0's item only -- one copy per row is
+                    # enough, _on_table_context_menu just needs SOME
+                    # item in the clicked row to pull it back out of.
+                    item.setData(Qt.UserRole, packet)
+                self.table.setItem(row, col, item)
             if info is not None and info["type"] == "position":
                 self.packet_decoded.emit(packet)
         self.table.scrollToBottom()
 
     def _on_clear_clicked(self):
         self.table.setRowCount(0)
+
+    def _on_table_context_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        packet = item.data(Qt.UserRole)
+        if packet is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("Copy Packet for Debugging").triggered.connect(
+            lambda: self._copy_packet_debug_info(packet)
+        )
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    @staticmethod
+    def _copy_packet_debug_info(packet):
+        """Copies everything useful for diagnosing a packet that isn't
+        translating correctly -- the ORIGINAL info-field bytes (as hex,
+        since they're not always printable text -- Mic-E's especially
+        aren't), not just whatever this app already made of them, so a
+        genuinely wrong translation can be tracked down from the real
+        wire data rather than from this app's own possibly-incorrect
+        interpretation of it. info_raw is the exact bytes
+        AprsDecoder.feed()/DirewolfBackend kept alongside the parsed
+        result specifically for this (see AprsDecoder's own
+        docstring) -- present regardless of whether parsing succeeded,
+        failed outright, or (the more insidious case worth debugging)
+        quietly produced a wrong-but-plausible-looking result."""
+        info = packet.get("info")
+        info_raw = packet.get("info_raw")
+        lines = [
+            f"Source: {packet.get('source', '?')}",
+            f"Destination: {packet.get('destination', '?')}",
+            f"Digipeaters: {','.join(packet.get('digipeaters') or []) or '(none)'}",
+        ]
+        if info_raw:
+            lines.append(f"Info (raw bytes, hex): {info_raw.hex(' ')}")
+            lines.append(f"Info (raw bytes, latin-1): {info_raw.decode('latin-1')!r}")
+        else:
+            lines.append("Info (raw bytes): (empty info field)")
+        lines.append(f"Parsed type: {info['type'] if info else '(none)'}")
+        lines.append(f"Parsed details: {_format_packet_details(info)}")
+        QGuiApplication.clipboard().setText("\n".join(lines))
 
     # ---- Send ----
 

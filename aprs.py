@@ -1351,8 +1351,15 @@ class AprsDecoder:
     .feed(pcm_bytes) -- returns a list of newly-decoded packets from
     that call (usually empty), each a dict: {"source", "destination",
     "digipeaters", "info": <parsed via parse_aprs_info, or None if the
-    info field was empty>}. All state is internal; construct a fresh
-    instance to start a new decode session."""
+    info field was empty>, "info_raw": <the original bytes "info" was
+    parsed from, or None>}. info_raw is kept alongside the parsed
+    result (not just for parse failures -- a packet can also come back
+    incorrectly/partially parsed as some OTHER, wrong type without
+    ever falling to "other", not just cleanly failing) specifically so
+    a still-wrong translation can be diagnosed from the original bytes
+    afterward -- see aprs_window.py's "Copy Packet for Debugging"
+    context-menu action, the intended consumer. All state is internal;
+    construct a fresh instance to start a new decode session."""
 
     def __init__(self, sample_rate: int):
         self.sample_rate = sample_rate
@@ -1379,10 +1386,9 @@ class AprsDecoder:
             parsed = parse_ax25_frame(raw)
             if parsed is None:
                 continue
-            parsed["info"] = (
-                parse_aprs_info(parsed["info"], parsed.get("destination_raw"))
-                if parsed["info"] else None
-            )
+            info_raw = parsed["info"]
+            parsed["info"] = parse_aprs_info(info_raw, parsed.get("destination_raw")) if info_raw else None
+            parsed["info_raw"] = info_raw if info_raw else None
             packets.append(parsed)
         return packets
 

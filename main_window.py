@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QSlider,
     QComboBox,
     QDoubleSpinBox,
@@ -75,7 +76,18 @@ class RadioWindow(QWidget):
             self._connection_label = f"{details['serial_port']} (USB)"
         self.setWindowTitle(f"TORCA -- {details['radio_model']}")
 
-        self.freq_display = QLabel("-- MHz")
+        # QLineEdit, not QLabel -- editable so an operator can type a
+        # frequency directly instead of only tuning via the knob/band
+        # buttons/scope click. setFrame(False) drops QLineEdit's own
+        # native border/sunken-panel chrome so the stylesheet below is
+        # the only thing drawing its box, matching the plain-label look
+        # this had before. Starts read-only (see _on_connected) -- no
+        # sense letting the operator type into it before there's a
+        # connected radio to send the result to.
+        self.freq_display = QLineEdit("-- MHz")
+        self.freq_display.setFrame(False)
+        self.freq_display.setReadOnly(True)
+        self.freq_display.setToolTip("Click to type a frequency directly, then press Enter.")
         self.freq_display.setStyleSheet(
             "font-size: 28px; font-weight: bold; color: white; "
             # Matches SpectrumWidget's own background fill (QColor(10, 10,
@@ -92,6 +104,10 @@ class RadioWindow(QWidget):
         # a too-narrow fixed-width label clips off the LEFT edge (the
         # visible symptom), so this needs headroom rather than an exact fit.
         self.freq_display.setFixedWidth(280)
+        # editingFinished covers both Enter (commit) and losing focus
+        # (e.g. clicking elsewhere mid-edit) with one connection --
+        # Qt's own documented behavior for this signal.
+        self.freq_display.editingFinished.connect(self._on_freq_display_edited)
 
         # Opposite corner from freq_display -- shows the nominal
         # (pre-Doppler-correction) frequency while satellite tracking is
@@ -594,6 +610,7 @@ class RadioWindow(QWidget):
     @Slot()
     def _on_connected(self):
         self.status_label.setText(f"Connected to {self._connection_label}")
+        self.freq_display.setReadOnly(False)
         self.tuning_knob.setEnabled(True)
         self.rit_knob.setEnabled(True)
         self.ptt_button.setEnabled(True)
@@ -668,10 +685,24 @@ class RadioWindow(QWidget):
         self.status_label.setText("Connection failed")
         QMessageBox.critical(self, "Connection Error", message)
 
+    def _set_freq_display_text(self, text):
+        # Skips while the operator is actively editing the field
+        # (typing a frequency directly, see _on_freq_display_edited) --
+        # otherwise a periodic poll update or automatic satellite-
+        # tracking tick landing mid-edit would silently overwrite
+        # whatever's part-way typed. Only used for those periodic/
+        # automatic update sites -- direct user-action sites (band
+        # button, tuning knob, scope click, and the edit handler's own
+        # commit) write self.freq_display.setText() straight, since
+        # none of those can race with the field having focus.
+        if self.freq_display.hasFocus():
+            return
+        self.freq_display.setText(text)
+
     @Slot(int)
     def _on_frequency_updated(self, freq_hz):
         self._current_freq_hz = freq_hz
-        self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+        self._set_freq_display_text(f"{freq_hz / 1e6:.6f} MHz")
         self._update_band_button_highlight()
         self.spectrum_widget.set_tuned_frequency(freq_hz)
 
@@ -853,7 +884,7 @@ class RadioWindow(QWidget):
             if receiver is not None:
                 self._update_active_receiver_ui(receiver)
             self._current_freq_hz = freq_hz
-            self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+            self._set_freq_display_text(f"{freq_hz / 1e6:.6f} MHz")
             if nominal_freq_hz is not None:
                 self.nominal_freq_display.setText(f"{nominal_freq_hz / 1e6:.6f} MHz")
             self._update_band_button_highlight()
@@ -950,7 +981,7 @@ class RadioWindow(QWidget):
                         self.worker.set_receiver_frequency(RECEIVER_SUB, freq_hz)
             if freq_hz is not None:
                 self._current_freq_hz = freq_hz
-                self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                self._set_freq_display_text(f"{freq_hz / 1e6:.6f} MHz")
                 nominal_hz = base_uplink_hz if transmitting else base_downlink_hz
                 if nominal_hz is not None:
                     self.nominal_freq_display.setText(f"{nominal_hz / 1e6:.6f} MHz")
@@ -964,7 +995,7 @@ class RadioWindow(QWidget):
                 self._current_freq_hz = freq_hz
                 if base_downlink_hz is not None:
                     self.nominal_freq_display.setText(f"{base_downlink_hz / 1e6:.6f} MHz")
-                self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+                self._set_freq_display_text(f"{freq_hz / 1e6:.6f} MHz")
                 self._update_band_button_highlight()
         # "uplink": deliberately nothing here -- see docstring.
         return warning_text
@@ -1163,7 +1194,7 @@ class RadioWindow(QWidget):
             percent = self.level_sliders[key].value()
             label.setText(f"{LEVEL_DEFINITIONS[key]['label']}{suffix}: {percent}%")
         self._current_freq_hz = None
-        self.freq_display.setText("-- MHz")
+        self._set_freq_display_text("-- MHz")
         self._update_band_button_highlight()
 
     @Slot(str, object)
@@ -1308,6 +1339,69 @@ class RadioWindow(QWidget):
             self.worker.set_frequency(freq_hz)
         # Update optimistically, same as _on_knob_steps -- the next
         # poll cycle confirms/corrects it.
+        self._current_freq_hz = freq_hz
+        self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
+        self._update_band_button_highlight()
+
+    @staticmethod
+    def _parse_freq_text(text):
+        """Parses operator-typed frequency text into whole Hz, or None
+        if unparseable. A bare number is interpreted as MHz, matching
+        this field's own display convention -- "14.250 MHz" round-trips
+        through editing as just "14.250" -- but an explicit "Hz"/"kHz"/
+        "MHz" suffix (case-insensitive, optional leading space) is also
+        accepted for an operator who'd rather type the raw Hz/kHz value
+        directly. Checked longest-suffix-first ("mhz"/"khz" before
+        bare "hz") since "mhz"/"khz" both themselves end in "hz"."""
+        text = text.strip().lower()
+        if not text:
+            return None
+        multiplier = 1_000_000.0  # bare number -- default unit is MHz
+        for suffix, mult in (("mhz", 1_000_000.0), ("khz", 1_000.0), ("hz", 1.0)):
+            if text.endswith(suffix):
+                text = text[:-len(suffix)].strip()
+                multiplier = mult
+                break
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        return round(value * multiplier)
+
+    def _on_freq_display_edited(self):
+        """editingFinished handler for the now-editable freq_display
+        field (see its own construction comment) -- fires on Enter OR
+        on losing focus, so this also has to cover "operator clicked in,
+        didn't actually change anything, clicked away" by just
+        re-echoing the current reading, not just the genuine-edit case.
+        Shares _on_scope_clicked's satellite-tracking-offset-adjust/
+        dual-receiver-Sub-targeting branching (same reasoning as that
+        method's own docstring for why it duplicates rather than
+        shares code with _on_knob_steps) -- the one real difference
+        from _on_scope_clicked is this does NOT snap to the current
+        step size, since a typed-in value is presumably already
+        exactly what the operator wants, not an imprecise pixel click."""
+        freq_hz = self._parse_freq_text(self.freq_display.text())
+        if freq_hz is None:
+            # Couldn't parse -- revert to the last known-good reading
+            # rather than leaving unparseable/partial text sitting there.
+            self.freq_display.setText(
+                f"{self._current_freq_hz / 1e6:.6f} MHz" if self._current_freq_hz is not None else "-- MHz"
+            )
+            return
+        freq_hz = max(0, freq_hz)
+
+        if self._role in ("full_duplex", "downlink") and self._satellite_session.is_tracking():
+            if self._current_freq_hz is not None:
+                self._satellite_session.adjust_offset(freq_hz - self._current_freq_hz)
+            return
+
+        if self.worker.is_dual_receiver and self.active_receiver_button.text() == "Active: SUB":
+            self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, freq_hz, "A")
+        else:
+            self.worker.set_frequency(freq_hz)
+        # Update optimistically, same as _on_scope_clicked/_on_knob_
+        # steps -- the next poll cycle confirms/corrects it.
         self._current_freq_hz = freq_hz
         self.freq_display.setText(f"{freq_hz / 1e6:.6f} MHz")
         self._update_band_button_highlight()

@@ -904,6 +904,7 @@ class HamClockWindow(QWidget):
         self._park_details_worker = None
         self._park_details_dialog = None
         self._park_details_dialog_reference = None  # which park the currently-open dialog is for
+        self._selected_park = None  # {"lat","lon"} of the last-clicked row, shown on the map only while the Parks tab is active
         self.parks_program_combo = QComboBox()
         self.parks_program_combo.setToolTip(
             "POTA has no single \"all parks\" list -- pick a country/region "
@@ -933,13 +934,17 @@ class HamClockWindow(QWidget):
         self.parks_table.verticalHeader().setVisible(False)
         self.parks_table.cellClicked.connect(self._on_park_row_clicked)
         self.parks_table.cellDoubleClicked.connect(self._on_park_row_double_clicked)
-        parks_tab = QWidget()
+        # Kept as an attribute (not a local) -- _on_band_data_tab_changed
+        # (wired below, once band_data_tabs itself exists) needs to
+        # identify this specific tab by object identity to know when to
+        # show/hide the map's selected-park marker.
+        self.parks_tab = QWidget()
         parks_tab_layout = QVBoxLayout()
         parks_tab_layout.setContentsMargins(4, 4, 4, 4)
         parks_tab_layout.addLayout(parks_controls_row)
         parks_tab_layout.addWidget(self.parks_status_label)
         parks_tab_layout.addWidget(self.parks_table)
-        parks_tab.setLayout(parks_tab_layout)
+        self.parks_tab.setLayout(parks_tab_layout)
 
         # ---- Tabbed container -- per explicit instruction, replaces
         # the old single-purpose "HF Band Conditions" area with a
@@ -952,7 +957,8 @@ class HamClockWindow(QWidget):
         self.band_data_tabs.addTab(self.band_conditions_table, "Band Conditions")
         self.band_data_tabs.addTab(contests_tab, "Contests")
         self.band_data_tabs.addTab(dx_spots_tab, "DX Spots")
-        self.band_data_tabs.addTab(parks_tab, "Parks")
+        self.band_data_tabs.addTab(self.parks_tab, "Parks")
+        self.band_data_tabs.currentChanged.connect(self._on_band_data_tab_changed)
         # upcoming_passes_table (built further down in __init__, same
         # row as this) isn't constructed yet at this point, so this
         # doesn't reference it -- just uses the same row-count/height
@@ -2010,8 +2016,18 @@ class HamClockWindow(QWidget):
         if item is None:
             return
         park = item.data(Qt.UserRole)
-        self.map_widget.set_selected_park_marker({"lat": park["lat"], "lon": park["lon"]})
+        self._selected_park = {"lat": park["lat"], "lon": park["lon"]}
+        self.map_widget.set_selected_park_marker(self._selected_park)
         self.map_widget.center_on(park["lat"], park["lon"])
+
+    def _on_band_data_tab_changed(self, index):
+        # The park marker is only meaningful while the Parks tab is
+        # actually the one on screen -- hide it the moment the operator
+        # switches to Band Conditions/Contests/DX Spots so it doesn't
+        # keep sitting on the map for a tab that's no longer showing
+        # which park it refers to, and restore it if they switch back.
+        on_parks_tab = self.band_data_tabs.widget(index) is self.parks_tab
+        self.map_widget.set_selected_park_marker(self._selected_park if on_parks_tab else None)
 
     def _on_park_row_double_clicked(self, row, _column):
         item = self.parks_table.item(row, 0)

@@ -571,9 +571,14 @@ class RadioWindow(QWidget):
 
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
+        # All the stretch lives here now, between left_column and
+        # rit_column -- rit_column sits snug against knob_row (a fixed,
+        # modest gap, not addStretch()) instead of floating in the
+        # middle, leaving the whole space between left_column and the
+        # RIT/tuning knob pair open for more buttons later.
         tuning_row.addStretch()
         tuning_row.addLayout(rit_column)
-        tuning_row.addStretch()
+        tuning_row.addSpacing(16)
         tuning_row.addLayout(knob_row)
 
         layout = QVBoxLayout()

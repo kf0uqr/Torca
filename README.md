@@ -1,28 +1,66 @@
 # TORCA -- That One Radio Control App - v0.0.1a
 
-A PySide6 GUI for controlling Icom radios (7300, 9700, 705) via [rigplane](https://pypi.org/project/rigplane/), with a dedicated worker thread for all async radio I/O.
+A PySide6 GUI for controlling Icom radios (IC-7300, IC-9700, IC-7610, IC-705) via [rigplane](https://pypi.org/project/rigplane/), built around a Ham Dashboard (satellite tracking, world map, QSO log, spot networks) and one window per connected radio (spectrum/waterfall, meters, memories, and a full set of digital-mode tools), with a dedicated worker thread handling all async radio I/O.
 
-Also included:
-
-- **Connection profiles** - save a whole setup (radio, network/USB settings, audio devices, location) under a name in the Connect dialog, and reload it from a dropdown next time instead of re-entering everything. Handy for e.g. a home station vs. a portable/field-day setup.
-- **Ham Dashboard** - solar conditions (NOAA/hamqsl), a day/night world map, and SGP4-based satellite tracking with TLE (CelesTrak) and transponder (SatNOGS DB) fetching. Stores every known transponder per satellite, editable by hand too.
-- **Satellite Doppler correction** - double-click a tracked satellite on the Ham Dashboard map to start live tracking in the *main* window: pick one of its stored transponders from a dropdown there, and VFO A is continuously re-tuned to track that transponder's downlink through its Doppler shift (real SGP4 orbital velocity against your set location), with elevation/azimuth/Doppler/time-to-AOS-or-LOS overlaid on the spectrum scope, next to the frequency readout. Double-click another satellite any time to switch -- tracking keeps running rather than blocking either window.
-- **Upcoming satellite passes** - the Ham Dashboard lists the next 10 AOS windows across every satellite checked to display on the map, soonest first, each with a live countdown, max elevation, and pass duration.
-- **Split mode** - a toggle next to the VFO A/B button.
-- **WSJT-X bridge** - launch WSJT-X/JTDX/fldigi into an isolated profile and drive it through this app's radio connection via a built-in Hamlib `rigctld`-compatible server (no external Hamlib install required).
-- **Audio streaming** - mic/speaker audio to and from the radio via rigplane's `AudioTransport`, plus Linux/PulseAudio virtual-audio-cable helpers.
-- Spectrum, waterfall, meter, and tuning-knob widgets, and a dark theme throughout.
+**See [USAGE.md](USAGE.md) for step-by-step instructions on every feature below.**
 
 <img width="1920" height="1200" alt="image" src="https://github.com/user-attachments/assets/6e8cb9c8-2238-40f2-be9f-ccf2d1c92e72" />
 <img width="1920" height="1200" alt="image" src="https://github.com/user-attachments/assets/a65dc651-961a-4ade-9faf-1b504b297bb1" />
 
+## Features
+
+**Multi-radio & satellite**
+- Connect any number of radios at once, each its own window, each with a saveable/loadable named connection profile (radio model, network/USB settings, audio devices).
+- Satellite tracking (SGP4, TLEs from CelesTrak, transponder data from SatNOGS DB) with live Doppler correction, an elevation/azimuth/Doppler/AOS-LOS overlay on the scope, and upcoming-pass predictions on the dashboard. Works across a single dual-receiver radio (Main/Sub) or a "poor man's full duplex" pair of separate uplink/downlink radios, coordinated by role.
+- A band-plan overlay under the waterfall showing CW/data/phone segments and the minimum license class for each, sourced directly from FCC rules -- plus a toggleable satellite-imagery map layer.
+
+**Digital mode tools** (each a per-radio window: send + live decode, sharing RX audio with normal listening)
+- CW: send via the radio's own keyer, adaptive tone decode, macro bank, adjustable WPM lock.
+- RTTY: AFSK send/decode, macro bank.
+- SSTV: continuous image decode (multiple modes auto-detected).
+- APRS: full packet decode (position/Mic-E/compressed/status/object/item/messages/telemetry/weather/third-party-relayed), symbol translation, packet send, and an optional `direwolf`-backed decoder alongside the built-in one.
+
+**Logging & spotting**
+- A local QSO log book (plain ADIF file) with optional two-way QRZ.com Logbook sync, configurable columns, and auto-fill from a connected radio's live frequency/mode (and active satellite/transponder, if tracking).
+- WSJT-X auto-logging via its own UDP broadcast -- no manual entry needed.
+- POTA activator spots, PSKReporter reception reports, and a traditional DX cluster feed, all plotted on the world map.
+- A read-only contest calendar (WA7BNM).
+
+**Memories**
+- App-side memory channels (VFO A/B frequency/mode + repeater tone), captured from a live radio or imported wholesale from a RepeaterBook CSV export -- no API key needed. Recall any entry back to the radio with one click.
+
+**Radio control**
+- Spectrum scope, waterfall, segmented meters, and a rotary tuning knob widget.
+- Split mode, RIT, band buttons (with band-stacking-register recall), memory recall.
+- Virtual Cables (Linux/PulseAudio or PipeWire) to route RX/TX audio to/from external apps.
+- A built-in Hamlib `rigctld`-compatible server per radio, and a one-click isolated WSJT-X launch already pointed at it.
+
+**Networking**
+- `torca-server`: share a USB-only radio over the network so any other TORCA instance can connect to it like a LAN radio (frequency/mode/PTT/meters/levels/scope/audio all work the same).
+
+**General**
+- An Operator Profile (callsign + location, saveable/loadable by name) shown at launch and reachable anytime, feeding satellite Doppler correction, the map marker, and PSKReporter/DX cluster/QSO logging.
+- Solar-terrestrial conditions (NOAA/hamqsl) and HF band-condition estimates.
+- Self-update in place from GitHub (dev checkout or `install.sh` install).
+- Dark theme throughout.
+
 ## Requirements
 
 - Python 3.9+
-- [PySide6](https://pypi.org/project/PySide6/) - GUI framework
-- [rigplane](https://pypi.org/project/rigplane/) - radio control backend
-- [sounddevice](https://pypi.org/project/sounddevice/) - audio device listing and streaming (PortAudio wrapper)
-- [sgp4](https://pypi.org/project/sgp4/) - satellite propagation for the Ham Dashboard's satellite tracking feature
+- [PySide6](https://pypi.org/project/PySide6/) -- GUI framework
+- [rigplane](https://pypi.org/project/rigplane/) -- radio control backend
+- [sounddevice](https://pypi.org/project/sounddevice/) -- audio device listing and streaming (PortAudio wrapper)
+- [sgp4](https://pypi.org/project/sgp4/) -- satellite propagation for satellite tracking
+- [numpy](https://pypi.org/project/numpy/) -- DSP for the CW/RTTY/SSTV/APRS decoders
+
+All required packages install via `pip install -r requirements.txt` (or automatically with `install.sh`). No external Hamlib install is needed -- the built-in `rigctld`-compatible server and WSJT-X bridge are self-contained.
+
+### Optional
+
+- **`pactl`** (PulseAudio, or PipeWire's `pipewire-pulse` compatibility layer) -- Linux only, needed for Virtual Cables. Nothing else requires it; the rest of the app runs the same without it.
+- **[direwolf](https://github.com/wb2osz/direwolf)** -- an alternative APRS decode backend, selectable alongside the built-in decoder in the APRS Tool. Purely optional; the built-in decoder needs nothing extra.
+- **`git`** -- only needed for self-update to work when running from a dev checkout (`install.sh` installs are updated the same way either way).
+- A **QRZ.com XML/Logbook Data subscription** -- only needed for QSO Log Book sync; the local log itself works fully without one.
 
 ## Installation
 
@@ -34,7 +72,7 @@ cd Torca
 sudo ./install.sh
 ```
 
-Installs the app and its own Python virtual environment to `/opt/torca`, and adds a `torca` command to `/usr/local/bin`. Re-run `sudo ./install.sh` any time to reinstall/upgrade, or `sudo ./install.sh --uninstall` to remove everything it installed.
+Installs the app and its own Python virtual environment to `/opt/torca`, and adds `torca`/`torca-server` commands to `/usr/local/bin` plus a desktop launcher entry. Re-run `sudo ./install.sh` any time to reinstall/upgrade (or use the in-app **Check for Updates...** button), or `sudo ./install.sh --uninstall` to remove everything it installed.
 
 ### Manual (any platform)
 
@@ -58,16 +96,7 @@ torca            # if installed via install.sh
 python main.py   # manual install
 ```
 
-You'll be prompted for connection details (serial or LAN), plus your location (lat/lon/elevation, used for satellite Doppler correction), before the main window opens. Click **Save Profile...** in that dialog to save the whole setup under a name for next time -- the last-used profile (or a fresh one you pick from the dropdown) loads automatically.
-
-Location can be entered by hand, or looked up approximately from your public IP via **Get GPS Coordinates (from IP)** -- that's an IP-geolocation lookup, not a real GPS fix, so it's typically only accurate to city level. Elevation always has to be entered manually and measurably improves Doppler accuracy on low satellite passes.
-
-### Using satellite tracking + Doppler correction
-
-1. In the Ham Dashboard, click **Satellites** to turn tracking on; right-click the button to manage the tracked list (refresh TLEs from CelesTrak, add satellites by hand, fetch transponder data from SatNOGS DB for every tracked satellite, or hand-edit transponders, and choose which satellites show on the map). This also populates **Upcoming Satellite Passes**, next to HF Band Conditions, with the next 10 passes across whichever satellites are checked to show on the map -- any pass already in progress right now sorts to the top, showing time until it sets instead of time until it starts.
-2. Double-click a satellite marker on the map, *or* a row in Upcoming Satellite Passes -- both do the same thing. Tracking starts in the *main radio window*, not the dashboard: pick a transponder from the dropdown that appears there, and VFO A gets continuously Doppler-corrected while elevation/azimuth/Doppler shift/time-to-AOS-or-LOS show as an overlay on the spectrum scope. The tuning knob adjusts an offset from the transponder's nominal downlink (applied before Doppler correction) instead of the radio directly while tracking's running -- use it to tune within a linear satellite's passband or nudge to better match where it's actually transmitting.
-3. **Start/Stop Tracking** pauses and resumes re-tuning without losing the selection -- the satellite (and any tuning offset) stays put until you double-click a different one on the map.
-4. How PTT drives the uplink depends on the radio, detected automatically at connect time: on a single-receiver radio (IC-7300/IC-705), **Split** (next to VFO A/B) turns on automatically while tracking runs, and **PTT** swaps VFO B in with a Doppler-corrected *uplink* for the transmission and back to VFO A's downlink the instant you release. On a dual-receiver radio (IC-9700/IC-7610), Main tracks the downlink while receiving and Sub takes over with the Doppler-corrected uplink for the duration of a transmission -- only whichever one is actually in use gets touched, so the radio stays put on it instead of the two flickering back and forth.
+The first thing you'll see is the **Operator Profile** dialog (callsign + location) -- see [USAGE.md](USAGE.md#operator-profile) for details, including the GPS-from-address/IP lookup. After that, the Ham Dashboard opens; connect a radio from its **Radios** button whenever you're ready. Full walkthroughs for every feature -- satellite tracking, the digital-mode tools, QSO logging, memories, and more -- are in **[USAGE.md](USAGE.md)**.
 
 ## Connecting to a radio over the network
 
@@ -107,24 +136,79 @@ If you connect directly (serial/USB, not through `torca-server`) rather than via
 
 ## Project layout
 
+**Entry points / core**
+
 | File | Purpose |
 | --- | --- |
-| `main.py` | Entry point |
-| `constants.py` | Bands, meter/control/level tables |
+| `main.py` | Entry point -- shows the Operator Profile dialog, then opens the Ham Dashboard |
+| `constants.py` | Bands, meter/control/level tables, radio profiles, satellite roles |
 | `rig_discovery.py` | Shared "find the real method name" helper |
-| `audio.py` | `AudioBridge` + Linux virtual-audio-cable helpers |
-| `radio_worker.py` | `RadioWorker` (QThread owning the radio connection) |
-| `connection_dialog.py` | `ConnectionDialog` (connection details, location, saved profiles), shown before the main window |
-| `remote_radio.py` | `RemoteWebRadio` -- client for a radio shared over the network via `torca-server` / rigplane's own `web` server |
-| `torca_server.py` | Wrapper `torca-server` runs -- patches out rigplane's periodic unselected-VFO-slot refresh, then dispatches to rigplane's own CLI |
-| `widgets.py` | `SpectrumWidget`, `WaterfallWidget`, `MeterWidget`, `TuningKnobWidget` |
-| `wsjtx_rigctld.py` | WSJT-X launcher + `RigctldServer` |
-| `solar_data.py` | NOAA/hamqsl fetching, `SolarDataWorker`, astronomy helpers |
-| `world_map.py` | `WorldMapWidget` (Ham Dashboard's day/night map, satellite markers) |
-| `satellite_tracking.py` | SGP4 propagation, TLE/SatNOGS fetching, Doppler/look-angle/AOS-LOS math, satellite/transponder dialogs |
-| `ham_dashboard.py` | `HamClockWindow`, ties the above three together |
-| `main_window.py` | `RadioWindow`, the main application window |
+| `audio.py` | `AudioBridge` + Linux virtual-audio-cable (PulseAudio/PipeWire) helpers |
+| `radio_worker.py` | `RadioWorker` (QThread owning one radio connection) |
 | `theme.py` | Dark theme applied to the whole app |
+
+**Connection & identity**
+
+| File | Purpose |
+| --- | --- |
+| `connection_dialog.py` | `ConnectionDialog` -- radio connection details + saved profiles |
+| `operator_profile.py` | `OperatorProfileDialog` -- callsign/location, saved profiles, shown at launch |
+| `remote_radio.py` | `RemoteWebRadio` -- client for a radio shared over the network via `torca-server` |
+| `torca_server.py` | Wrapper `torca-server` runs -- patches rigplane's periodic VFO-slot refresh, then dispatches to its own CLI |
+
+**Ham Dashboard & main radio window**
+
+| File | Purpose |
+| --- | --- |
+| `ham_dashboard.py` | `HamClockWindow` -- the central window: map, satellites, logging, spot networks, radio/Virtual Cable/rigctld management |
+| `main_window.py` | `RadioWindow` -- the per-radio window: scope/waterfall, meters, band buttons, tool launchers |
+| `widgets.py` | `SpectrumWidget`, `WaterfallWidget`, `BandPlanOverlayWidget`, `MeterWidget`, `TuningKnobWidget` |
+| `world_map.py` | `WorldMapWidget` -- day/night map, satellite markers, QSO/POTA/PSKReporter/APRS overlays |
+| `map_tiles.py` | OSM + satellite-imagery tile fetching/caching for the world map |
+| `band_plan.py` | US band-plan data (CW/data/phone segments, license class) sourced from FCC rules |
+| `split_dialog.py` | `SplitSettingsDialog` -- split/repeater-tone configuration |
+| `memories_window.py` | `MemoriesWindow` -- app-side memory channels, Local Repeaters CSV import, Recall |
+| `repeater_import.py` | Parses a RepeaterBook CSV export for the Local Repeaters tab |
+
+**Satellite tracking**
+
+| File | Purpose |
+| --- | --- |
+| `satellite_tracking.py` | SGP4 propagation, TLE/SatNOGS fetching, Doppler/look-angle/AOS-LOS math, satellite/transponder dialogs |
+| `satellite_session.py` | `SatelliteSession` -- shared Doppler-tracking coordinator across however many radios are connected |
+
+**Digital mode tools**
+
+| File | Purpose |
+| --- | --- |
+| `cw.py` / `cw_window.py` | Morse decode/send engine + `CwToolWindow` |
+| `rtty.py` / `rtty_window.py` | RTTY AFSK decode/send engine + `RttyToolWindow` |
+| `sstv.py` / `sstv_window.py` | SSTV image decoder + `SstvToolWindow` |
+| `aprs.py` / `aprs_window.py` | APRS/AX.25 packet decode/send engine + `AprsToolWindow` |
+| `direwolf_backend.py` | Alternative APRS decode backend using the external `direwolf` TNC |
+
+**Logging & spot networks**
+
+| File | Purpose |
+| --- | --- |
+| `adif.py` | ADIF read/write, mode mapping |
+| `qso_log.py` | Local QSO log (source of truth) + optional QRZ sync |
+| `qrz_logbook.py` | QRZ.com Logbook API client |
+| `log_book_window.py` | `LogBookWindow` -- the QSO log book UI |
+| `new_qso_dialog.py` | `NewQsoDialog` -- add/edit a QSO, auto-filled from a live radio |
+| `pota.py` | Parks on the Air activator-spot API client |
+| `pskreporter.py` | PSKReporter reception-report query client |
+| `dxcluster.py` | Traditional AK1A-protocol DX cluster telnet client |
+| `contests.py` | WA7BNM contest calendar feed |
+| `solar_data.py` | NOAA/hamqsl solar-terrestrial data fetching + astronomy helpers |
+
+**WSJT-X integration & updates**
+
+| File | Purpose |
+| --- | --- |
+| `wsjtx_rigctld.py` | WSJT-X launcher + `RigctldServer` (Hamlib-compatible) |
+| `wsjtx_udp.py` | WSJT-X UDP protocol listener for auto-logging |
+| `updater.py` | Self-update in place from GitHub |
 
 ## License
 

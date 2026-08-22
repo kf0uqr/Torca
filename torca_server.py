@@ -1,7 +1,8 @@
 """
 Thin wrapper around rigplane's own `web` CLI (invoked by torca-server)
 that disables one specific rigplane behavior: RadioPoller's periodic
-"unselected VFO slot" refresh (see README.md's "Known quirk" section).
+"unselected VFO slot" refresh (see README.md's "VFO A/B flicker +
+audio glitch" section).
 
 That refresh genuinely swaps the radio to VFO B, reads it, and swaps
 back via real CI-V commands roughly every 5 seconds per receiver, to

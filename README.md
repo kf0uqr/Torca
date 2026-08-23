@@ -17,6 +17,7 @@ A PySide6 GUI for controlling Icom radios (IC-7300, IC-9700, IC-7610, IC-705) vi
 **Digital mode tools** (each a per-radio window: send + live decode, sharing RX audio with normal listening)
 - CW: send via the radio's own keyer, adaptive tone decode, macro bank, adjustable WPM lock.
 - RTTY: AFSK send/decode, macro bank.
+- PSK31: BPSK31 send/decode with an adjustable audio tone, macro bank.
 - SSTV: continuous image decode (multiple modes auto-detected).
 - APRS: full packet decode (position/Mic-E/compressed/status/object/item/messages/telemetry/weather/third-party-relayed), symbol translation, packet send, and an optional `direwolf`-backed decoder alongside the built-in one.
 
@@ -51,7 +52,7 @@ A PySide6 GUI for controlling Icom radios (IC-7300, IC-9700, IC-7610, IC-705) vi
 - [rigplane](https://pypi.org/project/rigplane/) -- radio control backend
 - [sounddevice](https://pypi.org/project/sounddevice/) -- audio device listing and streaming (PortAudio wrapper)
 - [sgp4](https://pypi.org/project/sgp4/) -- satellite propagation for satellite tracking
-- [numpy](https://pypi.org/project/numpy/) -- DSP for the CW/RTTY/SSTV/APRS decoders
+- [numpy](https://pypi.org/project/numpy/) -- DSP for the CW/RTTY/PSK31/SSTV/APRS decoders
 
 All required packages install via `pip install -r requirements.txt` (or automatically with `install.sh`). No external Hamlib install is needed -- the built-in `rigctld`-compatible server and WSJT-X bridge are self-contained.
 
@@ -183,6 +184,7 @@ If you connect directly (serial/USB, not through `torca-server`) rather than via
 | --- | --- |
 | `cw.py` / `cw_window.py` | Morse decode/send engine + `CwToolWindow` |
 | `rtty.py` / `rtty_window.py` | RTTY AFSK decode/send engine + `RttyToolWindow` |
+| `psk31.py` / `psk31_window.py` | BPSK31 decode/send engine + `Psk31ToolWindow` |
 | `sstv.py` / `sstv_window.py` | SSTV image decoder + `SstvToolWindow` |
 | `aprs.py` / `aprs_window.py` | APRS/AX.25 packet decode/send engine + `AprsToolWindow` |
 | `direwolf_backend.py` | Alternative APRS decode backend using the external `direwolf` TNC |

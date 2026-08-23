@@ -14,6 +14,7 @@ Step-by-step instructions for every feature in TORCA. See [README.md](README.md)
 - [Digital mode tools](#digital-mode-tools)
   - [CW](#cw-tool)
   - [RTTY](#rtty-tool)
+  - [PSK31](#psk31-tool)
   - [SSTV](#sstv-tool)
   - [APRS](#aprs-tool)
 - [QSO Log Book](#qso-log-book)
@@ -103,6 +104,10 @@ Type text and click **Send** to key the radio's own built-in Morse keyer over CI
 ### RTTY Tool
 
 Same send/decode/macro shape as CW, but RTTY has no radio-side keyer -- send synthesizes AFSK mark/space tones locally and streams them out via PTT.
+
+### PSK31 Tool
+
+Same send/decode/macro shape as CW/RTTY, plus a **Tone (Hz)** field -- set it to match wherever you're actually tuned in the passband (e.g. the tone you see on the waterfall), since PSK31 has no fixed on-air audio frequency the way RTTY's mark/space pair does. Decode locks onto a signal automatically once one appears near that tone; it re-locks on its own if the signal drops out for a while (e.g. you retune).
 
 ### SSTV Tool
 

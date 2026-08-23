@@ -3041,9 +3041,60 @@ class HamClockWindow(QWidget):
         if server is not None:
             server.stop()
 
+    def _confirm_rigctld_before_launch(self, app_name):
+        """Shared pre-launch check for both "Launch WSJT-X" and "Launch
+        JS8Call" -- neither app can actually control a radio without
+        SOME rigctld server running (self._rigctld_servers, populated
+        only by a running RigctldServer -- see _on_rigctld_dialog_start),
+        so warn if none is running yet rather than let the operator
+        launch the app, get confused why it can't see a radio, and have
+        to work backwards to "oh, I never started Rigctld."
+
+        Returns True to proceed with the launch, False to abort it.
+        Choosing "Open Rigctld..." opens that dialog INSTEAD of
+        launching this click (matching the existing Rigctld button's own
+        per-selected-radio flow) -- the operator sets it up, then clicks
+        Launch WSJT-X/JS8Call again themselves. Doesn't distinguish
+        "no radio connected at all" from "radios connected but no
+        rigctld started for any of them" -- both are the same actionable
+        situation from here (go start one), and the Radios/Rigctld
+        dialogs already explain the rest once opened."""
+        if self._rigctld_servers:
+            return True  # at least one radio already has a rigctld server running
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(app_name)
+        box.setText(
+            f"No Rigctld server is currently running for any connected radio.\n\n"
+            f"{app_name} won't be able to control a radio (frequency, mode, PTT) "
+            "until one is started."
+        )
+        open_button = box.addButton("Open Rigctld...", QMessageBox.ActionRole)
+        box.addButton("Continue Without It", QMessageBox.AcceptRole)
+        cancel_button = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(open_button)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is cancel_button:
+            return False
+        if clicked is open_button:
+            self._on_rigctld_button_clicked()
+            if self._selected_radio_window() is None:
+                QMessageBox.information(
+                    self, "Rigctld",
+                    "Select a connected radio in the Radios list first, then use "
+                    "Rigctld... to start a server for it.",
+                )
+            return False  # opening the dialog replaces this click's launch, not followed by one
+        return True  # "Continue Without It"
+
     # ---- WSJT-X ----
 
     def _on_wsjtx_button_clicked(self):
+        if not self._confirm_rigctld_before_launch("WSJT-X"):
+            return
         settings = QSettings("IcomRadioApp", "RadioControl")
         path = settings.value("wsjtx_executable_path", "")
 
@@ -3071,6 +3122,8 @@ class HamClockWindow(QWidget):
     # ---- JS8Call ----
 
     def _on_js8call_button_clicked(self):
+        if not self._confirm_rigctld_before_launch("JS8Call"):
+            return
         settings = QSettings("IcomRadioApp", "RadioControl")
         path = settings.value("js8call_executable_path", "")
 

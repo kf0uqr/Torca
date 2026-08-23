@@ -34,7 +34,7 @@ A PySide6 GUI for controlling amateur radios via [rigplane](https://pypi.org/pro
 - Spectrum scope, waterfall, segmented meters, and a rotary tuning knob widget.
 - Split mode, RIT, band buttons (with band-stacking-register recall), memory recall.
 - Virtual Cables (Linux/PulseAudio or PipeWire) to route RX/TX audio to/from external apps.
-- A built-in Hamlib `rigctld`-compatible server per radio, and a one-click isolated WSJT-X launch already pointed at it.
+- A built-in Hamlib `rigctld`-compatible server per radio, and one-click WSJT-X/JS8Call launch buttons that can point at it.
 
 **Networking**
 - `torca-server`: share a USB-only radio over the network so any other TORCA instance can connect to it like a LAN radio (frequency/mode/PTT/meters/levels/scope/audio all work the same).
@@ -226,11 +226,11 @@ If you connect directly (serial/USB, not through `torca-server`) rather than via
 | `contests.py` | WA7BNM contest calendar feed |
 | `solar_data.py` | NOAA/hamqsl solar-terrestrial data fetching + astronomy helpers |
 
-**WSJT-X integration & updates**
+**WSJT-X / JS8Call integration & updates**
 
 | File | Purpose |
 | --- | --- |
-| `wsjtx_rigctld.py` | WSJT-X launcher + `RigctldServer` (Hamlib-compatible) |
+| `wsjtx_rigctld.py` | WSJT-X + JS8Call launchers + `RigctldServer` (Hamlib-compatible) |
 | `wsjtx_udp.py` | WSJT-X UDP protocol listener for auto-logging |
 | `updater.py` | Self-update in place from GitHub |
 

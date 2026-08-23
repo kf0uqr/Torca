@@ -24,7 +24,7 @@ Step-by-step instructions for every feature in TORCA. See [README.md](README.md)
   - [PSKReporter](#pskreporter)
   - [DX Cluster](#dx-cluster)
   - [Contest Calendar](#contest-calendar)
-- [WSJT-X integration](#wsjtx-integration)
+- [WSJT-X and JS8Call integration](#wsjt-x-and-js8call-integration)
 - [Virtual Cables](#virtual-cables)
 - [rigctld](#rigctld)
 - [Updating](#updating)
@@ -148,9 +148,9 @@ A traditional telnet DX cluster feed (default: a public AK1A-format cluster). En
 
 A read-only table of upcoming contests (WA7BNM's own published calendar) -- double-click a row for details and a link.
 
-## WSJT-X integration
+## WSJT-X and JS8Call integration
 
-**Launch WSJT-X** starts it in its own isolated profile (`--rig-name`), separate from your regular WSJT-X settings, so it won't collide with an existing setup. Use **Rigctld...** (below) to let it control a specific connected radio.
+**Launch WSJT-X** starts it in its own isolated profile (`--rig-name`), separate from your regular WSJT-X settings, so it won't collide with an existing setup. **Launch JS8Call** starts JS8Call directly (no isolated-profile flag -- it uses its own regular settings). Use **Rigctld...** (below) to let either one control a specific connected radio (point its own Radio settings at `127.0.0.1:<port>`, rig "Hamlib NET rigctl"). Both remember whichever executable path you locate the first time, and re-prompt (a file browser) if that path ever stops existing.
 
 ## Virtual Cables
 

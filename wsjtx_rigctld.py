@@ -1,10 +1,10 @@
 """
-Two independent pieces that let external CAT-aware apps (WSJT-X, JTDX,
-fldigi, etc.) work with this app's radio connection: a "Launch WSJT-X"
-helper (finds/remembers the executable, launches it into its own
-isolated --rig-name profile) and RigctldServer, a minimal Hamlib
-rigctld-compatible TCP server so those apps can drive the radio through
-this app's existing connection instead of opening their own.
+Two independent pieces that let external CAT-aware apps (WSJT-X, JS8Call,
+JTDX, fldigi, etc.) work with this app's radio connection: "Launch
+WSJT-X"/"Launch JS8Call" helpers (find/remember the executable, launch
+it) and RigctldServer, a minimal Hamlib rigctld-compatible TCP server so
+those apps can drive the radio through this app's existing connection
+instead of opening their own.
 """
 
 import os
@@ -60,6 +60,54 @@ def launch_wsjtx(executable_path):
     WSJTX_RIG_NAME above). Raises OSError/subprocess errors on failure --
     callers should catch and report those."""
     subprocess.Popen([executable_path, f"--rig-name={WSJTX_RIG_NAME}"])
+
+
+# JS8Call is a separate application (a fork of WSJT-X's codebase, but its
+# own program with its own settings/profile directory) -- launched plain,
+# with NO --rig-name isolation flag. WSJT-X's own --rig-name option is
+# confirmed via its documented man page (see WSJTX_RIG_NAME above); JS8Call
+# supporting the identical flag is not independently confirmed here, so
+# rather than guess and risk a launch failure from an unrecognized
+# argument, this launches it with no extra arguments at all -- same
+# rigctld server below still works with it regardless (point JS8Call's own
+# Settings > Radio at 127.0.0.1:4532, rig "Hamlib NET rigctl"), it just
+# means every launch uses JS8Call's own single/default settings profile
+# rather than an app-isolated one the way WSJT-X gets.
+_JS8CALL_CANDIDATE_PATHS = {
+    "Windows": [
+        r"C:\JS8Call\js8call.exe",
+        r"C:\Program Files\JS8Call\js8call.exe",
+        r"C:\Program Files (x86)\JS8Call\js8call.exe",
+    ],
+    "Darwin": [
+        "/Applications/JS8Call.app/Contents/MacOS/js8call",
+    ],
+    "Linux": [
+        "/usr/bin/js8call",
+        "/usr/local/bin/js8call",
+    ],
+}
+
+
+def find_js8call_executable():
+    """Best-effort auto-detection: checks the PATH, then common per-OS
+    install locations. Returns a path string or None if nothing was found
+    -- callers should fall back to asking the user to browse for it."""
+    on_path = shutil.which("js8call")
+    if on_path:
+        return on_path
+    for candidate in _JS8CALL_CANDIDATE_PATHS.get(platform.system(), []):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def launch_js8call(executable_path):
+    """Launches JS8Call (see the module-level comment above this function
+    for why no --rig-name isolation flag is passed). Raises OSError/
+    subprocess errors on failure -- callers should catch and report
+    those."""
+    subprocess.Popen([executable_path])
 
 
 # ==================== rigctld ("NET rigctl") server ====================

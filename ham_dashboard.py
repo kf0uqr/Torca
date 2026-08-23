@@ -80,7 +80,15 @@ import pota
 import contests
 import dxcluster
 import updater
-from wsjtx_rigctld import RigctldServer, RIGCTLD_DEFAULT_PORT, find_wsjtx_executable, launch_wsjtx, WSJTX_RIG_NAME
+from wsjtx_rigctld import (
+    RigctldServer,
+    RIGCTLD_DEFAULT_PORT,
+    find_wsjtx_executable,
+    launch_wsjtx,
+    WSJTX_RIG_NAME,
+    find_js8call_executable,
+    launch_js8call,
+)
 from wsjtx_udp import WsjtxUdpListener, WSJTX_DEFAULT_PORT
 from audio import (
     pactl_available,
@@ -1313,6 +1321,17 @@ class HamClockWindow(QWidget):
         )
         self.wsjtx_button.clicked.connect(self._on_wsjtx_button_clicked)
 
+        # ---- JS8Call launch -- same find/remember/browse-fallback
+        # pattern as "Launch WSJT-X" above, own separate QSettings key
+        # (js8call_executable_path) and own executable-search helpers
+        # (find_js8call_executable/launch_js8call, wsjtx_rigctld.py) ----
+        self.js8call_button = QPushButton("Launch JS8Call")
+        self.js8call_button.setToolTip(
+            "Launches JS8Call. Use the Rigctld button below to let it control a radio "
+            "(JS8Call's own Settings > Radio, rig \"Hamlib NET rigctl\", 127.0.0.1:<port>)."
+        )
+        self.js8call_button.clicked.connect(self._on_js8call_button_clicked)
+
         # ---- WSJT-X UDP auto-log ----
         # Listens for WSJT-X's own "Logged ADIF" UDP broadcast (sent
         # automatically the instant the operator clicks OK on WSJT-X's
@@ -1345,6 +1364,7 @@ class HamClockWindow(QWidget):
         top_buttons_row.addWidget(self.profile_button)
         top_buttons_row.addWidget(self.radios_button)
         top_buttons_row.addWidget(self.wsjtx_button)
+        top_buttons_row.addWidget(self.js8call_button)
         top_buttons_row.addWidget(self.wsjtx_autolog_button)
         top_buttons_row.addWidget(self.log_book_button)
         top_buttons_row.addWidget(self.new_qso_button)
@@ -3047,6 +3067,33 @@ class HamClockWindow(QWidget):
         # Only remember the path once it's actually confirmed to work
         # (subprocess.Popen not raising means the OS accepted it).
         settings.setValue("wsjtx_executable_path", path)
+
+    # ---- JS8Call ----
+
+    def _on_js8call_button_clicked(self):
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        path = settings.value("js8call_executable_path", "")
+
+        if not path or not os.path.isfile(path):
+            path = find_js8call_executable()
+
+        if not path:
+            path, _filter = QFileDialog.getOpenFileName(
+                self, "Locate the JS8Call executable",
+                "", "Executable (*.exe);;All files (*)" if platform.system() == "Windows" else "All files (*)",
+            )
+            if not path:
+                return  # user cancelled the browse dialog
+
+        try:
+            launch_js8call(path)
+        except OSError as exc:
+            QMessageBox.critical(self, "JS8Call", f"Couldn't launch JS8Call at:\n{path}\n\n{exc}")
+            return
+
+        # Only remember the path once it's actually confirmed to work
+        # (subprocess.Popen not raising means the OS accepted it).
+        settings.setValue("js8call_executable_path", path)
 
     def _on_wsjtx_autolog_toggled(self, checked):
         if checked:

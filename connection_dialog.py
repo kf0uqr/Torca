@@ -441,10 +441,26 @@ class ConnectionDialog(QDialog):
         profile = RADIO_PROFILES[radio_model]
         self.addr_input.setText(profile["addr_hex"])
         index = self.connection_combo.findData(profile["default_connection"])
-        if index != -1:
-            self.connection_combo.setCurrentIndex(index)
+        if index != -1 and index != self.connection_combo.currentIndex():
+            self.connection_combo.setCurrentIndex(index)  # currentIndexChanged -> _on_connection_type_changed
         else:
+            # Either this radio has no preferred connection type, or its
+            # default is the SAME index the combo is already on (e.g.
+            # switching between two "usb"-default radios) -- setCurrentIndex
+            # wouldn't fire currentIndexChanged in that case, so refresh
+            # the addr field's visibility explicitly (it depends on the
+            # newly-selected radio's protocol, not just connection type,
+            # see _current_radio_protocol).
             self._on_connection_type_changed(self.connection_combo.currentIndex())
+
+    def _current_radio_protocol(self):
+        """"civ" (the default -- every radio this app supported before
+        IC-7610/X6200/FTX-1 were added, plus IC-7610/X6200 themselves)
+        or "yaesu_cat" (FTX-1, no CI-V address concept at all -- see
+        RADIO_PROFILES' own comment)."""
+        radio_model = self.radio_combo.currentText()
+        profile = RADIO_PROFILES.get(radio_model, {})
+        return profile.get("protocol", "civ")
 
     def _on_connection_type_changed(self, _index):
         connection_type = self.connection_combo.currentData()
@@ -457,10 +473,12 @@ class ConnectionDialog(QDialog):
         # the form, not via network_rows/usb_rows/remote_rows) -- a
         # Remote Server connection doesn't need it at all, since the
         # server already has its own connection (and its own CI-V
-        # address) to the actual radio.
+        # address) to the actual radio. Neither does a non-CI-V radio
+        # (FTX-1's Yaesu CAT protocol has no such concept) regardless of
+        # connection type -- see _current_radio_protocol.
         form = self.layout().itemAt(0).layout()
         addr_label = form.labelForField(self.addr_input)
-        needs_addr = connection_type != "remote"
+        needs_addr = connection_type != "remote" and self._current_radio_protocol() == "civ"
         self.addr_input.setVisible(needs_addr)
         self.addr_input.setEnabled(needs_addr)
         if addr_label is not None:
@@ -480,9 +498,11 @@ class ConnectionDialog(QDialog):
 
         # No CI-V address for a Remote Server connection -- the server
         # already has its own connection (and its own CI-V address) to
-        # the actual radio; this client never speaks CI-V directly.
+        # the actual radio; this client never speaks CI-V directly. Same
+        # for a non-CI-V radio (FTX-1's Yaesu CAT protocol), regardless
+        # of connection type -- see _current_radio_protocol.
         addr = None
-        if connection_type != "remote":
+        if connection_type != "remote" and self._current_radio_protocol() == "civ":
             addr_text = self.addr_input.text().strip()
             try:
                 addr = int(addr_text, 16)

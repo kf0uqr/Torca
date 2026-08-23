@@ -77,6 +77,41 @@ except ImportError:
     DualReceiverCapable = None
     RECEIVER_MAIN, RECEIVER_SUB = 0, 1
 
+try:
+    # Works around a confirmed path bug in the vendored rigplane's Yaesu
+    # CAT backend (needed for the FTX-1 -- see constants.py's
+    # RADIO_PROFILES entry): backends/yaesu_cat/radio.py computes its
+    # default rig-profile directory as `Path(__file__).parents[4] /
+    # "rigs"`, which lands one level ABOVE the actual installed
+    # site-packages/rigplane/rigs/ directory (confirmed directly: that
+    # computed path doesn't exist on disk at all, while `Path(rigplane.
+    # __file__).parent / "rigs"` does and contains ftx1.toml). Left
+    # unpatched, constructing a YaesuCatRadio with the default profile=
+    # "ftx1" (i.e. any normal FTX-1 connection through this app, which
+    # never passes an explicit profile path) raises RigLoadError before
+    # ever reaching the radio. This patches the module's private _RIGS_DIR
+    # constant to the correct location.
+    #
+    # DELIBERATELY fragile, same convention as torca_server.py's own
+    # rigplane-internal patch: _RIGS_DIR is a private, underscore-
+    # prefixed module attribute, not a stable API. If a future rigplane
+    # release fixes the path itself (or renames/restructures this),
+    # this either becomes a harmless no-op or fails the try/except below
+    # -- caught, reported once, non-fatal either way. Direct consequence
+    # of NOT applying this on a still-broken install: FTX-1 connections
+    # fail immediately with a RigLoadError naming the wrong path.
+    import pathlib as _pathlib
+    import rigplane as _rigplane_pkg
+    import rigplane.backends.yaesu_cat.radio as _yaesu_cat_radio_module
+
+    _yaesu_cat_radio_module._RIGS_DIR = _pathlib.Path(_rigplane_pkg.__file__).parent / "rigs"
+except Exception as _yaesu_rigs_dir_patch_exc:
+    print(
+        f"radio_worker: couldn't patch rigplane's Yaesu CAT rig-profile "
+        f"directory ({_yaesu_rigs_dir_patch_exc}) -- FTX-1/other Yaesu CAT "
+        f"connections may fail with a RigLoadError until this is fixed.",
+    )
+
 from constants import (
     RADIO_BANDS,
     BAND_STACKING_CODES,
@@ -389,6 +424,22 @@ class RadioWorker(QThread):
         force_stereo=False (the radio profile's own proven-safe
         default) before giving up for real. See the retry logic there."""
         d = self._details
+        # model=d["radio_model"] matters a lot more than it looks: without
+        # it, rigplane's backend factory defaults an unset serial model to
+        # "IC-7610" (backends/factory.py's own fallback), which silently
+        # routed EVERY serial connection -- IC-7300, IC-9700, IC-705 alike
+        # -- through Icom7610SerialRadio's transport class regardless of
+        # which radio was actually selected here (confirmed directly:
+        # constructing SerialBackendConfig the way this method used to,
+        # with no model=, always produced an Icom7610SerialRadio). Existing
+        # Icom radios mostly got away with it because the real per-radio
+        # command set is resolved from the CI-V address, not the transport
+        # class -- but it silently substituted IC-7610-specific behavior
+        # (its own audio-teardown/scope-guardrail overrides) for other
+        # radios, and it's fatal for a genuinely different protocol family:
+        # a Yaesu CAT radio (FTX-1) routed through the Icom-only factory
+        # branch would speak the wrong wire protocol entirely. Passing the
+        # real model here fixes both.
         if d["connection_type"] == "network":
             kwargs = dict(
                 host=d["host"],
@@ -396,6 +447,7 @@ class RadioWorker(QThread):
                 radio_addr=d["addr"],
                 username=d["username"],
                 password=d["password"],
+                model=d.get("radio_model"),
             )
             if force_stereo:
                 kwargs["audio_codec"] = AudioCodec.PCM_2CH_16BIT
@@ -411,6 +463,7 @@ class RadioWorker(QThread):
             device=d["serial_port"],
             baudrate=d["baud_rate"],
             radio_addr=d["addr"],
+            model=d.get("radio_model"),
         )
 
     async def _setup_audio(self):

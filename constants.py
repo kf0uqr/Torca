@@ -10,6 +10,35 @@ RADIO_PROFILES = {
     "IC-7300": {"addr_hex": "94", "default_connection": "usb"},
     "IC-9700": {"addr_hex": "A2", "default_connection": "network"},
     "IC-705": {"addr_hex": "A4", "default_connection": "network"},
+    # IC-7610, X6200, FTX-1: added on rigplane's own already-shipped rig
+    # profiles/backends (rigplane/rigs/*.toml + backends/*), NOT verified
+    # against real hardware by this app -- see README.md's "Supported
+    # radios" section for the full caveat. "protocol": "civ" (the default,
+    # every radio above and IC-7610/X6200 too) means the standard Icom
+    # CI-V address field applies; "yaesu_cat" (FTX-1) means it doesn't --
+    # ConnectionDialog hides/skips the CI-V Address field entirely for
+    # those, see _on_radio_changed/_on_connection_type_changed/_on_accept.
+    #
+    # IC-7610: civ_addr 0x98 per rigplane's ic7610.toml (itself sourced
+    # from Icom's own IC-7610 CI-V Reference Guide + hardware testing, per
+    # that file's own header) -- same CI-V family as the three radios
+    # above, dual-receiver like the IC-9700.
+    "IC-7610": {"addr_hex": "98", "default_connection": "network", "protocol": "civ"},
+    # X6200: civ_addr 0xA4 -- the SAME default address as the IC-705 above.
+    # This is correct (confirmed directly against rigplane's own x6200.toml,
+    # sourced from Xiegu's official CI-V implementation doc) and NOT a
+    # typo -- rigplane's own profile header documents a real prior bug
+    # where an X6200 got misidentified as an IC-705 by address alone and
+    # wedged its display; that failure mode is specifically why this app's
+    # radio_worker.py now always passes the selected radio_model into
+    # rigplane's backend config (_build_backend_config) instead of ever
+    # letting the address alone imply which profile/personality to use.
+    "X6200": {"addr_hex": "A4", "default_connection": "usb", "protocol": "civ"},
+    # FTX-1 (Yaesu): Yaesu CAT, not CI-V -- no CI-V address at all, and no
+    # LAN backend (rigplane's ftx1.toml declares has_lan = false), so
+    # "usb" (serial) is not just the default here, it's the only
+    # connection type that can actually work.
+    "FTX-1": {"addr_hex": "", "default_connection": "usb", "protocol": "yaesu_cat"},
 }
 
 # Which role a connected radio plays in satellite Doppler control, chosen
@@ -68,6 +97,18 @@ RADIO_BANDS = {
     "IC-7300": HF_6M_BANDS,
     "IC-9700": VHF_UHF_BANDS,
     "IC-705": HF_6M_BANDS + VHF_UHF_BANDS[:2],  # HF+6m+2m+70cm; no 23cm on the 705
+    "IC-7610": HF_6M_BANDS,  # HF+6m only, same class as the IC-7300 -- no VHF/UHF
+    "X6200": HF_6M_BANDS,  # HF+6m-only QRP radio per rigplane's own x6200.toml description
+    # FTX-1: band coverage is BEST-EFFORT, not confirmed against Yaesu's
+    # own spec or real hardware the way the entries above are -- included
+    # on the same general HF+6m+2m+70cm class as the IC-705 rather than
+    # omitted outright, since a wrong "jump to low edge" tune is a much
+    # smaller mistake than it would be for, say, a meter scaling bug (see
+    # README.md's caveat on this radio generally). If BAND_STACKING_CODES'
+    # get_bsr() lookup doesn't exist on this radio/protocol at all (it
+    # doesn't -- YaesuCatRadio has no such method), band buttons cleanly
+    # fall back to tuning the low edge instead, see RadioWorker._select_band.
+    "FTX-1": HF_6M_BANDS + VHF_UHF_BANDS[:2],
 }
 
 # Confirmed two ways: (1) Icom's own IC-7300 CI-V reference manual lists

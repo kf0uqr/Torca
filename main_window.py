@@ -130,9 +130,12 @@ class RadioWindow(QWidget):
         # left-aligned since it sits on the opposite side. Only
         # meaningful for the satellite-tracking roles -- apply_satellite_
         # tick/_on_ptt_toggled are the only things that ever set its
-        # text, and neither runs for "non_sat" radios, but it's hidden
-        # outright for those (and left blank/never shown) rather than
-        # sitting there confusingly empty.
+        # text, and neither runs for "non_sat" radios. Per explicit
+        # instruction, shown/hidden along with tracking itself (not just
+        # gated on role) -- starts hidden here; _update_nominal_freq_
+        # display_visibility (called once below, right after registering
+        # with the satellite session, and again on every _on_tracking_
+        # changed) is what actually shows it once tracking is running.
         self.nominal_freq_display = QLabel("-- MHz")
         self.nominal_freq_display.setStyleSheet(
             "font-size: 28px; font-weight: bold; color: white; "
@@ -140,7 +143,7 @@ class RadioWindow(QWidget):
         )
         self.nominal_freq_display.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.nominal_freq_display.setFixedWidth(280)
-        self.nominal_freq_display.setVisible(self._role in ("full_duplex", "downlink", "uplink"))
+        self.nominal_freq_display.setVisible(False)
 
         # Three independently double-click-switchable meters side by side,
         # like a radio's multi-function meter that can show several
@@ -642,6 +645,12 @@ class RadioWindow(QWidget):
         # immediately rather than waiting for the next transponder change.
         if self._role != "non_sat":
             self._satellite_session.register(self, self._role)
+            # Covers joining mid-pass -- _on_tracking_changed's signal
+            # already fired for whatever session-wide start/stop most
+            # recently happened and won't fire again until the NEXT one,
+            # so a radio constructed while tracking is already running
+            # needs its own explicit sync here rather than waiting on it.
+            self._update_nominal_freq_display_visibility(self._satellite_session.is_tracking())
 
     @Slot()
     def _on_connected(self):
@@ -948,7 +957,20 @@ class RadioWindow(QWidget):
                 self.nominal_freq_display.setText(f"{nominal_freq_hz / 1e6:.6f} MHz")
             self._update_band_button_highlight()
 
+    def _update_nominal_freq_display_visibility(self, tracking):
+        """nominal_freq_display (the left-side pre-Doppler-correction
+        overlay) is only ever meaningful while satellite tracking is
+        actually running -- apply_satellite_tick/_on_ptt_toggled are the
+        only things that ever set its text, and neither runs otherwise.
+        Per explicit instruction: visible for the whole time tracking is
+        active, hidden the rest of the time, not just gated on this
+        radio's role the way it used to be (a "downlink"/"uplink"/
+        "full_duplex" radio would otherwise show an empty/stale "-- MHz"
+        box before tracking ever starts, or after it stops)."""
+        self.nominal_freq_display.setVisible(tracking and self._role in ("full_duplex", "downlink", "uplink"))
+
     def _on_tracking_changed(self, tracking):
+        self._update_nominal_freq_display_visibility(tracking)
         self._sub_vfo_a_selected = False
         # Dual-receiver ("full_duplex" role) only: restores behavior
         # dropped in the multi-radio refactor (648221a) -- pre-refactor,

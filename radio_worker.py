@@ -802,7 +802,7 @@ class RadioWorker(QThread):
         already holds it (has_rx_stream(): normal listening audio from
         the connection dialog, or an active Virtual Cable), CW decode
         piggybacks on that SAME stream via AudioBridge.
-        set_extra_rx_callback() rather than stealing the registration
+        add_extra_rx_callback() rather than stealing the registration
         out from under it (which would silently break whatever that
         bridge was already doing). Only registers CW decode's own
         direct start_rx() tap when nothing else currently holds it --
@@ -811,7 +811,7 @@ class RadioWorker(QThread):
         calls start_rx in the first place)."""
         if self.audio_bridge is not None and self.audio_bridge.has_rx_stream():
             self._cw_decode_via_bridge = True
-            self.audio_bridge.set_extra_rx_callback(self._on_cw_decode_frame_from_bridge)
+            self.audio_bridge.add_extra_rx_callback(self._on_cw_decode_frame_from_bridge)
             return
         self._cw_decode_via_bridge = False
         try:
@@ -858,7 +858,7 @@ class RadioWorker(QThread):
         before swapping the bridge instance)."""
         if self._cw_decode_via_bridge:
             if self.audio_bridge is not None:
-                self.audio_bridge.set_extra_rx_callback(None)
+                self.audio_bridge.remove_extra_rx_callback(self._on_cw_decode_frame_from_bridge)
             self._cw_decode_via_bridge = False
             return
         try:
@@ -884,14 +884,15 @@ class RadioWorker(QThread):
     async def _attach_sstv_decode(self):
         """Structural clone of _attach_cw_decode -- piggybacks on
         self.audio_bridge's already-flowing RX stream via
-        set_extra_rx_callback() when one exists (has_rx_stream()),
-        otherwise registers its own direct radio.start_rx() tap. Note
-        the shared single-slot limitation documented on
-        self._sstv_decode_callback above: this will clobber CW decode's
-        callback (or vice versa) if both are started at once."""
+        add_extra_rx_callback() when one exists (has_rx_stream()),
+        otherwise registers its own direct radio.start_rx() tap. Each
+        decoder registers its own distinct callback now (AudioBridge
+        supports multiple simultaneous extra-RX consumers), so this can
+        safely run alongside CW decode (or any other) without either
+        clobbering the other's callback."""
         if self.audio_bridge is not None and self.audio_bridge.has_rx_stream():
             self._sstv_decode_via_bridge = True
-            self.audio_bridge.set_extra_rx_callback(self._on_sstv_decode_frame_from_bridge)
+            self.audio_bridge.add_extra_rx_callback(self._on_sstv_decode_frame_from_bridge)
             return
         self._sstv_decode_via_bridge = False
         try:
@@ -931,7 +932,7 @@ class RadioWorker(QThread):
         under a bridge-mode attachment."""
         if self._sstv_decode_via_bridge:
             if self.audio_bridge is not None:
-                self.audio_bridge.set_extra_rx_callback(None)
+                self.audio_bridge.remove_extra_rx_callback(self._on_sstv_decode_frame_from_bridge)
             self._sstv_decode_via_bridge = False
             return
         try:
@@ -957,11 +958,11 @@ class RadioWorker(QThread):
     async def _attach_rtty_decode(self):
         """Structural clone of _attach_cw_decode/_attach_sstv_decode --
         piggybacks on self.audio_bridge's already-flowing RX stream via
-        set_extra_rx_callback() when one exists (has_rx_stream()),
+        add_extra_rx_callback() when one exists (has_rx_stream()),
         otherwise registers its own direct radio.start_rx() tap."""
         if self.audio_bridge is not None and self.audio_bridge.has_rx_stream():
             self._rtty_decode_via_bridge = True
-            self.audio_bridge.set_extra_rx_callback(self._on_rtty_decode_frame_from_bridge)
+            self.audio_bridge.add_extra_rx_callback(self._on_rtty_decode_frame_from_bridge)
             return
         self._rtty_decode_via_bridge = False
         try:
@@ -999,7 +1000,7 @@ class RadioWorker(QThread):
         tears down whichever mode _attach_rtty_decode last used."""
         if self._rtty_decode_via_bridge:
             if self.audio_bridge is not None:
-                self.audio_bridge.set_extra_rx_callback(None)
+                self.audio_bridge.remove_extra_rx_callback(self._on_rtty_decode_frame_from_bridge)
             self._rtty_decode_via_bridge = False
             return
         try:
@@ -1025,12 +1026,12 @@ class RadioWorker(QThread):
     async def _attach_aprs_decode(self):
         """Structural clone of _attach_cw_decode/_attach_sstv_decode/
         _attach_rtty_decode -- piggybacks on self.audio_bridge's
-        already-flowing RX stream via set_extra_rx_callback() when one
+        already-flowing RX stream via add_extra_rx_callback() when one
         exists (has_rx_stream()), otherwise registers its own direct
         radio.start_rx() tap."""
         if self.audio_bridge is not None and self.audio_bridge.has_rx_stream():
             self._aprs_decode_via_bridge = True
-            self.audio_bridge.set_extra_rx_callback(self._on_aprs_decode_frame_from_bridge)
+            self.audio_bridge.add_extra_rx_callback(self._on_aprs_decode_frame_from_bridge)
             return
         self._aprs_decode_via_bridge = False
         try:
@@ -1069,7 +1070,7 @@ class RadioWorker(QThread):
         decode last used."""
         if self._aprs_decode_via_bridge:
             if self.audio_bridge is not None:
-                self.audio_bridge.set_extra_rx_callback(None)
+                self.audio_bridge.remove_extra_rx_callback(self._on_aprs_decode_frame_from_bridge)
             self._aprs_decode_via_bridge = False
             return
         try:
@@ -1096,12 +1097,12 @@ class RadioWorker(QThread):
     async def _attach_psk31_decode(self):
         """Structural clone of _attach_cw_decode/_attach_sstv_decode/
         _attach_rtty_decode/_attach_aprs_decode -- piggybacks on self.
-        audio_bridge's already-flowing RX stream via set_extra_rx_
+        audio_bridge's already-flowing RX stream via add_extra_rx_
         callback() when one exists (has_rx_stream()), otherwise
         registers its own direct radio.start_rx() tap."""
         if self.audio_bridge is not None and self.audio_bridge.has_rx_stream():
             self._psk31_decode_via_bridge = True
-            self.audio_bridge.set_extra_rx_callback(self._on_psk31_decode_frame_from_bridge)
+            self.audio_bridge.add_extra_rx_callback(self._on_psk31_decode_frame_from_bridge)
             return
         self._psk31_decode_via_bridge = False
         try:
@@ -1140,7 +1141,7 @@ class RadioWorker(QThread):
         mode _attach_psk31_decode last used."""
         if self._psk31_decode_via_bridge:
             if self.audio_bridge is not None:
-                self.audio_bridge.set_extra_rx_callback(None)
+                self.audio_bridge.remove_extra_rx_callback(self._on_psk31_decode_frame_from_bridge)
             self._psk31_decode_via_bridge = False
             return
         try:

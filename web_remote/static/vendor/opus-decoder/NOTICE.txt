@@ -1,0 +1,5 @@
+opus-decoder v0.7.12 -- https://github.com/eshaz/wasm-audio-decoders
+Copyright 2021-2026 Ethan Halsall. MIT License.
+Vendored here (not loaded from a CDN) so Remote Access's audio
+streaming page works without depending on an external host being
+reachable from wherever the browser is.

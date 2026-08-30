@@ -690,9 +690,20 @@ class RadioWindow(QWidget):
             self.worker.set_scope_receiver(RECEIVER_SUB)
             self._update_active_receiver_ui(RECEIVER_SUB)
 
-    def _on_cw_tool_clicked(self):
+    def ensure_cw_tool_window(self):
+        """Lazily constructs self.cw_window if it doesn't exist yet,
+        WITHOUT showing it -- the construction-only half of
+        _on_cw_tool_clicked, factored out so Remote Access
+        (ham_dashboard.py's _on_connect_radio_clicked) can create the
+        same singleton hidden right when a radio connects, for its own
+        CW web page to attach to, without duplicating construction
+        logic or showing a window the operator never asked to see."""
         if self.cw_window is None:
             self.cw_window = CwToolWindow(self)
+        return self.cw_window
+
+    def _on_cw_tool_clicked(self):
+        self.ensure_cw_tool_window()
         self.cw_window.show()
         self.cw_window.raise_()
         self.cw_window.activateWindow()
@@ -718,10 +729,18 @@ class RadioWindow(QWidget):
         self.psk31_window.raise_()
         self.psk31_window.activateWindow()
 
-    def _on_aprs_tool_clicked(self):
+    def ensure_aprs_tool_window(self):
+        """Lazily constructs self.aprs_window if it doesn't exist yet
+        (including the packet_decoded passthrough wiring), WITHOUT
+        showing it -- see ensure_cw_tool_window's docstring for why
+        this exists (Remote Access's APRS web page)."""
         if self.aprs_window is None:
             self.aprs_window = AprsToolWindow(self)
             self.aprs_window.packet_decoded.connect(self.aprs_packet_decoded)
+        return self.aprs_window
+
+    def _on_aprs_tool_clicked(self):
+        self.ensure_aprs_tool_window()
         self.aprs_window.show()
         self.aprs_window.raise_()
         self.aprs_window.activateWindow()

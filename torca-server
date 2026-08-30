@@ -9,7 +9,10 @@
 # then dispatches to rigplane's own CLI unchanged. Pass connection
 # flags BEFORE any web-specific flags, e.g.:
 #   ./torca-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web
-
+#
+# This venv's own site-packages is prepended to PYTHONPATH -- see the
+# ./torca launcher's comment for why.
 source bin/activate
+export PYTHONPATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):$PYTHONPATH"
 python3 torca_server.py "$@"
 deactivate

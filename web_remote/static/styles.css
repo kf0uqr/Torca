@@ -1,0 +1,203 @@
+/* Matches theme.py's dark palette (Fusion + QPalette) so the web pages
+   read as the same app, not a different product. */
+:root {
+    --window-bg: #2d2d30;
+    --base-bg: #1e1e20;
+    --alt-bg: #2d2d30;
+    --text: #dcdcdc;
+    --text-disabled: #787878;
+    --button-bg: #37373a;
+    --border: #555555;
+    --highlight: #3c78c8;
+    --link: #5aa0ff;
+    --accent: #22aa66;
+    --bright: #ff5050;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    background: var(--window-bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 14px;
+}
+
+header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: var(--alt-bg);
+    border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+    font-size: 18px;
+    margin: 0;
+    flex: 1;
+}
+
+header a {
+    color: var(--link);
+    text-decoration: none;
+    font-size: 13px;
+}
+
+.token-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: #4a2020;
+    border-bottom: 1px solid var(--bright);
+    color: var(--text);
+    font-size: 13px;
+}
+.token-banner span { flex: 1; }
+
+main {
+    padding: 16px;
+    display: grid;
+    gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.panel {
+    background: var(--base-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+}
+
+.panel h2 {
+    font-size: 14px;
+    margin: 0 0 10px 0;
+    color: var(--text);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+}
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 4px 6px; }
+tbody tr:nth-child(odd) { background: var(--alt-bg); }
+
+.radio-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 6px;
+    border-radius: 4px;
+    text-decoration: none;
+    color: var(--text);
+}
+.radio-row:hover { background: var(--alt-bg); }
+.radio-row .freq { font-size: 20px; font-weight: bold; }
+.radio-row .mode { color: var(--link); margin-left: 8px; }
+
+.spot-counts { display: flex; gap: 24px; font-size: 20px; }
+.spot-counts div span { display: block; font-size: 12px; color: var(--text-disabled); }
+
+button, input, select {
+    background: var(--button-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 14px;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--highlight); }
+button.active {
+    background: var(--accent);
+    color: white;
+    font-weight: bold;
+    border-color: var(--accent);
+}
+
+.empty { color: var(--text-disabled); font-style: italic; }
+
+/* ---- Radio page ---- */
+/* Frequency/controls sit next to Meters (not stacked full-width) so a
+   typical desktop browser window fits the whole page without
+   scrolling; flex-wrap falls back to stacking them on narrow/mobile
+   viewports, where scrolling is expected. */
+.radio-top-row {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+.radio-controls-panel { flex: 2 1 420px; }
+.radio-meters-panel { flex: 1 1 260px; }
+
+.freq-display {
+    font-size: 40px;
+    font-weight: bold;
+    letter-spacing: 1px;
+    text-align: center;
+    padding: 10px;
+    background: var(--base-bg);
+    border-radius: 6px;
+}
+
+.controls-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-top: 12px;
+}
+
+#ptt-button {
+    font-size: 18px;
+    font-weight: bold;
+    padding: 14px 28px;
+}
+#ptt-button.active { background: var(--bright); border-color: var(--bright); }
+
+.meter { margin-bottom: 10px; }
+.meter .label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-disabled); }
+.meter .bar-bg { background: var(--base-bg); border: 1px solid var(--border); border-radius: 3px; height: 14px; overflow: hidden; }
+.meter .bar-fill { background: var(--highlight); height: 100%; width: 0%; }
+
+#scope-canvas, #waterfall-canvas {
+    width: 100%;
+    height: 180px;
+    background: var(--base-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    display: block;
+}
+
+/* ---- CW/APRS tool pages ---- */
+.decoded-text {
+    background: var(--base-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px;
+    height: 260px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+}
+
+.macro-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+}
+.macro-button { font-size: 12px; }
+
+.packet-list { max-height: 320px; overflow-y: auto; }
+.packet-row {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+}
+.packet-row .packet-source { color: var(--link); font-weight: bold; }
+.packet-row .packet-info { color: var(--text); }

@@ -43,13 +43,16 @@ class FakeBridge:
 
     def __init__(self, has_rx=True):
         self._has_rx = has_rx
-        self.extra_rx_callback = None
+        self.extra_rx_callbacks = []
 
     def has_rx_stream(self):
         return self._has_rx
 
-    def set_extra_rx_callback(self, callback):
-        self.extra_rx_callback = callback
+    def add_extra_rx_callback(self, callback):
+        self.extra_rx_callbacks.append(callback)
+
+    def remove_extra_rx_callback(self, callback):
+        self.extra_rx_callbacks.remove(callback)
 
 
 def make_worker():
@@ -87,14 +90,14 @@ def test_bridge_piggyback_path():
 
     asyncio.run(worker._attach_psk31_decode())
     assert worker._psk31_decode_via_bridge is True
-    assert worker.audio_bridge.extra_rx_callback == worker._on_psk31_decode_frame_from_bridge
+    assert worker.audio_bridge.extra_rx_callbacks == [worker._on_psk31_decode_frame_from_bridge]
     assert worker.radio.start_rx_calls == 0, "bridge path must not steal the direct tap"
 
     worker._on_psk31_decode_frame_from_bridge(b"\xaa\xbb")
     assert received == [b"\xaa\xbb"]
 
     asyncio.run(worker._detach_psk31_decode())
-    assert worker.audio_bridge.extra_rx_callback is None
+    assert worker.audio_bridge.extra_rx_callbacks == []
     assert worker.radio.stop_rx_calls == 0, "bridge path must never call radio.stop_rx()"
     print("  PASSED\n")
 
@@ -106,7 +109,7 @@ def test_no_bridge_rx_stream_falls_back_to_direct_tap():
     asyncio.run(worker._attach_psk31_decode())
     assert worker._psk31_decode_via_bridge is False
     assert worker.radio.start_rx_calls == 1
-    assert worker.audio_bridge.extra_rx_callback is None
+    assert worker.audio_bridge.extra_rx_callbacks == []
     print("  PASSED\n")
 
 

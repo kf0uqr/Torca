@@ -1,0 +1,4 @@
+Leaflet v1.9.4 -- https://leafletjs.com
+Copyright 2010-2026 Volodymyr Agafonkin, 2010-2011 CloudMade. BSD-2-Clause.
+Vendored here (not loaded from a CDN) for the same reason as
+opus-decoder -- see that vendor dir's own NOTICE.txt.

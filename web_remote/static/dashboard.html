@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TORCA -- Ham Dashboard</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+</head>
+<body>
+<header>
+    <h1>Ham Dashboard</h1>
+    <span id="conn-status" class="empty">connecting...</span>
+</header>
+<div id="token-banner" class="token-banner" style="display:none;">
+    <span>Remote Access needs a token to continue -- find it in TORCA's Remote Access dialog.</span>
+    <input id="token-input" type="text" placeholder="Access token" autocomplete="off">
+    <button id="token-submit">Connect</button>
+</div>
+<main>
+    <div class="panel" style="grid-column: 1 / -1;">
+        <h2>Map</h2>
+        <div class="controls-row" style="justify-content: flex-start;">
+            <button id="layer-satellites">Satellites: OFF</button>
+            <button id="layer-qsos">QSO Map: OFF</button>
+            <button id="layer-pskreporter">PSKReporter: OFF</button>
+            <button id="layer-pota">POTA: OFF</button>
+            <button id="layer-aprs">APRS: OFF</button>
+            <select id="layer-band-filter"><option value="">All Bands</option></select>
+        </div>
+        <div id="map" style="height: 420px; border-radius: 4px; margin-top: 10px;"></div>
+    </div>
+
+    <div class="panel">
+        <h2>Connected Radios</h2>
+        <div id="radios-list"><p class="empty">No radios connected.</p></div>
+    </div>
+
+    <div class="panel">
+        <h2>Upcoming Satellite Passes</h2>
+        <table>
+            <thead><tr><th>Satellite</th><th>AOS (UTC)</th><th>Max El</th></tr></thead>
+            <tbody id="passes-body"><tr><td colspan="3" class="empty">No passes.</td></tr></tbody>
+        </table>
+    </div>
+
+    <div class="panel">
+        <h2>Satellite Tracking</h2>
+        <div class="controls-row" style="justify-content: flex-start;">
+            <select id="satellite-select"><option value="">Select satellite...</option></select>
+            <select id="transponder-select" disabled><option value="">(no satellite selected)</option></select>
+        </div>
+        <div class="controls-row" style="justify-content: flex-start;">
+            <button id="satellite-toggle">Start Tracking</button>
+            <button id="offset-down">&minus; 1 kHz</button>
+            <button id="offset-up">+ 1 kHz</button>
+        </div>
+        <div id="satellite-status" class="empty">No satellite selected.</div>
+    </div>
+
+    <div class="panel">
+        <h2>Spot Networks</h2>
+        <div class="spot-counts">
+            <div id="pota-count">--<span>POTA</span></div>
+            <div id="pskreporter-count">--<span>PSKReporter</span></div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Recent QSOs</h2>
+        <table>
+            <thead><tr><th>Call</th><th>Freq</th><th>Mode</th><th>Date/Time</th></tr></thead>
+            <tbody id="qsos-body"><tr><td colspan="4" class="empty">No QSOs logged.</td></tr></tbody>
+        </table>
+    </div>
+</main>
+<script src="/static/vendor/leaflet/leaflet.js"></script>
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

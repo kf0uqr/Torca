@@ -38,6 +38,7 @@ A PySide6 GUI for controlling amateur radios via [rigplane](https://pypi.org/pro
 
 **Networking**
 - `torca-server`: share a USB-only radio over the network so any other TORCA instance can connect to it like a LAN radio (frequency/mode/PTT/meters/levels/scope/audio all work the same).
+- Remote Access: a browser-based Ham Dashboard (with live map) and per-radio control pages -- including RX audio streaming, CW/APRS tools, and satellite Doppler control -- reachable locally or over the internet at your own domain via a Cloudflare Tunnel. See [Remote Access over the Internet](#remote-access-over-the-internet-cloudflare-tunnel) below.
 
 **General**
 - An Operator Profile (callsign + location, saveable/loadable by name) shown at launch and reachable anytime, feeding satellite Doppler correction, the map marker, and PSKReporter/DX cluster/QSO logging.
@@ -75,6 +76,8 @@ If you own one of these three radios, connecting it and reporting back (what wor
 - [sounddevice](https://pypi.org/project/sounddevice/) -- audio device listing and streaming (PortAudio wrapper)
 - [sgp4](https://pypi.org/project/sgp4/) -- satellite propagation for satellite tracking
 - [numpy](https://pypi.org/project/numpy/) -- DSP for the CW/RTTY/PSK31/SSTV/APRS decoders
+- [fastapi](https://pypi.org/project/fastapi/) + [uvicorn](https://pypi.org/project/uvicorn/) -- Remote Access's embedded web server
+- [opuslib](https://pypi.org/project/opuslib/) -- encodes RX audio for Remote Access's audio streaming
 
 All required packages install via `pip install -r requirements.txt` (or automatically with `install.sh`). No external Hamlib install is needed -- the built-in `rigctld`-compatible server and WSJT-X bridge are self-contained.
 
@@ -157,6 +160,38 @@ rigplane has no public flag or config option to disable this (as of v2.11.1). `t
 
 If you connect directly (serial/USB, not through `torca-server`) rather than via Remote Server, this patch doesn't apply and both side effects are still present.
 
+## Remote Access over the Internet (Cloudflare Tunnel)
+
+Remote Access serves a browser-based version of the Ham Dashboard and each connected radio -- reachable on your local network always, and over the internet at a hostname on your own domain (e.g. `torca.kf0uqr.com`) via a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/). It covers:
+
+- The dashboard: connected radios, upcoming satellite passes, spot counts, recent QSOs (read-only), and a live map (day/night terminator, operator location, and POTA/PSKReporter/QSO/APRS/satellite markers -- each layer toggled the same as the desktop's own Satellites/QSO Map/PSKReporter/POTA/APRS buttons and band-filter dropdown, right there on the dashboard).
+- A per-radio control page: frequency/mode/PTT, meters, a spectrum scope + waterfall (same color scale as the desktop), and an **Enable Audio** toggle streaming that radio's live RX audio to the browser (Opus over the same websocket -- works in any modern browser, including ones without WebCodecs support). The frequency/controls and meters sit side by side so the whole page fits a normal desktop browser window without scrolling (narrow/mobile screens stack them and scroll as usual).
+- **CW and APRS tool pages** per radio (the two fully-hardware-tested digital-mode decoders) -- live decode text/packets, sending, and (CW) the macro bank, all sharing the exact same decode session the desktop tool window would use.
+- **Satellite Doppler control** from the dashboard: pick a satellite/transponder, start/stop tracking, and nudge the manual offset -- goes through the exact same selection code path a real double-click on the desktop map does, so the desktop's own transponder dropdown/labels/tracking button stay in sync with whatever's selected from the web.
+
+**Not yet available from the web**: RTTY/PSK31/SSTV tool pages (desktop-only for now -- those three decoders aren't confirmed against real hardware yet, see [Supported radios](#supported-radios)), Memories, full QSO log editing, and Virtual Cable management. Memories/logging are being held back until per-operator profiles exist.
+
+### One-time setup
+
+1. **Install `cloudflared`** (not a pip package -- see [Cloudflare's own install docs](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)) and log in once:
+   ```bash
+   cloudflared tunnel login
+   ```
+   This opens a browser to authorize `cloudflared` against your Cloudflare account (the one `kf0uqr.com`, or whichever domain you're using, is added to as a zone). One-time, outside this app -- TORCA has no way to drive an OAuth browser flow itself.
+2. In TORCA, open the Ham Dashboard's **Remote Access...** button, fill in the local port (default `8765`), a tunnel name (default `torca`), and your hostname (e.g. `torca.kf0uqr.com`), then click **Run Cloudflare Setup...**. This creates the named tunnel if it doesn't already exist, routes that hostname's DNS to it, and writes TORCA's own tunnel config under `~/.torca/cloudflared/` -- entirely separate from `~/.cloudflared/config.yml` or any other tunnel already on the machine. Safe to re-run any time the port/hostname changes.
+3. **Secure it with Cloudflare Access** (recommended, and assumed by this app's own security posture -- the local web server binds to `127.0.0.1` only, so it's reachable exclusively through the tunnel): in the Cloudflare dashboard, add an Access application for your hostname requiring a login (email OTP or your identity provider) before any request reaches TORCA at all. Done once, outside this app, the same way you'd configure Access for anything else on your account.
+
+### Using it
+
+Click **Start** in the same dialog -- this brings up the local web server and the tunnel together, and shows the public URL. The dialog also shows a randomly-generated **access token** (stored locally, regenerated only if cleared from QSettings) -- the first time a browser connects, it'll prompt for this token (via an inline banner, not a native popup) if it isn't already remembered for that browser. This token is defense-in-depth on top of Cloudflare Access, not a replacement for it -- don't rely on it alone if you skip the Access step above.
+
+### Troubleshooting
+
+- **`cloudflared tunnel login` says a certificate already exists.** It only ever authorizes ONE zone/domain at a time -- if you need to point it at a different domain than before, back up the existing `~/.cloudflared/cert.pem` (rename it, don't delete it) and re-run the login, picking the right zone in the browser step this time.
+- **DNS resolves but the page 404s / loads the wrong thing through the tunnel.** `cloudflared tunnel route dns <name> <hostname>` silently no-ops if that hostname is already routed to a DIFFERENT tunnel (including one you don't otherwise use) -- it won't overwrite an existing route even with `--overwrite-dns`. Delete the stale DNS record for that hostname in the Cloudflare dashboard (find the right zone -- it may not be the one you expect) and re-run the route command.
+- **Local (`127.0.0.1`) works but the public hostname doesn't, even though the DNS record and tunnel both look correct.** Cloudflare's own edge cache can be serving a stale copy of a static file from before you last updated Torca, ignoring the origin's `Cache-Control: no-store` header for common static extensions -- confirm with `curl -sI https://<hostname>/static/dashboard.js` and check `cf-cache-status`/`age`. Fix: Cloudflare dashboard -> **Caching -> Configuration -> Purge Cache**, and to stop it recurring on every future update, **Rules -> Cache Rules -> Create rule** matching your hostname with **Cache eligibility: Bypass cache**.
+- **A freshly (re)started tunnel is unreachable for the first minute or so.** Normal -- a brand-new tunnel connector takes a short moment to propagate across Cloudflare's edge network. It should settle on its own within a minute or two; no action needed.
+
 ## Project layout
 
 **Entry points / core**
@@ -233,6 +268,19 @@ If you connect directly (serial/USB, not through `torca-server`) rather than via
 | `wsjtx_rigctld.py` | WSJT-X + JS8Call launchers + `RigctldServer` (Hamlib-compatible) |
 | `wsjtx_udp.py` | WSJT-X UDP protocol listener for auto-logging |
 | `updater.py` | Self-update in place from GitHub |
+
+**Remote Access**
+
+| File | Purpose |
+| --- | --- |
+| `web_remote/server.py` | `RemoteWebServer` -- runs the FastAPI app on its own QThread/asyncio loop |
+| `web_remote/app.py` | FastAPI app: dashboard/radio pages, polling websockets, token auth |
+| `web_remote/bridge.py` | Cross-thread GUI-thread state caches/command bridges: `RadioRemoteState`, `CwRemoteState`, `AprsRemoteState`, `SatelliteRemoteState` |
+| `web_remote/routes_tools.py` | CW/APRS tool page websockets |
+| `web_remote/routes_satellite.py` | Satellite picker + Doppler start/stop/transponder/offset control |
+| `web_remote/routes_audio.py` | RX audio streaming (Opus-encodes `AudioBridge`'s RX PCM, one radio at a time) |
+| `web_remote/static/` | Page HTML/CSS/JS (no build step); `static/vendor/` has vendored Leaflet + opus-decoder (no CDN dependency) |
+| `cloudflare_tunnel.py` | `CloudflareTunnel` + `CloudflareSetupWorker` -- Cloudflare Tunnel setup/start/stop |
 
 ## License
 

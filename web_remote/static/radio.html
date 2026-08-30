@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TORCA -- Radio</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+    <a href="/">&larr; Dashboard</a>
+    <h1 id="radio-label">Radio</h1>
+    <a id="cw-tool-link" href="#">CW Tool</a>
+    <a id="aprs-tool-link" href="#">APRS Tool</a>
+    <span id="conn-status" class="empty">connecting...</span>
+</header>
+<div id="token-banner" class="token-banner" style="display:none;">
+    <span>Remote Access needs a token to continue -- find it in TORCA's Remote Access dialog.</span>
+    <input id="token-input" type="text" placeholder="Access token" autocomplete="off">
+    <button id="token-submit">Connect</button>
+</div>
+<main>
+    <div class="radio-top-row" style="grid-column: 1 / -1;">
+        <div class="panel radio-controls-panel">
+            <div class="freq-display" id="freq-display">-- MHz</div>
+            <div class="controls-row">
+                <input id="freq-input" type="text" placeholder="e.g. 14.074000" style="width:160px;">
+                <button id="tune-button">Tune</button>
+                <select id="mode-select">
+                    <option value="LSB">LSB</option>
+                    <option value="USB">USB</option>
+                    <option value="CW">CW</option>
+                    <option value="FM">FM</option>
+                    <option value="AM">AM</option>
+                    <option value="RTTY">RTTY</option>
+                    <option value="DATA">DATA</option>
+                </select>
+                <button id="ptt-button">PTT</button>
+            </div>
+            <div class="controls-row">
+                <button id="audio-toggle">Enable Audio</button>
+                <span id="audio-status" class="empty"></span>
+            </div>
+        </div>
+
+        <div class="panel radio-meters-panel">
+            <h2>Meters</h2>
+            <div id="meters"></div>
+        </div>
+    </div>
+
+    <div class="panel" style="grid-column: 1 / -1;">
+        <h2>Spectrum</h2>
+        <canvas id="scope-canvas" width="900" height="180"></canvas>
+        <canvas id="waterfall-canvas" width="900" height="180" style="margin-top:6px;"></canvas>
+    </div>
+</main>
+<script src="/static/vendor/opus-decoder/opus-decoder.min.js" charset="UTF-8"></script>
+<script src="/static/radio.js"></script>
+</body>
+</html>

@@ -310,14 +310,20 @@ class AudioBridge:
         self._rx_rate_bytes = 0
         self._rx_rate_next_report_at = None
 
-        # Optional second consumer of this bridge's already-downmixed
+        # Optional extra consumers of this bridge's already-downmixed
         # mono RX PCM -- e.g. RadioWorker.start_cw_decode() piggybacking
         # on whatever RX stream this bridge already holds (normal
         # listening audio or a Virtual Cable), instead of trying to
         # register its own separate radio.start_rx() callback, which
-        # rigplane only allows one of at a time. See set_extra_rx_
-        # callback/has_rx_stream.
-        self._extra_rx_callback = None
+        # rigplane only allows one of at a time. A LIST, not a single
+        # slot -- Remote Access needs a digital-mode decoder and an RX
+        # audio stream to the browser to coexist, and even
+        # desktop-only, a single overwriting slot meant starting a
+        # second decoder (e.g. SSTV while CW was already running)
+        # silently stole the callback out from under the first with no
+        # error. See add_extra_rx_callback/remove_extra_rx_callback/
+        # has_rx_stream.
+        self._extra_rx_callbacks = []
 
         self.sample_rate = getattr(radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
         self._pcm_ok = self._check_pcm_codec()
@@ -635,8 +641,8 @@ class AudioBridge:
             self._status(f"RX audio: first chunk received ({len(data)} bytes{detail}).")
         self._rx_chunk_count += 1
         self._report_rx_rate(len(data))
-        if self._extra_rx_callback is not None:
-            self._extra_rx_callback(data)
+        for extra_callback in self._extra_rx_callbacks:
+            extra_callback(data)
         try:
             self._rx_queue.put_nowait(data)
         except queue.Full:
@@ -875,22 +881,37 @@ class AudioBridge:
         """Whether this bridge currently holds rigplane's start_rx()
         registration (true once _start_rx has actually run -- only
         happens if an output device was configured; see start()).
-        Lets a second consumer (RadioWorker.start_cw_decode) know
-        whether it can piggyback via set_extra_rx_callback(), or
-        whether it should fall back to registering its own direct
-        start_rx() tap instead, since a TX-only bridge (mic configured,
-        no speaker) never claims that registration at all."""
+        Lets an extra consumer (RadioWorker.start_cw_decode, an RX
+        audio stream to a browser, etc.) know whether it can piggyback
+        via add_extra_rx_callback(), or whether it should fall back to
+        registering its own direct start_rx() tap instead, since a
+        TX-only bridge (mic configured, no speaker) never claims that
+        registration at all."""
         return self._rx_active
 
-    def set_extra_rx_callback(self, callback):
-        """Registers (callback is not None) or clears (callback is
-        None) a second consumer of this bridge's RX audio -- the same
-        already-downmixed mono PCM bytes queued for playback, handed
-        to `callback` right alongside that. Runs on this bridge's own
-        RX callback thread (same as _on_rx_audio itself), so `callback`
-        must follow the same cross-thread rules as everywhere else in
-        this app (no direct widget access)."""
-        self._extra_rx_callback = callback
+    def add_extra_rx_callback(self, callback):
+        """Registers one more consumer of this bridge's RX audio -- the
+        same already-downmixed mono PCM bytes queued for playback,
+        handed to `callback` right alongside that. Multiple callbacks
+        can be registered at once (e.g. a digital-mode decoder AND a
+        browser audio stream simultaneously) -- each is called in
+        registration order, independent of the others. Runs on this
+        bridge's own RX callback thread (same as _on_rx_audio itself),
+        so `callback` must follow the same cross-thread rules as
+        everywhere else in this app (no direct widget access). No-op
+        if `callback` is already registered (same object)."""
+        if callback not in self._extra_rx_callbacks:
+            self._extra_rx_callbacks.append(callback)
+
+    def remove_extra_rx_callback(self, callback):
+        """Unregisters a callback added via add_extra_rx_callback().
+        No-op if it isn't currently registered (already removed, or
+        never added) -- callers don't need to track registration state
+        themselves just to call this safely."""
+        try:
+            self._extra_rx_callbacks.remove(callback)
+        except ValueError:
+            pass
 
     def set_rx_downmix_channel(self, channel: str):
         """Changes which receiver's audio this bridge's RX output

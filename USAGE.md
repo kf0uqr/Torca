@@ -29,6 +29,7 @@ Step-by-step instructions for every feature in TORCA. See [README.md](README.md)
 - [rigctld](#rigctld)
 - [Updating](#updating)
 - [Connecting a radio over the network](#connecting-a-radio-over-the-network)
+- [Remote Access over the Internet](#remote-access-over-the-internet)
 
 ---
 
@@ -167,3 +168,7 @@ Select a radio in the Radios list, then **Rigctld...** to start a minimal Hamlib
 ## Connecting a radio over the network
 
 See [README.md](README.md#connecting-to-a-radio-over-the-network) for the full `torca-server` walkthrough (sharing a USB-only radio so any other TORCA instance can connect to it like a LAN radio).
+
+## Remote Access over the Internet
+
+See [README.md](README.md#remote-access-over-the-internet-cloudflare-tunnel) for the full Cloudflare Tunnel setup walkthrough. Once it's running, the **Remote Access...** button on the Ham Dashboard gives you a browser-based Ham Dashboard (with its own live map, and Satellites/QSO Map/PSKReporter/POTA/APRS overlay toggles) and, per connected radio, a control page (frequency/mode/PTT, meters, spectrum + waterfall, RX audio streaming) plus CW and APRS tool pages -- reachable both on your local network and, once set up, at your own domain over the internet.

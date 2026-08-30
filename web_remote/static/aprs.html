@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TORCA -- APRS Tool</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+    <a id="back-link" href="#">&larr; Radio</a>
+    <h1>APRS Tool</h1>
+    <span id="conn-status" class="empty">connecting...</span>
+</header>
+<div id="token-banner" class="token-banner" style="display:none;">
+    <span>Remote Access needs a token to continue -- find it in TORCA's Remote Access dialog.</span>
+    <input id="token-input" type="text" placeholder="Access token" autocomplete="off">
+    <button id="token-submit">Connect</button>
+</div>
+<main>
+    <div class="panel" style="grid-column: 1 / -1;">
+        <div class="controls-row">
+            <button id="decode-toggle">Start Decoding</button>
+            <select id="backend-select">
+                <option value="0">Built-in</option>
+                <option value="1">Direwolf (external)</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="panel" style="grid-column: 1 / -1;">
+        <h2>Decoded Packets</h2>
+        <div id="packet-list" class="packet-list"><p class="empty">No packets yet.</p></div>
+    </div>
+
+    <div class="panel" style="grid-column: 1 / -1;">
+        <h2>Send Position Report</h2>
+        <p class="empty">Sent from your configured Operator Profile location.</p>
+        <div class="controls-row">
+            <input id="comment-input" type="text" placeholder="Comment (optional)" style="flex:1;" maxlength="43">
+            <button id="send-button">Send</button>
+        </div>
+        <div id="send-status" class="empty"></div>
+    </div>
+</main>
+<script src="/static/aprs.js"></script>
+</body>
+</html>

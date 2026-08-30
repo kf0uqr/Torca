@@ -37,7 +37,7 @@ import os
 import platform
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot, QSettings
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QWidget,
     QDialog,
@@ -90,6 +90,23 @@ from wsjtx_rigctld import (
     launch_js8call,
 )
 from wsjtx_udp import WsjtxUdpListener, WSJTX_DEFAULT_PORT
+from web_remote.server import RemoteWebServer
+from web_remote.bridge import (
+    RadioRemoteState,
+    CwRemoteState,
+    AprsRemoteState,
+    SatelliteRemoteState,
+    MapLayersRemoteState,
+)
+from cloudflare_tunnel import (
+    CloudflareTunnel,
+    CloudflareSetupWorker,
+    cloudflared_available,
+    cloudflared_authenticated,
+    DEFAULT_TUNNEL_NAME,
+    DEFAULT_LOCAL_PORT,
+)
+import secrets
 from audio import (
     pactl_available,
     create_null_sink,
@@ -275,6 +292,131 @@ class RigctldDialog(QDialog):
             self._on_stop()
             self.toggle_button.setText("Start")
             self.port_spinbox.setEnabled(True)
+
+
+class RemoteAccessDialog(QDialog):
+    """Configures and starts/stops Remote Access -- a local web server
+    (web_remote/) giving a browser its own Ham Dashboard page and one
+    page per connected radio, exposed to the internet at a stable
+    hostname on your own domain via a Cloudflare Tunnel
+    (cloudflare_tunnel.py). Same "dialog owns the fields, callbacks do
+    the real work in HamClockWindow" shape as RigctldDialog above.
+
+    Two separate steps, both fired from here: "Run Setup" (one-time,
+    idempotent -- creates/looks-up the named tunnel, routes the given
+    hostname's DNS to it, writes this app's own cloudflared config) and
+    the Start/Stop toggle (brings up the local web server AND the
+    tunnel together, or tears both down). Setup only needs re-running
+    if the tunnel name, hostname, or local port changes."""
+
+    def __init__(self, is_running, port, tunnel_name, hostname, token, on_run_setup, on_start, on_stop, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Remote Access")
+        self._on_run_setup = on_run_setup
+        self._on_start = on_start
+        self._on_stop = on_stop
+
+        self.port_spinbox = QSpinBox()
+        self.port_spinbox.setRange(1, 65535)
+        self.port_spinbox.setValue(port)
+        self.port_spinbox.setToolTip("Local port the web server listens on (127.0.0.1 only -- reached over the internet only through the tunnel).")
+        self.port_spinbox.setEnabled(not is_running)
+
+        self.tunnel_name_input = QLineEdit(tunnel_name)
+        self.tunnel_name_input.setToolTip("Name of the Cloudflare Tunnel this app creates/uses -- doesn't affect any other tunnel already on this machine.")
+        self.hostname_input = QLineEdit(hostname)
+        self.hostname_input.setToolTip("Public hostname on your own domain, e.g. torca.kf0uqr.com -- must be a domain already added to your Cloudflare account.")
+
+        setup_button = QPushButton("Run Cloudflare Setup...")
+        setup_button.setToolTip("One-time (safe to re-run): creates the tunnel, routes the hostname's DNS to it, writes this app's own tunnel config.")
+        setup_button.clicked.connect(self._on_setup_clicked)
+
+        self.toggle_button = QPushButton("Stop" if is_running else "Start")
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(is_running)
+        self.toggle_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.toggle_button.toggled.connect(self._on_toggled)
+
+        self.url_label = QLabel(f"https://{hostname}" if is_running else "")
+        self.url_label.setStyleSheet("color: #5aa0ff;")
+        self.url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        # Read-only rather than disabled -- disabled QLineEdits can't
+        # be selected/copied by hand in some styles, and the whole
+        # point of showing this is to get it into the browser's token
+        # prompt easily (the Copy button below is the fast path, but
+        # manual select-and-copy should still work as a fallback).
+        self.token_input = QLineEdit(token)
+        self.token_input.setReadOnly(True)
+        self.token_input.setToolTip("Access token -- enter this in the browser page the first time it asks.")
+        copy_token_button = QPushButton("Copy")
+        copy_token_button.setToolTip("Copy the access token to the clipboard.")
+        copy_token_button.clicked.connect(self._on_copy_token_clicked)
+
+        self.status_label = QLabel("Enter the token above in the browser page the first time it asks.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #999; font-size: 11px;")
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+
+        form = QFormLayout()
+        form.addRow("Local port:", self.port_spinbox)
+        form.addRow("Tunnel name:", self.tunnel_name_input)
+        form.addRow("Hostname:", self.hostname_input)
+
+        token_row = QHBoxLayout()
+        token_row.addWidget(self.token_input, 1)
+        token_row.addWidget(copy_token_button)
+        form.addRow("Access token:", token_row)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel(
+            "Serves a Ham Dashboard page and one page per connected radio "
+            "over the local network, and (once set up) at the hostname "
+            "below over the internet via a Cloudflare Tunnel. Requires "
+            "cloudflared already installed and logged in -- see README.md."
+        ))
+        layout.addLayout(form)
+        layout.addWidget(setup_button)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(self.url_label)
+        layout.addWidget(self.status_label)
+        layout.addWidget(close_button)
+        self.setLayout(layout)
+
+    def _on_setup_clicked(self):
+        self._on_run_setup(
+            self.tunnel_name_input.text().strip(),
+            self.hostname_input.text().strip(),
+            self.port_spinbox.value(),
+        )
+
+    def _on_copy_token_clicked(self):
+        QGuiApplication.clipboard().setText(self.token_input.text())
+
+    def _on_toggled(self, checked):
+        if checked:
+            success = self._on_start(
+                self.port_spinbox.value(),
+                self.tunnel_name_input.text().strip(),
+                self.hostname_input.text().strip(),
+            )
+            if not success:
+                self.toggle_button.blockSignals(True)
+                self.toggle_button.setChecked(False)
+                self.toggle_button.blockSignals(False)
+                return
+            self.toggle_button.setText("Stop")
+            self.port_spinbox.setEnabled(False)
+            self.url_label.setText(f"https://{self.hostname_input.text().strip()}")
+        else:
+            self._on_stop()
+            self.toggle_button.setText("Start")
+            self.port_spinbox.setEnabled(True)
+            self.url_label.setText("")
 
 
 # Recomputing pass predictions (upcoming_passes) is real work -- SGP4
@@ -776,6 +918,11 @@ class HamClockWindow(QWidget):
         )
         self.satellite_session.state_updated.connect(self._on_satellite_state_updated)
         self.satellite_session.tracking_changed.connect(self._on_session_tracking_changed)
+        # Remote Access: lets the web dashboard start/stop tracking,
+        # change transponder, and adjust the Doppler offset -- see
+        # web_remote/bridge.py's SatelliteRemoteState for why this
+        # needs queued-signal marshaling rather than direct calls.
+        self.satellite_remote_state = SatelliteRemoteState(self)
 
         self._connected_radios = []  # RadioWindow instances, in connection order
         self._active_satellite = None  # for populating the transponder combo -- SatelliteSession keeps its own copy for computation
@@ -1153,6 +1300,16 @@ class HamClockWindow(QWidget):
                 self.qso_band_filter_combo.setCurrentIndex(index)
         self.qso_band_filter_combo.currentIndexChanged.connect(self._on_qso_band_filter_changed)
 
+        # Remote Access: lets the web dashboard control the whole map-
+        # overlay button row (Satellites/QSO Map/PSKReporter/POTA/APRS
+        # toggles + the band filter dropdown) -- see web_remote/bridge.
+        # py's MapLayersRemoteState for why this needs queued-signal
+        # marshaling rather than direct .setChecked()/.setCurrentIndex()
+        # calls from the web server's own thread. Constructed here, only
+        # after every widget it wires up (satellite_button through
+        # qso_band_filter_combo) already exists.
+        self.map_layers_remote_state = MapLayersRemoteState(self)
+
         # ---- Connected radios (list + Connect New Radio... button
         # live in RadiosDialog, opened via self.radios_button below --
         # still constructed/owned here since every method that reads/
@@ -1214,6 +1371,27 @@ class HamClockWindow(QWidget):
         # (e.g. WSJT-X reaching both an uplink and a downlink radio)
         # still needs a separate server, on a separate port, per
         # radio -- just configured one radio's dialog at a time now.) ----
+        # ---- Remote Access (Ham Dashboard + per-radio pages over the
+        # web, tunneled out via Cloudflare -- see web_remote/ and
+        # cloudflare_tunnel.py) ----
+        self._next_remote_radio_id = 1  # RadioWindow.remote_id assigned in connection order, never reused
+        self._remote_web_server = None
+        self._cloudflare_tunnel = None
+        self._remote_access_setup_worker = None
+        _remote_settings = QSettings("IcomRadioApp", "RadioControl")
+        self._remote_access_token = _remote_settings.value("remote_access_token", "") or ""
+        if not self._remote_access_token:
+            self._remote_access_token = secrets.token_urlsafe(24)
+            _remote_settings.setValue("remote_access_token", self._remote_access_token)
+
+        self.remote_access_button = QPushButton("Remote Access...")
+        self.remote_access_button.setToolTip(
+            "Configure and start a web version of this Ham Dashboard and "
+            "each connected radio -- reachable locally, or over the "
+            "internet via a Cloudflare Tunnel to your own domain."
+        )
+        self.remote_access_button.clicked.connect(self._on_remote_access_button_clicked)
+
         self._rigctld_servers = {}  # RadioWindow -> running RigctldServer
         self._rigctld_ports = {}    # RadioWindow -> remembered port (kept even while stopped)
 
@@ -1369,6 +1547,7 @@ class HamClockWindow(QWidget):
         top_buttons_row.addWidget(self.log_book_button)
         top_buttons_row.addWidget(self.new_qso_button)
         top_buttons_row.addWidget(self.update_button)
+        top_buttons_row.addWidget(self.remote_access_button)
         top_buttons_row.addStretch()
 
         # Stretches BETWEEN each label (not before the first or after
@@ -1464,6 +1643,12 @@ class HamClockWindow(QWidget):
         # being wasteful -- only actually runs while satellite mode is on.
         self._satellite_timer = QTimer(self)
         self._satellite_timer.timeout.connect(self._update_satellite_positions)
+        # Remote Access's own map reads this plain-list cache rather
+        # than calling map_widget.set_satellite_positions() or touching
+        # any Qt widget from the web server's own thread -- see
+        # _update_satellite_positions, which is this cache's only
+        # writer, and web_remote/app.py's dashboard_snapshot.
+        self._satellite_positions_cache = []
 
         # The actual pass search only reruns on this much coarser timer
         # -- see the module comment on PASSES_REFRESH_INTERVAL_MS for
@@ -1596,6 +1781,20 @@ class HamClockWindow(QWidget):
         )
         if self.qso_map_button.isChecked():
             self.map_widget.set_qso_markers(self._build_qso_markers())
+
+    def set_map_band_filter(self, band):
+        """GUI-thread-only entry point for MapLayersRemoteState
+        (web_remote/bridge.py) to change the band filter -- looks up
+        the combo index for `band` (a plain string, or None for "All
+        Bands") and sets it, which fires _on_qso_band_filter_changed
+        exactly as a real click would. A queued Signal connects
+        directly to this method rather than to
+        qso_band_filter_combo.setCurrentIndex itself, since the web
+        side only knows the band VALUE ("20m"), not which index it
+        currently occupies."""
+        index = self.qso_band_filter_combo.findData(band)
+        if index != -1:
+            self.qso_band_filter_combo.setCurrentIndex(index)
 
     def _on_qso_band_filter_changed(self, _index):
         band = self.qso_band_filter_combo.currentData()
@@ -2289,6 +2488,7 @@ class HamClockWindow(QWidget):
                 position["path"] = ground_track_points(sat.get("line1", ""), sat.get("line2", ""), now)
             positions.append(position)
         self.map_widget.set_satellite_positions(positions)
+        self._satellite_positions_cache = positions
 
     # Shared red/yellow/green "traffic light" palette for the passes
     # table -- per explicit instruction: used both for the Status
@@ -2453,29 +2653,51 @@ class HamClockWindow(QWidget):
         """(Re)starts tracking this satellite -- replaces whatever was
         active before (it stays selected/tracked until another double-
         click, or upcoming-pass row double-click, replaces it; pausing
-        via Stop Tracking doesn't clear it). Drives SatelliteSession
-        directly now -- this window owns tracking control, not just a
-        signal source for some other window to react to. Also makes it
-        the map-active satellite (same as a single left-click) -- doesn't
-        need a location configured, so this happens before that check
-        below, unlike the tracking behavior it gates."""
+        via Stop Tracking doesn't clear it). Also makes it the map-
+        active satellite (same as a single left-click) -- doesn't need
+        a location configured, so this happens unconditionally, before
+        _select_satellite_for_tracking's own location check."""
         self._on_satellite_left_clicked(name)
         satellite = next((sat for sat in self.satellites if sat.get("name") == name), None)
         if satellite is None:
             return
-        # (0, 0) is what an unset lat/lon defaults to (nobody's actual
-        # station is at 0N 0E), so treat it the same as "not set". Unlike
-        # transponder data (handled gracefully below -- elevation/
-        # azimuth/AOS-LOS don't need one), there's no useful degraded
-        # mode without a location at all.
-        if not self._observer_lat and not self._observer_lon:
+        if not self._select_satellite_for_tracking(satellite):
+            # (0, 0) is what an unset lat/lon defaults to (nobody's
+            # actual station is at 0N 0E), so treat it the same as "not
+            # set" -- _select_satellite_for_tracking returns False in
+            # exactly that case. Unlike transponder data (handled
+            # gracefully -- elevation/azimuth/AOS-LOS don't need one),
+            # there's no useful degraded mode without a location at all.
             QMessageBox.warning(
                 self, "Satellite Tracking",
                 "Set your location in Profile... first "
                 "(Latitude/Longitude/Elevation) -- satellite tracking needs "
                 "to know where you're observing from."
             )
-            return
+
+    def _select_satellite_for_tracking(self, satellite) -> bool:
+        """The actual "start tracking this satellite" side effects --
+        shared by _on_satellite_double_clicked (a real double-click)
+        and Remote Access's /api/satellite/start (via bridge.py's
+        SatelliteRemoteState, connected here through a queued Qt
+        signal). Both need this exact set of widget updates
+        (self._active_satellite, satellite_name_label, transponder_
+        combo repopulated, tracking_button checked/enabled) so the
+        desktop UI visibly reflects whichever satellite got selected,
+        regardless of where the selection came from -- calling
+        SatelliteSession.start() directly (an earlier version of the
+        web path did exactly this) leaves transponder_combo completely
+        unpopulated, so there's nothing for a subsequent transponder
+        pick to even select -- confirmed as the actual cause of a real
+        "transponder selection does nothing" report.
+
+        Returns False (no-op, nothing changed) if no observer location
+        is configured -- the caller decides how to report that itself
+        (a blocking QMessageBox makes sense for a real double-click;
+        the remote-control caller has no equivalent, so it just
+        silently doesn't track)."""
+        if not self._observer_lat and not self._observer_lon:
+            return False
 
         self._active_satellite = satellite
         self.satellite_name_label.setText(satellite.get("name", "?"))
@@ -2513,6 +2735,20 @@ class HamClockWindow(QWidget):
 
         self.satellite_session.start(satellite)
         self.satellite_session.set_transponder(self.transponder_combo.currentData())
+        return True
+
+    def select_transponder_remote(self, index: int):
+        """GUI-thread-only entry point for Remote Access's /api/
+        satellite/transponder (via SatelliteRemoteState) -- sets
+        transponder_combo's current index, which fires its own
+        currentIndexChanged -> _on_transponder_changed exactly as a
+        real selection would (same call-through-the-real-widget
+        reasoning as set_map_band_filter). `index` is positional into
+        whatever transponder_combo is CURRENTLY populated with, so
+        this only does anything useful after a satellite has actually
+        been selected (_select_satellite_for_tracking)."""
+        if 0 <= index < self.transponder_combo.count():
+            self.transponder_combo.setCurrentIndex(index)
 
     def _on_transponder_changed(self, _index):
         if self._active_satellite is not None:
@@ -2628,6 +2864,24 @@ class HamClockWindow(QWidget):
         window = RadioWindow(details, self.satellite_session)
         window.closed.connect(self._on_radio_window_closed)
         window.aprs_packet_decoded.connect(self._on_aprs_packet_decoded)
+        # Remote Access identity + state cache -- must be created here,
+        # on the GUI thread, NOT lazily from the web server's own
+        # thread later (see web_remote/bridge.py's own docstring for
+        # why RadioRemoteState's Qt signal connections need to be made
+        # on this thread).
+        window.remote_id = self._next_remote_radio_id
+        self._next_remote_radio_id += 1
+        window.remote_state = RadioRemoteState(window)
+        # Eagerly (but hidden) construct the CW/APRS tool windows too,
+        # via the exact same lazy-construction helpers the desktop's
+        # own Tool buttons use (main_window.py) -- so a web CW/APRS
+        # page attaches to the SAME decode session the desktop tool
+        # window would use if opened, rather than a second, competing
+        # one. See web_remote/bridge.py's CwRemoteState/AprsRemoteState.
+        window.ensure_cw_tool_window()
+        window.ensure_aprs_tool_window()
+        window.cw_remote_state = CwRemoteState(window.cw_window)
+        window.aprs_remote_state = AprsRemoteState(window.aprs_window)
         self._connected_radios.append(window)
 
         item = QListWidgetItem(self._radio_list_base_label(details))
@@ -3041,6 +3295,87 @@ class HamClockWindow(QWidget):
         if server is not None:
             server.stop()
 
+    # ---- Remote Access ----
+
+    def _on_remote_access_button_clicked(self):
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        port = settings.value("remote_access_port", DEFAULT_LOCAL_PORT, type=int)
+        tunnel_name = settings.value("remote_access_tunnel_name", DEFAULT_TUNNEL_NAME) or DEFAULT_TUNNEL_NAME
+        hostname = settings.value("remote_access_hostname", "") or ""
+        is_running = self._remote_web_server is not None
+        dialog = RemoteAccessDialog(
+            is_running, port, tunnel_name, hostname, self._remote_access_token,
+            on_run_setup=self._on_remote_access_run_setup,
+            on_start=self._on_remote_access_start,
+            on_stop=self._on_remote_access_stop,
+            parent=self,
+        )
+        dialog.exec()
+
+    def _on_remote_access_run_setup(self, tunnel_name, hostname, port):
+        if not cloudflared_available():
+            QMessageBox.critical(
+                self, "Remote Access",
+                "The `cloudflared` executable wasn't found on PATH -- install it first (see README.md)."
+            )
+            return
+        if not cloudflared_authenticated():
+            QMessageBox.critical(
+                self, "Remote Access",
+                "cloudflared isn't logged in yet -- run `cloudflared tunnel login` once outside "
+                "this app (opens a browser to authorize against your Cloudflare account), then retry."
+            )
+            return
+        if not hostname:
+            QMessageBox.critical(self, "Remote Access", "Enter a hostname first (e.g. torca.kf0uqr.com).")
+            return
+        if self._remote_access_setup_worker is not None and self._remote_access_setup_worker.isRunning():
+            return  # already running -- avoid a second overlapping setup pass
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        settings.setValue("remote_access_port", port)
+        settings.setValue("remote_access_tunnel_name", tunnel_name)
+        settings.setValue("remote_access_hostname", hostname)
+
+        worker = CloudflareSetupWorker(tunnel_name, hostname, port, self)
+        worker.status.connect(lambda msg: print(f"[Remote Access] {msg}"))
+        worker.finished_ok.connect(self._on_remote_access_setup_finished)
+        worker.failed.connect(self._on_remote_access_setup_failed)
+        self._remote_access_setup_worker = worker
+        worker.start()
+
+    def _on_remote_access_setup_finished(self, tunnel_id):
+        QMessageBox.information(
+            self, "Remote Access",
+            f"Cloudflare setup complete (tunnel {tunnel_id}). Click Start to bring Remote Access online."
+        )
+
+    def _on_remote_access_setup_failed(self, message):
+        QMessageBox.critical(self, "Remote Access", f"Cloudflare setup failed:\n\n{message}")
+
+    def _on_remote_access_start(self, port, tunnel_name, hostname) -> bool:
+        if self._remote_web_server is not None:
+            return True  # already running
+        server = RemoteWebServer(self, port=port, token=self._remote_access_token, parent=self)
+        server.error.connect(lambda msg: QMessageBox.critical(self, "Remote Access", msg))
+        server.start()
+        self._remote_web_server = server
+
+        if hostname and cloudflared_available() and cloudflared_authenticated():
+            tunnel = CloudflareTunnel(tunnel_name, self)
+            tunnel.status.connect(lambda msg: print(f"[Remote Access] {msg}"))
+            tunnel.error.connect(lambda msg: QMessageBox.warning(self, "Remote Access", msg))
+            tunnel.start()
+            self._cloudflare_tunnel = tunnel
+        return True
+
+    def _on_remote_access_stop(self):
+        if self._cloudflare_tunnel is not None:
+            self._cloudflare_tunnel.stop()
+            self._cloudflare_tunnel = None
+        if self._remote_web_server is not None:
+            self._remote_web_server.stop()
+            self._remote_web_server = None
+
     def _confirm_rigctld_before_launch(self, app_name):
         """Shared pre-launch check for both "Launch WSJT-X" and "Launch
         JS8Call" -- neither app can actually control a radio without
@@ -3204,6 +3539,7 @@ class HamClockWindow(QWidget):
         print(f"[WSJT-X Auto-Log] {message}")
 
     def closeEvent(self, event):
+        self._on_remote_access_stop()
         self.satellite_session.stop()
         if self._wsjtx_udp_listener is not None:
             self._wsjtx_udp_listener.stop()

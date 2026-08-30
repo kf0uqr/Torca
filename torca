@@ -1,5 +1,18 @@
 #!/bin/bash
-
+# Launches TORCA from a dev checkout.
+#
+# This venv's own site-packages is prepended to PYTHONPATH (not
+# unset/replaced -- some setups, e.g. PySide6 installed via the OS
+# package manager rather than pip, genuinely rely on an inherited
+# PYTHONPATH to see dependencies this venv doesn't have its own copy
+# of) so THIS venv's packages win over same-named ones earlier in an
+# inherited PYTHONPATH. Confirmed live: an old system-wide
+# typing_extensions (via an inherited PYTHONPATH placing it ahead of
+# this venv's own, newer copy) broke fastapi/pydantic's import chain
+# (pydantic_core needs typing_extensions.Sentinel, missing from the
+# old one) the moment web_remote/ (Remote Access) started importing
+# them -- every earlier dependency happened not to collide this way.
 source bin/activate
+export PYTHONPATH="$(python -c 'import site; print(site.getsitepackages()[0])'):$PYTHONPATH"
 python main.py
 deactivate

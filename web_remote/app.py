@@ -1,6 +1,7 @@
 """
-create_app(dashboard, token): the Remote Access FastAPI app -- a Ham
-Dashboard page (/) and a per-radio page (/radio/{id}), each backed by a
+create_app(dashboard, operator_token, guest_token, viewer_token, audit):
+the Remote Access FastAPI app -- a Ham Dashboard page (/) and a
+per-radio page (/radio/{id}), each backed by a
 polling websocket (/ws/dashboard, /ws/radio/{id}) rather than an
 event-driven broadcast. Polling (a plain `while True: send; sleep()`
 loop per connection) was chosen over wiring Qt signals straight into
@@ -29,7 +30,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 import adif
 import qso_log
-from web_remote.common import find_radio_window, make_token_check
+from constants import RADIO_BANDS
+from web_remote.common import ROLE_VIEWER, find_radio_window, make_role_checker
 from web_remote.routes_tools import create_tools_router
 from web_remote.routes_satellite import create_satellite_router
 from web_remote.routes_audio import create_audio_router
@@ -42,37 +44,37 @@ RADIO_POLL_INTERVAL = 0.2
 
 
 class NoCacheStaticMiddleware(BaseHTTPMiddleware):
-    """Forces `Cache-Control: no-store` on every /static/* response.
-
-    Without this, a browser can silently keep serving an OLD cached
-    dashboard.js/cw.js/etc. after this app updates on disk (a self-
-    update, or -- during development -- an in-place code edit) even
-    though the freshly-served HTML references the new markup. Confirmed
-    as a real, reproducible bug: new HTML (new buttons/dropdown) plus
-    stale cached JS (no click handlers, no population logic for either)
-    made a feature look completely non-functional even after a plain
-    page reload, until the browser's cache was force-cleared. Given how
-    small this app's static assets are, unconditionally disabling
-    caching is a simpler, more robust fix than cache-busting query
-    params or ETag plumbing."""
+    """Forces `Cache-Control: no-store` on EVERY response, not just
+    /static/* assets -- the dashboard/radio/cw/aprs page routes
+    (app.py's own index/radio_page/cw_tool_page/aprs_tool_page) return
+    HTMLResponse with no Cache-Control of their own at all, confirmed
+    live (a plain `curl -D-` showed no cache-control header whatsoever
+    on GET /radio/{id}/tool/cw), so a browser's own default heuristic
+    caching could still serve a stale PAGE even with the assets
+    themselves already protected -- confirmed as the actual cause of a
+    real "new feature doesn't show up at all" report, on a route this
+    file-scoped version didn't cover. Given how small this app's
+    responses are, unconditionally disabling caching everywhere is
+    simpler and more robust than trying to enumerate which routes
+    need it."""
 
     async def dispatch(self, request, call_next):
         response = await call_next(request)
-        if request.url.path.startswith("/static/"):
-            response.headers["Cache-Control"] = "no-store"
+        response.headers["Cache-Control"] = "no-store"
         return response
 
 
-def create_app(dashboard, token=None):
+def create_app(dashboard, operator_token=None, guest_token=None, viewer_token=None, audit=None):
     app = FastAPI()
     app.add_middleware(NoCacheStaticMiddleware)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    app.include_router(create_tools_router(dashboard, token))
-    app.include_router(create_satellite_router(dashboard, token))
-    app.include_router(create_audio_router(dashboard, token))
-    app.include_router(create_map_router(dashboard, token))
 
-    token_ok = make_token_check(token)
+    role_for = make_role_checker(operator_token, guest_token, viewer_token)
+
+    app.include_router(create_tools_router(dashboard, role_for, audit=audit))
+    app.include_router(create_satellite_router(dashboard, role_for))
+    app.include_router(create_audio_router(dashboard, role_for, audit=audit))
+    app.include_router(create_map_router(dashboard, role_for))
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -101,12 +103,15 @@ def create_app(dashboard, token=None):
         # token and never showed why, even though the backend had
         # their connected radio the whole time).
         await websocket.accept()
-        if not token_ok(websocket.query_params.get("token")):
+        role = role_for(websocket.query_params.get("token"))
+        if role is None:
             await websocket.close(code=4401)
             return
         try:
             while True:
-                await websocket.send_json(dashboard_snapshot(dashboard))
+                snapshot = dashboard_snapshot(dashboard)
+                snapshot["role"] = role
+                await websocket.send_json(snapshot)
                 await asyncio.sleep(DASHBOARD_POLL_INTERVAL)
         except WebSocketDisconnect:
             pass
@@ -114,37 +119,90 @@ def create_app(dashboard, token=None):
     @app.websocket("/ws/radio/{radio_id}")
     async def ws_radio(websocket: WebSocket, radio_id: int):
         await websocket.accept()
-        if not token_ok(websocket.query_params.get("token")):
+        role = role_for(websocket.query_params.get("token"))
+        if role is None:
             await websocket.close(code=4401)
             return
         window = find_radio_window(dashboard, radio_id)
         if window is None or not hasattr(window, "remote_state"):
             await websocket.close(code=4404)
             return
-        receive_task = asyncio.create_task(_handle_radio_commands(websocket, window))
+        window.remote_state.register_session(role)
+        receive_task = asyncio.create_task(_handle_radio_commands(websocket, window, role, radio_id, audit))
         try:
             while True:
-                await websocket.send_json(radio_snapshot(window))
+                snapshot = radio_snapshot(window)
+                snapshot["role"] = role
+                await websocket.send_json(snapshot)
                 await asyncio.sleep(RADIO_POLL_INTERVAL)
         except WebSocketDisconnect:
             pass
         finally:
             receive_task.cancel()
+            window.remote_state.unregister_session(role)
 
     return app
 
 
-async def _handle_radio_commands(websocket, window):
+async def _handle_radio_commands(websocket, window, role, radio_id, audit):
     try:
         while True:
             msg = await websocket.receive_json()
             cmd = msg.get("cmd")
+            if role == ROLE_VIEWER:
+                if audit is not None:
+                    audit.log(radio_id, role, cmd or "unknown", False, detail="viewer role -- read-only session")
+                await websocket.send_json({"error": "read-only session -- command ignored"})
+                continue
+            if cmd == "ptt":
+                on = bool(msg.get("on"))
+                if on and not window.remote_state.can_transmit(role):
+                    if audit is not None:
+                        audit.log(radio_id, role, "ptt", False, detail="unsupervised or TX-locked")
+                    await websocket.send_json({"error": "transmit not permitted -- no control operator supervising, or TX is locked"})
+                    continue
+                window.remote_state.request_ptt(on)
+                if audit is not None:
+                    audit.log(radio_id, role, "ptt", True, detail=f"on={on}")
+                continue
+            if cmd == "kill_tx":
+                if role != "operator":
+                    await websocket.send_json({"error": "operator role required"})
+                    continue
+                window.remote_state.kill_tx()
+                if audit is not None:
+                    audit.log(radio_id, role, "kill_tx", True)
+                continue
+            if cmd == "clear_tx_lock":
+                if role != "operator":
+                    await websocket.send_json({"error": "operator role required"})
+                    continue
+                window.remote_state.clear_tx_lock()
+                if audit is not None:
+                    audit.log(radio_id, role, "clear_tx_lock", True)
+                continue
             if cmd == "set_frequency" and "freq_hz" in msg:
                 window.remote_state.request_frequency(msg["freq_hz"])
+                if audit is not None:
+                    audit.log(radio_id, role, "set_frequency", True, detail=str(msg["freq_hz"]))
             elif cmd == "set_control" and "key" in msg:
                 window.remote_state.request_control(msg["key"], msg.get("value"))
-            elif cmd == "ptt":
-                window.remote_state.request_ptt(bool(msg.get("on")))
+                if audit is not None:
+                    audit.log(radio_id, role, "set_control", True, detail=str(msg["key"]))
+            elif cmd == "select_receiver" and "receiver" in msg:
+                window.remote_state.request_active_receiver(int(msg["receiver"]))
+            elif cmd == "set_level" and "key" in msg and "value" in msg:
+                window.remote_state.request_level(msg["key"], msg["value"])
+            elif cmd == "select_band" and "band_label" in msg and "low_edge_hz" in msg:
+                # Same receiver targeting as main_window.py's own
+                # _on_band_selected: only address Sub explicitly on a
+                # dual-receiver radio currently showing Sub as active --
+                # otherwise None, which select_band() treats as Main.
+                receiver = (
+                    1 if window.worker.is_dual_receiver and window.remote_state.state.get("active_receiver") == 1
+                    else None
+                )
+                window.remote_state.request_select_band(msg["band_label"], int(msg["low_edge_hz"]), receiver)
     except WebSocketDisconnect:
         pass
 
@@ -153,6 +211,25 @@ def radio_snapshot(window):
     state = dict(window.remote_state.state)
     state["id"] = getattr(window, "remote_id", None)
     state["label"] = window._details.get("radio_model", "Radio")
+    # Read live rather than from the cached dict: is_dual_receiver is a
+    # plain bool RadioWorker only finalizes once the connection actually
+    # completes (radio_worker.py, right before it emits `connected`) --
+    # RadioRemoteState is constructed synchronously right after the
+    # worker thread is *started*, so a cached one-time read (or even one
+    # keyed off the `connected` signal) can lose a race against a fast
+    # connection and freeze at the False default forever. Reading it
+    # fresh on every poll tick (same GIL-safe plain-attribute cross-
+    # thread read this app already relies on elsewhere, e.g.
+    # RadioWindow._current_freq_hz) sidesteps the race entirely.
+    state["is_dual_receiver"] = window.worker.is_dual_receiver
+    # Same RADIO_BANDS table main_window.py builds its band buttons
+    # from, keyed by the same radio_model string -- so the web
+    # dropdown's options always match whatever the desktop shows for
+    # this radio, with no separate list to keep in sync.
+    state["bands"] = [
+        {"label": label, "low_hz": low_hz, "high_hz": high_hz}
+        for label, low_hz, high_hz in RADIO_BANDS.get(window._details.get("radio_model"), [])
+    ]
     return state
 
 

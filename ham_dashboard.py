@@ -91,6 +91,7 @@ from wsjtx_rigctld import (
 )
 from wsjtx_udp import WsjtxUdpListener, WSJTX_DEFAULT_PORT
 from web_remote.server import RemoteWebServer
+from web_remote.audit import AuditLog
 from web_remote.bridge import (
     RadioRemoteState,
     CwRemoteState,
@@ -309,12 +310,17 @@ class RemoteAccessDialog(QDialog):
     tunnel together, or tears both down). Setup only needs re-running
     if the tunnel name, hostname, or local port changes."""
 
-    def __init__(self, is_running, port, tunnel_name, hostname, token, on_run_setup, on_start, on_stop, parent=None):
+    def __init__(self, is_running, port, tunnel_name, hostname,
+                 operator_token, guest_token, viewer_token,
+                 on_run_setup, on_start, on_stop, on_kill_tx, on_clear_tx_lock, audit=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Remote Access")
         self._on_run_setup = on_run_setup
         self._on_start = on_start
         self._on_stop = on_stop
+        self._on_kill_tx = on_kill_tx
+        self._on_clear_tx_lock = on_clear_tx_lock
+        self._audit = audit
 
         self.port_spinbox = QSpinBox()
         self.port_spinbox.setRange(1, 65535)
@@ -343,21 +349,54 @@ class RemoteAccessDialog(QDialog):
         self.url_label.setStyleSheet("color: #5aa0ff;")
         self.url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        # Read-only rather than disabled -- disabled QLineEdits can't
-        # be selected/copied by hand in some styles, and the whole
-        # point of showing this is to get it into the browser's token
-        # prompt easily (the Copy button below is the fast path, but
-        # manual select-and-copy should still work as a fallback).
-        self.token_input = QLineEdit(token)
-        self.token_input.setReadOnly(True)
-        self.token_input.setToolTip("Access token -- enter this in the browser page the first time it asks.")
-        copy_token_button = QPushButton("Copy")
-        copy_token_button.setToolTip("Copy the access token to the clipboard.")
-        copy_token_button.clicked.connect(self._on_copy_token_clicked)
+        # Three independent access links -- see web_remote/common.py's
+        # ROLE_* docstring. Each row is read-only (not disabled: a
+        # disabled QLineEdit can't be manually selected/copied in some
+        # styles, and the whole point here is getting it into the
+        # browser's token prompt) plus its own Copy button.
+        self.operator_token_input, operator_row = self._make_token_row(
+            operator_token,
+            "Full control -- PTT/TX, frequency, mode, CW/APRS send. This is the "
+            "licensee's own link; treat it like handing someone the microphone."
+        )
+        self.guest_token_input, guest_row = self._make_token_row(
+            guest_token,
+            "Can transmit ONLY while an operator link (above) is also connected to "
+            "the same radio -- direct-supervision requirement, 47 CFR 97.115."
+        )
+        self.viewer_token_input, viewer_row = self._make_token_row(
+            viewer_token,
+            "Read-only -- can watch frequency/meters/audio but never transmit or "
+            "change any setting. Safe to share freely."
+        )
 
-        self.status_label = QLabel("Enter the token above in the browser page the first time it asks.")
+        self.kill_tx_button = QPushButton("Kill All Remote TX")
+        self.kill_tx_button.setStyleSheet(
+            "QPushButton { background-color: #a02020; color: white; font-weight: bold; }"
+        )
+        self.kill_tx_button.setToolTip(
+            "Immediately stops PTT on every connected radio and locks out further "
+            "remote transmission until cleared below."
+        )
+        self.kill_tx_button.clicked.connect(self._on_kill_tx_clicked)
+        self.clear_lock_button = QPushButton("Clear TX Lock")
+        self.clear_lock_button.clicked.connect(self._on_clear_tx_lock_clicked)
+
+        self.status_label = QLabel("Enter the appropriate token above in the browser page the first time it asks.")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #999; font-size: 11px;")
+
+        self.activity_list = QListWidget()
+        self.activity_list.setToolTip(
+            "Recent PTT/CW-send/APRS-send/kill-switch activity, allowed and blocked -- "
+            "the full record is also written to remote_audit.log next to this app's settings."
+        )
+        self.activity_list.setMaximumHeight(120)
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(2000)
+        self._activity_timer.timeout.connect(self._refresh_activity)
+        self._activity_timer.start()
+        self._refresh_activity()
 
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
@@ -366,11 +405,13 @@ class RemoteAccessDialog(QDialog):
         form.addRow("Local port:", self.port_spinbox)
         form.addRow("Tunnel name:", self.tunnel_name_input)
         form.addRow("Hostname:", self.hostname_input)
+        form.addRow("Operator link:", operator_row)
+        form.addRow("Guest link:", guest_row)
+        form.addRow("Viewer link:", viewer_row)
 
-        token_row = QHBoxLayout()
-        token_row.addWidget(self.token_input, 1)
-        token_row.addWidget(copy_token_button)
-        form.addRow("Access token:", token_row)
+        kill_row = QHBoxLayout()
+        kill_row.addWidget(self.kill_tx_button)
+        kill_row.addWidget(self.clear_lock_button)
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel(
@@ -383,9 +424,37 @@ class RemoteAccessDialog(QDialog):
         layout.addWidget(setup_button)
         layout.addWidget(self.toggle_button)
         layout.addWidget(self.url_label)
+        layout.addLayout(kill_row)
+        layout.addWidget(QLabel("Recent activity:"))
+        layout.addWidget(self.activity_list)
         layout.addWidget(self.status_label)
         layout.addWidget(close_button)
         self.setLayout(layout)
+
+    def _make_token_row(self, token, tooltip):
+        """A read-only token QLineEdit + its own Copy button, wrapped in
+        a small container widget so it can be dropped straight into a
+        QFormLayout row (form.addRow needs one widget/layout per row,
+        not a bare QLineEdit plus a separate button). Returns
+        (token_input, row_widget) -- the CALLER must keep a reference to
+        row_widget (e.g. pass it straight to form.addRow) since it has
+        no parent yet at this point: with no Python reference either,
+        PySide6/shiboken garbage-collects it (and its child QLineEdit)
+        before form.addRow ever runs, which is exactly what a bare
+        `.parent()` call on the returned token_input used to crash on
+        (RuntimeError: Internal C++ object already deleted)."""
+        row_widget = QWidget()
+        row = QHBoxLayout(row_widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        token_input = QLineEdit(token)
+        token_input.setReadOnly(True)
+        token_input.setToolTip(tooltip)
+        copy_button = QPushButton("Copy")
+        copy_button.setToolTip(tooltip)
+        copy_button.clicked.connect(lambda: QGuiApplication.clipboard().setText(token_input.text()))
+        row.addWidget(token_input, 1)
+        row.addWidget(copy_button)
+        return token_input, row_widget
 
     def _on_setup_clicked(self):
         self._on_run_setup(
@@ -394,8 +463,24 @@ class RemoteAccessDialog(QDialog):
             self.port_spinbox.value(),
         )
 
-    def _on_copy_token_clicked(self):
-        QGuiApplication.clipboard().setText(self.token_input.text())
+    def _on_kill_tx_clicked(self):
+        self._on_kill_tx()
+        self._refresh_activity()
+
+    def _on_clear_tx_lock_clicked(self):
+        self._on_clear_tx_lock()
+        self._refresh_activity()
+
+    def _refresh_activity(self):
+        if self._audit is None:
+            return
+        self.activity_list.clear()
+        for entry in reversed(self._audit.recent(20)):
+            mark = "OK" if entry["allowed"] else "BLOCKED"
+            text = f"[{entry['ts']}] radio {entry['radio_id']} {entry['role']} {entry['cmd']} -- {mark}"
+            if entry.get("detail"):
+                text += f" ({entry['detail']})"
+            self.activity_list.addItem(text)
 
     def _on_toggled(self, checked):
         if checked:
@@ -1379,10 +1464,29 @@ class HamClockWindow(QWidget):
         self._cloudflare_tunnel = None
         self._remote_access_setup_worker = None
         _remote_settings = QSettings("IcomRadioApp", "RadioControl")
-        self._remote_access_token = _remote_settings.value("remote_access_token", "") or ""
-        if not self._remote_access_token:
-            self._remote_access_token = secrets.token_urlsafe(24)
-            _remote_settings.setValue("remote_access_token", self._remote_access_token)
+        # Three independent secrets (operator/guest/viewer -- see
+        # web_remote/common.py's ROLE_* docstring for what each is
+        # allowed to do) rather than the one shared token this used to
+        # be: anyone holding the operator link can transmit, so handing
+        # it to a guest is the same as handing them the microphone.
+        # One-time migration: an old single remote_access_token becomes
+        # the operator token (rather than being silently orphaned) so
+        # any already-bookmarked link keeps working.
+        self._remote_access_token_operator = _remote_settings.value("remote_access_token_operator", "") or ""
+        if not self._remote_access_token_operator:
+            legacy_token = _remote_settings.value("remote_access_token", "") or ""
+            self._remote_access_token_operator = legacy_token or secrets.token_urlsafe(24)
+            _remote_settings.setValue("remote_access_token_operator", self._remote_access_token_operator)
+        self._remote_access_token_guest = _remote_settings.value("remote_access_token_guest", "") or ""
+        if not self._remote_access_token_guest:
+            self._remote_access_token_guest = secrets.token_urlsafe(24)
+            _remote_settings.setValue("remote_access_token_guest", self._remote_access_token_guest)
+        self._remote_access_token_viewer = _remote_settings.value("remote_access_token_viewer", "") or ""
+        if not self._remote_access_token_viewer:
+            self._remote_access_token_viewer = secrets.token_urlsafe(24)
+            _remote_settings.setValue("remote_access_token_viewer", self._remote_access_token_viewer)
+
+        self.remote_audit_log = AuditLog.default()
 
         self.remote_access_button = QPushButton("Remote Access...")
         self.remote_access_button.setToolTip(
@@ -1391,6 +1495,22 @@ class HamClockWindow(QWidget):
             "internet via a Cloudflare Tunnel to your own domain."
         )
         self.remote_access_button.clicked.connect(self._on_remote_access_button_clicked)
+
+        # Link-independent kill switch (47 CFR 97.213): stops every
+        # connected radio's remote TX immediately from right here in
+        # the desktop process -- doesn't depend on the Cloudflare
+        # Tunnel, a browser, or any websocket being open at all, so it
+        # still works even if THOSE are what's misbehaving.
+        self.kill_remote_tx_button = QPushButton("Kill All Remote TX")
+        self.kill_remote_tx_button.setStyleSheet(
+            "QPushButton { background-color: #a02020; color: white; font-weight: bold; }"
+        )
+        self.kill_remote_tx_button.setToolTip(
+            "Immediately stops PTT on every connected radio and locks out further "
+            "remote transmission (operator and guest alike) until cleared from the "
+            "Remote Access dialog or a radio's own web page."
+        )
+        self.kill_remote_tx_button.clicked.connect(self._on_kill_all_remote_tx)
 
         self._rigctld_servers = {}  # RadioWindow -> running RigctldServer
         self._rigctld_ports = {}    # RadioWindow -> remembered port (kept even while stopped)
@@ -1548,6 +1668,7 @@ class HamClockWindow(QWidget):
         top_buttons_row.addWidget(self.new_qso_button)
         top_buttons_row.addWidget(self.update_button)
         top_buttons_row.addWidget(self.remote_access_button)
+        top_buttons_row.addWidget(self.kill_remote_tx_button)
         top_buttons_row.addStretch()
 
         # Stretches BETWEEN each label (not before the first or after
@@ -2871,7 +2992,7 @@ class HamClockWindow(QWidget):
         # on this thread).
         window.remote_id = self._next_remote_radio_id
         self._next_remote_radio_id += 1
-        window.remote_state = RadioRemoteState(window)
+        window.remote_state = RadioRemoteState(window, audit=self.remote_audit_log)
         # Eagerly (but hidden) construct the CW/APRS tool windows too,
         # via the exact same lazy-construction helpers the desktop's
         # own Tool buttons use (main_window.py) -- so a web CW/APRS
@@ -3304,13 +3425,33 @@ class HamClockWindow(QWidget):
         hostname = settings.value("remote_access_hostname", "") or ""
         is_running = self._remote_web_server is not None
         dialog = RemoteAccessDialog(
-            is_running, port, tunnel_name, hostname, self._remote_access_token,
+            is_running, port, tunnel_name, hostname,
+            self._remote_access_token_operator, self._remote_access_token_guest, self._remote_access_token_viewer,
             on_run_setup=self._on_remote_access_run_setup,
             on_start=self._on_remote_access_start,
             on_stop=self._on_remote_access_stop,
+            on_kill_tx=self._on_kill_all_remote_tx,
+            on_clear_tx_lock=self._on_clear_all_remote_tx_lock,
+            audit=self.remote_audit_log,
             parent=self,
         )
         dialog.exec()
+
+    def _on_kill_all_remote_tx(self):
+        """Runs entirely in this (desktop) process -- see
+        RadioRemoteState.kill_tx's own docstring for why this doesn't
+        depend on the web server, tunnel, or any browser connection
+        being healthy at all."""
+        for window in self._connected_radios:
+            remote_state = getattr(window, "remote_state", None)
+            if remote_state is not None:
+                remote_state.kill_tx()
+
+    def _on_clear_all_remote_tx_lock(self):
+        for window in self._connected_radios:
+            remote_state = getattr(window, "remote_state", None)
+            if remote_state is not None:
+                remote_state.clear_tx_lock()
 
     def _on_remote_access_run_setup(self, tunnel_name, hostname, port):
         if not cloudflared_available():
@@ -3355,7 +3496,14 @@ class HamClockWindow(QWidget):
     def _on_remote_access_start(self, port, tunnel_name, hostname) -> bool:
         if self._remote_web_server is not None:
             return True  # already running
-        server = RemoteWebServer(self, port=port, token=self._remote_access_token, parent=self)
+        server = RemoteWebServer(
+            self, port=port,
+            operator_token=self._remote_access_token_operator,
+            guest_token=self._remote_access_token_guest,
+            viewer_token=self._remote_access_token_viewer,
+            audit=self.remote_audit_log,
+            parent=self,
+        )
         server.error.connect(lambda msg: QMessageBox.critical(self, "Remote Access", msg))
         server.start()
         self._remote_web_server = server

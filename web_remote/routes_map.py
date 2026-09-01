@@ -13,18 +13,23 @@ than needing a second socket.
 
 from fastapi import APIRouter, Request, HTTPException
 
-from web_remote.common import make_token_check
+from web_remote.common import ROLE_VIEWER
 
 
-def create_map_router(dashboard, token=None):
+def create_map_router(dashboard, role_for):
     router = APIRouter()
-    token_ok = make_token_check(token)
 
     def check_auth(request: Request):
+        # Every endpoint here is a mutating toggle -- viewer (read-only)
+        # is never allowed, no allow_viewer param needed like
+        # routes_satellite.py's GET endpoints have.
         header = request.headers.get("authorization", "")
         candidate = header[7:] if header.lower().startswith("bearer ") else None
-        if not token_ok(candidate):
+        role = role_for(candidate)
+        if role is None:
             raise HTTPException(status_code=401, detail="invalid or missing token")
+        if role == ROLE_VIEWER:
+            raise HTTPException(status_code=403, detail="read-only session -- viewer role cannot control the station")
 
     async def _toggle(request: Request, request_method):
         check_auth(request)

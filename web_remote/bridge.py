@@ -27,17 +27,55 @@ emitting it from a different thread than the widget's is the standard,
 supported way to safely mutate a widget cross-thread (Qt resolves the
 connection to Qt.QueuedConnection automatically based on thread
 affinity), avoiding a direct cross-thread .setChecked() call.
+
+Supervision + kill switch (47 CFR 97.115/97.213 compliance): guests
+(third parties per Part 97) may only transmit while a control operator
+is concurrently connected -- register_session()/unregister_session()
+track that per radio, can_transmit() is the single gate app.py/
+routes_tools.py/routes_audio.py all call before honoring a TX-capable
+command. kill_tx() locks out ALL transmission (including the operator's
+own) until clear_tx_lock() -- the desktop's own "Kill All Remote TX"
+button (ham_dashboard.py) calls kill_tx() directly too, so it works even
+if the web link itself is the thing misbehaving.
+
+Automatic station ID (97.119: at least every 10 minutes): fires on PTT
+RELEASE, not mid-transmission -- auto-keying CW over a live voice/audio
+TX stream isn't attempted here (see request_ptt's own comment for the
+mid-transmission-overdue case this can't cover).
 """
 
-from PySide6.QtCore import QObject, Signal
+import time
+
+from PySide6.QtCore import QObject, QSettings, QTimer, Signal
+
+
+# Comfortably under the 10-minute (600s) limit in 47 CFR 97.119.
+AUTO_ID_INTERVAL_SECONDS = 570
+# How overdue (past the full 600s) a still-ongoing transmission has to
+# be before the 30s watchdog logs a warning -- see _check_id_overdue.
+ID_OVERDUE_WARNING_SECONDS = 600
+
+
+def operator_callsign():
+    """Same QSettings read AprsRemoteState.request_send_position already
+    does for its own source callsign -- the station's assigned call
+    sign is what 97.119 requires on air, not any individual operator's
+    identity, so one shared setting is correct even with multiple
+    roles/sessions able to key this radio."""
+    settings = QSettings("IcomRadioApp", "RadioControl")
+    return (settings.value("operator_callsign", "") or "N0CALL").strip().upper()
 
 
 class RadioRemoteState(QObject):
     _set_ptt_widget = Signal(bool)
 
-    def __init__(self, window, parent=None):
+    def __init__(self, window, audit=None, parent=None):
         super().__init__(parent)
         self.window = window
+        self.audit = audit
+        self._operator_sessions = 0
+        self._last_id_monotonic = None
+        self._id_overdue_logged = False
         self.state = {
             "freq_hz": window._current_freq_hz,
             "mode": None,
@@ -45,13 +83,24 @@ class RadioRemoteState(QObject):
             "meters": {},
             "meter_defs": {},
             "scope": None,
+            "active_receiver": None,
+            "levels": {},
+            "operator_present": False,
+            "tx_locked": False,
         }
         window.worker.frequency_updated.connect(self._on_freq)
         window.worker.control_updated.connect(self._on_control)
         window.worker.meter_updated.connect(self._on_meter)
         window.worker.meters_ready.connect(self._on_meter_defs)
         window.worker.scope_frame_received.connect(self._on_scope_frame)
+        window.worker.active_receiver_changed.connect(self._on_active_receiver)
+        window.worker.level_updated.connect(self._on_level)
         self._set_ptt_widget.connect(window.ptt_button.setChecked)
+
+        self._id_watchdog = QTimer(self)
+        self._id_watchdog.setInterval(30_000)
+        self._id_watchdog.timeout.connect(self._check_id_overdue)
+        self._id_watchdog.start()
 
     def _on_freq(self, hz):
         self.state["freq_hz"] = hz
@@ -71,6 +120,15 @@ class RadioRemoteState(QObject):
             for key, defn in definitions.items()
         }
 
+    def _on_active_receiver(self, receiver):
+        self.state["active_receiver"] = receiver
+
+    def _on_level(self, key, value):
+        # value is 0.0-1.0, same scale main_window.py's sliders use
+        # (RadioWorker.level_updated -- see its own docstring/signal
+        # comment for the raw-value normalization it already does).
+        self.state["levels"][key] = value
+
     def _on_scope_frame(self, frame):
         import base64
         self.state["scope"] = {
@@ -86,13 +144,123 @@ class RadioRemoteState(QObject):
     def request_control(self, key: str, value):
         self.window.worker.set_control_value(key, value)
 
+    def register_session(self, role):
+        """Called from app.py when a /ws/radio/{id} connection opens.
+        Only 'operator' role sessions count toward supervision -- a
+        guest or viewer merely being connected doesn't satisfy 97.115's
+        direct-supervision requirement."""
+        from web_remote.common import ROLE_OPERATOR
+
+        if role == ROLE_OPERATOR:
+            self._operator_sessions += 1
+            self.state["operator_present"] = self._operator_sessions > 0
+
+    def unregister_session(self, role):
+        from web_remote.common import ROLE_OPERATOR
+
+        if role == ROLE_OPERATOR:
+            self._operator_sessions = max(0, self._operator_sessions - 1)
+            self.state["operator_present"] = self._operator_sessions > 0
+
+    def can_transmit(self, role):
+        """The single gate every TX-capable command (ptt-on, CW
+        send_text, APRS send_position, TX audio frames) is checked
+        against. viewer: never. guest: only while an operator session
+        is connected AND not locked -- direct supervision, 97.115.
+        operator: always, unless the kill switch has locked TX for
+        everyone (including the operator) until explicitly cleared."""
+        from web_remote.common import ROLE_GUEST, ROLE_OPERATOR
+
+        if self.state.get("tx_locked"):
+            return False
+        if role == ROLE_OPERATOR:
+            return True
+        if role == ROLE_GUEST:
+            return bool(self.state.get("operator_present"))
+        return False
+
+    def kill_tx(self):
+        """Link-independent in intent, not just in this method: the
+        desktop's own toolbar button (ham_dashboard.py) calls this
+        directly, so it works even if the Cloudflare Tunnel or a
+        guest's own network link is what's misbehaving -- this doesn't
+        depend on any websocket being open at all."""
+        self.state["tx_locked"] = True
+        self.request_ptt(False)
+
+    def clear_tx_lock(self):
+        self.state["tx_locked"] = False
+
     def request_ptt(self, on: bool):
         self.state["ptt"] = bool(on)
         if on:
             self.window.worker.start_ptt()
+            if self._last_id_monotonic is None:
+                self._last_id_monotonic = time.monotonic()
         else:
             self.window.worker.stop_ptt()
+            self._maybe_auto_id()
         self._set_ptt_widget.emit(bool(on))
+
+    def _maybe_auto_id(self):
+        """Fires an automatic CW station ID on PTT release once
+        AUTO_ID_INTERVAL_SECONDS has elapsed since the last one (97.119:
+        at least every 10 minutes, AUTO_ID_INTERVAL_SECONDS leaves a
+        margin under that). Uses send_cw_text() directly -- the radio's
+        own built-in keyer, independent of PTT/audio bridge state (see
+        RadioWorker.send_cw_text's own docstring) -- rather than
+        anything tied to whatever mode/audio session the transmission
+        that just ended was using."""
+        now = time.monotonic()
+        if self._last_id_monotonic is not None and now - self._last_id_monotonic < AUTO_ID_INTERVAL_SECONDS:
+            return
+        self.window.worker.send_cw_text(operator_callsign())
+        self._last_id_monotonic = now
+        self._id_overdue_logged = False
+        if self.audit is not None:
+            self.audit.log(getattr(self.window, "remote_id", None), "system", "auto_id", True)
+
+    def _check_id_overdue(self):
+        """30s watchdog: a single continuous PTT hold longer than the
+        10-minute limit doesn't get a mid-transmission auto-ID from this
+        implementation (auto-keying CW over a live voice/audio TX
+        stream is a separate, riskier feature) -- this just makes that
+        case visible in the audit log/UI (once, not on every 30s tick)
+        so the operator notices and IDs manually, rather than silently
+        exceeding 97.119."""
+        if not self.state.get("ptt") or self._last_id_monotonic is None or self._id_overdue_logged:
+            return
+        overdue = time.monotonic() - self._last_id_monotonic
+        if overdue >= ID_OVERDUE_WARNING_SECONDS and self.audit is not None:
+            self._id_overdue_logged = True
+            self.audit.log(
+                getattr(self.window, "remote_id", None), "system", "id_overdue", False,
+                detail=f"{overdue:.0f}s into a continuous transmission with no ID",
+            )
+
+    def request_level(self, key: str, value: float):
+        self.window.worker.set_level_value(key, float(value))
+
+    def request_select_band(self, band_label: str, low_edge_hz: int, receiver=None):
+        self.window.worker.select_band(band_label, int(low_edge_hz), receiver)
+
+    def request_start_tx_audio_stream(self):
+        self.window.worker.start_tx_audio_stream()
+
+    def request_push_tx_audio(self, pcm_bytes: bytes):
+        self.window.worker.push_tx_audio_pcm(pcm_bytes)
+
+    def request_stop_tx_audio_stream(self):
+        self.window.worker.stop_tx_audio_stream()
+
+    def request_active_receiver(self, receiver: int):
+        """Dual-receiver only: mirrors main_window.py's
+        _on_active_receiver_toggle_clicked -- makes `receiver` active
+        AND moves the scope/waterfall to match, the same paired call
+        the desktop button makes (set_scope_receiver doesn't follow
+        select_receiver on its own, confirmed live on a real 9700)."""
+        self.window.worker.select_receiver(receiver)
+        self.window.worker.set_scope_receiver(receiver)
 
 
 class CwRemoteState(QObject):
@@ -225,7 +393,20 @@ class AprsRemoteState(QObject):
     _MAX_BUFFERED_PACKETS = 200
 
     def _on_packet(self, packet):
-        self.state["packets"] = (self.state["packets"] + [packet])[-self._MAX_BUFFERED_PACKETS:]
+        # info_raw is the raw UNDECODED bytes of the info field
+        # (aprs.py's AprsDecoder.feed) -- kept on the packet dict for
+        # the desktop table's own right-click "view raw" feature, but
+        # bytes aren't JSON-serializable and would crash routes_
+        # tools.py's ws_aprs polling loop (websocket.send_json) the
+        # moment any packet ever arrived -- confirmed as the actual
+        # cause of a real "opens then immediately disconnects/
+        # retries" report. Build a new dict rather than mutating
+        # `packet` in place -- it's the SAME dict object aprs_
+        # window.py's table stores via QTableWidgetItem.setData(Qt.
+        # UserRole, packet) for that raw-bytes feature, which would
+        # otherwise silently break too.
+        safe_packet = {k: v for k, v in packet.items() if k != "info_raw"}
+        self.state["packets"] = (self.state["packets"] + [safe_packet])[-self._MAX_BUFFERED_PACKETS:]
 
     def _on_decoding_toggled(self, checked):
         self.state["decoding"] = checked

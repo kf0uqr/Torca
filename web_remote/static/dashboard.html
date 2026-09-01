@@ -17,7 +17,18 @@
     <input id="token-input" type="text" placeholder="Access token" autocomplete="off">
     <button id="token-submit">Connect</button>
 </div>
-<main>
+<div id="role-banner" class="token-banner" style="display:none;">
+    <span>Read-only viewer session -- satellite tracking and map-layer controls are disabled.</span>
+</div>
+<div id="split-view" class="split-container">
+<div id="tool-pane" class="split-pane pane-left">
+    <div class="split-pane-bar">
+        <span id="tool-pane-title">Tool</span>
+        <button id="tool-pane-close" class="split-pane-close">&times; Close</button>
+    </div>
+    <iframe id="tool-frame" class="split-pane-frame" src="about:blank" title="Tool"></iframe>
+</div>
+<main id="dashboard-pane">
     <div class="panel" style="grid-column: 1 / -1;">
         <h2>Map</h2>
         <div class="controls-row" style="justify-content: flex-start;">
@@ -74,6 +85,14 @@
         </table>
     </div>
 </main>
+<div id="radio-pane" class="split-pane pane-right">
+    <div class="split-pane-bar">
+        <span id="radio-pane-title">Radio</span>
+        <button id="radio-pane-close" class="split-pane-close">&times; Close</button>
+    </div>
+    <iframe id="radio-frame" class="split-pane-frame" src="about:blank" title="Radio control"></iframe>
+</div>
+</div>
 <script src="/static/vendor/leaflet/leaflet.js"></script>
 <script src="/static/dashboard.js"></script>
 </body>

@@ -6,6 +6,14 @@
 const RADIO_ID = parseInt(location.pathname.split("/")[2], 10);
 document.getElementById("back-link").href = `/radio/${RADIO_ID}`;
 
+// Hidden when opened in a tool pane (radio.js/dashboard.js's
+// openTool/openToolPane) -- that pane already has its own Close
+// button, and navigating this link would load a redundant radio page
+// inside the tool's own iframe instead of just closing the pane.
+if (window.self !== window.top) {
+    document.getElementById("back-link").style.display = "none";
+}
+
 function storedToken() {
     return localStorage.getItem("torca_token") || "";
 }
@@ -58,7 +66,35 @@ function summarizeInfo(info) {
     return info.type || "?";
 }
 
+function renderRoleBanner(state) {
+    const banner = document.getElementById("role-banner");
+    const text = document.getElementById("role-banner-text");
+    let txAllowed = true;
+    if (state.role === "viewer") {
+        banner.style.display = "flex";
+        banner.classList.remove("role-banner-ok");
+        text.textContent = "Read-only viewer session -- cannot send a position report.";
+        txAllowed = false;
+    } else if (state.role === "guest") {
+        const supervised = !!state.operator_present;
+        const locked = !!state.tx_locked;
+        banner.style.display = "flex";
+        banner.classList.toggle("role-banner-ok", supervised && !locked);
+        text.textContent = locked ? "TX locked by the control operator -- send disabled."
+            : supervised ? "Supervised by a connected control operator -- OK to send."
+            : "No control operator connected -- send disabled (47 CFR 97.115).";
+        txAllowed = supervised && !locked;
+    } else {
+        banner.style.display = state.tx_locked ? "flex" : "none";
+        text.textContent = state.tx_locked ? "TX locked -- clear the lock from the radio page to resume." : "";
+        txAllowed = !state.tx_locked;
+    }
+    document.getElementById("send-button").disabled = !txAllowed;
+    document.getElementById("comment-input").disabled = !txAllowed;
+}
+
 function render(state) {
+    renderRoleBanner(state);
     const decodeButton = document.getElementById("decode-toggle");
     decodeButton.textContent = state.decoding ? "Stop Decoding" : "Start Decoding";
     decodeButton.classList.toggle("active", state.decoding);

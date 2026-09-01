@@ -7,6 +7,15 @@
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+<div id="radio-split" class="split-container">
+<div id="tool-pane" class="split-pane pane-left">
+    <div class="split-pane-bar">
+        <span id="tool-pane-title">Tool</span>
+        <button id="tool-pane-close" class="split-pane-close">&times; Close</button>
+    </div>
+    <iframe id="tool-frame" class="split-pane-frame" src="about:blank" title="Tool"></iframe>
+</div>
+<div id="radio-content">
 <header>
     <a href="/">&larr; Dashboard</a>
     <h1 id="radio-label">Radio</h1>
@@ -19,10 +28,15 @@
     <input id="token-input" type="text" placeholder="Access token" autocomplete="off">
     <button id="token-submit">Connect</button>
 </div>
+<div id="role-banner" class="token-banner" style="display:none;">
+    <span id="role-banner-text"></span>
+    <button id="kill-tx-button" style="display:none;">Kill TX</button>
+    <button id="clear-lock-button" style="display:none;">Clear Lock</button>
+</div>
 <main>
     <div class="radio-top-row" style="grid-column: 1 / -1;">
         <div class="panel radio-controls-panel">
-            <div class="freq-display" id="freq-display">-- MHz</div>
+            <div class="freq-display" id="freq-display"><span class="freq-empty">-- Hz</span></div>
             <div class="controls-row">
                 <input id="freq-input" type="text" placeholder="e.g. 14.074000" style="width:160px;">
                 <button id="tune-button">Tune</button>
@@ -35,11 +49,34 @@
                     <option value="RTTY">RTTY</option>
                     <option value="DATA">DATA</option>
                 </select>
+                <button id="data-mode-button">Digital Mode</button>
+                <select id="band-select"><option value="">Band...</option></select>
+                <button id="vfo-button">VFO A</button>
+                <button id="active-receiver-button" style="display:none;" title="Dual-receiver only: makes Main or Sub the radio's active receiver and switches the scope/waterfall to match. PTT always transmits from Main regardless.">Active: MAIN</button>
                 <button id="ptt-button">PTT</button>
+                <span id="command-error" class="empty"></span>
             </div>
             <div class="controls-row">
                 <button id="audio-toggle">Enable Audio</button>
                 <span id="audio-status" class="empty"></span>
+            </div>
+            <div class="controls-row">
+                <button id="mic-toggle">Enable Mic</button>
+                <span id="mic-status" class="empty">TX audio streams to the radio only while PTT is held.</span>
+            </div>
+            <div class="levels" id="levels">
+                <div class="level-row">
+                    <div class="level-row-label"><span>Squelch</span><span id="squelch-value">0%</span></div>
+                    <input id="squelch-slider" type="range" min="0" max="100" value="0">
+                </div>
+                <div class="level-row">
+                    <div class="level-row-label"><span>TX Level</span><span id="tx_level-value">0%</span></div>
+                    <input id="tx_level-slider" type="range" min="0" max="100" value="0">
+                </div>
+                <div class="level-row">
+                    <div class="level-row-label"><span>RF Level</span><span id="rf_level-value">0%</span></div>
+                    <input id="rf_level-slider" type="range" min="0" max="100" value="0">
+                </div>
             </div>
         </div>
 
@@ -55,6 +92,8 @@
         <canvas id="waterfall-canvas" width="900" height="180" style="margin-top:6px;"></canvas>
     </div>
 </main>
+</div>
+</div>
 <script src="/static/vendor/opus-decoder/opus-decoder.min.js" charset="UTF-8"></script>
 <script src="/static/radio.js"></script>
 </body>

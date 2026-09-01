@@ -31,19 +31,23 @@ class RemoteWebServer(QThread):
     stopped = Signal()
     error = Signal(str)
 
-    def __init__(self, dashboard, host="127.0.0.1", port=8765, token=None, parent=None):
+    def __init__(self, dashboard, host="127.0.0.1", port=8765, operator_token=None,
+                 guest_token=None, viewer_token=None, audit=None, parent=None):
         super().__init__(parent)
         self.dashboard = dashboard
         self.host = host
         self.port = port
-        self.token = token
+        self.operator_token = operator_token
+        self.guest_token = guest_token
+        self.viewer_token = viewer_token
+        self.audit = audit
         self.loop = None
         self._uvicorn_server = None
 
     def run(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        app = create_app(self.dashboard, self.token)
+        app = create_app(self.dashboard, self.operator_token, self.guest_token, self.viewer_token, audit=self.audit)
         config = uvicorn.Config(app, host=self.host, port=self.port, loop="none", log_level="warning")
         self._uvicorn_server = uvicorn.Server(config)
         try:

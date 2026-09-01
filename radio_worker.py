@@ -307,6 +307,7 @@ class RadioWorker(QThread):
         self._stop_requested = False
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
         self._tx_audio_future = None  # concurrent.futures.Future for the in-flight send_tx_audio_pcm coroutine, if any -- see stop_tx_audio_send
+        self._tx_stream_push_name = None  # resolved push_audio_tx_pcm/push_tx name while a start_tx_audio_stream()/stop_tx_audio_stream() session is open -- see those methods
         # Which receiver's audio the RX virtual cable carries ("mix"/
         # "main"/"sub", see audio._downmix_stereo_to_mono) -- a user
         # preference for feeding an external decoder (e.g. WSJT-X on a
@@ -739,6 +740,78 @@ class RadioWorker(QThread):
                     f"Send TX audio: radio.set_ptt(False) FAILED ({exc}) -- radio may still be keyed! "
                     "Check the radio directly."
                 )
+
+    def start_tx_audio_stream(self):
+        """Thread-safe: call from any thread. Opens a TX-audio push
+        session for a LIVE, ongoing stream of PCM chunks (Remote
+        Access's browser-mic TX audio, web_remote/routes_audio.py) --
+        the streaming counterpart to send_tx_audio_pcm() above, but
+        deliberately does NOT touch PTT itself: unlike a synthesized
+        one-shot send (APRS position packet, etc), a live mic stream's
+        PTT is keyed/unkeyed by the operator holding the browser's own
+        PTT button (request_ptt() -> start_ptt()/stop_ptt(), already
+        wired), which may span many push_tx_audio_pcm() calls. Calling
+        set_ptt() here too would double-key/unkey against whatever the
+        PTT button is already doing."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._start_tx_audio_stream(), self.loop)
+
+    async def _start_tx_audio_stream(self):
+        self._tx_stream_push_name = find_method_name(self.radio, ["push_audio_tx_pcm", "push_tx"])
+        if self._tx_stream_push_name is None:
+            self.error.emit("TX audio stream: this radio/connection has no TX audio push method available.")
+            return
+        start_name = find_method_name(self.radio, ["start_audio_tx_pcm", "start_tx"])
+        try:
+            if start_name:
+                await getattr(self.radio, start_name)()
+        except Exception as exc:
+            self.error.emit(f"TX audio stream: start failed ({exc}).")
+
+    def push_tx_audio_pcm(self, pcm_bytes: bytes):
+        """Thread-safe: call from any thread. Pushes one chunk of a
+        LIVE stream already opened by start_tx_audio_stream() --
+        pcm_bytes must be at AUDIO_TX_PCM_SAMPLE_RATE (48000 Hz, mono,
+        s16le), same hard requirement as send_tx_audio_pcm(). A no-op
+        if start_tx_audio_stream() hasn't resolved a push method yet
+        (not connected, or this radio has no TX audio support)."""
+        if self.loop is None or self.radio is None or self._tx_stream_push_name is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._push_tx_audio_stream_pcm(pcm_bytes), self.loop)
+
+    async def _push_tx_audio_stream_pcm(self, pcm_bytes: bytes):
+        push_name = self._tx_stream_push_name
+        if push_name is None:
+            return
+        padded = pcm_bytes
+        remainder = len(padded) % AUDIO_TX_PCM_FRAME_BYTES
+        if remainder:
+            padded += b"\x00" * (AUDIO_TX_PCM_FRAME_BYTES - remainder)
+        try:
+            for i in range(0, len(padded), AUDIO_TX_PCM_FRAME_BYTES):
+                await getattr(self.radio, push_name)(padded[i:i + AUDIO_TX_PCM_FRAME_BYTES])
+        except Exception as exc:
+            self.error.emit(f"TX audio stream: push failed ({exc}).")
+
+    def stop_tx_audio_stream(self):
+        """Thread-safe: call from any thread. Closes a session opened
+        by start_tx_audio_stream() -- does NOT touch PTT, see that
+        method's own docstring. Safe to call even if no session is
+        open (e.g. the browser's TX audio websocket never successfully
+        started one)."""
+        if self.loop is None or self.radio is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._stop_tx_audio_stream(), self.loop)
+
+    async def _stop_tx_audio_stream(self):
+        stop_name = find_method_name(self.radio, ["stop_audio_tx_pcm", "stop_tx"])
+        try:
+            if stop_name:
+                await getattr(self.radio, stop_name)()
+        except Exception as exc:
+            self.error.emit(f"TX audio stream: stop failed ({exc}).")
+        self._tx_stream_push_name = None
 
     def send_cw_text(self, text: str):
         """Thread-safe: call from the GUI thread. Sends `text` via the

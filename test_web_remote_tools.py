@@ -56,11 +56,25 @@ class FakeAprsRemoteState:
         self.calls.append(("send_position", comment))
 
 
+class FakeRadioRemoteState:
+    """Stand-in for bridge.py's RadioRemoteState -- routes_tools.py
+    checks window.remote_state.can_transmit(role) before honoring
+    send_text/send_position (the CW/APRS tools share the radio's own
+    supervision state, they don't have one of their own)."""
+    def __init__(self, can_transmit=True, operator_present=False, tx_locked=False):
+        self.state = {"operator_present": operator_present, "tx_locked": tx_locked}
+        self._can_transmit = can_transmit
+
+    def can_transmit(self, role):
+        return self._can_transmit
+
+
 class FakeWindow:
-    def __init__(self, remote_id):
+    def __init__(self, remote_id, can_transmit=True):
         self.remote_id = remote_id
         self.cw_remote_state = FakeCwRemoteState()
         self.aprs_remote_state = FakeAprsRemoteState()
+        self.remote_state = FakeRadioRemoteState(can_transmit=can_transmit)
 
 
 class FakeDashboard:
@@ -73,7 +87,7 @@ class FakeDashboard:
 
 def test_ws_cw_streams_snapshot_with_macros():
     window = FakeWindow(1)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/1/tool/cw") as ws:
         snapshot = ws.receive_json()
@@ -84,7 +98,7 @@ def test_ws_cw_streams_snapshot_with_macros():
 
 def test_ws_cw_dispatches_commands():
     window = FakeWindow(1)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/1/tool/cw") as ws:
         ws.receive_json()  # initial snapshot
@@ -110,7 +124,7 @@ def test_ws_cw_dispatches_commands():
 
 
 def test_ws_cw_closes_for_unknown_radio():
-    app = create_app(FakeDashboard(), token=None)
+    app = create_app(FakeDashboard(), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/999/tool/cw") as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -120,7 +134,7 @@ def test_ws_cw_closes_for_unknown_radio():
 
 def test_ws_cw_rejects_wrong_token():
     window = FakeWindow(1)
-    app = create_app(FakeDashboard(radios=[window]), token="secret")
+    app = create_app(FakeDashboard(radios=[window]), operator_token="secret")
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/1/tool/cw?token=wrong") as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -130,7 +144,7 @@ def test_ws_cw_rejects_wrong_token():
 
 def test_ws_aprs_streams_packets():
     window = FakeWindow(1)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/1/tool/aprs") as ws:
         snapshot = ws.receive_json()
@@ -140,7 +154,7 @@ def test_ws_aprs_streams_packets():
 
 def test_ws_aprs_dispatches_commands():
     window = FakeWindow(1)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/1/tool/aprs") as ws:
         ws.receive_json()
@@ -164,7 +178,7 @@ def test_ws_aprs_dispatches_commands():
 
 
 def test_ws_aprs_closes_for_unknown_radio():
-    app = create_app(FakeDashboard(), token=None)
+    app = create_app(FakeDashboard(), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/999/tool/aprs") as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -172,9 +186,37 @@ def test_ws_aprs_closes_for_unknown_radio():
         assert exc_info.value.code == 4404
 
 
+def test_ws_aprs_survives_non_json_serializable_state():
+    # Regression test for the route-layer defense: if something
+    # non-JSON-serializable ever slips into remote_state.state again
+    # (the real bug was bytes in a cached packet's info_raw field,
+    # bridge.py -- fixed at the source, but this covers the class of
+    # bug, not just that one instance), the connection should skip
+    # that tick and keep polling, not die and send the browser into
+    # an endless "disconnected -- retrying" loop.
+    window = FakeWindow(1)
+    window.aprs_remote_state.state["packets"] = [{"info_raw": b"not json safe"}]
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
+    client = TestClient(app)
+    with client.websocket_connect("/ws/radio/1/tool/aprs") as ws:
+        window.aprs_remote_state.state["packets"] = [{"source": "N0CALL"}]  # fix it mid-flight
+        deadline_snapshot = None
+        import time
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                snapshot = ws.receive_json()
+            except Exception:
+                continue
+            if snapshot["packets"] and snapshot["packets"][0].get("source") == "N0CALL":
+                deadline_snapshot = snapshot
+                break
+        assert deadline_snapshot is not None, "connection died instead of skipping the bad tick"
+
+
 def test_cw_and_aprs_tool_pages_serve_html():
     window = FakeWindow(1)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
     assert client.get("/radio/1/tool/cw").status_code == 200
     assert client.get("/radio/1/tool/aprs").status_code == 200

@@ -17,12 +17,31 @@
     <input id="token-input" type="text" placeholder="Access token" autocomplete="off">
     <button id="token-submit">Connect</button>
 </div>
+<div id="role-banner" class="token-banner" style="display:none;">
+    <span id="role-banner-text"></span>
+</div>
 <main>
     <div class="panel" style="grid-column: 1 / -1;">
         <div class="controls-row">
             <button id="decode-toggle">Start Decoding</button>
-            <label>WPM <input id="wpm-input" type="number" min="5" max="60" value="20" style="width:60px;"></label>
-            <label>Pitch (Hz) <input id="pitch-input" type="number" min="300" max="900" step="5" value="600" style="width:70px;"></label>
+            <label>WPM
+                <span class="number-stepper">
+                    <input id="wpm-input" type="number" min="5" max="60" value="20">
+                    <span class="stepper-arrows">
+                        <button type="button" class="stepper-btn stepper-up" data-target="wpm-input" aria-label="Increase WPM">&#9650;</button>
+                        <button type="button" class="stepper-btn stepper-down" data-target="wpm-input" aria-label="Decrease WPM">&#9660;</button>
+                    </span>
+                </span>
+            </label>
+            <label>Pitch (Hz)
+                <span class="number-stepper">
+                    <input id="pitch-input" type="number" min="300" max="900" step="5" value="600">
+                    <span class="stepper-arrows">
+                        <button type="button" class="stepper-btn stepper-up" data-target="pitch-input" aria-label="Increase pitch">&#9650;</button>
+                        <button type="button" class="stepper-btn stepper-down" data-target="pitch-input" aria-label="Decrease pitch">&#9660;</button>
+                    </span>
+                </span>
+            </label>
         </div>
     </div>
 

@@ -56,12 +56,84 @@ header a {
     font-size: 13px;
 }
 .token-banner span { flex: 1; }
+.token-banner.role-banner-ok { background: #204a2c; }
 
 main {
     padding: 16px;
     display: grid;
     gap: 16px;
     grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+/* ---- Split views ----
+   Shared by two nested levels of the same pattern: dashboard.html
+   opens a radio's control page in a pane alongside the dashboard
+   (clicking a radio in "Connected Radios"), and radio.html itself
+   opens a CW/APRS tool page in a pane alongside ITS OWN content
+   (clicking "CW Tool"/"APRS Tool") -- an iframe in both cases, same
+   origin, so it shares localStorage's saved token automatically, no
+   URL-based auth needed, rather than navigating away and losing
+   whatever's already showing. Every split-view container follows the
+   same structure: a fixed-content "main" side (#dashboard-pane /
+   #radio-content) plus one or more togglable `.split-pane` siblings
+   that are hidden until opened. Stacks vertically on narrow/mobile
+   viewports instead of side-by-side, same "desktop fits without
+   scrolling, mobile scrolls" precedent as the radio page's own
+   layout.
+
+   The tool pane specifically opens on the LEFT (it's placed first in
+   the DOM, so it's leftmost in flex order with no extra CSS needed)
+   rather than the right like the radio pane -- when radio.html is
+   itself embedded in the dashboard's own radio pane, opening a tool
+   there instead posts a message up to the parent dashboard (see
+   radio.js/dashboard.js) asking IT to open the tool pane over its own
+   #dashboard-pane, "covering" the dashboard while keeping the radio
+   pane it's already showing untouched on the right -- so the two
+   things actually being worked with (tool + radio) end up side by
+   side either way, whichever page happens to be hosting the split. */
+.split-container {
+    display: flex;
+    align-items: stretch;
+    min-height: 100vh;
+}
+.split-pane {
+    display: none;
+    flex-direction: column;
+    flex: 1 1 50%;
+    min-width: 0;
+}
+.split-pane.open { display: flex; }
+.split-pane.pane-right { border-left: 1px solid var(--border); }
+.split-pane.pane-left { border-right: 1px solid var(--border); }
+.split-pane-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    background: var(--alt-bg);
+    border-bottom: 1px solid var(--border);
+    font-weight: bold;
+}
+.split-pane-close {
+    background: transparent;
+    border: none;
+    color: var(--link);
+    font-size: 13px;
+    cursor: pointer;
+}
+.split-pane-frame {
+    flex: 1;
+    width: 100%;
+    border: none;
+}
+#dashboard-pane, #radio-content {
+    flex: 1 1 50%;
+    min-width: 0;
+}
+@media (max-width: 900px) {
+    .split-container { flex-direction: column; min-height: 0; }
+    .split-pane.pane-right.open { border-left: none; border-top: 1px solid var(--border); min-height: 600px; }
+    .split-pane.pane-left.open { border-right: none; border-bottom: 1px solid var(--border); min-height: 600px; }
 }
 
 .panel {
@@ -118,6 +190,54 @@ button.active {
 
 .empty { color: var(--text-disabled); font-style: italic; }
 
+/* ---- Number stepper (up/down arrows next to a number input) ----
+   Custom buttons instead of relying on the browser's native spin
+   button: native styling is inconsistent across browsers and easy to
+   lose against a dark theme (some render as barely-visible light-grey
+   arrows). Deliberately sized and colored to stand out (solid accent
+   fill, not just the same dark button color as everything else) --
+   an earlier, more subtle version (8px glyphs, same background as
+   every other button) was functionally there but easy to miss
+   entirely at a glance. */
+.number-stepper {
+    display: inline-flex;
+    align-items: stretch;
+    vertical-align: middle;
+}
+.number-stepper input[type="number"] {
+    width: 70px;
+    border-right: none;
+    border-radius: 4px 0 0 4px;
+    -moz-appearance: textfield;
+    font-size: 16px;
+    text-align: center;
+}
+.number-stepper input[type="number"]::-webkit-inner-spin-button,
+.number-stepper input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+.stepper-arrows {
+    display: flex;
+    flex-direction: column;
+    width: 32px;
+}
+.stepper-btn {
+    flex: 1;
+    min-height: 19px;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1;
+    border: 1px solid var(--highlight);
+    border-left: none;
+    border-radius: 0;
+    background: var(--highlight);
+    color: white;
+}
+.stepper-btn:hover { background: var(--link); border-color: var(--link); }
+.stepper-btn.stepper-up { border-bottom: 1px solid rgba(0, 0, 0, 0.35); border-radius: 0 4px 0 0; }
+.stepper-btn.stepper-down { border-radius: 0 0 4px 0; }
+
 /* ---- Radio page ---- */
 /* Frequency/controls sit next to Meters (not stacked full-width) so a
    typical desktop browser window fits the whole page without
@@ -131,14 +251,59 @@ button.active {
 .radio-controls-panel { flex: 2 1 420px; }
 .radio-meters-panel { flex: 1 1 260px; }
 
+/* Per-digit frequency spinner: an up arrow above and a down arrow
+   below each digit, each nudging the frequency by that digit's own
+   place value (e.g. the arrows over the "4" in the kHz position move
+   1000 Hz at a time) -- same blue-accent stepper look as
+   .number-stepper (CW Tool's WPM/Pitch) for visual consistency. */
 .freq-display {
-    font-size: 40px;
-    font-weight: bold;
-    letter-spacing: 1px;
-    text-align: center;
-    padding: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 10px 6px;
     background: var(--base-bg);
     border-radius: 6px;
+}
+.freq-empty {
+    font-size: 32px;
+    font-weight: bold;
+    color: var(--text-disabled);
+}
+.freq-digit-col {
+    display: flex;
+    flex-direction: column;
+    width: 28px;
+}
+.freq-digit-arrow {
+    padding: 3px 0;
+    font-size: 12px;
+    line-height: 1;
+    border: 1px solid var(--highlight);
+    background: var(--highlight);
+    color: white;
+    border-radius: 0;
+}
+.freq-digit-arrow:hover { background: var(--link); border-color: var(--link); }
+.freq-digit-up { border-radius: 4px 4px 0 0; border-bottom: 1px solid rgba(0, 0, 0, 0.35); }
+.freq-digit-down { border-radius: 0 0 4px 4px; border-top: none; }
+.freq-digit {
+    font-size: 30px;
+    font-weight: bold;
+    font-family: "Courier New", monospace;
+    text-align: center;
+    padding: 2px 0;
+    border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    background: var(--window-bg);
+}
+.freq-digit-sep { width: 10px; }
+.freq-unit-label {
+    align-self: center;
+    margin-left: 8px;
+    font-size: 16px;
+    color: var(--text-disabled);
 }
 
 .controls-row {
@@ -161,6 +326,22 @@ button.active {
 .meter .label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-disabled); }
 .meter .bar-bg { background: var(--base-bg); border: 1px solid var(--border); border-radius: 3px; height: 14px; overflow: hidden; }
 .meter .bar-fill { background: var(--highlight); height: 100%; width: 0%; }
+
+/* ---- Level sliders (Squelch/TX Level/RF Level) ----
+   Static <input type="range"> elements, built once in radio.html --
+   NOT rebuilt on every poll tick (see radio.js's freq-digit-spinner
+   comment for why that pattern breaks real user interaction: a
+   mid-drag rebuild would drop the drag same as a mid-click DOM swap
+   would drop a click). render() only ever touches .value/textContent
+   on these, and only while the user isn't actively dragging. */
+.levels { margin-top: 14px; }
+.level-row { margin-bottom: 10px; }
+.level-row-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-disabled); margin-bottom: 2px; }
+.level-row input[type="range"] {
+    width: 100%;
+    padding: 0;
+    accent-color: var(--highlight);
+}
 
 #scope-canvas, #waterfall-canvas {
     width: 100%;

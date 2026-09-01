@@ -1,10 +1,10 @@
 """
 Tests for web_remote/routes_satellite.py -- satellite picker + start/
-stop/transponder/offset control. Patches satellite_tracking.
-load_satellite_data (a real file read) with fixed test data, and uses
-a fake SatelliteRemoteState double (not a real one -- that needs a
-real SatelliteSession/QTimer) to verify the route layer calls the
-right request_* method with the right arguments.
+stop/transponder/offset control. Reads from dashboard.satellites (the
+desktop's own in-memory catalog, not a separate disk read) with fixed
+test data, and uses a fake SatelliteRemoteState double (not a real one
+-- that needs a real SatelliteSession/QTimer) to verify the route layer
+calls the right request_* method with the right arguments.
 """
 
 import os
@@ -21,6 +21,7 @@ FAKE_SATELLITES = [
         "name": "AO-91",
         "line1": "1 43017U ...",
         "line2": "2 43017 ...",
+        "selected": True,
         "transponders": [
             {"description": "FM Voice", "uplink_mhz": 435.25, "downlink_mhz": 145.96, "mode": "FM"},
         ],
@@ -29,6 +30,14 @@ FAKE_SATELLITES = [
         "name": "SO-50",
         "line1": "1 27607U ...",
         "line2": "2 27607 ...",
+        "selected": True,
+        "transponders": [],
+    },
+    {
+        "name": "ISS",
+        "line1": "1 25544U ...",
+        "line2": "2 25544 ...",
+        "selected": False,  # not checked "visible" in SatelliteConfigDialog
         "transponders": [],
     },
 ]
@@ -53,33 +62,35 @@ class FakeSatelliteRemoteState:
 
 
 class FakeDashboard:
-    def __init__(self):
+    def __init__(self, satellites=None):
         self._connected_radios = []
         self._upcoming_passes = []
         self._pota_spots_cache = []
         self._pskreporter_spots_cache = []
+        self.satellites = satellites if satellites is not None else FAKE_SATELLITES
         self.satellite_remote_state = FakeSatelliteRemoteState()
 
 
-def make_client(token=None):
-    dashboard = FakeDashboard()
-    app = create_app(dashboard, token=token)
+def make_client(token=None, satellites=None):
+    dashboard = FakeDashboard(satellites)
+    app = create_app(dashboard, operator_token=token)
     return TestClient(app), dashboard
 
 
-@patch("web_remote.routes_satellite.satellite_tracking.load_satellite_data", return_value=FAKE_SATELLITES)
-def test_list_satellites(mock_load):
+def test_list_satellites_only_returns_selected():
+    # ISS is "selected": False (not checked "visible" in the desktop's
+    # SatelliteConfigDialog) -- the web picker should never offer it.
     client, _ = make_client()
     response = client.get("/api/satellites")
     assert response.status_code == 200
     body = response.json()
-    assert body[0]["name"] == "AO-91"
+    names = [sat["name"] for sat in body]
+    assert names == ["AO-91", "SO-50"]
     assert body[0]["transponders"][0]["mode"] == "FM"
     assert "line1" not in body[0]  # raw TLE not exposed to the browser
 
 
-@patch("web_remote.routes_satellite.satellite_tracking.load_satellite_data", return_value=FAKE_SATELLITES)
-def test_start_satellite_by_name(mock_load):
+def test_start_satellite_by_name():
     client, dashboard = make_client()
     response = client.post("/api/satellite/start", json={"name": "AO-91"})
     assert response.status_code == 200
@@ -88,8 +99,7 @@ def test_start_satellite_by_name(mock_load):
     assert calls[0][1]["name"] == "AO-91"
 
 
-@patch("web_remote.routes_satellite.satellite_tracking.load_satellite_data", return_value=FAKE_SATELLITES)
-def test_start_unknown_satellite_404s(mock_load):
+def test_start_unknown_satellite_404s():
     client, _ = make_client()
     response = client.post("/api/satellite/start", json={"name": "NOT-A-SAT"})
     assert response.status_code == 404
@@ -97,8 +107,7 @@ def test_start_unknown_satellite_404s(mock_load):
 
 @patch("web_remote.routes_satellite.satellite_tracking.ground_track_points",
        return_value=[(1.0, 2.0), (3.0, 4.0)])
-@patch("web_remote.routes_satellite.satellite_tracking.load_satellite_data", return_value=FAKE_SATELLITES)
-def test_ground_track(mock_load, mock_track):
+def test_ground_track(mock_track):
     client, _ = make_client()
     response = client.get("/api/satellites/AO-91/ground_track")
     assert response.status_code == 200
@@ -107,8 +116,7 @@ def test_ground_track(mock_load, mock_track):
     assert body["current"] == {"lat": 1.0, "lon": 2.0}
 
 
-@patch("web_remote.routes_satellite.satellite_tracking.load_satellite_data", return_value=FAKE_SATELLITES)
-def test_ground_track_unknown_satellite_404s(mock_load):
+def test_ground_track_unknown_satellite_404s():
     client, _ = make_client()
     response = client.get("/api/satellites/NOT-A-SAT/ground_track")
     assert response.status_code == 404
@@ -121,8 +129,7 @@ def test_stop_satellite():
     assert dashboard.satellite_remote_state.calls == [("stop",)]
 
 
-@patch("web_remote.routes_satellite.satellite_tracking.load_satellite_data", return_value=FAKE_SATELLITES)
-def test_set_transponder_by_index(mock_load):
+def test_set_transponder_by_index():
     client, dashboard = make_client()
     dashboard.satellite_remote_state.state["satellite_name"] = "AO-91"
     response = client.post("/api/satellite/transponder", json={"index": 0})

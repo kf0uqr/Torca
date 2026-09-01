@@ -50,7 +50,7 @@ class FakeDashboard:
 
 def make_client(token=None):
     dashboard = FakeDashboard()
-    app = create_app(dashboard, token=token)
+    app = create_app(dashboard, operator_token=token)
     return TestClient(app), dashboard
 
 

@@ -66,7 +66,7 @@ def wait_for(predicate, timeout=2.0):
 def test_audio_streams_real_opus_frames():
     bridge = FakeAudioBridge(sample_rate=8000)
     window = FakeWindow(1, bridge)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
 
     with client.websocket_connect("/ws/radio/1/audio") as ws:
@@ -86,7 +86,7 @@ def test_audio_reframes_odd_sized_chunks():
     produce a valid Opus frame, not a crash."""
     bridge = FakeAudioBridge(sample_rate=8000)
     window = FakeWindow(1, bridge)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
 
     with client.websocket_connect("/ws/radio/1/audio") as ws:
@@ -100,7 +100,7 @@ def test_audio_reframes_odd_sized_chunks():
 def test_audio_closes_when_no_rx_stream():
     bridge = FakeAudioBridge(has_rx=False)
     window = FakeWindow(1, bridge)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/1/audio") as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -109,7 +109,7 @@ def test_audio_closes_when_no_rx_stream():
 
 
 def test_audio_closes_for_unknown_radio():
-    app = create_app(FakeDashboard(), token=None)
+    app = create_app(FakeDashboard(), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/999/audio") as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -120,7 +120,7 @@ def test_audio_closes_for_unknown_radio():
 def test_audio_rejects_wrong_token():
     bridge = FakeAudioBridge()
     window = FakeWindow(1, bridge)
-    app = create_app(FakeDashboard(radios=[window]), token="secret")
+    app = create_app(FakeDashboard(radios=[window]), operator_token="secret")
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/1/audio?token=wrong") as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -131,9 +131,96 @@ def test_audio_rejects_wrong_token():
 def test_audio_closes_for_unsupported_sample_rate():
     bridge = FakeAudioBridge(sample_rate=44100)  # not one of Opus's valid rates
     window = FakeWindow(1, bridge)
-    app = create_app(FakeDashboard(radios=[window]), token=None)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
     client = TestClient(app)
     with client.websocket_connect("/ws/radio/1/audio") as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
             ws.receive_bytes()
         assert exc_info.value.code == 4406
+
+
+# ---- TX audio (browser mic -> radio) ----
+
+class FakeTxWorker:
+    def __init__(self, connected=True):
+        self.loop = object() if connected else None
+        self.radio = object() if connected else None
+
+
+class FakeRadioRemoteState:
+    def __init__(self, ptt=False, can_transmit=True):
+        self.state = {"ptt": ptt}
+        self.calls = []
+        self._can_transmit = can_transmit
+
+    def can_transmit(self, role):
+        return self._can_transmit
+
+    def request_start_tx_audio_stream(self):
+        self.calls.append(("start",))
+
+    def request_push_tx_audio(self, pcm_bytes):
+        self.calls.append(("push", pcm_bytes))
+
+    def request_stop_tx_audio_stream(self):
+        self.calls.append(("stop",))
+
+
+class FakeTxWindow:
+    def __init__(self, remote_id, connected=True, ptt=False):
+        self.remote_id = remote_id
+        self.worker = FakeTxWorker(connected)
+        self.remote_state = FakeRadioRemoteState(ptt)
+
+
+def test_tx_audio_pushes_pcm_while_ptt_active():
+    window = FakeTxWindow(1, ptt=True)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
+    client = TestClient(app)
+    with client.websocket_connect("/ws/radio/1/tx_audio") as ws:
+        ws.send_bytes(b"\x00\x01" * 100)
+        assert wait_for(lambda: ("push", b"\x00\x01" * 100) in window.remote_state.calls)
+
+    assert window.remote_state.calls[0] == ("start",)
+    assert window.remote_state.calls[-1] == ("stop",)
+
+
+def test_tx_audio_drops_frames_while_ptt_inactive():
+    window = FakeTxWindow(1, ptt=False)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
+    client = TestClient(app)
+    with client.websocket_connect("/ws/radio/1/tx_audio") as ws:
+        ws.send_bytes(b"\x00\x01" * 100)
+        assert wait_for(lambda: len(window.remote_state.calls) >= 1)
+        time.sleep(0.1)  # give a dropped frame a chance to (wrongly) show up
+
+    assert ("push", b"\x00\x01" * 100) not in window.remote_state.calls
+
+
+def test_tx_audio_closes_when_not_connected():
+    window = FakeTxWindow(1, connected=False)
+    app = create_app(FakeDashboard(radios=[window]), operator_token=None)
+    client = TestClient(app)
+    with client.websocket_connect("/ws/radio/1/tx_audio") as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+        assert exc_info.value.code == 4405
+
+
+def test_tx_audio_closes_for_unknown_radio():
+    app = create_app(FakeDashboard(), operator_token=None)
+    client = TestClient(app)
+    with client.websocket_connect("/ws/radio/999/tx_audio") as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+        assert exc_info.value.code == 4404
+
+
+def test_tx_audio_rejects_wrong_token():
+    window = FakeTxWindow(1)
+    app = create_app(FakeDashboard(radios=[window]), operator_token="secret")
+    client = TestClient(app)
+    with client.websocket_connect("/ws/radio/1/tx_audio?token=wrong") as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+        assert exc_info.value.code == 4401

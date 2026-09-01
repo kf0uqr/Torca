@@ -18,27 +18,40 @@ import datetime
 from fastapi import APIRouter, Request, HTTPException
 
 import satellite_tracking
-from web_remote.common import make_token_check
+from web_remote.common import ROLE_VIEWER
 
 
-def create_satellite_router(dashboard, token=None):
+def create_satellite_router(dashboard, role_for):
     router = APIRouter()
-    token_ok = make_token_check(token)
 
-    def check_auth(request: Request):
+    def check_auth(request: Request, allow_viewer=True):
         header = request.headers.get("authorization", "")
         candidate = header[7:] if header.lower().startswith("bearer ") else None
-        if not token_ok(candidate):
+        role = role_for(candidate)
+        if role is None:
             raise HTTPException(status_code=401, detail="invalid or missing token")
+        if not allow_viewer and role == ROLE_VIEWER:
+            raise HTTPException(status_code=403, detail="read-only session -- viewer role cannot control the station")
+        return role
 
     def find_satellite(name):
-        satellites = satellite_tracking.load_satellite_data()
-        return next((sat for sat in satellites if sat.get("name") == name), None)
+        # dashboard.satellites (the desktop's own in-memory catalog,
+        # ham_dashboard.py) rather than a separate
+        # load_satellite_data() disk read -- avoids finding/starting a
+        # satellite that's stale relative to whatever the desktop UI
+        # (and SatelliteConfigDialog's unsaved edits) currently has.
+        return next((sat for sat in dashboard.satellites if sat.get("name") == name), None)
 
     @router.get("/api/satellites")
     async def list_satellites(request: Request):
         check_auth(request)
-        satellites = satellite_tracking.load_satellite_data()
+        # Only satellites checked "visible" in the desktop's
+        # SatelliteConfigDialog (satellite_tracking.py) -- same
+        # sat.get("selected") filter ham_dashboard.py already applies
+        # to the map overlay and upcoming-passes table, so the web
+        # picker only ever offers satellites the desktop itself is
+        # actually tracking/showing.
+        satellites = [sat for sat in dashboard.satellites if sat.get("selected")]
         return [
             {
                 "name": sat.get("name"),
@@ -57,7 +70,7 @@ def create_satellite_router(dashboard, token=None):
 
     @router.post("/api/satellite/start")
     async def start_satellite(request: Request):
-        check_auth(request)
+        check_auth(request, allow_viewer=False)
         body = await request.json()
         name = body.get("name")
         satellite = find_satellite(name)
@@ -68,7 +81,7 @@ def create_satellite_router(dashboard, token=None):
 
     @router.post("/api/satellite/stop")
     async def stop_satellite(request: Request):
-        check_auth(request)
+        check_auth(request, allow_viewer=False)
         dashboard.satellite_remote_state.request_stop()
         return {"ok": True}
 
@@ -84,7 +97,7 @@ def create_satellite_router(dashboard, token=None):
         # against the satellite's own transponder count so a bogus
         # index 400s instead of silently no-op'ing against an
         # out-of-range combo index.
-        check_auth(request)
+        check_auth(request, allow_viewer=False)
         body = await request.json()
         index = body.get("index")
         satellite_name = dashboard.satellite_remote_state.state.get("satellite_name")
@@ -118,7 +131,7 @@ def create_satellite_router(dashboard, token=None):
 
     @router.post("/api/satellite/offset")
     async def adjust_offset(request: Request):
-        check_auth(request)
+        check_auth(request, allow_viewer=False)
         body = await request.json()
         delta_hz = body.get("delta_hz", 0)
         dashboard.satellite_remote_state.request_offset(delta_hz)

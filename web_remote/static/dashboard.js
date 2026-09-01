@@ -71,7 +71,22 @@ document.getElementById("token-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") document.getElementById("token-submit").click();
 });
 
+const DASHBOARD_CONTROL_IDS = [
+    "satellite-select", "satellite-toggle", "transponder-select", "offset-up", "offset-down",
+    "layer-satellites", "layer-qsos", "layer-pskreporter", "layer-pota", "layer-aprs", "layer-band-filter",
+];
+
+function renderRoleBanner(role) {
+    const isViewer = role === "viewer";
+    document.getElementById("role-banner").style.display = isViewer ? "flex" : "none";
+    for (const id of DASHBOARD_CONTROL_IDS) {
+        const el = document.getElementById(id);
+        if (el) el.disabled = isViewer;
+    }
+}
+
 function render(snapshot) {
+    renderRoleBanner(snapshot.role);
     const radiosDiv = document.getElementById("radios-list");
     if (snapshot.radios.length === 0) {
         radiosDiv.innerHTML = '<p class="empty">No radios connected.</p>';
@@ -79,7 +94,7 @@ function render(snapshot) {
         radiosDiv.innerHTML = snapshot.radios.map((r) => {
             const freq = r.freq_hz != null ? (r.freq_hz / 1e6).toFixed(6) + " MHz" : "--";
             const mode = r.mode ? `<span class="mode">${r.mode}</span>` : "";
-            return `<a class="radio-row" href="/radio/${r.id}">
+            return `<a class="radio-row" href="/radio/${r.id}" data-radio-id="${r.id}" data-radio-label="${r.label}">
                 <span>${r.label}</span>
                 <span><span class="freq">${freq}</span>${mode}</span>
             </a>`;
@@ -157,6 +172,21 @@ function populateTransponders(satelliteName) {
 
 document.getElementById("satellite-select").addEventListener("change", (e) => {
     populateTransponders(e.target.value);
+    // If tracking is already running, picking a different satellite
+    // from the dropdown should switch straight to it -- same as the
+    // desktop's double-click behavior ("(re)starts tracking, replaces
+    // whatever was active before"), and ham_dashboard.py's
+    // _select_satellite_for_tracking() already handles being called
+    // while a different satellite is active by just reassigning
+    // everything (no need to stop first). If nothing is being tracked
+    // yet, only repopulate the transponder list -- the user still has
+    // to press "Start Tracking" explicitly, unchanged from before.
+    if (document.getElementById("satellite-toggle").classList.contains("active")) {
+        apiFetch("/api/satellite/start", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: e.target.value }),
+        });
+    }
 });
 
 document.getElementById("satellite-toggle").addEventListener("click", async () => {
@@ -220,6 +250,71 @@ function renderSatellite(satellite) {
     if (satellite.warning_text) parts.push(satellite.warning_text);
     statusDiv.textContent = parts.join(" -- ");
 }
+
+// ---- Split view (radio pane) ----
+// Clicking a radio in the list opens its control page in an iframe
+// alongside the dashboard instead of navigating away -- listener is
+// on #radios-list itself (delegation), not on the individual <a>
+// rows, since render() replaces those rows wholesale on every ~2s
+// poll tick (same "don't attach to something that gets rebuilt out
+// from under you" lesson as the radio page's frequency digit
+// spinner). The iframe is same-origin, so it shares localStorage's
+// saved token automatically -- no need to thread it through the URL.
+document.getElementById("radios-list").addEventListener("click", (e) => {
+    const row = e.target.closest(".radio-row");
+    if (!row) return;
+    e.preventDefault();
+    openRadioPane(row.dataset.radioId, row.dataset.radioLabel);
+});
+
+function openRadioPane(radioId, label) {
+    document.getElementById("radio-pane-title").textContent = label || "Radio";
+    document.getElementById("radio-frame").src = `/radio/${radioId}`;
+    document.getElementById("radio-pane").classList.add("open");
+}
+
+function closeRadioPane() {
+    document.getElementById("radio-pane").classList.remove("open");
+    // Navigating the iframe away tears down its websocket connections
+    // (audio, tool pages if the user drilled further in) rather than
+    // leaving them running invisibly in a hidden pane.
+    document.getElementById("radio-frame").src = "about:blank";
+    closeToolPane();  // a tool without its radio showing doesn't make sense
+}
+
+document.getElementById("radio-pane-close").addEventListener("click", closeRadioPane);
+
+// ---- Split view (tool pane) ----
+// The radio pane's own iframe (radio.js) can't reach across into ITS
+// parent's DOM directly (cross-document, even though same-origin) --
+// it posts a message up asking this page to open the tool pane over
+// #dashboard-pane instead, keeping the radio pane (already open, to
+// the right) untouched. This is what makes "opening a tool covers the
+// dashboard but the radio stays visible" work when the radio is being
+// viewed through the dashboard's own split view -- see radio.js's own
+// comment for the parallel case where radio.html is loaded standalone
+// (no parent dashboard to cover, so it manages an equivalent split of
+// its own instead).
+window.addEventListener("message", (e) => {
+    if (e.origin !== window.location.origin) return;
+    if (!e.data || e.data.type !== "torca-open-tool") return;
+    openToolPane(e.data.url, e.data.label);
+});
+
+function openToolPane(url, label) {
+    document.getElementById("tool-pane-title").textContent = label || "Tool";
+    document.getElementById("tool-frame").src = url;
+    document.getElementById("tool-pane").classList.add("open");
+    document.getElementById("dashboard-pane").style.display = "none";
+}
+
+function closeToolPane() {
+    document.getElementById("tool-pane").classList.remove("open");
+    document.getElementById("tool-frame").src = "about:blank";
+    document.getElementById("dashboard-pane").style.display = "";
+}
+
+document.getElementById("tool-pane-close").addEventListener("click", closeToolPane);
 
 loadSatelliteCatalog();
 connect();

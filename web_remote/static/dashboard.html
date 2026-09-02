@@ -29,60 +29,69 @@
     <iframe id="tool-frame" class="split-pane-frame" src="about:blank" title="Tool"></iframe>
 </div>
 <main id="dashboard-pane">
-    <div class="panel" style="grid-column: 1 / -1;">
-        <h2>Map</h2>
-        <div class="controls-row" style="justify-content: flex-start;">
-            <button id="layer-satellites">Satellites: OFF</button>
-            <button id="layer-qsos">QSO Map: OFF</button>
-            <button id="layer-pskreporter">PSKReporter: OFF</button>
-            <button id="layer-pota">POTA: OFF</button>
-            <button id="layer-aprs">APRS: OFF</button>
-            <select id="layer-band-filter"><option value="">All Bands</option></select>
+    <div class="dashboard-layout">
+        <div class="dashboard-tabs-col">
+            <div class="tab-bar" id="dashboard-tab-bar">
+                <button class="tab-btn active" data-tab="radios">Connected Radios</button>
+                <button class="tab-btn" data-tab="passes">Satellite Passes</button>
+                <button class="tab-btn" data-tab="tracking">Satellite Tracking</button>
+                <button class="tab-btn" data-tab="spots">Spot Networks</button>
+                <button class="tab-btn" data-tab="qsos">Recent QSOs</button>
+            </div>
+
+            <div class="tab-panel panel active" data-tab="radios">
+                <div id="radios-list"><p class="empty">No radios connected.</p></div>
+            </div>
+
+            <div class="tab-panel panel" data-tab="passes">
+                <table>
+                    <thead><tr><th>Satellite</th><th>AOS (UTC)</th><th>Max El</th></tr></thead>
+                    <tbody id="passes-body"><tr><td colspan="3" class="empty">No passes.</td></tr></tbody>
+                </table>
+            </div>
+
+            <div class="tab-panel panel" data-tab="tracking">
+                <div class="controls-row" style="justify-content: flex-start;">
+                    <select id="satellite-select"><option value="">Select satellite...</option></select>
+                    <select id="transponder-select" disabled><option value="">(no satellite selected)</option></select>
+                </div>
+                <div class="controls-row" style="justify-content: flex-start;">
+                    <button id="satellite-toggle">Start Tracking</button>
+                    <button id="offset-down">&minus; 1 kHz</button>
+                    <button id="offset-up">+ 1 kHz</button>
+                </div>
+                <div id="satellite-status" class="empty">No satellite selected.</div>
+            </div>
+
+            <div class="tab-panel panel" data-tab="spots">
+                <div class="spot-counts">
+                    <div id="pota-count">--<span>POTA</span></div>
+                    <div id="pskreporter-count">--<span>PSKReporter</span></div>
+                </div>
+            </div>
+
+            <div class="tab-panel panel" data-tab="qsos">
+                <table>
+                    <thead><tr><th>Call</th><th>Freq</th><th>Mode</th><th>Date/Time</th></tr></thead>
+                    <tbody id="qsos-body"><tr><td colspan="4" class="empty">No QSOs logged.</td></tr></tbody>
+                </table>
+            </div>
         </div>
-        <div id="map" style="height: 420px; border-radius: 4px; margin-top: 10px;"></div>
-    </div>
 
-    <div class="panel">
-        <h2>Connected Radios</h2>
-        <div id="radios-list"><p class="empty">No radios connected.</p></div>
-    </div>
-
-    <div class="panel">
-        <h2>Upcoming Satellite Passes</h2>
-        <table>
-            <thead><tr><th>Satellite</th><th>AOS (UTC)</th><th>Max El</th></tr></thead>
-            <tbody id="passes-body"><tr><td colspan="3" class="empty">No passes.</td></tr></tbody>
-        </table>
-    </div>
-
-    <div class="panel">
-        <h2>Satellite Tracking</h2>
-        <div class="controls-row" style="justify-content: flex-start;">
-            <select id="satellite-select"><option value="">Select satellite...</option></select>
-            <select id="transponder-select" disabled><option value="">(no satellite selected)</option></select>
+        <div class="dashboard-map-col">
+            <div class="panel map-panel">
+                <h2>Map</h2>
+                <div class="controls-row" style="justify-content: flex-start;">
+                    <button id="layer-satellites">Satellites: OFF</button>
+                    <button id="layer-qsos">QSO Map: OFF</button>
+                    <button id="layer-pskreporter">PSKReporter: OFF</button>
+                    <button id="layer-pota">POTA: OFF</button>
+                    <button id="layer-aprs">APRS: OFF</button>
+                    <select id="layer-band-filter"><option value="">All Bands</option></select>
+                </div>
+                <div id="map" style="border-radius: 4px; margin-top: 10px;"></div>
+            </div>
         </div>
-        <div class="controls-row" style="justify-content: flex-start;">
-            <button id="satellite-toggle">Start Tracking</button>
-            <button id="offset-down">&minus; 1 kHz</button>
-            <button id="offset-up">+ 1 kHz</button>
-        </div>
-        <div id="satellite-status" class="empty">No satellite selected.</div>
-    </div>
-
-    <div class="panel">
-        <h2>Spot Networks</h2>
-        <div class="spot-counts">
-            <div id="pota-count">--<span>POTA</span></div>
-            <div id="pskreporter-count">--<span>PSKReporter</span></div>
-        </div>
-    </div>
-
-    <div class="panel">
-        <h2>Recent QSOs</h2>
-        <table>
-            <thead><tr><th>Call</th><th>Freq</th><th>Mode</th><th>Date/Time</th></tr></thead>
-            <tbody id="qsos-body"><tr><td colspan="4" class="empty">No QSOs logged.</td></tr></tbody>
-        </table>
     </div>
 </main>
 <div id="radio-pane" class="split-pane pane-right">

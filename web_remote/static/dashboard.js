@@ -85,6 +85,18 @@ function renderRoleBanner(role) {
     }
 }
 
+// ---- Dashboard tabs (Connected Radios/Satellite Passes/Tracking/Spot
+// Networks/Recent QSOs) -- plain show/hide, no routing: nothing here
+// needs a URL of its own, and the websocket snapshot keeps updating
+// every panel's content regardless of which tab is visible.
+document.getElementById("dashboard-tab-bar").addEventListener("click", (e) => {
+    const button = e.target.closest(".tab-btn");
+    if (!button) return;
+    const tab = button.dataset.tab;
+    document.querySelectorAll("#dashboard-tab-bar .tab-btn").forEach((b) => b.classList.toggle("active", b === button));
+    document.querySelectorAll(".dashboard-tabs-col .tab-panel").forEach((p) => p.classList.toggle("active", p.dataset.tab === tab));
+});
+
 function render(snapshot) {
     renderRoleBanner(snapshot.role);
     const radiosDiv = document.getElementById("radios-list");

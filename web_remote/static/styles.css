@@ -60,9 +60,69 @@ header a {
 
 main {
     padding: 16px;
-    display: grid;
+}
+
+/* ---- Dashboard layout ----
+   Tabbed panels (Connected Radios/Satellite Passes/Tracking/Spot
+   Networks/Recent QSOs) in a fixed-width left column, map filling the
+   rest of the window on the right -- stacks (tabs above map) on
+   narrow/mobile, same precedent as the split-view panes below. */
+.dashboard-layout {
+    display: flex;
+    align-items: stretch;
     gap: 16px;
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    min-height: 640px;
+}
+.dashboard-tabs-col {
+    flex: 0 0 380px;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.dashboard-map-col {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+}
+.dashboard-map-col .panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.dashboard-map-col #map {
+    flex: 1;
+    min-height: 420px;
+}
+.tab-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 10px;
+}
+.tab-bar .tab-btn {
+    flex: 1 1 auto;
+    font-size: 13px;
+    padding: 6px 8px;
+}
+.tab-bar .tab-btn.active {
+    background: var(--highlight);
+    color: white;
+    font-weight: bold;
+    border-color: var(--highlight);
+}
+.tab-panel {
+    display: none;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+}
+.tab-panel.active { display: block; }
+
+@media (max-width: 900px) {
+    .dashboard-layout { flex-direction: column; min-height: 0; }
+    .dashboard-tabs-col { flex: none; }
+    .dashboard-map-col #map { min-height: 420px; }
 }
 
 /* ---- Split views ----

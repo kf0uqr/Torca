@@ -8,9 +8,9 @@ const RADIO_ID = parseInt(location.pathname.split("/").pop(), 10);
 document.getElementById("cw-tool-link").href = `/radio/${RADIO_ID}/tool/cw`;
 document.getElementById("aprs-tool-link").href = `/radio/${RADIO_ID}/tool/aprs`;
 
-// Hides "<- Dashboard" when loaded inside the dashboard's own split-
-// view radio pane (dashboard.js's openRadioPane) -- that pane already
-// has its own Close button, and navigating this link would otherwise
+// Hides "<- Dashboard" when loaded inside one of the dashboard's own
+// radio tabs (dashboard.js's openRadioTab) -- that tab already has
+// its own × close button, and navigating this link would otherwise
 // load a second, redundant dashboard inside the iframe itself.
 if (window.self !== window.top) {
     const dashboardLink = document.querySelector('header a[href="/"]');
@@ -22,13 +22,14 @@ if (window.self !== window.top) {
 // radio controls entirely. Now it opens alongside instead, on the
 // left, so the tool and the radio stay visible together -- exactly
 // where depends on how THIS page is itself currently being shown:
-//   - Embedded in the dashboard's own split view (window.top is the
-//     dashboard, this page is its radio pane): can't reach across
-//     into a different document's DOM directly, so it posts a message
-//     up asking the dashboard to open the tool pane over its OWN
-//     #dashboard-pane (see dashboard.js's "message" listener) --
-//     "covering" the dashboard while the radio pane it's already
-//     showing (this page) stays untouched on the right.
+//   - Embedded in one of the dashboard's own radio tabs (window.top
+//     is the dashboard, this page is that tab's iframe): can't reach
+//     across into a different document's DOM directly, so it posts a
+//     message up asking the dashboard to open its own #tool-pane
+//     instead (see dashboard.js's "message" listener) -- that hides
+//     only the dashboard's left-hand tab column, leaving this radio's
+//     own tab (already active, since only the active tab is
+//     clickable) untouched on the right.
 //   - Standalone (this page IS window.top, e.g. loaded directly or in
 //     its own tab): no parent to ask, so it manages an equivalent
 //     split of its own (#tool-pane/#radio-content in radio.html).

@@ -78,8 +78,12 @@
             </div>
         </div>
 
-        <div class="dashboard-map-col">
-            <div class="panel map-panel">
+        <div class="dashboard-map-col" id="dashboard-map-col">
+            <div class="tab-bar" id="map-tab-bar">
+                <button class="tab-btn active" data-tab="map">Map</button>
+            </div>
+
+            <div class="tab-panel panel map-panel active" data-tab="map">
                 <h2>Map</h2>
                 <div class="controls-row" style="justify-content: flex-start;">
                     <button id="layer-satellites">Satellites: OFF</button>
@@ -94,13 +98,6 @@
         </div>
     </div>
 </main>
-<div id="radio-pane" class="split-pane pane-right">
-    <div class="split-pane-bar">
-        <span id="radio-pane-title">Radio</span>
-        <button id="radio-pane-close" class="split-pane-close">&times; Close</button>
-    </div>
-    <iframe id="radio-frame" class="split-pane-frame" src="about:blank" title="Radio control"></iframe>
-</div>
 </div>
 <script src="/static/vendor/leaflet/leaflet.js"></script>
 <script src="/static/dashboard.js"></script>

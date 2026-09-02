@@ -88,9 +88,14 @@ main {
     flex: 1;
     min-width: 0;
     display: flex;
+    flex-direction: column;
 }
-.dashboard-map-col .panel {
-    flex: 1;
+/* Map + each opened radio share this column's tab strip (radio tabs
+   are appended to #map-tab-bar / #dashboard-map-col by
+   openRadioTab() in dashboard.js) -- override the generic
+   .tab-panel's block display with flex-column so both the map panel
+   and a radio's iframe can fill the column's full height. */
+.dashboard-map-col .tab-panel.active {
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -98,6 +103,17 @@ main {
 .dashboard-map-col #map {
     flex: 1;
     min-height: 420px;
+}
+.radio-tab-panel {
+    background: var(--base-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.radio-tab-panel iframe {
+    flex: 1;
+    width: 100%;
+    border: none;
 }
 .tab-bar {
     display: flex;
@@ -116,6 +132,11 @@ main {
     font-weight: bold;
     border-color: var(--highlight);
 }
+.tab-close {
+    margin-left: 6px;
+    opacity: 0.7;
+}
+.tab-close:hover { opacity: 1; }
 .tab-panel {
     display: none;
     flex: 1;
@@ -131,31 +152,24 @@ main {
 }
 
 /* ---- Split views ----
-   Shared by two nested levels of the same pattern: dashboard.html
-   opens a radio's control page in a pane alongside the dashboard
-   (clicking a radio in "Connected Radios"), and radio.html itself
-   opens a CW/APRS tool page in a pane alongside ITS OWN content
-   (clicking "CW Tool"/"APRS Tool") -- an iframe in both cases, same
-   origin, so it shares localStorage's saved token automatically, no
-   URL-based auth needed, rather than navigating away and losing
-   whatever's already showing. Every split-view container follows the
-   same structure: a fixed-content "main" side (#dashboard-pane /
-   #radio-content) plus one or more togglable `.split-pane` siblings
-   that are hidden until opened. Stacks vertically on narrow/mobile
-   viewports instead of side-by-side, same "desktop fits without
-   scrolling, mobile scrolls" precedent as the radio page's own
-   layout.
+   dashboard.html's own #tool-pane (opened over the dashboard when a
+   radio tab's CW/APRS tool is clicked -- see dashboard.js's
+   openToolPane, which hides only .dashboard-tabs-col so whichever
+   radio tab is already active in .dashboard-map-col stays visible
+   next to it) and radio.html's equivalent standalone #tool-pane/
+   #radio-content split (used when radio.html is loaded directly, not
+   through a dashboard radio tab) both follow this same structure: a
+   fixed-content "main" side plus a togglable `.split-pane` sibling
+   hidden until opened, an iframe in both cases -- same origin, so it
+   shares localStorage's saved token automatically, no URL-based auth
+   needed, rather than navigating away and losing whatever's already
+   showing. Stacks vertically on narrow/mobile viewports instead of
+   side-by-side, same "desktop fits without scrolling, mobile
+   scrolls" precedent as the radio page's own layout.
 
-   The tool pane specifically opens on the LEFT (it's placed first in
-   the DOM, so it's leftmost in flex order with no extra CSS needed)
-   rather than the right like the radio pane -- when radio.html is
-   itself embedded in the dashboard's own radio pane, opening a tool
-   there instead posts a message up to the parent dashboard (see
-   radio.js/dashboard.js) asking IT to open the tool pane over its own
-   #dashboard-pane, "covering" the dashboard while keeping the radio
-   pane it's already showing untouched on the right -- so the two
-   things actually being worked with (tool + radio) end up side by
-   side either way, whichever page happens to be hosting the split. */
+   The tool pane opens on the LEFT (it's placed first in the DOM, so
+   it's leftmost in flex order with no extra CSS needed) so the
+   content it's opened alongside stays on the right, unmoved. */
 .split-container {
     display: flex;
     align-items: stretch;

@@ -263,50 +263,95 @@ function renderSatellite(satellite) {
     statusDiv.textContent = parts.join(" -- ");
 }
 
-// ---- Split view (radio pane) ----
-// Clicking a radio in the list opens its control page in an iframe
-// alongside the dashboard instead of navigating away -- listener is
-// on #radios-list itself (delegation), not on the individual <a>
-// rows, since render() replaces those rows wholesale on every ~2s
-// poll tick (same "don't attach to something that gets rebuilt out
-// from under you" lesson as the radio page's frequency digit
-// spinner). The iframe is same-origin, so it shares localStorage's
-// saved token automatically -- no need to thread it through the URL.
+// ---- Radio tabs (share the map column's tab strip) ----
+// Clicking a radio in the list opens its control page in an iframe as
+// a new tab next to "Map" instead of navigating away or sliding in a
+// separate pane -- each opened radio gets its own persistent tab/
+// iframe (kept alive, websocket and all, while a different tab is
+// active) until explicitly closed. Listener is on #radios-list itself
+// (delegation), not the individual <a> rows, since render() replaces
+// those rows wholesale on every ~2s poll tick (same "don't attach to
+// something that gets rebuilt out from under you" lesson as the radio
+// page's frequency digit spinner). The iframe is same-origin, so it
+// shares localStorage's saved token automatically -- no need to
+// thread it through the URL.
+const openRadioTabs = new Map(); // radioId (string) -> { button, panel }
+
 document.getElementById("radios-list").addEventListener("click", (e) => {
     const row = e.target.closest(".radio-row");
     if (!row) return;
     e.preventDefault();
-    openRadioPane(row.dataset.radioId, row.dataset.radioLabel);
+    openRadioTab(row.dataset.radioId, row.dataset.radioLabel);
 });
 
-function openRadioPane(radioId, label) {
-    document.getElementById("radio-pane-title").textContent = label || "Radio";
-    document.getElementById("radio-frame").src = `/radio/${radioId}`;
-    document.getElementById("radio-pane").classList.add("open");
+function openRadioTab(radioId, label) {
+    let entry = openRadioTabs.get(radioId);
+    if (!entry) {
+        const tab = `radio-${radioId}`;
+        const button = document.createElement("button");
+        button.className = "tab-btn";
+        button.dataset.tab = tab;
+        button.dataset.radioId = radioId;
+        button.innerHTML = `${label || "Radio"} <span class="tab-close" title="Close">&times;</span>`;
+        document.getElementById("map-tab-bar").appendChild(button);
+
+        const panel = document.createElement("div");
+        panel.className = "tab-panel radio-tab-panel";
+        panel.dataset.tab = tab;
+        panel.innerHTML = `<iframe src="/radio/${radioId}" title="${label || "Radio"}"></iframe>`;
+        document.getElementById("dashboard-map-col").appendChild(panel);
+
+        entry = { button, panel };
+        openRadioTabs.set(radioId, entry);
+    }
+    activateMapTab(`radio-${radioId}`);
 }
 
-function closeRadioPane() {
-    document.getElementById("radio-pane").classList.remove("open");
+function closeRadioTab(radioId) {
+    const entry = openRadioTabs.get(radioId);
+    if (!entry) return;
+    const wasActive = entry.button.classList.contains("active");
+    entry.button.remove();
     // Navigating the iframe away tears down its websocket connections
     // (audio, tool pages if the user drilled further in) rather than
-    // leaving them running invisibly in a hidden pane.
-    document.getElementById("radio-frame").src = "about:blank";
-    closeToolPane();  // a tool without its radio showing doesn't make sense
+    // leaving them running invisibly after the tab is gone.
+    entry.panel.remove();
+    openRadioTabs.delete(radioId);
+    if (wasActive) {
+        activateMapTab("map");
+        closeToolPane(); // a tool without its radio tab showing doesn't make sense
+    }
 }
 
-document.getElementById("radio-pane-close").addEventListener("click", closeRadioPane);
+document.getElementById("map-tab-bar").addEventListener("click", (e) => {
+    const closeButton = e.target.closest(".tab-close");
+    if (closeButton) {
+        e.stopPropagation();
+        closeRadioTab(closeButton.closest(".tab-btn").dataset.radioId);
+        return;
+    }
+    const button = e.target.closest(".tab-btn");
+    if (button) activateMapTab(button.dataset.tab);
+});
+
+function activateMapTab(tab) {
+    document.querySelectorAll("#map-tab-bar .tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+    document.querySelectorAll("#dashboard-map-col .tab-panel").forEach((p) => p.classList.toggle("active", p.dataset.tab === tab));
+}
 
 // ---- Split view (tool pane) ----
-// The radio pane's own iframe (radio.js) can't reach across into ITS
+// A radio tab's own iframe (radio.js) can't reach across into ITS
 // parent's DOM directly (cross-document, even though same-origin) --
-// it posts a message up asking this page to open the tool pane over
-// #dashboard-pane instead, keeping the radio pane (already open, to
-// the right) untouched. This is what makes "opening a tool covers the
-// dashboard but the radio stays visible" work when the radio is being
-// viewed through the dashboard's own split view -- see radio.js's own
-// comment for the parallel case where radio.html is loaded standalone
-// (no parent dashboard to cover, so it manages an equivalent split of
-// its own instead).
+// it posts a message up asking this page to open the tool pane
+// instead, alongside whichever radio tab is already active (only the
+// active tab's iframe is visible/clickable, so it's unambiguous which
+// radio the tool belongs to). Opening the tool pane hides only
+// .dashboard-tabs-col (Connected Radios/Satellite Passes/etc), not
+// .dashboard-map-col, so the active radio tab (and Map, and every
+// other opened radio tab) stays right where it was -- see radio.js's
+// own comment for the parallel case where radio.html is loaded
+// standalone (no parent dashboard to ask, so it manages an equivalent
+// split of its own instead).
 window.addEventListener("message", (e) => {
     if (e.origin !== window.location.origin) return;
     if (!e.data || e.data.type !== "torca-open-tool") return;
@@ -317,13 +362,13 @@ function openToolPane(url, label) {
     document.getElementById("tool-pane-title").textContent = label || "Tool";
     document.getElementById("tool-frame").src = url;
     document.getElementById("tool-pane").classList.add("open");
-    document.getElementById("dashboard-pane").style.display = "none";
+    document.querySelector(".dashboard-tabs-col").style.display = "none";
 }
 
 function closeToolPane() {
     document.getElementById("tool-pane").classList.remove("open");
     document.getElementById("tool-frame").src = "about:blank";
-    document.getElementById("dashboard-pane").style.display = "";
+    document.querySelector(".dashboard-tabs-col").style.display = "";
 }
 
 document.getElementById("tool-pane-close").addEventListener("click", closeToolPane);

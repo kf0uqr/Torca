@@ -149,7 +149,7 @@ function send(cmd) {
 let currentRole = null;
 
 const TX_CONTROL_IDS = [
-    "ptt-button", "mic-toggle", "mode-select", "data-mode-button",
+    "ptt-button", "atu-button", "mic-toggle", "mode-select", "data-mode-button",
     "vfo-button", "band-select", "tune-button", "freq-input",
     "squelch-slider", "tx_level-slider", "rf_level-slider",
 ];
@@ -233,6 +233,16 @@ function render(state) {
     const pttButton = document.getElementById("ptt-button");
     pttButton.classList.toggle("active", pttActive);
     pttButton.textContent = pttActive ? "TRANSMITTING" : "PTT";
+
+    // Tuner status: 0=off, 1=on, 2=tuning. null on radios with no
+    // tuner (get_tuner_status() never succeeded) -- leaves the button
+    // showing "ATU" but role-gated same as every other TX control,
+    // same "just never does anything useful" fallback as the desktop.
+    const tuning = state.tuner_status === 2;
+    const atuButton = document.getElementById("atu-button");
+    atuButton.classList.toggle("active", tuning);
+    atuButton.textContent = tuning ? "Tuning..." : (state.tuner_status === 1 ? "ATU (ON)" : "ATU");
+    if (tuning) atuButton.disabled = true; // on top of renderRoleBanner's role-based disable above
 
     dataModeActive = !!state.data_mode;
     document.getElementById("data-mode-button").classList.toggle("active", dataModeActive);
@@ -575,6 +585,10 @@ document.getElementById("mode-select").addEventListener("change", (e) => {
 
 document.getElementById("ptt-button").addEventListener("click", () => {
     send({ cmd: "ptt", on: !pttActive });
+});
+
+document.getElementById("atu-button").addEventListener("click", () => {
+    send({ cmd: "tuner_start" });
 });
 
 document.getElementById("data-mode-button").addEventListener("click", () => {

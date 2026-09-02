@@ -87,6 +87,7 @@ class RadioRemoteState(QObject):
             "levels": {},
             "operator_present": False,
             "tx_locked": False,
+            "tuner_status": None,  # 0=off, 1=on, 2=tuning -- None until the first poll on radios with no tuner
         }
         window.worker.frequency_updated.connect(self._on_freq)
         window.worker.control_updated.connect(self._on_control)
@@ -95,6 +96,7 @@ class RadioRemoteState(QObject):
         window.worker.scope_frame_received.connect(self._on_scope_frame)
         window.worker.active_receiver_changed.connect(self._on_active_receiver)
         window.worker.level_updated.connect(self._on_level)
+        window.worker.tuner_status_changed.connect(self._on_tuner_status)
         self._set_ptt_widget.connect(window.ptt_button.setChecked)
 
         self._id_watchdog = QTimer(self)
@@ -122,6 +124,9 @@ class RadioRemoteState(QObject):
 
     def _on_active_receiver(self, receiver):
         self.state["active_receiver"] = receiver
+
+    def _on_tuner_status(self, status):
+        self.state["tuner_status"] = status
 
     def _on_level(self, key, value):
         # value is 0.0-1.0, same scale main_window.py's sliders use
@@ -237,6 +242,12 @@ class RadioRemoteState(QObject):
                 getattr(self.window, "remote_id", None), "system", "id_overdue", False,
                 detail=f"{overdue:.0f}s into a continuous transmission with no ID",
             )
+
+    def request_tuner_start(self):
+        """Starts an antenna tuner tune cycle -- keys the transmitter
+        briefly, same as PTT, so app.py gates this behind can_transmit()
+        before calling it (see the "tuner_start" command branch)."""
+        self.window.worker.start_tuner()
 
     def request_level(self, key: str, value: float):
         self.window.worker.set_level_value(key, float(value))

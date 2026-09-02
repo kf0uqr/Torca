@@ -165,6 +165,16 @@ async def _handle_radio_commands(websocket, window, role, radio_id, audit):
                 if audit is not None:
                     audit.log(radio_id, role, "ptt", True, detail=f"on={on}")
                 continue
+            if cmd == "tuner_start":
+                if not window.remote_state.can_transmit(role):
+                    if audit is not None:
+                        audit.log(radio_id, role, "tuner_start", False, detail="unsupervised or TX-locked")
+                    await websocket.send_json({"error": "transmit not permitted -- no control operator supervising, or TX is locked"})
+                    continue
+                window.remote_state.request_tuner_start()
+                if audit is not None:
+                    audit.log(radio_id, role, "tuner_start", True)
+                continue
             if cmd == "kill_tx":
                 if role != "operator":
                     await websocket.send_json({"error": "operator role required"})

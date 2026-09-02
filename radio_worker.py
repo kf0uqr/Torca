@@ -198,6 +198,7 @@ class RadioWorker(QThread):
     scope_ready = Signal()               # emitted once enable_scope() actually succeeds -- see is_scope_capable
     key_speed_changed = Signal(int)      # WPM, 6-48, from get_key_speed() polling
     cw_pitch_changed = Signal(int)       # Hz, 300-900, from get_cw_pitch() polling
+    tuner_status_changed = Signal(int)   # 0=off, 1=on, 2=tuning, from get_tuner_status() polling
     memory_snapshot_captured = Signal(object)  # {"A": {...}, "B": {...}} or None on failure -- see capture_memory_snapshot
     error = Signal(str)
 
@@ -219,6 +220,7 @@ class RadioWorker(QThread):
         # pitch settings (see set_key_speed/set_cw_pitch below).
         self._last_observed_key_speed = None
         self._last_observed_cw_pitch = None
+        self._last_observed_tuner_status = None
         # Set by start_cw_decode(), cleared by stop_cw_decode() -- the
         # caller-supplied function _on_cw_decode_frame hands raw PCM
         # bytes to once audio starts arriving.
@@ -644,6 +646,24 @@ class RadioWorker(QThread):
                 f"PTT: radio.set_ptt(False) FAILED ({exc}) -- radio may still be keyed! "
                 "Check the radio directly."
             )
+
+    def start_tuner(self):
+        """Thread-safe: call from the GUI thread on the Tune button
+        press. Fire-and-forget -- set_tuner_status(2) starts a tune
+        cycle; get_tuner_status() polling in _poll_loop (0=off, 1=on,
+        2=tuning) is what reports it finishing, same "poll for the
+        real result" split as start_ptt()/set_ptt() vs the radio's own
+        PTT state."""
+        if self.loop is None or self.radio is None:
+            self.error.emit("Tuner: not connected yet -- start_tuner() ignored.")
+            return
+        asyncio.run_coroutine_threadsafe(self._start_tuner(), self.loop)
+
+    async def _start_tuner(self):
+        try:
+            await self.radio.set_tuner_status(2)
+        except Exception as exc:
+            self.error.emit(f"Tuner: radio.set_tuner_status(2) failed ({exc}).")
 
     def send_tx_audio_pcm(self, pcm_bytes: bytes):
         """Thread-safe: call from the GUI thread. Generic "key PTT,
@@ -1924,6 +1944,22 @@ class RadioWorker(QThread):
                     self.cw_pitch_changed.emit(cw_pitch)
             except Exception as exc:
                 self.error.emit(f"get_cw_pitch: {exc}")
+
+            # Antenna tuner status (0=off, 1=on, 2=tuning) -- same
+            # change-filtered polling as key_speed/cw_pitch above.
+            # Unlike those, not every profile actually declares the
+            # "tuner" capability (FTX-1's is a different CAT command
+            # rigplane doesn't map to get_tuner_status), so a bare
+            # except here just means the button never lights up on
+            # radios without one, rather than spamming the error log
+            # every poll cycle.
+            try:
+                tuner_status = await self.radio.get_tuner_status()
+                if tuner_status != self._last_observed_tuner_status:
+                    self._last_observed_tuner_status = tuner_status
+                    self.tuner_status_changed.emit(tuner_status)
+            except Exception:
+                pass
 
             try:
                 # get_frequency's receiver param is NOT a Main/Sub

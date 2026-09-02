@@ -229,6 +229,23 @@ class RadioWindow(QWidget):
         # there's no sensible manual PTT action for this role either.
         self.ptt_button.setVisible(self._role != "downlink")
 
+        # Starts an antenna tuner tune cycle (set_tuner_status(2)) --
+        # keys the transmitter briefly, so hidden for "downlink" role
+        # radios same as PTT above. Status (off/on/tuning) comes back
+        # via worker.tuner_status_changed polling; not every radio
+        # profile declares tuner support, so it just never leaves its
+        # initial "Tune" state on those instead of erroring.
+        self.tune_button = QPushButton("Tune")
+        self.tune_button.setFixedHeight(32)
+        self.tune_button.setStyleSheet(
+            "QPushButton { background-color: #37373a; color: #dcdcdc; font-weight: bold; border-radius: 4px; }"
+            "QPushButton:disabled { background-color: #2d2d30; color: #777; }"
+        )
+        self.tune_button.setEnabled(False)
+        self.tune_button.setToolTip("Start an antenna tuner tune cycle.")
+        self.tune_button.clicked.connect(self._on_tune_clicked)
+        self.tune_button.setVisible(self._role != "downlink")
+
         # Dual-receiver (9700/7610) only -- rigplane's select_receiver(),
         # confirmed via its own docstring to issue the real main_select/
         # sub_select CI-V opcode (0x07 0xD0/0xD1) and update RadioState.
@@ -568,6 +585,7 @@ class RadioWindow(QWidget):
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.ptt_button)
+        knob_row.addWidget(self.tune_button)
 
         # RIT knob column -- between left_column (ending in the CW/
         # SSTV/RTTY tool buttons) and knob_row (VFO tuning knob/PTT),
@@ -623,6 +641,7 @@ class RadioWindow(QWidget):
         self.worker.scope_speed_changed.connect(self._on_scope_speed_changed)
         self.worker.scope_ready.connect(self._on_scope_ready)
         self.worker.meters_ready.connect(self._on_meters_ready)
+        self.worker.tuner_status_changed.connect(self._on_tuner_status_changed)
         self.worker.start()
 
         # Feeds the band-plan overlay's memory-channel tick marks --
@@ -659,6 +678,7 @@ class RadioWindow(QWidget):
         self.tuning_knob.setEnabled(True)
         self.rit_knob.setEnabled(True)
         self.ptt_button.setEnabled(True)
+        self.tune_button.setEnabled(True)
         self.cw_tool_button.setEnabled(True)
         self.sstv_tool_button.setEnabled(True)
         self.rtty_tool_button.setEnabled(True)
@@ -847,6 +867,26 @@ class RadioWindow(QWidget):
 
     def _on_split_button_context_menu(self, pos):
         SplitSettingsDialog(self).exec()
+
+    def _on_tune_clicked(self):
+        self.worker.start_tuner()
+
+    def _on_tuner_status_changed(self, status):
+        # 0=off, 1=on, 2=tuning -- disabled while tuning so a second
+        # click can't interrupt/restart the cycle already running.
+        if status == 2:
+            self.tune_button.setText("Tuning...")
+            self.tune_button.setEnabled(False)
+            self.tune_button.setStyleSheet(
+                "QPushButton { background-color: #f2a83c; color: #1c1c1e; font-weight: bold; border-radius: 4px; }"
+            )
+        else:
+            self.tune_button.setText("Tune (ON)" if status == 1 else "Tune")
+            self.tune_button.setEnabled(True)
+            self.tune_button.setStyleSheet(
+                "QPushButton { background-color: #37373a; color: #dcdcdc; font-weight: bold; border-radius: 4px; }"
+                "QPushButton:disabled { background-color: #2d2d30; color: #777; }"
+            )
 
     def _on_ptt_toggled(self, checked):
         self.ptt_button.setText("TRANSMITTING" if checked else "PTT")

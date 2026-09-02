@@ -345,6 +345,28 @@ connect();
 // satellite_tracking.ground_track_points() the desktop uses, for
 // numerical parity without porting SGP4 to JS.
 
+// Satellite ground tracks/footprints are computed in plain -180..180
+// longitude, so a pass crossing the antimeridian has consecutive
+// points jumping straight from e.g. 179 to -179 -- drawn literally,
+// Leaflet connects those with a chord straight across the whole map.
+// Un-wrapping (letting longitude run continuously past ±180 instead
+// of snapping back) keeps each point's true position relative to the
+// last one, which the Mercator projection renders correctly with no
+// special-casing needed on top.
+function unwrapLongitudes(points) {
+    if (!points || points.length === 0) return points;
+    let prevLon = points[0].lon;
+    const result = [{ lat: points[0].lat, lon: prevLon }];
+    for (let i = 1; i < points.length; i++) {
+        let lon = points[i].lon;
+        while (lon - prevLon > 180) lon -= 360;
+        while (lon - prevLon < -180) lon += 360;
+        result.push({ lat: points[i].lat, lon });
+        prevLon = lon;
+    }
+    return result;
+}
+
 const map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
 L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
@@ -460,7 +482,7 @@ async function updateSatelliteOnMap(satellite) {
         const data = await response.json();
 
         if (groundTrackLine) map.removeLayer(groundTrackLine);
-        groundTrackLine = L.polyline((data.points || []).map((p) => [p.lat, p.lon]), {
+        groundTrackLine = L.polyline(unwrapLongitudes(data.points || []).map((p) => [p.lat, p.lon]), {
             color: "#ffa53c", weight: 2, dashArray: "4,4", interactive: false,
         }).addTo(map);
 
@@ -563,12 +585,12 @@ function renderSatelliteOverlay(positions) {
         }).bindTooltip(sat.name).addTo(satelliteOverlayGroup);
 
         if (sat.footprint && sat.footprint.length > 1) {
-            L.polygon(sat.footprint.map((p) => [p.lat, p.lon]), {
+            L.polygon(unwrapLongitudes(sat.footprint).map((p) => [p.lat, p.lon]), {
                 color: "#ffe28a", weight: 1, fillOpacity: 0.05, interactive: false,
             }).addTo(satelliteOverlayGroup);
         }
         if (sat.path && sat.path.length > 1) {
-            L.polyline(sat.path.map((p) => [p.lat, p.lon]), {
+            L.polyline(unwrapLongitudes(sat.path).map((p) => [p.lat, p.lon]), {
                 color: "#ffe28a", weight: 1.5, dashArray: "2,4", opacity: 0.7, interactive: false,
             }).addTo(satelliteOverlayGroup);
         }

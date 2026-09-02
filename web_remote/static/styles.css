@@ -71,7 +71,12 @@ main {
     display: flex;
     align-items: stretch;
     gap: 16px;
-    min-height: 640px;
+    /* Fills most of the browser window's height (minus header/banners
+       above it) so the map can be zoomed in further before its tiles
+       repeat vertically, rather than a fixed height that left it
+       squat regardless of window size. 640px is the floor for short
+       viewports. */
+    min-height: max(640px, calc(100vh - 130px));
 }
 .dashboard-tabs-col {
     flex: 0 0 380px;

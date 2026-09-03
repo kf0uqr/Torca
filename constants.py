@@ -328,30 +328,40 @@ LEVEL_DEFINITIONS = {
     },
 }
 
-# Twin PBT (passband tuning) -- rigplane's DspControlCapable.get/set_pbt_
-# inner/outer, each an independent 0-255 level (NOT the 0.0-1.0-normalized
-# scale LEVEL_DEFINITIONS above uses -- these are already raw per the
-# protocol's own docstrings, "Set PBT Inner/Outer level (0-255)"). 128 is
-# the centered/neutral value with no narrowing effect, confirmed by
-# rigplane's own default state (web/state_schema.py: "pbtInner: int = 128",
-# "pbtOuter: int = 128"); moving either slider away from 128 in either
-# direction narrows the IF passband from that edge, matching real Icom
-# Twin PBT behavior. Icom-only in practice (IC-7610/IC-9700 profiles
-# declare "pbt" in their capabilities; the Yaesu CAT backend defines the
-# same method names but unconditionally raises NotImplementedError) --
-# see RadioWorker.is_pbt_capable, which gates on the profile's declared
-# capability set rather than these method names being merely present.
+# Twin PBT (passband tuning): each an independent 0-255 level (NOT the
+# 0.0-1.0-normalized scale LEVEL_DEFINITIONS above uses -- these are raw
+# per rigplane's own protocol docstrings, "Set PBT Inner/Outer level
+# (0-255)"). 128 is the centered/neutral value with no narrowing effect,
+# confirmed by rigplane's own default state (web/state_schema.py:
+# "pbtInner: int = 128", "pbtOuter: int = 128"); moving either slider
+# away from 128 in either direction narrows the IF passband from that
+# edge, matching real Icom Twin PBT behavior. Icom-only in practice
+# (IC-7610/IC-9700/IC-705 profiles declare "pbt" in their capabilities;
+# the Yaesu CAT backend defines the same method names but unconditionally
+# raises NotImplementedError) -- see RadioWorker.is_pbt_capable, which
+# gates on the profile's declared capability set.
+#
+# "civ_sub": the plain CI-V 0x14 sub-command byte for each (confirmed
+# against the IC-705's own CI-V Reference Guide, Misc/IC-705_ENG_CI-V_4b.
+# pdf p.3: cmd 14 sub 07 = PBT1/inner, sub 08 = PBT2/outer). RadioWorker
+# sends these directly via rigplane's public send_civ() rather than
+# calling rigplane's own get_pbt_inner/set_pbt_inner/get_pbt_outer/
+# set_pbt_outer convenience methods -- confirmed live on a real IC-705
+# (both USB and LAN, both 19200 and 115200 baud, so not a speed issue)
+# that those methods reliably fail (reads time out, writes silently
+# don't reach the radio) because rigplane's commands/levels.py hardcodes
+# command29=True for all four, which wraps the frame in an extra
+# "29 <receiver>" prefix meant for DUAL-RECEIVER radios (see
+# build_cmd29_frame's own docstring: "Command29-wrapped CI-V frame for
+# dual-receiver radios", sourced from IC-7610.rig) -- the single-receiver
+# IC-705 doesn't understand that wrapper at all, and rigplane's own
+# receiver-aware guard (_require_cmd29_route) only checks non-MAIN
+# receivers, so nothing catches this for receiver=MAIN before the
+# malformed frame goes out. send_civ() builds a plain, unwrapped frame
+# instead, matching the real IC-705 CI-V manual exactly.
 PBT_DEFINITIONS = {
-    "pbt_inner": {
-        "label": "PBT Inner",
-        "getter_candidates": ["get_pbt_inner"],
-        "setter_candidates": ["set_pbt_inner"],
-    },
-    "pbt_outer": {
-        "label": "PBT Outer",
-        "getter_candidates": ["get_pbt_outer"],
-        "setter_candidates": ["set_pbt_outer"],
-    },
+    "pbt_inner": {"label": "PBT Inner", "civ_sub": 0x07},
+    "pbt_outer": {"label": "PBT Outer", "civ_sub": 0x08},
 }
 
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on

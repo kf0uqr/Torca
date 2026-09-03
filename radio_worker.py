@@ -182,6 +182,28 @@ async def _try_recall_band_stack(radio, band_code, register=BAND_STACKING_REGIST
     except Exception as exc:
         return None, f"set_frequency({freq_hz}) failed: {exc}"
     return freq_hz, None
+
+
+def _bcd_encode_pbt_level(value: int) -> bytes:
+    """0-255 int -> 2-byte BCD, matching the encoding rigplane's own
+    (broken-for-PBT-on-a-single-receiver-radio, see PBT_DEFINITIONS'
+    comment) get/set_pbt_inner/outer use internally -- reimplemented
+    here, rather than importing rigplane's private _level_bcd_encode,
+    so this app's raw-CI-V PBT workaround doesn't depend on rigplane's
+    internal (underscore-prefixed, no compatibility guarantee) API.
+    Each byte holds two BCD digits: 128 -> b'\\x01\\x28' (0,1 / 2,8)."""
+    if not 0 <= value <= 255:
+        raise ValueError(f"PBT level must be 0-255, got {value}")
+    d = f"{value:04d}"
+    return bytes([(int(d[0]) << 4) | int(d[1]), (int(d[2]) << 4) | int(d[3])])
+
+
+def _bcd_decode_pbt_level(data: bytes) -> int:
+    """Inverse of _bcd_encode_pbt_level."""
+    d0, d1 = data[0], data[1]
+    return (d0 >> 4) * 1000 + (d0 & 0x0F) * 100 + (d1 >> 4) * 10 + (d1 & 0x0F)
+
+
 class RadioWorker(QThread):
     """Owns the asyncio loop and the rigplane radio connection.
 
@@ -369,7 +391,7 @@ class RadioWorker(QThread):
         # poll and looking like the slider "bouncing back". See
         # set_level_value()/_debounce_level_value().
         self._level_debounce_tasks = {}
-        self._pbt_methods = {}  # pbt key -> (get_name, set_name), populated by _setup_pbt()
+        self._pbt_methods = {}  # pbt key -> CI-V 0x14 sub-command byte, populated by _setup_pbt()
         self._pbt_debounce_tasks = {}  # same debounce idea as _level_debounce_tasks, separate dict/keyspace
 
     def run(self):
@@ -1297,21 +1319,23 @@ class RadioWorker(QThread):
             )
 
     async def _setup_pbt(self):
-        """Discovers the real get/set method names for PBT_DEFINITIONS,
-        same find_method_name discovery as _setup_levels() -- but only
-        when is_pbt_capable is already True (set from the radio's own
-        declared "pbt" capability, not from these method names merely
-        existing -- see CAP_PBT import comment; unlike _setup_levels()
-        there's no "missing" case worth reporting here, since a False
-        is_pbt_capable already fully explains an empty result."""
+        """Populates self._pbt_methods (pbt key -> CI-V 0x14 sub-command
+        byte) when is_pbt_capable is already True (set from the radio's
+        own declared "pbt" capability). Deliberately does NOT use
+        find_method_name to discover rigplane's own get_pbt_inner/
+        set_pbt_inner/get_pbt_outer/set_pbt_outer -- those are confirmed
+        broken on a real (single-receiver) IC-705, see PBT_DEFINITIONS'
+        own comment in constants.py. _set_pbt_value/the poll loop instead
+        send raw CI-V frames directly via rigplane's public send_civ(),
+        which this radio object needs to actually expose -- an object
+        that claims is_pbt_capable via CAP_PBT but has no send_civ (e.g.
+        a future non-CI-V backend) just gets an empty _pbt_methods, same
+        as the old "no working getter+setter found" case."""
         self._pbt_methods = {}
-        if not self.is_pbt_capable:
+        if not self.is_pbt_capable or not hasattr(self.radio, "send_civ"):
             return
         for key, definition in PBT_DEFINITIONS.items():
-            get_name = find_method_name(self.radio, definition["getter_candidates"])
-            set_name = find_method_name(self.radio, definition["setter_candidates"])
-            if get_name and set_name:
-                self._pbt_methods[key] = (get_name, set_name)
+            self._pbt_methods[key] = definition["civ_sub"]
 
         if "af_gain" in self._level_methods:
             self._hint_usb_audio_level_attrs()
@@ -1530,13 +1554,17 @@ class RadioWorker(QThread):
         self._pbt_debounce_tasks[key] = asyncio.ensure_future(_wait_then_apply())
 
     async def _set_pbt_value(self, key: str, value: int):
-        _get_name, set_name = self._pbt_methods[key]
+        civ_sub = self._pbt_methods[key]
         definition = PBT_DEFINITIONS[key]
-        setter = getattr(self.radio, set_name)
         try:
-            await setter(value)
+            # Raw CI-V 0x14/<civ_sub> write via send_civ(), NOT
+            # rigplane's own set_pbt_inner/set_pbt_outer -- see
+            # PBT_DEFINITIONS' comment in constants.py for why.
+            await self.radio.send_civ(
+                0x14, sub=civ_sub, data=_bcd_encode_pbt_level(value), wait_response=False
+            )
         except Exception as exc:
-            self.error.emit(f"{definition['label']}: {set_name}() failed ({exc}).")
+            self.error.emit(f"{definition['label']}: send_civ(0x14, 0x{civ_sub:02x}) failed ({exc}).")
 
     async def _main(self):
         try:
@@ -2135,12 +2163,15 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
 
-            for key, (get_name, _set_name) in self._pbt_methods.items():
+            for key, civ_sub in self._pbt_methods.items():
                 definition = PBT_DEFINITIONS[key]
-                getter = getattr(self.radio, get_name)
                 try:
-                    raw_value = await getter()
-                    self.pbt_updated.emit(key, int(raw_value))
+                    # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
+                    # rigplane's own get_pbt_inner/get_pbt_outer -- see
+                    # PBT_DEFINITIONS' comment in constants.py for why.
+                    resp = await self.radio.send_civ(0x14, sub=civ_sub, wait_response=True)
+                    if resp is not None and len(resp.data) >= 2:
+                        self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
 

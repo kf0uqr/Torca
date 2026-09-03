@@ -42,17 +42,53 @@ def amplitude_to_color(amp, max_amp=160):
     return QColor(*_COLOR_ANCHORS[-1][1])
 
 
-def _pbt_edge_fraction(level):
-    """Twin PBT level (0-255, 128=centered) -> how much of the mode's
-    default passband edge remains: 1.0 (full width, no narrowing) at
-    128, shrinking to 0.0 (fully collapsed onto the tuned frequency) at
-    either extreme -- matches real Icom Twin PBT behavior (a
-    center-detent control that narrows the passband from either
-    direction away from center). Shared by SpectrumWidget's scope
-    overlay and FilterShapeWidget's dedicated filter-shape display, both
-    of which are otherwise-uncalibrated approximations against
-    MODE_BANDWIDTH_HZ -- see that dict's own disclaimer."""
-    return max(0.0, 1.0 - abs(level - 128) / 128.0)
+def _pbt_trapezoid_hz(level, width_hz, center_hz):
+    """One Twin PBT knob's own filter shape: a copy of the mode's full
+    default passband (same width_hz, centered at center_hz when the raw
+    0-255 level is at 128) that SLIDES along frequency as the knob turns
+    away from center -- confirmed against a real Icom radio: each PBT
+    knob moves a whole filter shape left/right, it does NOT narrow one
+    edge in place (this module's earlier assumption). At either extreme
+    (0 or 255) the trapezoid has shifted by half its own width, so two
+    knobs at opposite extremes produce trapezoids that just barely touch
+    (zero-width overlap -- see _pbt_overlap_hz). Returns (low_hz, high_hz)
+    offsets from the tuned frequency."""
+    max_shift_hz = width_hz / 2.0
+    shift_hz = (level - 128) / 128.0 * max_shift_hz
+    shifted_center = center_hz + shift_hz
+    return shifted_center - width_hz / 2.0, shifted_center + width_hz / 2.0
+
+
+def _pbt_overlap_hz(mode, inner_level, outer_level):
+    """The actual resulting passband: the OVERLAP of PBT1 (inner) and
+    PBT2 (outer)'s own independently-shifted trapezoids (see
+    _pbt_trapezoid_hz) -- matches real Twin PBT behavior, where audio
+    only passes where BOTH filters pass simultaneously. Both knobs
+    centered (128) means both trapezoids sit exactly on the mode's
+    default passband, so the overlap IS that default passband, unchanged
+    -- same as this app's very first (pre-Twin-PBT) scope shading.
+    Shared by SpectrumWidget's scope overlay and FilterShapeWidget's
+    dedicated filter-shape display, both otherwise-uncalibrated
+    approximations against MODE_BANDWIDTH_HZ -- see that dict's own
+    disclaimer.
+
+    Returns (overlap_low_hz, overlap_high_hz, default_low_hz,
+    default_high_hz, width_hz, center_hz), all as offsets from the tuned
+    frequency except width_hz -- or None if `mode` has no
+    MODE_BANDWIDTH_HZ entry. overlap_high_hz is never less than
+    overlap_low_hz (clamped to equal when the trapezoids no longer
+    overlap at all); check overlap_high_hz > overlap_low_hz before
+    treating the result as an audible (nonzero-width) passband."""
+    if mode not in MODE_BANDWIDTH_HZ:
+        return None
+    default_low_hz, default_high_hz = MODE_BANDWIDTH_HZ[mode]
+    width_hz = default_low_hz + default_high_hz
+    center_hz = (default_high_hz - default_low_hz) / 2.0
+    low1, high1 = _pbt_trapezoid_hz(inner_level, width_hz, center_hz)
+    low2, high2 = _pbt_trapezoid_hz(outer_level, width_hz, center_hz)
+    overlap_low_hz = max(low1, low2)
+    overlap_high_hz = max(overlap_low_hz, min(high1, high2))
+    return overlap_low_hz, overlap_high_hz, default_low_hz, default_high_hz, width_hz, center_hz
 
 
 class SpectrumWidget(QWidget):
@@ -205,35 +241,25 @@ class SpectrumWidget(QWidget):
                 if x_high > x_low:
                     painter.fillRect(QRectF(x_low, 0, x_high - x_low, h), QColor(0, 150, 255, 45))
 
-                # Twin PBT overlay -- narrows the plain mode-bandwidth
-                # shading above from each edge, drawn on top of it in a
-                # distinct color so both the full filter and the actual
-                # PBT-narrowed passband stay simultaneously visible.
-                # Approximate, same epistemic status as MODE_BANDWIDTH_HZ
-                # itself: rigplane exposes the PBT level as an
-                # uncalibrated 0-255 raw value (128=centered/no effect),
-                # not a Hz figure, so this just scales linearly against
-                # the unclipped mode edges computed above -- a reasonable
-                # visual hint, not a precise reading.
+                # Twin PBT overlay -- the actual resulting passband
+                # (the overlap of PBT1/PBT2's own independently-shifted
+                # trapezoids, see _pbt_overlap_hz), drawn on top of the
+                # plain mode-bandwidth shading above in a distinct color
+                # so both the full default filter and the real PBT
+                # passband stay simultaneously visible.
                 if self._pbt_inner is not None and self._pbt_outer is not None:
-                    x_tuned_pbt = self._freq_to_x(self._tuned_freq_hz, w)
-                    if x_tuned_pbt is not None:
-                        # low edge = inner (nearer the tuned freq for a
-                        # symmetric CW/AM/FM passband), high edge = outer
-                        # -- an arbitrary but consistent assignment; there's
-                        # no way to know which literal edge Icom's real
-                        # front panel calls "inner" for an asymmetric
-                        # LSB/USB passband without hardware to test
-                        # against, so this only needs to be internally
-                        # consistent, not objectively correct.
-                        pbt_x_low = x_tuned_pbt - (x_tuned_pbt - x_low_edge) * _pbt_edge_fraction(self._pbt_inner)
-                        pbt_x_high = x_tuned_pbt + (x_high_edge - x_tuned_pbt) * _pbt_edge_fraction(self._pbt_outer)
-                        pbt_x_low = max(0.0, pbt_x_low)
-                        pbt_x_high = min(float(w), pbt_x_high)
-                        if pbt_x_high > pbt_x_low:
-                            painter.fillRect(
-                                QRectF(pbt_x_low, 0, pbt_x_high - pbt_x_low, h), QColor(255, 170, 0, 70)
-                            )
+                    overlap = _pbt_overlap_hz(self._mode, self._pbt_inner, self._pbt_outer)
+                    if overlap is not None:
+                        overlap_low_hz, overlap_high_hz, *_rest = overlap
+                        pbt_x_low = self._freq_to_x(self._tuned_freq_hz + overlap_low_hz, w)
+                        pbt_x_high = self._freq_to_x(self._tuned_freq_hz + overlap_high_hz, w)
+                        if pbt_x_low is not None and pbt_x_high is not None:
+                            pbt_x_low = max(0.0, pbt_x_low)
+                            pbt_x_high = min(float(w), pbt_x_high)
+                            if pbt_x_high > pbt_x_low:
+                                painter.fillRect(
+                                    QRectF(pbt_x_low, 0, pbt_x_high - pbt_x_low, h), QColor(255, 170, 0, 70)
+                                )
 
         painter.setPen(QPen(QColor(0, 220, 120), 1.5))
         path = QPainterPath()
@@ -263,22 +289,23 @@ class SpectrumWidget(QWidget):
 
 class FilterShapeWidget(QWidget):
     """Dedicated Twin PBT filter-shape readout, styled after a real
-    Icom radio's own "FILTER" screen (BW/SFT numeric readouts, a
-    trapezoid passband shape drawn against a fixed Hz scale, and two
-    color-coded PBT1/PBT2 level bars below it). Same approximate-not-
-    precise status as SpectrumWidget's own PBT overlay (see
-    MODE_BANDWIDTH_HZ's disclaimer and _pbt_edge_fraction's docstring)
-    -- rigplane exposes no calibrated Hz value for the raw 0-255 PBT
-    level, so BW/SFT here are scaled off the same per-mode
-    MODE_BANDWIDTH_HZ default edges the scope overlay uses, not a real
-    reading."""
+    Icom radio's own "FILTER" screen: BW/SFT numeric readouts, PBT1
+    (inner, blue) and PBT2 (outer, green) each drawn as their own
+    trapezoid -- same width as the mode's default passband, sliding
+    along frequency as its knob turns away from center -- with the
+    actual resulting passband (their overlap) filled in orange on top,
+    plus the two knobs' own raw-level bars below. See _pbt_overlap_hz's
+    docstring for the underlying model (confirmed against a real Icom
+    radio) and MODE_BANDWIDTH_HZ's disclaimer for why BW/SFT are an
+    approximation rather than a calibrated reading -- rigplane exposes
+    no Hz value for the raw 0-255 PBT level at all."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(150)
         self.setMinimumHeight(150)
         self._mode = None            # set via set_mode()
-        self._pbt_inner = None       # set via set_pbt() -- None means "draw centered/no narrowing"
+        self._pbt_inner = None       # set via set_pbt() -- None means "draw both trapezoids centered"
         self._pbt_outer = None
 
     def set_mode(self, mode):
@@ -301,40 +328,45 @@ class FilterShapeWidget(QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "FILTER")
             return
 
-        low_default_hz, high_default_hz = MODE_BANDWIDTH_HZ[self._mode]
         inner_level = self._pbt_inner if self._pbt_inner is not None else 128
         outer_level = self._pbt_outer if self._pbt_outer is not None else 128
-        low_edge_hz = low_default_hz * _pbt_edge_fraction(inner_level)
-        high_edge_hz = high_default_hz * _pbt_edge_fraction(outer_level)
+        overlap_low_hz, overlap_high_hz, default_low_hz, default_high_hz, width_hz, center_hz = _pbt_overlap_hz(
+            self._mode, inner_level, outer_level
+        )
+        pbt1_low_hz, pbt1_high_hz = _pbt_trapezoid_hz(inner_level, width_hz, center_hz)
+        pbt2_low_hz, pbt2_high_hz = _pbt_trapezoid_hz(outer_level, width_hz, center_hz)
 
-        # Fixed reference scale spanning the full (un-narrowed) default
-        # passband -- matches the real radio's own FILTER screen, which
-        # keeps its axis fixed and moves/resizes the trapezoid within it
-        # rather than rescaling the axis to the current filter.
-        axis_span_hz = max(low_default_hz, 1) + max(high_default_hz, 1)
+        # Fixed reference scale -- wide enough to show both trapezoids
+        # across their FULL range of travel (each can shift up to half
+        # its own width off default_low_hz/default_high_hz), not just
+        # the mode's own default passband -- matches the real radio's
+        # own FILTER screen, which keeps its axis fixed rather than
+        # rescaling to whatever the current knobs happen to be doing.
+        axis_low_hz = center_hz - width_hz
+        axis_high_hz = center_hz + width_hz
+        axis_span_hz = max(axis_high_hz - axis_low_hz, 1)
         margin_left, margin_right = 8, 8
         top_y = 24
         axis_y = h - 42
         plot_w = w - margin_left - margin_right
 
         def x_for_offset_hz(offset_hz):
-            # offset_hz measured from the tuned frequency (negative =
-            # below, positive = above); the axis itself spans
-            # -low_default_hz .. +high_default_hz.
-            frac = (offset_hz + low_default_hz) / axis_span_hz
+            frac = (offset_hz - axis_low_hz) / axis_span_hz
             return margin_left + frac * plot_w
 
         x_tuned = x_for_offset_hz(0)
-        x_low = x_for_offset_hz(-low_edge_hz)
-        x_high = x_for_offset_hz(high_edge_hz)
-        x_axis_low = x_for_offset_hz(-low_default_hz)
-        x_axis_high = x_for_offset_hz(high_default_hz)
+        x_axis_low = x_for_offset_hz(axis_low_hz)
+        x_axis_high = x_for_offset_hz(axis_high_hz)
 
         # BW/SFT readouts, matching the real screen's own labels --
         # rounded to the nearest 10 Hz, same approximate status as the
-        # trapezoid itself (see class docstring).
-        bw_hz = round((high_edge_hz + low_edge_hz) / 10) * 10
-        sft_hz = round(((high_edge_hz - low_edge_hz) / 2) / 10) * 10
+        # trapezoids themselves (see class docstring). SFT is how far
+        # the overlap's own center has moved from center_hz -- the
+        # passband's nominal, both-knobs-centered position -- NOT from
+        # the tuned frequency itself (which for an asymmetric SSB
+        # passband isn't the same thing at all).
+        bw_hz = round((overlap_high_hz - overlap_low_hz) / 10) * 10
+        sft_hz = round(((overlap_high_hz + overlap_low_hz) / 2 - center_hz) / 10) * 10
         font = painter.font()
         font.setPointSize(9)
         font.setBold(True)
@@ -345,21 +377,26 @@ class FilterShapeWidget(QWidget):
         painter.drawText(QRectF(0, 4, w / 2, 16), Qt.AlignCenter, bw_text)
         painter.drawText(QRectF(w / 2, 4, w / 2, 16), Qt.AlignCenter, sft_text)
 
-        # Axis line + tick labels at the fixed low/tuned/high reference
-        # points (NOT the current narrowed filter edges -- see
-        # axis_span_hz above).
+        # Axis line + tick labels at the mode's own nominal default
+        # edges/tuned point (NOT the current axis extremes, which exist
+        # only to give the trapezoids room to slide) -- same 3-label
+        # style as the real screen.
         painter.setPen(QPen(QColor(90, 90, 90), 1))
         painter.drawLine(QPointF(x_axis_low, axis_y), QPointF(x_axis_high, axis_y))
         font.setPointSize(7)
         font.setBold(False)
         painter.setFont(font)
         painter.setPen(QColor(150, 150, 150))
-        for hz, x in ((-low_default_hz, x_axis_low), (0, x_tuned), (high_default_hz, x_axis_high)):
+        for hz, x in (
+            (-default_low_hz, x_for_offset_hz(-default_low_hz)),
+            (0, x_tuned),
+            (default_high_hz, x_for_offset_hz(default_high_hz)),
+        ):
             painter.drawText(QRectF(x - 20, axis_y + 4, 40, 12), Qt.AlignCenter, f"{abs(hz):.0f}" if hz else "0")
 
-        # Trapezoid passband shape -- flat top inset from the base
-        # edges, matching the real screen's iconography.
-        if x_high > x_low:
+        def _trapezoid_path(low_hz, high_hz):
+            x_low = x_for_offset_hz(low_hz)
+            x_high = x_for_offset_hz(high_hz)
             inset = min(10.0, max(2.0, (x_high - x_low) * 0.15))
             path = QPainterPath()
             path.moveTo(QPointF(x_low, axis_y))
@@ -367,16 +404,30 @@ class FilterShapeWidget(QWidget):
             path.lineTo(QPointF(x_high - inset, top_y))
             path.lineTo(QPointF(x_high, axis_y))
             path.closeSubpath()
+            return path
+
+        # PBT1/PBT2's own trapezoids, drawn as outlines only (their
+        # combined effect -- the overlap -- is what gets filled below)
+        # so it's clear each knob really does move its own whole shape.
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(70, 140, 255), 1.5))
+        painter.drawPath(_trapezoid_path(pbt1_low_hz, pbt1_high_hz))
+        painter.setPen(QPen(QColor(90, 210, 90), 1.5))
+        painter.drawPath(_trapezoid_path(pbt2_low_hz, pbt2_high_hz))
+
+        # The actual resulting passband -- solid orange fill, on top of
+        # both outlines, only where they overlap.
+        if overlap_high_hz > overlap_low_hz:
             painter.setPen(QPen(QColor(255, 170, 0), 1.5))
-            painter.setBrush(QBrush(QColor(255, 140, 0, 130)))
-            painter.drawPath(path)
+            painter.setBrush(QBrush(QColor(255, 140, 0, 150)))
+            painter.drawPath(_trapezoid_path(overlap_low_hz, overlap_high_hz))
 
         painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
         painter.drawLine(QPointF(x_tuned, top_y - 4), QPointF(x_tuned, axis_y))
 
         # PBT1 (inner)/PBT2 (outer) level bars -- same blue/green color
-        # coding as the real screen, raw 0-255 range with a center-detent
-        # tick at 128.
+        # coding as the trapezoids above, raw 0-255 range with a
+        # center-detent tick at 128.
         bar_h = 8
         bar_y1 = h - 2 * bar_h - 8
         bar_y2 = h - bar_h - 2

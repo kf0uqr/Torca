@@ -88,6 +88,7 @@ class RadioRemoteState(QObject):
             "operator_present": False,
             "tx_locked": False,
             "tuner_status": None,  # 0=off, 1=on, 2=tuning -- None until the first poll on radios with no tuner
+            "scope_span": None,  # preset index 0-7, from get_scope_span() polling
         }
         window.worker.frequency_updated.connect(self._on_freq)
         window.worker.control_updated.connect(self._on_control)
@@ -97,6 +98,7 @@ class RadioRemoteState(QObject):
         window.worker.active_receiver_changed.connect(self._on_active_receiver)
         window.worker.level_updated.connect(self._on_level)
         window.worker.tuner_status_changed.connect(self._on_tuner_status)
+        window.worker.scope_span_changed.connect(self._on_scope_span)
         self._set_ptt_widget.connect(window.ptt_button.setChecked)
 
         self._id_watchdog = QTimer(self)
@@ -127,6 +129,9 @@ class RadioRemoteState(QObject):
 
     def _on_tuner_status(self, status):
         self.state["tuner_status"] = status
+
+    def _on_scope_span(self, span_index):
+        self.state["scope_span"] = span_index
 
     def _on_level(self, key, value):
         # value is 0.0-1.0, same scale main_window.py's sliders use
@@ -248,6 +253,9 @@ class RadioRemoteState(QObject):
         briefly, same as PTT, so app.py gates this behind can_transmit()
         before calling it (see the "tuner_start" command branch)."""
         self.window.worker.start_tuner()
+
+    def request_scope_span(self, span_index: int):
+        self.window.worker.set_scope_span(span_index)
 
     def request_level(self, key: str, value: float):
         self.window.worker.set_level_value(key, float(value))

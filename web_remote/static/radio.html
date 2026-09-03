@@ -34,6 +34,16 @@
     <button id="clear-lock-button" style="display:none;">Clear Lock</button>
 </div>
 <main>
+    <div class="panel" style="grid-column: 1 / -1;">
+        <h2>Spectrum</h2>
+        <div class="controls-row" style="justify-content: flex-start;">
+            <label for="span-select">Span:</label>
+            <select id="span-select"></select>
+        </div>
+        <canvas id="scope-canvas" width="900" height="180"></canvas>
+        <canvas id="waterfall-canvas" width="900" height="180" style="margin-top:6px;"></canvas>
+    </div>
+
     <div class="radio-top-row" style="grid-column: 1 / -1;">
         <div class="panel radio-controls-panel">
             <div class="freq-display" id="freq-display"><span class="freq-empty">-- Hz</span></div>
@@ -85,12 +95,6 @@
             <h2>Meters</h2>
             <div id="meters"></div>
         </div>
-    </div>
-
-    <div class="panel" style="grid-column: 1 / -1;">
-        <h2>Spectrum</h2>
-        <canvas id="scope-canvas" width="900" height="180"></canvas>
-        <canvas id="waterfall-canvas" width="900" height="180" style="margin-top:6px;"></canvas>
     </div>
 </main>
 </div>

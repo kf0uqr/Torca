@@ -71,6 +71,9 @@ let dataModeActive = false;
 let currentVfo = "A";
 let currentActiveReceiver = 0; // 0=MAIN, 1=SUB
 let modeSelectFocused = false;
+let spanSelectFocused = false;
+let spanLabelsRendered = 0; // guards against rebuilding <option>s (and losing focus/mid-pick state) every ~200ms poll tick
+let currentMode = null;
 
 // Same inline-token-banner flow as dashboard.js -- see its own
 // comment for why this deliberately avoids window.prompt().
@@ -147,10 +150,11 @@ function send(cmd) {
 // guest -- purely a UX nicety, since the server enforces the real gate
 // (app.py's can_transmit()) regardless of what this does.
 let currentRole = null;
+let txAllowed = true; // set by renderRoleBanner -- read by the scope/waterfall canvas click-to-tune handlers below, which aren't plain form controls TX_CONTROL_IDS' el.disabled loop can gate
 
 const TX_CONTROL_IDS = [
     "ptt-button", "atu-button", "mic-toggle", "mode-select", "data-mode-button",
-    "vfo-button", "band-select", "tune-button", "freq-input",
+    "vfo-button", "band-select", "tune-button", "freq-input", "span-select",
     "squelch-slider", "tx_level-slider", "rf_level-slider",
 ];
 
@@ -161,7 +165,7 @@ function renderRoleBanner(state) {
     const killButton = document.getElementById("kill-tx-button");
     const clearButton = document.getElementById("clear-lock-button");
 
-    let txAllowed = true;
+    txAllowed = true;
     if (currentRole === "viewer") {
         banner.style.display = "flex";
         banner.classList.remove("role-banner-ok");
@@ -224,9 +228,16 @@ function render(state) {
         renderFreqDisplay(state.freq_hz);
     }
 
+    if (state.mode) currentMode = state.mode; // read by drawSpectrumBars for the passband overlay, independent of mode-select's own focus guard
     if (!modeSelectFocused && state.mode) {
         const select = document.getElementById("mode-select");
         if (select.value !== state.mode) select.value = state.mode;
+    }
+
+    renderSpanOptions(state.scope_span_labels || []);
+    if (!spanSelectFocused && state.scope_span != null) {
+        const spanSelect = document.getElementById("span-select");
+        if (spanSelect.value !== String(state.scope_span)) spanSelect.value = String(state.scope_span);
     }
 
     pttActive = !!state.ptt;
@@ -290,6 +301,24 @@ function renderBandOptions(bands) {
     select.innerHTML = '<option value="">Band...</option>' +
         bands.map((b, i) => `<option value="${i}">${b.label}</option>`).join("");
 }
+
+// ---- Scope span select ----
+// Unlike band-select, this DOES have a real server-reported current
+// value (state.scope_span, from get_scope_span() polling), so it's
+// reflected persistently rather than one-shot -- same
+// focused-while-picking guard as mode-select above.
+function renderSpanOptions(labels) {
+    if (labels.length === spanLabelsRendered) return; // rebuilt only once, right after the first snapshot arrives
+    spanLabelsRendered = labels.length;
+    document.getElementById("span-select").innerHTML =
+        labels.map((label, i) => `<option value="${i}">${label}</option>`).join("");
+}
+
+document.getElementById("span-select").addEventListener("focus", () => { spanSelectFocused = true; });
+document.getElementById("span-select").addEventListener("blur", () => { spanSelectFocused = false; });
+document.getElementById("span-select").addEventListener("change", (e) => {
+    send({ cmd: "set_scope_span", index: Number(e.target.value) });
+});
 
 document.getElementById("band-select").addEventListener("change", (e) => {
     const index = e.target.value;
@@ -475,17 +504,70 @@ function renderMeters(meters, defs) {
     }).join("");
 }
 
+// Approximate occupied-bandwidth passband per mode (hz_below_tuned_
+// freq, hz_above_tuned_freq) -- ported line-for-line from constants.
+// MODE_BANDWIDTH_HZ (widgets.py's SpectrumWidget uses the same table
+// for the desktop's own passband shading), so the web page matches
+// the desktop's overlay exactly rather than reimplementing a rough
+// guess at the same numbers.
+const MODE_BANDWIDTH_HZ = {
+    LSB: [2400, 0], USB: [0, 2400], AM: [3000, 3000], CW: [250, 250],
+    CW_R: [250, 250], RTTY: [350, 350], RTTY_R: [350, 350],
+    FM: [6000, 6000], WFM: [90000, 90000], DV: [3000, 3000],
+};
+
+let lastScopeFrame = null; // {start_freq_hz, end_freq_hz} -- read by the click-to-tune handlers on both canvases
+
 function renderScope(scope) {
+    lastScopeFrame = scope;
     const raw = atob(scope.pixels_b64);
-    drawSpectrumBars(raw);
+    drawSpectrumBars(raw, scope);
     pushWaterfallRow(raw);
 }
 
-function drawSpectrumBars(raw) {
+// Same x<->frequency mapping as widgets.py's SpectrumWidget._freq_to_x/
+// _x_to_freq -- against the CSS-displayed width (canvas.clientWidth),
+// not the canvas's internal pixel-buffer width (canvas.width, used
+// only for bar-drawing resolution below), so click coordinates (which
+// arrive in CSS pixels) line up correctly regardless of any zoom/
+// scaling between the two.
+function freqToX(freqHz, scope, width) {
+    const { start_freq_hz: start, end_freq_hz: end } = scope;
+    if (start === end) return null;
+    return ((freqHz - start) / (end - start)) * width;
+}
+
+function xToFreq(x, scope, width) {
+    if (!scope || width <= 0) return null;
+    const { start_freq_hz: start, end_freq_hz: end } = scope;
+    return start + (x / width) * (end - start);
+}
+
+function drawSpectrumBars(raw, scope) {
     const canvas = document.getElementById("scope-canvas");
     const ctx = canvas.getContext("2d");
     const n = raw.length;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Passband/bandwidth shading -- drawn BEFORE the amplitude bars so
+    // the bars stay fully visible on top of it, same layering as the
+    // desktop's SpectrumWidget.paintEvent.
+    const bandwidth = currentMode && MODE_BANDWIDTH_HZ[currentMode];
+    if (currentFreqHz != null && bandwidth) {
+        const [belowHz, aboveHz] = bandwidth;
+        let xLow = freqToX(currentFreqHz - belowHz, scope, canvas.width);
+        let xHigh = freqToX(currentFreqHz + aboveHz, scope, canvas.width);
+        if (xLow != null && xHigh != null) {
+            if (xLow > xHigh) [xLow, xHigh] = [xHigh, xLow];
+            xLow = Math.max(0, xLow);
+            xHigh = Math.min(canvas.width, xHigh);
+            if (xHigh > xLow) {
+                ctx.fillStyle = "rgba(0, 150, 255, 0.18)";
+                ctx.fillRect(xLow, 0, xHigh - xLow, canvas.height);
+            }
+        }
+    }
+
     ctx.fillStyle = "#3c78c8";
     const barWidth = canvas.width / n;
     for (let i = 0; i < n; i++) {
@@ -493,7 +575,44 @@ function drawSpectrumBars(raw) {
         const h = (amplitude / 160) * canvas.height;
         ctx.fillRect(i * barWidth, canvas.height - h, Math.max(1, barWidth), h);
     }
+
+    // Tuning line -- drawn on top of both the shading and the bars,
+    // same as the desktop.
+    if (currentFreqHz != null) {
+        const xTuned = freqToX(currentFreqHz, scope, canvas.width);
+        if (xTuned != null && xTuned >= 0 && xTuned <= canvas.width) {
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(xTuned, 0);
+            ctx.lineTo(xTuned, canvas.height);
+            ctx.stroke();
+        }
+    }
 }
+
+function scopeCanvasClickToFreq(canvas, event) {
+    if (!lastScopeFrame) return null;
+    const rect = canvas.getBoundingClientRect();
+    return xToFreq(event.clientX - rect.left, lastScopeFrame, rect.width);
+}
+
+// Click-to-tune on either canvas -- same contract as the desktop's
+// SpectrumWidget/WaterfallWidget.frequency_clicked (mousePressEvent):
+// a click anywhere in the plot retunes there, optimistically updated
+// like the digit spinner/band-select/Tune button above.
+function onScopeCanvasClick(event) {
+    if (!txAllowed) return;
+    const freqHz = scopeCanvasClickToFreq(event.currentTarget, event);
+    if (freqHz == null) return;
+    const rounded = Math.round(freqHz);
+    currentFreqHz = rounded;
+    renderFreqDisplay(rounded);
+    freqSyncBlockedUntil = Date.now() + FREQ_DISPLAY_SYNC_HOLDOFF_MS;
+    send({ cmd: "set_frequency", freq_hz: rounded });
+}
+document.getElementById("scope-canvas").addEventListener("click", onScopeCanvasClick);
+document.getElementById("waterfall-canvas").addEventListener("click", onScopeCanvasClick);
 
 // ---- Waterfall ----
 // Scrolling history of scope frames, newest at the top -- ported from

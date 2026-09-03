@@ -30,7 +30,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 import adif
 import qso_log
-from constants import RADIO_BANDS
+from constants import RADIO_BANDS, SCOPE_SPAN_LABELS
 from web_remote.common import ROLE_VIEWER, find_radio_window, make_role_checker
 from web_remote.routes_tools import create_tools_router
 from web_remote.routes_satellite import create_satellite_router
@@ -213,6 +213,8 @@ async def _handle_radio_commands(websocket, window, role, radio_id, audit):
                     else None
                 )
                 window.remote_state.request_select_band(msg["band_label"], int(msg["low_edge_hz"]), receiver)
+            elif cmd == "set_scope_span" and "index" in msg:
+                window.remote_state.request_scope_span(int(msg["index"]))
     except WebSocketDisconnect:
         pass
 
@@ -240,6 +242,11 @@ def radio_snapshot(window):
         {"label": label, "low_hz": low_hz, "high_hz": high_hz}
         for label, low_hz, high_hz in RADIO_BANDS.get(window._details.get("radio_model"), [])
     ]
+    # Static, index-matched to set_scope_span()'s preset index (0-7) --
+    # same list main_window.py's own scope_span_combo is populated
+    # from (constants.py), sent here so the web page's dropdown always
+    # matches without a second copy of the labels to keep in sync.
+    state["scope_span_labels"] = SCOPE_SPAN_LABELS
     return state
 
 

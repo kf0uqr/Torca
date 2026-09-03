@@ -425,6 +425,7 @@ button.active {
 #scope-canvas, #waterfall-canvas {
     width: 100%;
     height: 180px;
+    cursor: crosshair;
     background: var(--base-bg);
     border: 1px solid var(--border);
     border-radius: 4px;

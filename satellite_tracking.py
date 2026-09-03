@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QMenu,
+    QComboBox,
 )
 
 # ==================== Satellite tracking ====================
@@ -62,6 +63,14 @@ from PySide6.QtWidgets import (
 SATELLITE_TLE_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=tle"
 SATELLITE_DATA_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "satellites.json"
 EARTH_RADIUS_KM = 6371.0
+
+# Broad operating-style categories, purely informational (no other
+# behavior in this app reads it yet) -- lets an operator scanning the
+# tracked list at a glance tell a linear-transponder bird from an FM
+# repeater/digipeater/SSTV one without opening Edit Transponders.
+# Blank ("-- Type --") is the default for anything not yet categorized
+# rather than guessing/defaulting to one of the five real options.
+SATELLITE_CATEGORIES = ["Linear", "FM", "Digipeater", "SSTV", "Multi"]
 
 
 def load_satellite_data():
@@ -1063,8 +1072,8 @@ class SatelliteConfigDialog(QDialog):
         self._observer_lon = observer_lon
         self._observer_elevation_km = observer_elevation_km
 
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Show", "Name"])
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Show", "Name", "Type"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
@@ -1102,10 +1111,10 @@ class SatelliteConfigDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addWidget(QLabel(
-            "Check satellites to display on the map. \"Fetch Transponder "
-            "Data\" updates every tracked satellite from SatNOGS DB; select "
-            "one row and click \"Edit Transponders...\" to view or hand-edit "
-            "its list."
+            "Check satellites to display on the map, and optionally pick a "
+            "Type (informational only). \"Fetch Transponder Data\" updates "
+            "every tracked satellite from SatNOGS DB; select one row and "
+            "click \"Edit Transponders...\" to view or hand-edit its list."
         ))
         layout.addWidget(self.table)
         layout.addLayout(button_row)
@@ -1123,6 +1132,14 @@ class SatelliteConfigDialog(QDialog):
             name_item = QTableWidgetItem(sat.get("name", ""))
             name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, 1, name_item)
+
+            type_combo = QComboBox()
+            type_combo.addItem("-- Type --", "")
+            for category in SATELLITE_CATEGORIES:
+                type_combo.addItem(category, category)
+            current_index = type_combo.findData(sat.get("category", ""))
+            type_combo.setCurrentIndex(current_index if current_index >= 0 else 0)
+            self.table.setCellWidget(row, 2, type_combo)
 
     def _on_refresh_tles(self):
         try:
@@ -1247,6 +1264,7 @@ class SatelliteConfigDialog(QDialog):
     def _on_accept(self):
         for row, sat in enumerate(self._satellites):
             sat["selected"] = self.table.item(row, 0).checkState() == Qt.Checked
+            sat["category"] = self.table.cellWidget(row, 2).currentData()
         self.accept()
 
     def result_satellites(self):

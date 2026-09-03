@@ -295,6 +295,32 @@ LEVEL_DEFINITIONS = {
     },
 }
 
+# Twin PBT (passband tuning) -- rigplane's DspControlCapable.get/set_pbt_
+# inner/outer, each an independent 0-255 level (NOT the 0.0-1.0-normalized
+# scale LEVEL_DEFINITIONS above uses -- these are already raw per the
+# protocol's own docstrings, "Set PBT Inner/Outer level (0-255)"). 128 is
+# the centered/neutral value with no narrowing effect, confirmed by
+# rigplane's own default state (web/state_schema.py: "pbtInner: int = 128",
+# "pbtOuter: int = 128"); moving either slider away from 128 in either
+# direction narrows the IF passband from that edge, matching real Icom
+# Twin PBT behavior. Icom-only in practice (IC-7610/IC-9700 profiles
+# declare "pbt" in their capabilities; the Yaesu CAT backend defines the
+# same method names but unconditionally raises NotImplementedError) --
+# see RadioWorker.is_pbt_capable, which gates on the profile's declared
+# capability set rather than these method names being merely present.
+PBT_DEFINITIONS = {
+    "pbt_inner": {
+        "label": "PBT Inner",
+        "getter_candidates": ["get_pbt_inner"],
+        "setter_candidates": ["set_pbt_inner"],
+    },
+    "pbt_outer": {
+        "label": "PBT Outer",
+        "getter_candidates": ["get_pbt_outer"],
+        "setter_candidates": ["set_pbt_outer"],
+    },
+}
+
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on
 # a dual-receiver radio. Their real getter/setter DOES accept a
 # receiver= kwarg (confirmed via a full inspect.signature() sweep

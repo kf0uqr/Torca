@@ -58,6 +58,20 @@ except ImportError:
     LevelsCapable = None
 
 try:
+    # CAP_PBT: the profile-declared capability tag (rigplane's
+    # radio.capabilities set), NOT a Protocol to isinstance-check against
+    # -- DspControlCapable's get/set_pbt_inner/outer method names exist on
+    # BOTH the Icom and Yaesu backends structurally, but Yaesu's just
+    # unconditionally raise NotImplementedError (confirmed in
+    # backends/yaesu_cat/radio.py). Only the IC-7610/IC-9700 rig profiles
+    # actually declare "pbt" in their [capabilities] features list, so
+    # that's the only reliable way to know Twin PBT is real on this
+    # specific connected radio -- see is_pbt_capable below.
+    from rigplane.core.capabilities import CAP_PBT
+except ImportError:
+    CAP_PBT = None
+
+try:
     # Confirmed via rigplane's own type signatures: "Radio has two
     # independent receivers (e.g. IC-7610 Main/Sub)" -- the IC-9700 is
     # the other one, per its own docs. Confirmed live (a real 9700 vs.
@@ -119,6 +133,7 @@ from constants import (
     BAND_STACKING_EXCLUDED,
     LEVEL_DEBOUNCE_SECONDS,
     LEVEL_DEFINITIONS,
+    PBT_DEFINITIONS,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
@@ -191,6 +206,7 @@ class RadioWorker(QThread):
     scope_frame_received = Signal(object)  # rigplane.scope.ScopeFrame
     audio_status = Signal(str)           # informational, not an error
     level_updated = Signal(str, float)   # (level key, value 0.0-1.0)
+    pbt_updated = Signal(str, int)       # (pbt key, raw level 0-255, 128=centered) -- see PBT_DEFINITIONS
     active_receiver_changed = Signal(int)  # dual-receiver only: 0=MAIN, 1=SUB, from get_active_receiver() polling
     scope_span_changed = Signal(int)     # preset index 0-7, from get_scope_span() polling
     scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
@@ -209,6 +225,7 @@ class RadioWorker(QThread):
         self._main_task = None  # the _main() asyncio Task, created inside run() -- see stop()
         self.radio = None      # rigplane Radio, set once connected
         self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
+        self.is_pbt_capable = False  # set once connected -- see CAP_PBT import comment
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -352,6 +369,8 @@ class RadioWorker(QThread):
         # poll and looking like the slider "bouncing back". See
         # set_level_value()/_debounce_level_value().
         self._level_debounce_tasks = {}
+        self._pbt_methods = {}  # pbt key -> (get_name, set_name), populated by _setup_pbt()
+        self._pbt_debounce_tasks = {}  # same debounce idea as _level_debounce_tasks, separate dict/keyspace
 
     def run(self):
         """Thread entry point: create and own the asyncio loop here."""
@@ -1277,6 +1296,23 @@ class RadioWorker(QThread):
                 f"Related attributes found on radio: {', '.join(hints) or '(none)'}"
             )
 
+    async def _setup_pbt(self):
+        """Discovers the real get/set method names for PBT_DEFINITIONS,
+        same find_method_name discovery as _setup_levels() -- but only
+        when is_pbt_capable is already True (set from the radio's own
+        declared "pbt" capability, not from these method names merely
+        existing -- see CAP_PBT import comment; unlike _setup_levels()
+        there's no "missing" case worth reporting here, since a False
+        is_pbt_capable already fully explains an empty result."""
+        self._pbt_methods = {}
+        if not self.is_pbt_capable:
+            return
+        for key, definition in PBT_DEFINITIONS.items():
+            get_name = find_method_name(self.radio, definition["getter_candidates"])
+            set_name = find_method_name(self.radio, definition["setter_candidates"])
+            if get_name and set_name:
+                self._pbt_methods[key] = (get_name, set_name)
+
         if "af_gain" in self._level_methods:
             self._hint_usb_audio_level_attrs()
 
@@ -1469,6 +1505,39 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"{definition['label']}: {set_name}() failed ({exc}).")
 
+    def set_pbt_value(self, key: str, value: int):
+        """Thread-safe: call from the GUI thread. value is the raw 0-255
+        PBT level (128=centered) -- see PBT_DEFINITIONS. Debounced the
+        same way as set_level_value(), through a separate dict/keyspace
+        (_pbt_debounce_tasks) so a PBT drag and a level-slider drag never
+        cancel each other's pending task."""
+        if self.loop is None or key not in self._pbt_methods:
+            return
+        asyncio.run_coroutine_threadsafe(self._debounce_pbt_value(key, value), self.loop)
+
+    async def _debounce_pbt_value(self, key: str, value: int):
+        existing = self._pbt_debounce_tasks.get(key)
+        if existing is not None and not existing.done():
+            existing.cancel()
+
+        async def _wait_then_apply():
+            try:
+                await asyncio.sleep(LEVEL_DEBOUNCE_SECONDS)
+            except asyncio.CancelledError:
+                return
+            await self._set_pbt_value(key, value)
+
+        self._pbt_debounce_tasks[key] = asyncio.ensure_future(_wait_then_apply())
+
+    async def _set_pbt_value(self, key: str, value: int):
+        _get_name, set_name = self._pbt_methods[key]
+        definition = PBT_DEFINITIONS[key]
+        setter = getattr(self.radio, set_name)
+        try:
+            await setter(value)
+        except Exception as exc:
+            self.error.emit(f"{definition['label']}: {set_name}() failed ({exc}).")
+
     async def _main(self):
         try:
             if self._details.get("connection_type") == "remote":
@@ -1517,6 +1586,7 @@ class RadioWorker(QThread):
             return
 
         self.is_dual_receiver = DualReceiverCapable is not None and isinstance(self.radio, DualReceiverCapable)
+        self.is_pbt_capable = CAP_PBT is not None and CAP_PBT in getattr(self.radio, "capabilities", set())
         self.connected.emit()
         # Everything from here through _poll_loop() is wrapped in one
         # try/finally so self._radio_cm.__aexit__() (closing the actual
@@ -1531,6 +1601,7 @@ class RadioWorker(QThread):
         try:
             await self._setup_audio()
             await self._setup_levels()
+            await self._setup_pbt()
             self._setup_meters()
             self.meters_ready.emit(self._meter_definitions)
             self._setup_controls()
@@ -2061,6 +2132,15 @@ class RadioWorker(QThread):
                     # reflects which receiver these end up affecting.
                     raw_value = await self._poll_receiver_aware(key, getter)
                     self.level_updated.emit(key, self._normalize_level_value(raw_value))
+                except Exception as exc:
+                    self.error.emit(f"{definition['label']}: {exc}")
+
+            for key, (get_name, _set_name) in self._pbt_methods.items():
+                definition = PBT_DEFINITIONS[key]
+                getter = getattr(self.radio, get_name)
+                try:
+                    raw_value = await getter()
+                    self.pbt_updated.emit(key, int(raw_value))
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
 

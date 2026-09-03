@@ -58,6 +58,8 @@ class SpectrumWidget(QWidget):
         self._overlays = {}  # corner -> (widget, margin)
         self._tuned_freq_hz = None  # set via set_tuned_frequency() -- whichever receiver the scope is currently following
         self._mode = None           # set via set_mode() -- CONTROL_DEFINITIONS["mode"]'s plain string values (e.g. "USB", "FM")
+        self._pbt_inner = None      # set via set_pbt() -- raw 0-255 PBT level, 128=centered; None = no PBT overlay drawn
+        self._pbt_outer = None
 
     def set_tuned_frequency(self, freq_hz):
         """The actual VFO/receiver frequency the scope is centered on --
@@ -77,6 +79,16 @@ class SpectrumWidget(QWidget):
         just means no bandwidth shading gets drawn (the tuning line
         itself doesn't depend on mode)."""
         self._mode = mode
+        self.update()
+
+    def set_pbt(self, inner_level, outer_level):
+        """Twin PBT (passband tuning) levels, raw 0-255 (128=centered) --
+        see PBT_DEFINITIONS in constants.py. Narrows the passband
+        shading drawn in paintEvent from the near/far edge respectively;
+        pass None/None (the default) to draw only the plain per-mode
+        shading, unchanged, e.g. on a radio without PBT."""
+        self._pbt_inner = inner_level
+        self._pbt_outer = outer_level
         self.update()
 
     def set_overlay_widget(self, widget, margin=8, corner="top-right"):
@@ -171,13 +183,46 @@ class SpectrumWidget(QWidget):
             x_low = self._freq_to_x(self._tuned_freq_hz - low_hz, w)
             x_high = self._freq_to_x(self._tuned_freq_hz + high_hz, w)
             if x_low is not None and x_high is not None:
-                x_low, x_high = sorted((x_low, x_high))
+                x_low_edge, x_high_edge = sorted((x_low, x_high))
                 # Clip to the visible area -- a wide passband (WFM) can
                 # easily extend past either edge of a narrow scope span.
-                x_low = max(0.0, x_low)
-                x_high = min(float(w), x_high)
+                x_low = max(0.0, x_low_edge)
+                x_high = min(float(w), x_high_edge)
                 if x_high > x_low:
                     painter.fillRect(QRectF(x_low, 0, x_high - x_low, h), QColor(0, 150, 255, 45))
+
+                # Twin PBT overlay -- narrows the plain mode-bandwidth
+                # shading above from each edge, drawn on top of it in a
+                # distinct color so both the full filter and the actual
+                # PBT-narrowed passband stay simultaneously visible.
+                # Approximate, same epistemic status as MODE_BANDWIDTH_HZ
+                # itself: rigplane exposes the PBT level as an
+                # uncalibrated 0-255 raw value (128=centered/no effect),
+                # not a Hz figure, so this just scales linearly against
+                # the unclipped mode edges computed above -- a reasonable
+                # visual hint, not a precise reading.
+                if self._pbt_inner is not None and self._pbt_outer is not None:
+                    x_tuned_pbt = self._freq_to_x(self._tuned_freq_hz, w)
+                    if x_tuned_pbt is not None:
+                        def _edge_frac(level):
+                            return max(0.0, 1.0 - abs(level - 128) / 128.0)
+
+                        # low edge = inner (nearer the tuned freq for a
+                        # symmetric CW/AM/FM passband), high edge = outer
+                        # -- an arbitrary but consistent assignment; there's
+                        # no way to know which literal edge Icom's real
+                        # front panel calls "inner" for an asymmetric
+                        # LSB/USB passband without hardware to test
+                        # against, so this only needs to be internally
+                        # consistent, not objectively correct.
+                        pbt_x_low = x_tuned_pbt - (x_tuned_pbt - x_low_edge) * _edge_frac(self._pbt_inner)
+                        pbt_x_high = x_tuned_pbt + (x_high_edge - x_tuned_pbt) * _edge_frac(self._pbt_outer)
+                        pbt_x_low = max(0.0, pbt_x_low)
+                        pbt_x_high = min(float(w), pbt_x_high)
+                        if pbt_x_high > pbt_x_low:
+                            painter.fillRect(
+                                QRectF(pbt_x_low, 0, pbt_x_high - pbt_x_low, h), QColor(255, 170, 0, 70)
+                            )
 
         painter.setPen(QPen(QColor(0, 220, 120), 1.5))
         path = QPainterPath()

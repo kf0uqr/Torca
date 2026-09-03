@@ -33,6 +33,7 @@ from constants import (
     RADIO_BANDS,
     RADIO_ROLES,
     LEVEL_DEFINITIONS,
+    PBT_DEFINITIONS,
     DUAL_RECEIVER_LEVEL_KEYS,
     CONTROL_DEFINITIONS,
     CONTROL_OPTION_EXCLUDED,
@@ -453,6 +454,32 @@ class RadioWindow(QWidget):
             self.level_sliders[key] = slider
             self.level_labels[key] = label
 
+        # Twin PBT (passband tuning) -- Icom-only, so both slider+label
+        # pairs stay hidden until _on_connected() confirms
+        # worker.is_pbt_capable (unlike the levels above, which are
+        # merely disabled-but-visible pre-connect: PBT isn't just "not
+        # ready yet", it may genuinely not exist on this radio at all).
+        # Raw 0-255 range (128=centered), NOT the 0-100% scale
+        # LEVEL_DEFINITIONS' sliders use -- see PBT_DEFINITIONS.
+        self.pbt_sliders = {}
+        self.pbt_labels = {}
+        pbt_row = QVBoxLayout()
+        for key, definition in PBT_DEFINITIONS.items():
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(0, 255)
+            slider.setValue(128)
+            slider.setVisible(False)
+            slider.setEnabled(False)
+            slider.valueChanged.connect(lambda value, k=key: self._on_pbt_changed(k, value))
+            label = QLabel(f"{definition['label']}: --")
+            label.setVisible(False)
+            row = QHBoxLayout()
+            row.addWidget(label)
+            row.addWidget(slider)
+            pbt_row.addLayout(row)
+            self.pbt_sliders[key] = slider
+            self.pbt_labels[key] = label
+
         # Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO -- built generically
         # from CONTROL_DEFINITIONS: a combo box ("combo" type), a
         # checkable toggle button ("toggle" type), or a plain click-to-
@@ -622,6 +649,7 @@ class RadioWindow(QWidget):
         layout.addLayout(self.band_buttons_row)
         layout.addLayout(tuning_row)
         layout.addLayout(levels_row)
+        layout.addLayout(pbt_row)
         layout.addWidget(self.status_label)
         self.setLayout(layout)
 
@@ -634,6 +662,7 @@ class RadioWindow(QWidget):
         self.worker.error.connect(self._on_error)
         self.worker.audio_status.connect(self._on_audio_status)
         self.worker.level_updated.connect(self._on_level_updated)
+        self.worker.pbt_updated.connect(self._on_pbt_updated)
         self.worker.control_updated.connect(self._on_control_updated)
         self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
         self.worker.scope_span_changed.connect(self._on_scope_span_changed)
@@ -688,6 +717,11 @@ class RadioWindow(QWidget):
         if self.worker.is_dual_receiver:
             self.active_receiver_button.setVisible(True)
             self.active_receiver_button.setEnabled(True)
+        if self.worker.is_pbt_capable:
+            for key, slider in self.pbt_sliders.items():
+                slider.setVisible(True)
+                slider.setEnabled(True)
+                self.pbt_labels[key].setVisible(True)
         # Scope controls are NOT enabled here -- is_scope_capable isn't
         # known true yet at this point (see RadioWorker._main's
         # scope_ready docstring); _on_scope_ready handles it once the
@@ -857,6 +891,35 @@ class RadioWindow(QWidget):
         suffix = self._level_receiver_suffix.get(key, "")
         self.level_labels[key].setText(f"{LEVEL_DEFINITIONS[key]['label']}{suffix}: {value}%")
         self.worker.set_level_value(key, value / 100.0)
+
+    def _on_pbt_updated(self, key, value):
+        slider = self.pbt_sliders.get(key)
+        label = self.pbt_labels.get(key)
+        if slider is None:
+            return
+        # Block signals while reflecting the radio's actual value so this
+        # doesn't immediately fire _on_pbt_changed and write it straight
+        # back to the radio -- same reasoning as _on_level_updated.
+        if slider.value() != value:
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        label.setText(f"{PBT_DEFINITIONS[key]['label']}: {value}")
+        self._update_pbt_overlay()
+
+    def _on_pbt_changed(self, key, value):
+        self.pbt_labels[key].setText(f"{PBT_DEFINITIONS[key]['label']}: {value}")
+        self.worker.set_pbt_value(key, value)
+        self._update_pbt_overlay()
+
+    def _update_pbt_overlay(self):
+        """Pushes both PBT sliders' current values into the spectrum
+        widget's passband-narrowing overlay, immediately -- not waiting
+        for the next poll round-trip, matching the tuned-frequency line's
+        instant-feedback behavior."""
+        self.spectrum_widget.set_pbt(
+            self.pbt_sliders["pbt_inner"].value(), self.pbt_sliders["pbt_outer"].value()
+        )
 
     def _on_control_combo_changed(self, key, widget):
         value = widget.currentData()

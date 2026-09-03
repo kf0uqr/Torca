@@ -192,6 +192,24 @@ MODE_BANDWIDTH_HZ = {
     "DV": (3000, 3000),
 }
 
+# Twin PBT: Hz each PBT1/PBT2 raw-level step (0-255, 128=centered) shifts
+# that knob's own IF passband copy -- taken directly from the IC-705
+# Basic Manual, "Using the Digital Twin PBT": "The PBT is adjustable in
+# 50 Hz steps in the SSB, CW, and RTTY modes, and 200 Hz in the AM
+# mode." (Misc/IC-705_ENG_Basic_9.pdf, p. 4-4) -- a real calibrated
+# figure, unlike MODE_BANDWIDTH_HZ's own defaults. Only covers the modes
+# that same page says Twin PBT actually applies to (SSB, CW, RTTY, AM);
+# FM/WFM/DV aren't listed there at all, so they're deliberately absent
+# here -- see widgets.py's _pbt_overlap_hz, which treats a missing entry
+# as "this knob has no effect in this mode" (hz_per_level=0), not an
+# error.
+PBT_HZ_PER_LEVEL = {
+    "LSB": 50, "USB": 50,
+    "CW": 50, "CW_R": 50,
+    "RTTY": 50, "RTTY_R": 50,
+    "AM": 200,
+}
+
 # Audio format used for the local capture/playback streams. Only raw PCM16
 # mono is handled -- if the radio reports a different codec via its
 # audio_codec/audio_tx_codec attributes, AudioBridge disables streaming

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QWidget, QMenu, QToolTip
 
 from constants import (
     METER_DEFINITIONS, S_METER_RAW_S9, S_METER_RAW_MAX, S_METER_S9_FRACTION, DEGREES_PER_KNOB_STEP,
-    WATERFALL_ROWS, MODE_BANDWIDTH_HZ,
+    WATERFALL_ROWS, MODE_BANDWIDTH_HZ, PBT_HZ_PER_LEVEL,
 )
 import band_plan
 
@@ -42,20 +42,21 @@ def amplitude_to_color(amp, max_amp=160):
     return QColor(*_COLOR_ANCHORS[-1][1])
 
 
-def _pbt_trapezoid_hz(level, width_hz, center_hz):
+def _pbt_trapezoid_hz(level, hz_per_level, width_hz, center_hz):
     """One Twin PBT knob's own filter shape: a copy of the mode's full
     default passband (same width_hz, centered at center_hz when the raw
     0-255 level is at 128) that SLIDES along frequency as the knob turns
-    away from center -- confirmed against a real Icom radio: each PBT
-    knob moves a whole filter shape left/right, it does NOT narrow one
-    edge in place (this module's earlier assumption). At either extreme
-    (0 or 255) the trapezoid has shifted by half its own width, so two
-    knobs at opposite extremes produce trapezoids that just barely touch
-    (zero-width overlap -- see _pbt_overlap_hz). Returns (low_hz, high_hz)
-    offsets from the tuned frequency."""
-    max_shift_hz = width_hz / 2.0
-    shift_hz = (level - 128) / 128.0 * max_shift_hz
-    shifted_center = center_hz + shift_hz
+    away from center -- confirmed against a real Icom radio (IC-705
+    Basic Manual, "Using the Digital Twin PBT"): each PBT knob moves a
+    whole filter shape left/right, it does NOT narrow one edge in place
+    (this module's earlier, unconfirmed assumption). hz_per_level is the
+    real, manual-confirmed shift per raw-level step away from 128 (see
+    PBT_HZ_PER_LEVEL) -- NOT scaled to width_hz, so a knob can shift
+    its trapezoid arbitrarily far past the point the two trapezoids
+    stop overlapping at all (matches the real control: turning past
+    that point does nothing further, it doesn't "wrap" or rescale).
+    Returns (low_hz, high_hz) offsets from the tuned frequency."""
+    shifted_center = center_hz + (level - 128) * hz_per_level
     return shifted_center - width_hz / 2.0, shifted_center + width_hz / 2.0
 
 
@@ -67,10 +68,14 @@ def _pbt_overlap_hz(mode, inner_level, outer_level):
     centered (128) means both trapezoids sit exactly on the mode's
     default passband, so the overlap IS that default passband, unchanged
     -- same as this app's very first (pre-Twin-PBT) scope shading.
-    Shared by SpectrumWidget's scope overlay and FilterShapeWidget's
-    dedicated filter-shape display, both otherwise-uncalibrated
-    approximations against MODE_BANDWIDTH_HZ -- see that dict's own
-    disclaimer.
+    Modes Twin PBT doesn't apply to (FM/WFM/DV -- absent from
+    PBT_HZ_PER_LEVEL) get hz_per_level=0, i.e. both knobs have no effect
+    and the overlap is always just the unmodified default passband,
+    rather than treating it as an error. Shared by SpectrumWidget's
+    scope overlay and FilterShapeWidget's dedicated filter-shape
+    display; the trapezoid WIDTH is still only an approximation against
+    MODE_BANDWIDTH_HZ (see that dict's own disclaimer) even though the
+    shift-per-level is now a real, manual-confirmed figure.
 
     Returns (overlap_low_hz, overlap_high_hz, default_low_hz,
     default_high_hz, width_hz, center_hz), all as offsets from the tuned
@@ -84,8 +89,9 @@ def _pbt_overlap_hz(mode, inner_level, outer_level):
     default_low_hz, default_high_hz = MODE_BANDWIDTH_HZ[mode]
     width_hz = default_low_hz + default_high_hz
     center_hz = (default_high_hz - default_low_hz) / 2.0
-    low1, high1 = _pbt_trapezoid_hz(inner_level, width_hz, center_hz)
-    low2, high2 = _pbt_trapezoid_hz(outer_level, width_hz, center_hz)
+    hz_per_level = PBT_HZ_PER_LEVEL.get(mode, 0)
+    low1, high1 = _pbt_trapezoid_hz(inner_level, hz_per_level, width_hz, center_hz)
+    low2, high2 = _pbt_trapezoid_hz(outer_level, hz_per_level, width_hz, center_hz)
     overlap_low_hz = max(low1, low2)
     overlap_high_hz = max(overlap_low_hz, min(high1, high2))
     return overlap_low_hz, overlap_high_hz, default_low_hz, default_high_hz, width_hz, center_hz
@@ -333,15 +339,20 @@ class FilterShapeWidget(QWidget):
         overlap_low_hz, overlap_high_hz, default_low_hz, default_high_hz, width_hz, center_hz = _pbt_overlap_hz(
             self._mode, inner_level, outer_level
         )
-        pbt1_low_hz, pbt1_high_hz = _pbt_trapezoid_hz(inner_level, width_hz, center_hz)
-        pbt2_low_hz, pbt2_high_hz = _pbt_trapezoid_hz(outer_level, width_hz, center_hz)
+        hz_per_level = PBT_HZ_PER_LEVEL.get(self._mode, 0)
+        pbt1_low_hz, pbt1_high_hz = _pbt_trapezoid_hz(inner_level, hz_per_level, width_hz, center_hz)
+        pbt2_low_hz, pbt2_high_hz = _pbt_trapezoid_hz(outer_level, hz_per_level, width_hz, center_hz)
 
-        # Fixed reference scale -- wide enough to show both trapezoids
-        # across their FULL range of travel (each can shift up to half
-        # its own width off default_low_hz/default_high_hz), not just
-        # the mode's own default passband -- matches the real radio's
-        # own FILTER screen, which keeps its axis fixed rather than
-        # rescaling to whatever the current knobs happen to be doing.
+        # Fixed reference scale, one width_hz of headroom on either side
+        # of the default passband -- enough to show the two trapezoids
+        # all the way out to the point they stop overlapping at all
+        # (which happens once each has shifted width_hz/2 apart from
+        # center). A knob can shift much farther than that in raw-level
+        # terms (see _pbt_trapezoid_hz), but past this point the overlap
+        # is already zero and staying zero, so there's nothing more
+        # useful to show -- the trapezoid outline just slides off the
+        # edge of the plot, same as the real radio's own FILTER screen
+        # keeping a fixed axis rather than rescaling to the current knobs.
         axis_low_hz = center_hz - width_hz
         axis_high_hz = center_hz + width_hz
         axis_span_hz = max(axis_high_hz - axis_low_hz, 1)

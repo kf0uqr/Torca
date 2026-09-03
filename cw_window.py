@@ -139,6 +139,24 @@ _PTT_TRAIL_MS = 500
 _DURATION_SAFETY_MARGIN = 1.08
 
 
+class TranscriptTextEdit(QTextEdit):
+    """Plain QTextEdit plus one thing: double-clicking a word emits it,
+    so CwToolWindow can drop a callsign straight from the decode
+    transcript into the Contact field instead of retyping it. Reuses
+    Qt's own word-under-cursor selection (super().mouseDoubleClickEvent
+    already does this -- the same double-click-to-select-word behavior
+    any text edit has) rather than re-implementing word-boundary
+    detection by hand."""
+
+    word_double_clicked = Signal(str)
+
+    def mouseDoubleClickEvent(self, event):
+        super().mouseDoubleClickEvent(event)
+        word = self.textCursor().selectedText().strip()
+        if word:
+            self.word_double_clicked.emit(word)
+
+
 class CwToolWindow(QWidget):
     # Internal cross-thread hop only: _on_decode_audio_frame runs on
     # RadioWorker's asyncio-loop thread (same requirement as every
@@ -293,8 +311,10 @@ class CwToolWindow(QWidget):
         self.decode_status_label = QLabel("Not decoding.")
         self.decode_status_label.setStyleSheet("color: #aaa;")
 
-        self.transcript = QTextEdit()
+        self.transcript = TranscriptTextEdit()
         self.transcript.setReadOnly(True)
+        self.transcript.setToolTip("Double-click a word to drop it into the Contact field.")
+        self.transcript.word_double_clicked.connect(self._on_transcript_word_double_clicked)
 
         decode_group = QVBoxLayout()
         decode_group.addWidget(QLabel("<b>Decode</b>"))
@@ -570,6 +590,13 @@ class CwToolWindow(QWidget):
 
     def _on_clear_clicked(self):
         self.transcript.clear()
+
+    def _on_transcript_word_double_clicked(self, word):
+        # Uppercased same as _substitute_tokens already does when
+        # reading this field back out for {CALL} -- stored that way
+        # up front so the field reads correctly immediately, not just
+        # once a macro is sent.
+        self.contact_call_edit.setText(word.strip(".,;:!?()[]").upper())
 
     # ---- Lifecycle ----
 

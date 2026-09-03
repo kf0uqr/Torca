@@ -42,7 +42,9 @@ from constants import (
     SCOPE_SPEED_LABELS,
 )
 from radio_worker import RadioWorker, RECEIVER_MAIN, RECEIVER_SUB
-from widgets import SpectrumWidget, WaterfallWidget, BandPlanOverlayWidget, MeterWidget, TuningKnobWidget
+from widgets import (
+    SpectrumWidget, WaterfallWidget, BandPlanOverlayWidget, MeterWidget, TuningKnobWidget, FilterShapeWidget,
+)
 from satellite_tracking import radio_mode_for_transponder
 from cw_window import CwToolWindow
 from split_dialog import SplitSettingsDialog
@@ -193,6 +195,14 @@ class RadioWindow(QWidget):
         self.spectrum_widget.set_overlay_widget(self.freq_display)
         self.spectrum_widget.set_overlay_widget(self.nominal_freq_display, corner="top-left")
         self.spectrum_widget.frequency_clicked.connect(self._on_scope_clicked)
+
+        # Twin PBT filter-shape readout -- placed to the left of the RIT
+        # knob (see tuning_row below), mirroring a real Icom radio's own
+        # "FILTER" screen. Kept in sync with the scope's own mode/PBT
+        # state via _on_control_updated (mode) and _update_pbt_overlay
+        # (PBT levels), same event sources as SpectrumWidget's own
+        # equivalents, rather than a separate polling path.
+        self.filter_shape_widget = FilterShapeWidget()
         self.waterfall_widget = WaterfallWidget()
         self.waterfall_widget.frequency_clicked.connect(self._on_scope_clicked)
         self.band_plan_widget = BandPlanOverlayWidget()
@@ -635,6 +645,8 @@ class RadioWindow(QWidget):
         # middle, leaving the whole space between left_column and the
         # RIT/tuning knob pair open for more buttons later.
         tuning_row.addStretch()
+        tuning_row.addWidget(self.filter_shape_widget, alignment=Qt.AlignVCenter)
+        tuning_row.addSpacing(8)
         tuning_row.addLayout(rit_column)
         tuning_row.addSpacing(16)
         tuning_row.addLayout(knob_row)
@@ -914,12 +926,14 @@ class RadioWindow(QWidget):
 
     def _update_pbt_overlay(self):
         """Pushes both PBT sliders' current values into the spectrum
-        widget's passband-narrowing overlay, immediately -- not waiting
-        for the next poll round-trip, matching the tuned-frequency line's
-        instant-feedback behavior."""
-        self.spectrum_widget.set_pbt(
-            self.pbt_sliders["pbt_inner"].value(), self.pbt_sliders["pbt_outer"].value()
-        )
+        widget's passband-narrowing overlay and the dedicated filter-
+        shape widget, immediately -- not waiting for the next poll
+        round-trip, matching the tuned-frequency line's instant-feedback
+        behavior."""
+        inner = self.pbt_sliders["pbt_inner"].value()
+        outer = self.pbt_sliders["pbt_outer"].value()
+        self.spectrum_widget.set_pbt(inner, outer)
+        self.filter_shape_widget.set_pbt(inner, outer)
 
     def _on_control_combo_changed(self, key, widget):
         value = widget.currentData()
@@ -1404,6 +1418,7 @@ class RadioWindow(QWidget):
     def _on_control_updated(self, key, value):
         if key == "mode":
             self.spectrum_widget.set_mode(value)
+            self.filter_shape_widget.set_mode(value)
         widget = self.control_widgets.get(key)
         if widget is None:
             return

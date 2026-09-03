@@ -41,6 +41,20 @@ def amplitude_to_color(amp, max_amp=160):
             return QColor(r, g, b)
     return QColor(*_COLOR_ANCHORS[-1][1])
 
+
+def _pbt_edge_fraction(level):
+    """Twin PBT level (0-255, 128=centered) -> how much of the mode's
+    default passband edge remains: 1.0 (full width, no narrowing) at
+    128, shrinking to 0.0 (fully collapsed onto the tuned frequency) at
+    either extreme -- matches real Icom Twin PBT behavior (a
+    center-detent control that narrows the passband from either
+    direction away from center). Shared by SpectrumWidget's scope
+    overlay and FilterShapeWidget's dedicated filter-shape display, both
+    of which are otherwise-uncalibrated approximations against
+    MODE_BANDWIDTH_HZ -- see that dict's own disclaimer."""
+    return max(0.0, 1.0 - abs(level - 128) / 128.0)
+
+
 class SpectrumWidget(QWidget):
     """Amplitude-vs-frequency plot of the most recent ScopeFrame."""
 
@@ -204,9 +218,6 @@ class SpectrumWidget(QWidget):
                 if self._pbt_inner is not None and self._pbt_outer is not None:
                     x_tuned_pbt = self._freq_to_x(self._tuned_freq_hz, w)
                     if x_tuned_pbt is not None:
-                        def _edge_frac(level):
-                            return max(0.0, 1.0 - abs(level - 128) / 128.0)
-
                         # low edge = inner (nearer the tuned freq for a
                         # symmetric CW/AM/FM passband), high edge = outer
                         # -- an arbitrary but consistent assignment; there's
@@ -215,8 +226,8 @@ class SpectrumWidget(QWidget):
                         # LSB/USB passband without hardware to test
                         # against, so this only needs to be internally
                         # consistent, not objectively correct.
-                        pbt_x_low = x_tuned_pbt - (x_tuned_pbt - x_low_edge) * _edge_frac(self._pbt_inner)
-                        pbt_x_high = x_tuned_pbt + (x_high_edge - x_tuned_pbt) * _edge_frac(self._pbt_outer)
+                        pbt_x_low = x_tuned_pbt - (x_tuned_pbt - x_low_edge) * _pbt_edge_fraction(self._pbt_inner)
+                        pbt_x_high = x_tuned_pbt + (x_high_edge - x_tuned_pbt) * _pbt_edge_fraction(self._pbt_outer)
                         pbt_x_low = max(0.0, pbt_x_low)
                         pbt_x_high = min(float(w), pbt_x_high)
                         if pbt_x_high > pbt_x_low:
@@ -248,6 +259,147 @@ class SpectrumWidget(QWidget):
         end_text = f"{self._frame.end_freq_hz / 1e6:.4f} MHz"
         painter.drawText(5, h - 5, start_text)
         painter.drawText(w - painter.fontMetrics().horizontalAdvance(end_text) - 5, h - 5, end_text)
+
+
+class FilterShapeWidget(QWidget):
+    """Dedicated Twin PBT filter-shape readout, styled after a real
+    Icom radio's own "FILTER" screen (BW/SFT numeric readouts, a
+    trapezoid passband shape drawn against a fixed Hz scale, and two
+    color-coded PBT1/PBT2 level bars below it). Same approximate-not-
+    precise status as SpectrumWidget's own PBT overlay (see
+    MODE_BANDWIDTH_HZ's disclaimer and _pbt_edge_fraction's docstring)
+    -- rigplane exposes no calibrated Hz value for the raw 0-255 PBT
+    level, so BW/SFT here are scaled off the same per-mode
+    MODE_BANDWIDTH_HZ default edges the scope overlay uses, not a real
+    reading."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(150)
+        self.setMinimumHeight(150)
+        self._mode = None            # set via set_mode()
+        self._pbt_inner = None       # set via set_pbt() -- None means "draw centered/no narrowing"
+        self._pbt_outer = None
+
+    def set_mode(self, mode):
+        self._mode = mode
+        self.update()
+
+    def set_pbt(self, inner_level, outer_level):
+        self._pbt_inner = inner_level
+        self._pbt_outer = outer_level
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor(10, 10, 20))
+        w, h = self.width(), self.height()
+
+        if self._mode not in MODE_BANDWIDTH_HZ:
+            painter.setPen(QColor(120, 120, 120))
+            painter.drawText(self.rect(), Qt.AlignCenter, "FILTER")
+            return
+
+        low_default_hz, high_default_hz = MODE_BANDWIDTH_HZ[self._mode]
+        inner_level = self._pbt_inner if self._pbt_inner is not None else 128
+        outer_level = self._pbt_outer if self._pbt_outer is not None else 128
+        low_edge_hz = low_default_hz * _pbt_edge_fraction(inner_level)
+        high_edge_hz = high_default_hz * _pbt_edge_fraction(outer_level)
+
+        # Fixed reference scale spanning the full (un-narrowed) default
+        # passband -- matches the real radio's own FILTER screen, which
+        # keeps its axis fixed and moves/resizes the trapezoid within it
+        # rather than rescaling the axis to the current filter.
+        axis_span_hz = max(low_default_hz, 1) + max(high_default_hz, 1)
+        margin_left, margin_right = 8, 8
+        top_y = 24
+        axis_y = h - 42
+        plot_w = w - margin_left - margin_right
+
+        def x_for_offset_hz(offset_hz):
+            # offset_hz measured from the tuned frequency (negative =
+            # below, positive = above); the axis itself spans
+            # -low_default_hz .. +high_default_hz.
+            frac = (offset_hz + low_default_hz) / axis_span_hz
+            return margin_left + frac * plot_w
+
+        x_tuned = x_for_offset_hz(0)
+        x_low = x_for_offset_hz(-low_edge_hz)
+        x_high = x_for_offset_hz(high_edge_hz)
+        x_axis_low = x_for_offset_hz(-low_default_hz)
+        x_axis_high = x_for_offset_hz(high_default_hz)
+
+        # BW/SFT readouts, matching the real screen's own labels --
+        # rounded to the nearest 10 Hz, same approximate status as the
+        # trapezoid itself (see class docstring).
+        bw_hz = round((high_edge_hz + low_edge_hz) / 10) * 10
+        sft_hz = round(((high_edge_hz - low_edge_hz) / 2) / 10) * 10
+        font = painter.font()
+        font.setPointSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(220, 220, 220))
+        bw_text = f"BW {bw_hz / 1000:.2f}k" if bw_hz >= 1000 else f"BW {bw_hz}"
+        sft_text = f"SFT {'+' if sft_hz > 0 else ''}{sft_hz}"
+        painter.drawText(QRectF(0, 4, w / 2, 16), Qt.AlignCenter, bw_text)
+        painter.drawText(QRectF(w / 2, 4, w / 2, 16), Qt.AlignCenter, sft_text)
+
+        # Axis line + tick labels at the fixed low/tuned/high reference
+        # points (NOT the current narrowed filter edges -- see
+        # axis_span_hz above).
+        painter.setPen(QPen(QColor(90, 90, 90), 1))
+        painter.drawLine(QPointF(x_axis_low, axis_y), QPointF(x_axis_high, axis_y))
+        font.setPointSize(7)
+        font.setBold(False)
+        painter.setFont(font)
+        painter.setPen(QColor(150, 150, 150))
+        for hz, x in ((-low_default_hz, x_axis_low), (0, x_tuned), (high_default_hz, x_axis_high)):
+            painter.drawText(QRectF(x - 20, axis_y + 4, 40, 12), Qt.AlignCenter, f"{abs(hz):.0f}" if hz else "0")
+
+        # Trapezoid passband shape -- flat top inset from the base
+        # edges, matching the real screen's iconography.
+        if x_high > x_low:
+            inset = min(10.0, max(2.0, (x_high - x_low) * 0.15))
+            path = QPainterPath()
+            path.moveTo(QPointF(x_low, axis_y))
+            path.lineTo(QPointF(x_low + inset, top_y))
+            path.lineTo(QPointF(x_high - inset, top_y))
+            path.lineTo(QPointF(x_high, axis_y))
+            path.closeSubpath()
+            painter.setPen(QPen(QColor(255, 170, 0), 1.5))
+            painter.setBrush(QBrush(QColor(255, 140, 0, 130)))
+            painter.drawPath(path)
+
+        painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
+        painter.drawLine(QPointF(x_tuned, top_y - 4), QPointF(x_tuned, axis_y))
+
+        # PBT1 (inner)/PBT2 (outer) level bars -- same blue/green color
+        # coding as the real screen, raw 0-255 range with a center-detent
+        # tick at 128.
+        bar_h = 8
+        bar_y1 = h - 2 * bar_h - 8
+        bar_y2 = h - bar_h - 2
+        font.setPointSize(7)
+        painter.setFont(font)
+        for label, level, color, bar_y in (
+            ("PBT1", inner_level, QColor(70, 140, 255), bar_y1),
+            ("PBT2", outer_level, QColor(90, 210, 90), bar_y2),
+        ):
+            bar_x = margin_left + 30
+            bar_w = w - bar_x - margin_right
+            painter.setPen(QColor(150, 150, 150))
+            painter.drawText(QRectF(margin_left, bar_y - 1, 28, bar_h + 2), Qt.AlignVCenter | Qt.AlignLeft, label)
+            painter.setPen(QPen(QColor(60, 60, 60), 1))
+            painter.setBrush(QBrush(QColor(25, 25, 35)))
+            painter.drawRect(QRectF(bar_x, bar_y, bar_w, bar_h))
+            marker_x = bar_x + (level / 255.0) * bar_w
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawRect(QRectF(bar_x, bar_y, marker_x - bar_x, bar_h))
+            center_x = bar_x + 0.5 * bar_w
+            painter.setPen(QPen(QColor(200, 200, 200), 1))
+            painter.drawLine(QPointF(center_x, bar_y), QPointF(center_x, bar_y + bar_h))
 
 
 class WaterfallWidget(QWidget):

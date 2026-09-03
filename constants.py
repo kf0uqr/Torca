@@ -7,9 +7,24 @@ of circular imports.
 """
 
 RADIO_PROFILES = {
-    "IC-7300": {"addr_hex": "94", "default_connection": "usb"},
-    "IC-9700": {"addr_hex": "A2", "default_connection": "network"},
-    "IC-705": {"addr_hex": "A4", "default_connection": "network"},
+    # default_baud: matches each radio's own rigplane rig profile
+    # (rigs/*.toml default_baud) -- NOT the same as this file's own
+    # DEFAULT_BAUD_RATE fallback (19200), which predates these per-radio
+    # values and is too slow for any of the Icom CI-V radios below.
+    # Confirmed as the actual cause of a real bug: Twin PBT reads
+    # ("[ERROR] PBT Inner/Outer: CI-V response timed out") reproduced
+    # live on an IC-705 at 19200 baud, over BOTH LAN and USB -- ic705.toml
+    # documents "default_baud = 115200  # Required for scope data over
+    # serial CI-V", and evidently some DSP-adjacent commands (Twin PBT
+    # among them) need that same higher baud to get a response back
+    # within rigplane's read timeout, even though slower commands
+    # (frequency, mode, filter select) still work at 19200, just more
+    # slowly -- which is exactly why this went unnoticed until Twin PBT
+    # was added. See ConnectionDialog._on_radio_changed, which applies
+    # this the same way it already applies addr_hex per selected radio.
+    "IC-7300": {"addr_hex": "94", "default_connection": "usb", "default_baud": 115200},
+    "IC-9700": {"addr_hex": "A2", "default_connection": "network", "default_baud": 115200},
+    "IC-705": {"addr_hex": "A4", "default_connection": "network", "default_baud": 115200},
     # IC-7610, X6200, FTX-1: added on rigplane's own already-shipped rig
     # profiles/backends (rigplane/rigs/*.toml + backends/*), NOT verified
     # against real hardware by this app -- see README.md's "Supported
@@ -23,7 +38,7 @@ RADIO_PROFILES = {
     # from Icom's own IC-7610 CI-V Reference Guide + hardware testing, per
     # that file's own header) -- same CI-V family as the three radios
     # above, dual-receiver like the IC-9700.
-    "IC-7610": {"addr_hex": "98", "default_connection": "network", "protocol": "civ"},
+    "IC-7610": {"addr_hex": "98", "default_connection": "network", "protocol": "civ", "default_baud": 115200},
     # X6200: civ_addr 0xA4 -- the SAME default address as the IC-705 above.
     # This is correct (confirmed directly against rigplane's own x6200.toml,
     # sourced from Xiegu's official CI-V implementation doc) and NOT a
@@ -33,12 +48,12 @@ RADIO_PROFILES = {
     # radio_worker.py now always passes the selected radio_model into
     # rigplane's backend config (_build_backend_config) instead of ever
     # letting the address alone imply which profile/personality to use.
-    "X6200": {"addr_hex": "A4", "default_connection": "usb", "protocol": "civ"},
+    "X6200": {"addr_hex": "A4", "default_connection": "usb", "protocol": "civ", "default_baud": 19200},
     # FTX-1 (Yaesu): Yaesu CAT, not CI-V -- no CI-V address at all, and no
     # LAN backend (rigplane's ftx1.toml declares has_lan = false), so
     # "usb" (serial) is not just the default here, it's the only
     # connection type that can actually work.
-    "FTX-1": {"addr_hex": "", "default_connection": "usb", "protocol": "yaesu_cat"},
+    "FTX-1": {"addr_hex": "", "default_connection": "usb", "protocol": "yaesu_cat", "default_baud": 38400},
 }
 
 # Which role a connected radio plays in satellite Doppler control, chosen

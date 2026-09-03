@@ -440,6 +440,16 @@ class ConnectionDialog(QDialog):
     def _on_radio_changed(self, radio_model):
         profile = RADIO_PROFILES[radio_model]
         self.addr_input.setText(profile["addr_hex"])
+        # Per-radio default_baud (see RADIO_PROFILES' own comment) --
+        # this app's own DEFAULT_BAUD_RATE fallback (19200) is too slow
+        # for these radios' own rig profiles, confirmed live to cause
+        # Twin PBT commands to time out on an IC-705 even though slower
+        # commands still work at that rate. Applied the same
+        # unconditional way addr_hex is above -- a saved connection
+        # profile's own baud_rate (if any) still overrides this
+        # afterward, same ordering as addr_hex/connection_type (see
+        # __init__'s last_profile handling, which runs after this).
+        self.baud_rate_input.setValue(profile.get("default_baud", DEFAULT_BAUD_RATE))
         index = self.connection_combo.findData(profile["default_connection"])
         if index != -1 and index != self.connection_combo.currentIndex():
             self.connection_combo.setCurrentIndex(index)  # currentIndexChanged -> _on_connection_type_changed

@@ -324,6 +324,22 @@ class AudioBridge:
         # error. See add_extra_rx_callback/remove_extra_rx_callback/
         # has_rx_stream.
         self._extra_rx_callbacks = []
+        # Same idea as _extra_rx_callbacks, but fed the RAW pre-downmix
+        # payload (interleaved stereo L=Main/R=Sub when the radio
+        # negotiated a stereo codec, otherwise the same mono bytes
+        # _extra_rx_callbacks gets) -- for a consumer that needs Main/
+        # Sub independently of whatever this bridge's OWN listening
+        # downmix (_rx_downmix_channel) is currently set to, e.g. the
+        # recording tool letting an operator record Sub while listening
+        # to Main. See add_extra_rx_raw_callback/is_rx_stereo.
+        self._extra_rx_raw_callbacks = []
+        # Extra consumers of outgoing TX mic audio -- e.g. the recording
+        # tool. Unlike RX, there was never a need for this until now (no
+        # existing feature piggybacks on TX), so there's only ever been
+        # the one real consumer (radio.push_tx() itself via _tx_pump) --
+        # still a list, for the same "more than one thing might want it
+        # someday" reasoning _extra_rx_callbacks already established.
+        self._extra_tx_callbacks = []
 
         self.sample_rate = getattr(radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
         self._pcm_ok = self._check_pcm_codec()
@@ -606,7 +622,12 @@ class AudioBridge:
             self._rx_stereo_remainder = combined[usable:]
             aligned = combined[:usable]
             self._accumulate_stereo_channel_diagnostic(aligned)
+            for extra_raw_callback in self._extra_rx_raw_callbacks:
+                extra_raw_callback(aligned)
             data = _downmix_stereo_to_mono(aligned, channel=self._rx_downmix_channel)
+        elif data is not None:
+            for extra_raw_callback in self._extra_rx_raw_callbacks:
+                extra_raw_callback(data)
         if data is None:
             # packet=None is a genuine, expected case (a jitter-buffer
             # gap placeholder -- confirmed via AudioPacket's own docs),
@@ -790,6 +811,8 @@ class AudioBridge:
         if self._tx_captured_count == 0:
             self._status(f"TX audio: first chunk captured from mic ({len(data)} bytes).")
         self._tx_captured_count += 1
+        for extra_tx_callback in self._extra_tx_callbacks:
+            extra_tx_callback(data)
         self.loop.call_soon_threadsafe(self._enqueue_tx, data)
 
     def _enqueue_tx(self, data):
@@ -910,6 +933,62 @@ class AudioBridge:
         themselves just to call this safely."""
         try:
             self._extra_rx_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def is_rx_stereo(self):
+        """Whether this bridge's RX stream is a negotiated stereo
+        dual-receiver codec (L=Main/R=Sub) -- lets a raw-callback
+        consumer (e.g. the recording tool) know how to interpret the
+        bytes add_extra_rx_raw_callback() hands it: interleaved stereo
+        if True, plain mono if False. Fixed for the lifetime of this
+        bridge (set once from the radio's negotiated codec at
+        construction), so a consumer only needs to check this once."""
+        return self._rx_stereo
+
+    def add_extra_rx_raw_callback(self, callback):
+        """Registers one more consumer of this bridge's RAW pre-downmix
+        RX audio -- interleaved stereo PCM (L=Main/R=Sub) when
+        is_rx_stereo() is True, otherwise the same mono bytes
+        add_extra_rx_callback() gets. Unlike add_extra_rx_callback,
+        this is NOT affected by set_rx_downmix_channel() at all -- it
+        always sees both receivers' audio when the radio provides it,
+        independent of what this bridge's own listening output is
+        currently downmixed to. Same threading/registration rules as
+        add_extra_rx_callback (runs on this bridge's RX callback
+        thread, multiple callbacks coexist, no-op if already
+        registered)."""
+        if callback not in self._extra_rx_raw_callbacks:
+            self._extra_rx_raw_callbacks.append(callback)
+
+    def remove_extra_rx_raw_callback(self, callback):
+        """Unregisters a callback added via add_extra_rx_raw_callback().
+        No-op if it isn't currently registered."""
+        try:
+            self._extra_rx_raw_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def add_extra_tx_callback(self, callback):
+        """Registers one more consumer of outgoing TX mic audio -- the
+        same PCM16 mono bytes captured from the input device and queued
+        for radio.push_tx(), handed to `callback` right alongside that.
+        Only ever called while genuinely transmitting (_on_input_
+        captured already gates on _tx_active before either the queue or
+        any extra callback sees a chunk), so a consumer never needs to
+        separately track PTT state just to know when real TX audio is
+        flowing. Runs on this bridge's own PortAudio input-stream
+        thread (not the asyncio loop, not the GUI thread) -- same
+        cross-thread rules as every other audio callback in this file.
+        No-op if `callback` is already registered."""
+        if callback not in self._extra_tx_callbacks:
+            self._extra_tx_callbacks.append(callback)
+
+    def remove_extra_tx_callback(self, callback):
+        """Unregisters a callback added via add_extra_tx_callback().
+        No-op if it isn't currently registered."""
+        try:
+            self._extra_tx_callbacks.remove(callback)
         except ValueError:
             pass
 

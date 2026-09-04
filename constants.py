@@ -164,15 +164,20 @@ DEFAULT_BAUD_RATE = 19200
 DEFAULT_REMOTE_PORT = 8080  # matches rigplane.web.server.WebConfig's own default port
 
 POLL_INTERVAL_SEC = 0.5  # how often to read frequency/s-meter from the radio
-# How many POLL_INTERVAL_SEC ticks between polls of PBT/filter width/
-# filter shape/preamp-attenuator -- settings that mostly only change via
-# a user action THROUGH THIS APP (which already reflects the value
-# locally/immediately) rather than needing every-cycle freshness like
-# frequency/meters/mode. See radio_worker.py's _poll_loop for why this
-# exists: confirmed live that polling everything every single cycle
-# made the sequential CI-V round-trip chain long enough to cause real
-# timeouts under load.
-SLOW_POLL_EVERY_N_CYCLES = 4  # ~2s at POLL_INTERVAL_SEC=0.5s
+# Separate, slower cadence for everything that only changes via a user
+# action -- either THROUGH THIS APP (which already reflects the value
+# locally/immediately, e.g. _update_pbt_overlay) or on the radio's own
+# front panel (where a couple seconds of latency before this app
+# notices is an acceptable tradeoff) -- rather than continuous readings
+# like frequency/meters. See radio_worker.py's _poll_loop_fast/_poll_
+# loop_slow: these used to all share ONE loop at POLL_INTERVAL_SEC,
+# which meant meters (SWR in particular) sat behind a long sequential
+# chain of ~20 settings reads every single cycle and lagged several
+# seconds behind a real PTT press -- confirmed live. Splitting the two
+# loops (running concurrently, each on its own asyncio.sleep cadence)
+# means the fast loop's requests no longer have to wait for the slow
+# loop's entire backlog to finish first.
+SLOW_POLL_INTERVAL_SEC = 3.0
 WATERFALL_ROWS = 200     # how many past scope frames the waterfall keeps on screen
 
 # Step sizes offered next to the tuning knob, and how many degrees of knob

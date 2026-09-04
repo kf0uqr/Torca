@@ -13,7 +13,7 @@ import inspect
 
 from PySide6.QtCore import QThread, Signal
 
-from rigplane import create_radio, LanBackendConfig, CommandError, AudioCodec
+from rigplane import create_radio, LanBackendConfig, CommandError, AudioCodec, Priority
 try:
     # Confirmed by reading rigplane's own source
     # (backends/config.py's SerialBackendConfig.__init__): the real
@@ -170,7 +170,7 @@ from constants import (
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
-    SLOW_POLL_EVERY_N_CYCLES,
+    SLOW_POLL_INTERVAL_SEC,
     AUDIO_DEVICE_SYSTEM_DEFAULT,
     AUDIO_TX_PCM_FRAME_BYTES,
 )
@@ -326,7 +326,7 @@ class RadioWorker(QThread):
         self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
         self.is_pbt_capable = False  # set once connected -- see CAP_PBT import comment
         self.is_filter_width_capable = False  # set once connected -- see CAP_FILTER_WIDTH import comment
-        self._filter_width_hz = None  # live DSP filter width, polled -- see _poll_loop
+        self._filter_width_hz = None  # live DSP filter width, polled -- see _poll_loop_slow
         self._filter_width_range_mode = None  # last mode a filter_width_range_updated was computed/emitted for -- avoids recomputing every poll cycle
         self._filter_width_debounce_task = None  # pending asyncio.Task, for set_filter_width_value()'s debounce
         self.is_filter_shape_capable = False  # set once connected -- see CAP_FILTER_SHAPE import comment
@@ -339,13 +339,12 @@ class RadioWorker(QThread):
         # register doesn't reset itself on RX), looking like it had
         # "frozen" instead of returning to a defined at-rest reading.
         # Set True/False by _start_ptt()/_stop_ptt() (both PTT entry
-        # points funnel through these), read by _poll_loop() to skip
-        # polling SWR at all while not transmitting.
+        # points funnel through these), read by _poll_loop_fast() to
+        # skip polling SWR at all while not transmitting.
         self._ptt_active = False
         self._swr_reset_pending = False  # True right after PTT releases, until one reset value has been emitted
-        self._poll_cycle_count = 0  # see is_slow_poll_cycle in _poll_loop
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
-        # Last-observed span/ref/speed, so _poll_loop only emits
+        # Last-observed span/ref/speed, so _poll_loop_slow only emits
         # scope_*_changed when the value genuinely changes -- same
         # change-filtering as _last_observed_active_receiver above.
         self._last_observed_scope_span = None
@@ -434,7 +433,7 @@ class RadioWorker(QThread):
         # Dual-receiver diagnostic: last value observed from
         # get_active_receiver() (a pure, instant read of rigplane's own
         # internal RadioState.active belief -- no extra CI-V traffic) --
-        # _poll_loop() emits an audio_status message (visible in the
+        # _poll_loop_fast() emits an audio_status message (visible in the
         # console via [AUDIO], no special setup needed) every time this
         # changes, so an unexpected flip-flop is directly observable
         # instead of inferred from symptoms like the band-button
@@ -524,8 +523,8 @@ class RadioWorker(QThread):
         # startup (real hardware over USB serial can take multiple
         # seconds to time out on some commands, per BAND_STACKING_
         # EXCLUDED's own docstring) left the old stop() -- which only
-        # set self._stop_requested, a flag _poll_loop's own while-
-        # condition checks and nothing else does -- completely unable
+        # set self._stop_requested, a flag both poll loops' own while-
+        # conditions check and nothing else does -- completely unable
         # to interrupt it. main_window.py's closeEvent only waits 2s
         # (worker.wait(2000)) before returning regardless, so Qt then
         # destroyed the still-running QThread out from under it:
@@ -795,7 +794,7 @@ class RadioWorker(QThread):
     def start_tuner(self):
         """Thread-safe: call from the GUI thread on the Tune button
         press. Fire-and-forget -- set_tuner_status(2) starts a tune
-        cycle; get_tuner_status() polling in _poll_loop (0=off, 1=on,
+        cycle; get_tuner_status() polling in _poll_loop_slow (0=off, 1=on,
         2=tuning) is what reports it finishing, same "poll for the
         real result" split as start_ptt()/set_ptt() vs the radio's own
         PTT state."""
@@ -1393,7 +1392,7 @@ class RadioWorker(QThread):
         every entry in LEVEL_DEFINITIONS (same find_method_name
         discovery used elsewhere). Missing ones are reported once, with
         a filtered dir(radio) hint, instead of failing silently on first
-        use. Live values are polled continuously in _poll_loop() rather
+        use. Live values are polled continuously in _poll_loop_slow() rather
         than only read once here, so a slider reflects changes made
         directly on the radio's own front panel too."""
         self._level_methods = {}
@@ -1801,7 +1800,7 @@ class RadioWorker(QThread):
                 # remote_radio.py's own docstring). Everything from
                 # here on (__aenter__, isinstance capability checks,
                 # _setup_audio/_setup_levels/_setup_meters/
-                # _setup_controls, the scope-enable block, _poll_loop)
+                # _setup_controls, the scope-enable block, the poll loops)
                 # is already fully backend-agnostic and needs no
                 # remote-specific handling at all.
                 self._radio_cm = RemoteWebRadio(
@@ -1874,12 +1873,12 @@ class RadioWorker(QThread):
         )
         self.is_ic705_swr_workaround = self.is_ic705_preamp_att  # same model+send_civ gate, see SWR_CIV_SUB's comment
         self.connected.emit()
-        # Everything from here through _poll_loop() is wrapped in one
+        # Everything from here through the poll loops is wrapped in one
         # try/finally so self._radio_cm.__aexit__() (closing the actual
         # serial/network connection) always runs -- including if stop()
         # cancels this task while still in setup (_setup_audio/_setup_
         # levels/etc, or enable_scope's own up-to-5s verification wait),
-        # not just once _poll_loop() is reached. Without this, closing
+        # not just once the poll loops are reached. Without this, closing
         # the window during a slow real-hardware startup would cancel
         # cleanly (no more Qt abort -- see stop()'s docstring) but leak
         # the underlying connection, likely blocking a subsequent
@@ -1914,7 +1913,12 @@ class RadioWorker(QThread):
             except Exception as exc:
                 self.error.emit(f"Scope unavailable: {exc}")
 
-            await self._poll_loop()
+            # Two independent loops (own asyncio.sleep cadence each) --
+            # see _poll_loop_slow's docstring for why. gather() so a
+            # genuine failure in either one still propagates/cancels the
+            # other, same all-or-nothing shutdown semantics a single
+            # loop had.
+            await asyncio.gather(self._poll_loop_fast(), self._poll_loop_slow())
         finally:
             # Cancel any pending debounced level-value sends -- without
             # this, a slider drag right before disconnect could leave a
@@ -2223,30 +2227,19 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"Restoring active receiver ({previously_active}) after {key} failed: {exc}")
 
-    async def _poll_loop(self):
-        """Periodically reads live values: frequency, plus every
-        confirmed-supported meter (see _setup_meters()). There are only a
-        handful, so polling all of them each cycle is negligible overhead
-        -- this lets any number of independently-selectable MeterWidgets
-        share this one poll loop, each just filtering meter_updated for
-        whichever type it's currently showing, rather than the worker
-        needing to track which widget wants which type."""
+    async def _poll_loop_fast(self):
+        """Frequency, active receiver, and every confirmed-supported
+        meter (see _setup_meters()) -- polled every POLL_INTERVAL_SEC,
+        runs CONCURRENTLY with _poll_loop_slow (see that method's own
+        docstring for why the two are split). These are the only things
+        that genuinely need sub-second freshness: meters reflect live
+        signal/TX conditions, frequency drives the tuning display and
+        satellite tracking, and active receiver gates which receiver's
+        meter this loop's own next iteration reads (see
+        _receiver_kwargs below) -- staleness there would misattribute a
+        meter reading to the wrong receiver, unlike everything in the
+        slow loop where a few seconds' staleness is harmless."""
         while not self._stop_requested:
-            # PBT/filter width/filter shape/preamp-attenuator (below)
-            # only need to catch a front-panel change, since this app's
-            # own UI already reflects a locally-set value immediately
-            # (see _update_pbt_overlay et al.) -- unlike frequency/
-            # meters/mode, which genuinely need every-cycle freshness.
-            # Confirmed live that polling all of them every single
-            # POLL_INTERVAL_SEC cycle, on top of everything else this
-            # loop already does, made the sequential CI-V round-trip
-            # chain long enough to cause real timeouts under load (PBT/
-            # filter width/filter shape all timed out in the same
-            # session) -- skipping them most cycles frees that budget
-            # for what actually needs it.
-            is_slow_poll_cycle = self._poll_cycle_count % SLOW_POLL_EVERY_N_CYCLES == 0
-            self._poll_cycle_count += 1
-
             if self.is_dual_receiver:
                 try:
                     observed = await self.radio.get_active_receiver()
@@ -2270,6 +2263,96 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"get_active_receiver: {exc}")
 
+            try:
+                # get_frequency's receiver param is NOT a Main/Sub
+                # identity selector -- confirmed by reading rigplane's
+                # own source (runtime/_dual_rx_runtime.py): receiver=0
+                # means "whichever receiver is currently SELECTED" (a
+                # bare, no-cmd29 CI-V read that just returns whatever's
+                # active), receiver=1 means "the UNSELECTED one"
+                # specifically (CI-V 0x25 0x01, a dedicated "read the
+                # other receiver" command). So once Sub is genuinely
+                # selected (select_receiver), asking for receiver=1
+                # actually reads Main -- the OPPOSITE of what
+                # self._active_receiver was meant to express. Always
+                # asking for receiver=0/"selected" is what correctly
+                # follows whichever receiver select_receiver() last
+                # made active, regardless of whether that's genuinely
+                # Main or Sub.
+                freq_hz = await self.radio.get_frequency(receiver=RECEIVER_MAIN)
+                self.frequency_updated.emit(freq_hz)
+            except Exception as exc:
+                self.error.emit(str(exc))
+
+            for meter_type, getter_name in self._meter_getters.items():
+                definition = self._meter_definitions[meter_type]
+                try:
+                    if meter_type == "swr":
+                        # SWR is only meaningful during TX -- see
+                        # _ptt_active's own comment for why this skips
+                        # polling entirely (rather than just displaying)
+                        # while not transmitting, and emits exactly one
+                        # defined at-rest reading right on PTT release.
+                        if not self._ptt_active:
+                            if self._swr_reset_pending:
+                                self._swr_reset_pending = False
+                                self.meter_updated.emit("swr", definition.get("display_min", 0.0))
+                            continue
+                        if self.is_ic705_swr_workaround:
+                            # Raw CI-V 0x15/0x12 read via send_civ(), NOT
+                            # rigplane's own get_swr() -- see SWR_CIV_SUB's
+                            # comment in constants.py for why.
+                            resp = await self.radio.send_civ(0x15, sub=SWR_CIV_SUB, wait_response=True)
+                            if resp is None or not resp.data:
+                                continue
+                            value = _interpolate_swr(_bcd_decode_pbt_level(resp.data))
+                        else:
+                            getter = getattr(self.radio, getter_name)
+                            kwargs = (
+                                self._receiver_kwargs(getter, self._active_receiver)
+                                if self.is_dual_receiver
+                                else {}
+                            )
+                            value = await getter(**kwargs)
+                    else:
+                        getter = getattr(self.radio, getter_name)
+                        kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                        value = await getter(**kwargs)
+                    self.meter_updated.emit(meter_type, value)
+                except Exception as exc:
+                    self.error.emit(f"{definition['label']}: {exc}")
+
+            await asyncio.sleep(POLL_INTERVAL_SEC)
+
+    async def _poll_loop_slow(self):
+        """Scope span/ref/speed, CW keyer speed/pitch, tuner status,
+        every CONTROL_DEFINITIONS-based control (mode/AGC/filter/NR/NB/
+        VFO/split/RIT/XIT/etc), every LEVEL_DEFINITIONS-based level,
+        PBT, filter width, filter shape, and (IC-705 only) preamp/
+        attenuator -- everything that only changes via a user action,
+        either THROUGH THIS APP (where the UI already reflects the new
+        value locally/immediately -- see _update_pbt_overlay et al.,
+        _on_control_toggled/_on_control_combo_changed) or on the
+        radio's own front panel (where a few seconds of latency before
+        this app notices is a fine tradeoff) -- unlike frequency/meters,
+        which genuinely need every-cycle freshness (see
+        _poll_loop_fast).
+
+        Runs as its own asyncio task, concurrently with _poll_loop_fast,
+        on a separate SLOW_POLL_INTERVAL_SEC cadence -- confirmed live
+        that folding all of this into ONE shared-cadence loop made the
+        SWR meter (and others) sit behind a long sequential chain of
+        ~20 settings reads every cycle and lag several seconds behind a
+        real PTT press. Splitting the loops means the fast loop's own
+        requests no longer have to wait for this loop's entire backlog
+        to finish first. Our own raw send_civ() calls here also pass
+        Priority.BACKGROUND, rigplane's own documented mechanism for
+        exactly this ("background pollers pass Priority.BACKGROUND so
+        polls yield to user commands") -- rigplane's higher-level
+        convenience methods (get_mode, get_filter_width, etc.) don't
+        expose a priority knob to pass through, so only our own bespoke
+        raw-CI-V calls (PBT/filter shape/preamp/attenuator) get this."""
+        while not self._stop_requested:
             if self.is_scope_capable:
                 # Reflects the scope's real settings -- e.g. hand-adjusted
                 # from the radio's own front panel -- same change-filtered
@@ -2333,65 +2416,6 @@ class RadioWorker(QThread):
                     self.tuner_status_changed.emit(tuner_status)
             except Exception:
                 pass
-
-            try:
-                # get_frequency's receiver param is NOT a Main/Sub
-                # identity selector -- confirmed by reading rigplane's
-                # own source (runtime/_dual_rx_runtime.py): receiver=0
-                # means "whichever receiver is currently SELECTED" (a
-                # bare, no-cmd29 CI-V read that just returns whatever's
-                # active), receiver=1 means "the UNSELECTED one"
-                # specifically (CI-V 0x25 0x01, a dedicated "read the
-                # other receiver" command). So once Sub is genuinely
-                # selected (select_receiver), asking for receiver=1
-                # actually reads Main -- the OPPOSITE of what
-                # self._active_receiver was meant to express. Always
-                # asking for receiver=0/"selected" is what correctly
-                # follows whichever receiver select_receiver() last
-                # made active, regardless of whether that's genuinely
-                # Main or Sub.
-                freq_hz = await self.radio.get_frequency(receiver=RECEIVER_MAIN)
-                self.frequency_updated.emit(freq_hz)
-            except Exception as exc:
-                self.error.emit(str(exc))
-
-            for meter_type, getter_name in self._meter_getters.items():
-                definition = self._meter_definitions[meter_type]
-                try:
-                    if meter_type == "swr":
-                        # SWR is only meaningful during TX -- see
-                        # _ptt_active's own comment for why this skips
-                        # polling entirely (rather than just displaying)
-                        # while not transmitting, and emits exactly one
-                        # defined at-rest reading right on PTT release.
-                        if not self._ptt_active:
-                            if self._swr_reset_pending:
-                                self._swr_reset_pending = False
-                                self.meter_updated.emit("swr", definition.get("display_min", 0.0))
-                            continue
-                        if self.is_ic705_swr_workaround:
-                            # Raw CI-V 0x15/0x12 read via send_civ(), NOT
-                            # rigplane's own get_swr() -- see SWR_CIV_SUB's
-                            # comment in constants.py for why.
-                            resp = await self.radio.send_civ(0x15, sub=SWR_CIV_SUB, wait_response=True)
-                            if resp is None or not resp.data:
-                                continue
-                            value = _interpolate_swr(_bcd_decode_pbt_level(resp.data))
-                        else:
-                            getter = getattr(self.radio, getter_name)
-                            kwargs = (
-                                self._receiver_kwargs(getter, self._active_receiver)
-                                if self.is_dual_receiver
-                                else {}
-                            )
-                            value = await getter(**kwargs)
-                    else:
-                        getter = getattr(self.radio, getter_name)
-                        kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
-                        value = await getter(**kwargs)
-                    self.meter_updated.emit(meter_type, value)
-                except Exception as exc:
-                    self.error.emit(f"{definition['label']}: {exc}")
 
             for key, (get_name, _set_name) in self._control_methods.items():
                 if get_name is None:
@@ -2468,20 +2492,21 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
 
-            if is_slow_poll_cycle:
-                for key, civ_sub in self._pbt_methods.items():
-                    definition = PBT_DEFINITIONS[key]
-                    try:
-                        # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
-                        # rigplane's own get_pbt_inner/get_pbt_outer -- see
-                        # PBT_DEFINITIONS' comment in constants.py for why.
-                        resp = await self.radio.send_civ(0x14, sub=civ_sub, wait_response=True)
-                        if resp is not None and len(resp.data) >= 2:
-                            self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
-                    except Exception as exc:
-                        self.error.emit(f"{definition['label']}: {exc}")
+            for key, civ_sub in self._pbt_methods.items():
+                definition = PBT_DEFINITIONS[key]
+                try:
+                    # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
+                    # rigplane's own get_pbt_inner/get_pbt_outer -- see
+                    # PBT_DEFINITIONS' comment in constants.py for why.
+                    resp = await self.radio.send_civ(
+                        0x14, sub=civ_sub, wait_response=True, priority=Priority.BACKGROUND
+                    )
+                    if resp is not None and len(resp.data) >= 2:
+                        self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
+                except Exception as exc:
+                    self.error.emit(f"{definition['label']}: {exc}")
 
-            if is_slow_poll_cycle and self.is_filter_width_capable:
+            if self.is_filter_width_capable:
                 try:
                     width_hz = await self.radio.get_filter_width()
                     self._filter_width_hz = width_hz
@@ -2489,24 +2514,30 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"Filter width: {exc}")
 
-            if is_slow_poll_cycle and self._filter_shape_available:
+            if self._filter_shape_available:
                 try:
                     # Raw CI-V 0x16/0x56 read via send_civ(), NOT
                     # rigplane's own get_filter_shape() -- see
                     # FILTER_SHAPE_CIV_SUB's comment in constants.py.
-                    resp = await self.radio.send_civ(0x16, sub=FILTER_SHAPE_CIV_SUB, wait_response=True)
+                    resp = await self.radio.send_civ(
+                        0x16, sub=FILTER_SHAPE_CIV_SUB, wait_response=True, priority=Priority.BACKGROUND
+                    )
                     if resp is not None and resp.data:
                         self.filter_shape_updated.emit(resp.data[0])
                 except Exception as exc:
                     self.error.emit(f"Filter shape: {exc}")
 
-            if is_slow_poll_cycle and self.is_ic705_preamp_att:
+            if self.is_ic705_preamp_att:
                 try:
                     # Raw CI-V reads via send_civ(), NOT rigplane's own
                     # get_preamp()/attenuator methods -- see
                     # PREAMP_CIV_SUB's comment in constants.py.
-                    preamp_resp = await self.radio.send_civ(0x16, sub=PREAMP_CIV_SUB, wait_response=True)
-                    atten_resp = await self.radio.send_civ(ATT_CIV_COMMAND, wait_response=True)
+                    preamp_resp = await self.radio.send_civ(
+                        0x16, sub=PREAMP_CIV_SUB, wait_response=True, priority=Priority.BACKGROUND
+                    )
+                    atten_resp = await self.radio.send_civ(
+                        ATT_CIV_COMMAND, wait_response=True, priority=Priority.BACKGROUND
+                    )
                     if preamp_resp is not None and preamp_resp.data and atten_resp is not None and atten_resp.data:
                         self.preamp_att_updated.emit(
                             _bcd_decode_byte(preamp_resp.data), _bcd_decode_byte(atten_resp.data)
@@ -2514,7 +2545,7 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"Preamp/Attenuator: {exc}")
 
-            await asyncio.sleep(POLL_INTERVAL_SEC)
+            await asyncio.sleep(SLOW_POLL_INTERVAL_SEC)
 
     # ---- Thread-safe command entry points (call these from the GUI thread) ----
 
@@ -2935,7 +2966,7 @@ class RadioWorker(QThread):
                 # get_frequency/get_mode's receiver=RECEIVER_MAIN(0)
                 # means "whichever receiver is currently SELECTED", not
                 # literally Main -- same quirk documented at length in
-                # _poll_loop above. So this always reads the genuinely
+                # _poll_loop_fast above. So this always reads the genuinely
                 # active receiver's VFO A/B, whether that's really Main
                 # or Sub, with no extra receiver-identity bookkeeping
                 # needed here.
@@ -3164,7 +3195,7 @@ class RadioWorker(QThread):
         """Reads `receiver`'s (RECEIVER_MAIN/RECEIVER_SUB identity)
         actual frequency, translated through rigplane's real GET
         addressing -- see the comment above the frequency poll in
-        _poll_loop. get_frequency(receiver=...) is NOT a Main/Sub
+        _poll_loop_fast. get_frequency(receiver=...) is NOT a Main/Sub
         identity selector: receiver=RECEIVER_MAIN(0) always means
         "whichever receiver is currently selected" and
         receiver=RECEIVER_SUB(1) always means "the unselected one",
@@ -3597,10 +3628,10 @@ class RadioWorker(QThread):
         Cancels the _main() task directly (via call_soon_threadsafe,
         the correct thread-safe way to touch another thread's asyncio
         loop) rather than only setting self._stop_requested -- that
-        flag is exactly as before (still what cleanly ends _poll_loop
-        once it's actually running, checked at the top of its own
-        while loop), but it did nothing at all to interrupt _main()
-        during connection/startup, which can genuinely take several
+        flag is exactly as before (still what cleanly ends both poll
+        loops once they're actually running, checked at the top of each
+        one's own while loop), but it did nothing at all to interrupt
+        _main() during connection/startup, which can genuinely take several
         seconds on real hardware (slow/unresponsive CI-V round-trips,
         enable_scope's own up-to-5s verification wait). Cancellation
         unwinds _main() from wherever it currently is, not just

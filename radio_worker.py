@@ -161,6 +161,7 @@ from constants import (
     BAND_STACKING_EXCLUDED,
     LEVEL_DEBOUNCE_SECONDS,
     LEVEL_DEFINITIONS,
+    PBT_CAPABLE_MODES,
     PBT_DEFINITIONS,
     FILTER_SHAPE_CIV_SUB,
     PREAMP_CIV_SUB,
@@ -380,6 +381,7 @@ class RadioWorker(QThread):
         self.is_filter_width_capable = False  # set once connected -- see CAP_FILTER_WIDTH import comment
         self._filter_width_hz = None  # live DSP filter width, polled -- see _poll_loop_slow
         self._filter_width_range_mode = None  # last mode a filter_width_range_updated was computed/emitted for -- avoids recomputing every poll cycle
+        self._current_mode = None  # last-polled mode name (e.g. "FM", "USB") -- see PBT_CAPABLE_MODES' gate in _poll_loop_slow
         self._filter_width_debounce_task = None  # pending asyncio.Task, for set_filter_width_value()'s debounce
         self.is_filter_shape_capable = False  # set once connected -- see CAP_FILTER_SHAPE import comment
         self._filter_shape_available = False  # set in _setup_filter_shape() -- send_civ() usable for this radio
@@ -2703,9 +2705,11 @@ class RadioWorker(QThread):
                         if hasattr(value, "name"):
                             value = value.name
                         self.control_updated.emit(key, value)
-                        if key == "mode" and self.is_filter_width_capable and value != self._filter_width_range_mode:
-                            self._filter_width_range_mode = value
-                            self.filter_width_range_updated.emit(self._resolve_filter_width_range(value))
+                        if key == "mode":
+                            self._current_mode = value
+                            if self.is_filter_width_capable and value != self._filter_width_range_mode:
+                                self._filter_width_range_mode = value
+                                self.filter_width_range_updated.emit(self._resolve_filter_width_range(value))
                     except Exception as exc:
                         self.error.emit(f"{definition['label']}: {exc}")
 
@@ -2729,21 +2733,44 @@ class RadioWorker(QThread):
                     except Exception as exc:
                         self.error.emit(f"{definition['label']}: {exc}")
 
-                for key, civ_sub in self._pbt_methods.items():
-                    definition = PBT_DEFINITIONS[key]
-                    try:
-                        # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
-                        # rigplane's own get_pbt_inner/get_pbt_outer -- see
-                        # PBT_DEFINITIONS' comment in constants.py for why.
-                        resp = await self.radio.send_civ(
-                            0x14, sub=civ_sub, wait_response=True
-                        )
-                        if resp is not None and len(resp.data) >= 2:
-                            self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
-                    except Exception as exc:
-                        self.error.emit(f"{definition['label']}: {exc}")
+                # PBT/filter width/filter shape all only genuinely apply in
+                # SSB/CW/RTTY/AM -- confirmed against the IC-9700's own CI-V
+                # Reference Guide ("IF filter width settings, Command: 1A
+                # 03" lists only SSB/CW/RTTY/AM rows, no FM at all) and
+                # matches PBT_CAPABLE_MODES' existing IC-705-manual-sourced
+                # set, already used for the UI overlay math (widgets.py's
+                # _pbt_overlap_hz) but never applied here before. Root-
+                # caused a real "these three time out on essentially every
+                # single poll cycle, 100% of the time, unaffected by
+                # priority or connection quality" report to exactly this:
+                # confirmed live the radio was sitting in FM the whole
+                # time, where these commands are simply meaningless -- the
+                # radio never replies at all (not a NAK, a true timeout)
+                # rather than erroring cleanly. self._current_mode is None
+                # until the very first "mode" poll lands, so this stays
+                # permissive (keeps trying) until the real mode is known,
+                # rather than silently skipping forever on a radio/profile
+                # where mode polling itself isn't working.
+                mode_allows_pbt_filter = (
+                    self._current_mode is None or self._current_mode in PBT_CAPABLE_MODES
+                )
 
-                if self.is_filter_width_capable:
+                if mode_allows_pbt_filter:
+                    for key, civ_sub in self._pbt_methods.items():
+                        definition = PBT_DEFINITIONS[key]
+                        try:
+                            # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
+                            # rigplane's own get_pbt_inner/get_pbt_outer -- see
+                            # PBT_DEFINITIONS' comment in constants.py for why.
+                            resp = await self.radio.send_civ(
+                                0x14, sub=civ_sub, wait_response=True
+                            )
+                            if resp is not None and len(resp.data) >= 2:
+                                self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
+                        except Exception as exc:
+                            self.error.emit(f"{definition['label']}: {exc}")
+
+                if mode_allows_pbt_filter and self.is_filter_width_capable:
                     try:
                         width_hz = await self.radio.get_filter_width()
                         self._filter_width_hz = width_hz
@@ -2751,7 +2778,7 @@ class RadioWorker(QThread):
                     except Exception as exc:
                         self.error.emit(f"Filter width: {exc}")
 
-                if self._filter_shape_available:
+                if mode_allows_pbt_filter and self._filter_shape_available:
                     try:
                         # Raw CI-V 0x16/0x56 read via send_civ(), NOT
                         # rigplane's own get_filter_shape() -- see

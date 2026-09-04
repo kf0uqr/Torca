@@ -3824,7 +3824,9 @@ class RadioWorker(QThread):
             await self._resolve_receiver_band_conflict(RECEIVER_MAIN, low_edge_hz)
 
         if band_code is not None and receiver is None:
-            freq_hz, reason = await _try_recall_band_stack(self.radio, band_code)
+            async with self._receiver_switch_lock:
+                await self._reselect_main_before_write("band recall")
+                freq_hz, reason = await _try_recall_band_stack(self.radio, band_code)
             if freq_hz is not None:
                 self.audio_status.emit(
                     f"Band: recalled {band_label} via band-stacking register ({freq_hz / 1e6:.6f} MHz)."
@@ -3839,12 +3841,51 @@ class RadioWorker(QThread):
             await self._select_receiver_vfo_and_set_frequency(receiver, "A", low_edge_hz)
             return
 
+        # Root-caused a real "Main can't switch to a band Sub is on
+        # (Sub->Main's band works fine though)" report to THIS write
+        # being unprotected: _resolve_receiver_band_conflict() above
+        # reselects Main (via a bare, unlocked select_receiver call) once
+        # it's done parking Sub out of the way, but nothing then stopped
+        # a concurrently-running poll-loop iteration (e.g. reading Sub's
+        # own frequency/mode/meters, several of which temporarily flip
+        # the radio's active receiver via rigplane's own
+        # _run_with_receiver_vfo_fallback and flip it back afterward)
+        # from interleaving in the gap between that reselect and this
+        # write, landing this fire-and-forget set_frequency(receiver=
+        # MAIN) call on whatever receiver the radio actually had selected
+        # by the time it reached the wire -- not necessarily Main. The
+        # Sub path just above doesn't have this problem because
+        # _select_receiver_vfo_and_set_frequency already wraps its own
+        # reselect+write in self._receiver_switch_lock. Same fix here:
+        # hold the lock across an explicit Main reselect (with the same
+        # confirmed-necessary settle delay used everywhere else this
+        # exact race was root-caused, e.g. _set_control_value) and the
+        # write itself, so no concurrent receiver-switching poll code can
+        # interleave in between.
+        async with self._receiver_switch_lock:
+            await self._reselect_main_before_write("band tune")
+            try:
+                # Explicit receiver=RECEIVER_MAIN -- see _set_frequency's
+                # own comment for why a bare call isn't reliable here.
+                await self.radio.set_frequency(low_edge_hz, receiver=RECEIVER_MAIN)
+            except Exception as exc:
+                self.error.emit(f"Band: setting frequency failed ({exc}).")
+
+    async def _reselect_main_before_write(self, context: str):
+        """Explicitly reselect Main and let the radio settle before a
+        Main-targeted write that immediately follows -- see the big
+        comment in _select_band's low-edge-fallback branch for the exact
+        race this closes. No-op on a single-receiver radio
+        (select_receiver() is already a no-op there). Callers must hold
+        self._receiver_switch_lock across this AND their own write."""
+        if not self.is_dual_receiver:
+            return
         try:
-            # Explicit receiver=RECEIVER_MAIN -- see _set_frequency's
-            # own comment for why a bare call isn't reliable here.
-            await self.radio.set_frequency(low_edge_hz, receiver=RECEIVER_MAIN)
+            await self.radio.select_receiver(RECEIVER_MAIN)
+            self._active_receiver = RECEIVER_MAIN
+            await asyncio.sleep(0.15)
         except Exception as exc:
-            self.error.emit(f"Band: setting frequency failed ({exc}).")
+            self.error.emit(f"Select active receiver (Main) before {context} failed: {exc}")
 
     def stop(self):
         """Request a clean shutdown of the polling loop and thread.

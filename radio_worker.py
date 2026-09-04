@@ -87,6 +87,19 @@ except ImportError:
     CAP_FILTER_WIDTH = None
 
 try:
+    # CAP_FILTER_SHAPE: the profile-declared capability tag for SHARP/
+    # SOFT filter shape. Unlike CAP_FILTER_WIDTH, get_filter_shape/
+    # set_filter_shape have the SAME Command29-hardcoding bug as PBT
+    # (confirmed by reading rigplane/commands/mode.py: both leaf command
+    # functions hardcode command29=True unconditionally) -- so, like
+    # PBT_DEFINITIONS, RadioWorker sends this via raw send_civ() rather
+    # than calling those two methods. See FILTER_SHAPE_CIV_SUB's comment
+    # in constants.py.
+    from rigplane.core.capabilities import CAP_FILTER_SHAPE
+except ImportError:
+    CAP_FILTER_SHAPE = None
+
+try:
     # Confirmed via rigplane's own type signatures: "Radio has two
     # independent receivers (e.g. IC-7610 Main/Sub)" -- the IC-9700 is
     # the other one, per its own docs. Confirmed live (a real 9700 vs.
@@ -149,6 +162,7 @@ from constants import (
     LEVEL_DEBOUNCE_SECONDS,
     LEVEL_DEFINITIONS,
     PBT_DEFINITIONS,
+    FILTER_SHAPE_CIV_SUB,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
@@ -251,6 +265,7 @@ class RadioWorker(QThread):
     # recomputed whenever the polled mode changes. See _refresh_filter_
     # width_range and main_window.py's _on_filter_width_range_updated.
     filter_width_range_updated = Signal(object)
+    filter_shape_updated = Signal(int)   # 0=SHARP, 1=SOFT -- see FILTER_SHAPE_OPTIONS
     active_receiver_changed = Signal(int)  # dual-receiver only: 0=MAIN, 1=SUB, from get_active_receiver() polling
     scope_span_changed = Signal(int)     # preset index 0-7, from get_scope_span() polling
     scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
@@ -274,6 +289,8 @@ class RadioWorker(QThread):
         self._filter_width_hz = None  # live DSP filter width, polled -- see _poll_loop
         self._filter_width_range_mode = None  # last mode a filter_width_range_updated was computed/emitted for -- avoids recomputing every poll cycle
         self._filter_width_debounce_task = None  # pending asyncio.Task, for set_filter_width_value()'s debounce
+        self.is_filter_shape_capable = False  # set once connected -- see CAP_FILTER_SHAPE import comment
+        self._filter_shape_available = False  # set in _setup_filter_shape() -- send_civ() usable for this radio
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -1366,6 +1383,15 @@ class RadioWorker(QThread):
         for key, definition in PBT_DEFINITIONS.items():
             self._pbt_methods[key] = definition["civ_sub"]
 
+    async def _setup_filter_shape(self):
+        """Same idea as _setup_pbt() -- self._filter_shape_available is
+        just "is_filter_shape_capable AND this radio object exposes
+        send_civ()", since get_filter_shape/set_filter_shape are
+        confirmed broken the same way PBT's were (see FILTER_SHAPE_
+        CIV_SUB's comment in constants.py) and RadioWorker sends raw
+        CI-V directly instead."""
+        self._filter_shape_available = self.is_filter_shape_capable and hasattr(self.radio, "send_civ")
+
     def _resolve_filter_width_range(self, mode_name):
         """Looks up the adjustable filter-width range for `mode_name` via
         rigplane's public radio.profile.resolve_filter_rule() -- the same
@@ -1652,6 +1678,26 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Filter width: set_filter_width({width_hz}) failed ({exc}).")
 
+    def set_filter_shape_value(self, value: int):
+        """Thread-safe: call from the GUI thread. value is 0 (SHARP) or
+        1 (SOFT) -- see FILTER_SHAPE_OPTIONS. Not debounced, unlike the
+        PBT/filter-width sliders -- this is a discrete combo selection,
+        same immediate-dispatch treatment as the FIL1/2/3 combo
+        (_on_control_combo_changed), not a dragged control."""
+        if self.loop is None or not self._filter_shape_available:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_filter_shape_value(value), self.loop)
+
+    async def _set_filter_shape_value(self, value: int):
+        try:
+            # Raw CI-V 0x16/0x56 write via send_civ(), NOT rigplane's
+            # own set_filter_shape() -- see FILTER_SHAPE_CIV_SUB's
+            # comment in constants.py.
+            await self.radio.send_civ(0x16, sub=FILTER_SHAPE_CIV_SUB, data=bytes([value]), wait_response=False)
+            self.filter_shape_updated.emit(value)
+        except Exception as exc:
+            self.error.emit(f"Filter shape: send_civ(0x16, 0x56) failed ({exc}).")
+
     async def _main(self):
         try:
             if self._details.get("connection_type") == "remote":
@@ -1704,6 +1750,9 @@ class RadioWorker(QThread):
         self.is_filter_width_capable = (
             CAP_FILTER_WIDTH is not None and CAP_FILTER_WIDTH in getattr(self.radio, "capabilities", set())
         )
+        self.is_filter_shape_capable = (
+            CAP_FILTER_SHAPE is not None and CAP_FILTER_SHAPE in getattr(self.radio, "capabilities", set())
+        )
         self.connected.emit()
         # Everything from here through _poll_loop() is wrapped in one
         # try/finally so self._radio_cm.__aexit__() (closing the actual
@@ -1719,6 +1768,7 @@ class RadioWorker(QThread):
             await self._setup_audio()
             await self._setup_levels()
             await self._setup_pbt()
+            await self._setup_filter_shape()
             self._setup_meters()
             self.meters_ready.emit(self._meter_definitions)
             self._setup_controls()
@@ -2274,6 +2324,17 @@ class RadioWorker(QThread):
                     self.filter_width_updated.emit(width_hz)
                 except Exception as exc:
                     self.error.emit(f"Filter width: {exc}")
+
+            if self._filter_shape_available:
+                try:
+                    # Raw CI-V 0x16/0x56 read via send_civ(), NOT
+                    # rigplane's own get_filter_shape() -- see
+                    # FILTER_SHAPE_CIV_SUB's comment in constants.py.
+                    resp = await self.radio.send_civ(0x16, sub=FILTER_SHAPE_CIV_SUB, wait_response=True)
+                    if resp is not None and resp.data:
+                        self.filter_shape_updated.emit(resp.data[0])
+                except Exception as exc:
+                    self.error.emit(f"Filter shape: {exc}")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 

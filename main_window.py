@@ -34,6 +34,7 @@ from constants import (
     RADIO_ROLES,
     LEVEL_DEFINITIONS,
     PBT_DEFINITIONS,
+    FILTER_SHAPE_OPTIONS,
     DUAL_RECEIVER_LEVEL_KEYS,
     CONTROL_DEFINITIONS,
     CONTROL_OPTION_EXCLUDED,
@@ -619,6 +620,32 @@ class RadioWindow(QWidget):
                     buttons_row.setAlignment(widget, Qt.AlignTop)
             self.control_widgets[key] = widget
 
+        # Filter shape (SHARP/SOFT) -- not part of CONTROL_DEFINITIONS'
+        # generic combo dispatch above, since get/set_filter_shape need
+        # the same raw-CI-V bypass as Twin PBT (see FILTER_SHAPE_CIV_SUB's
+        # comment in constants.py); built by hand instead, same visual
+        # column style as the generic combos, placed right after Filter
+        # (FIL1/2/3) -- matching the real radio's own FILTER screen,
+        # which groups these two together. Hidden until _on_connected()
+        # confirms worker.is_filter_shape_capable, same treatment as the
+        # PBT sliders (this may genuinely not exist on the connected
+        # radio, not just "not ready yet").
+        self.filter_shape_combo = QComboBox()
+        for option_label, option_value in FILTER_SHAPE_OPTIONS:
+            self.filter_shape_combo.addItem(option_label, option_value)
+        self.filter_shape_combo.setEnabled(False)
+        self.filter_shape_combo.setVisible(False)
+        self.filter_shape_combo.currentIndexChanged.connect(self._on_filter_shape_combo_changed)
+        filter_shape_label = QLabel("Filter Shape")
+        filter_shape_label.setVisible(False)
+        self.filter_shape_label = filter_shape_label
+        filter_shape_col = QVBoxLayout()
+        filter_shape_col.addWidget(filter_shape_label, alignment=Qt.AlignHCenter)
+        filter_shape_col.addWidget(self.filter_shape_combo)
+        filter_shape_col.addStretch()
+        dropdowns_row.addLayout(filter_shape_col)
+        dropdowns_row.setAlignment(filter_shape_col, Qt.AlignTop)
+
         # dropdowns_row (Mode/AGC/Preamp/Filter) stacked above
         # buttons_row (Digital/NR/NB/VFO/Split) -- per explicit
         # instruction, two separate rows rather than one mixed row.
@@ -719,6 +746,7 @@ class RadioWindow(QWidget):
         self.worker.pbt_updated.connect(self._on_pbt_updated)
         self.worker.filter_width_updated.connect(self._on_filter_width_updated)
         self.worker.filter_width_range_updated.connect(self._on_filter_width_range_updated)
+        self.worker.filter_shape_updated.connect(self._on_filter_shape_updated)
         self.worker.control_updated.connect(self._on_control_updated)
         self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
         self.worker.scope_span_changed.connect(self._on_scope_span_changed)
@@ -778,6 +806,10 @@ class RadioWindow(QWidget):
                 slider.setVisible(True)
                 slider.setEnabled(True)
                 self.pbt_labels[key].setVisible(True)
+        if self.worker.is_filter_shape_capable:
+            self.filter_shape_combo.setVisible(True)
+            self.filter_shape_combo.setEnabled(True)
+            self.filter_shape_label.setVisible(True)
         # Scope controls are NOT enabled here -- is_scope_capable isn't
         # known true yet at this point (see RadioWorker._main's
         # scope_ready docstring); _on_scope_ready handles it once the
@@ -1046,6 +1078,20 @@ class RadioWindow(QWidget):
         self.worker.set_filter_width_value(width_hz)
         self.spectrum_widget.set_filter_width_hz(width_hz)
         self.filter_shape_widget.set_filter_width_hz(width_hz)
+
+    def _on_filter_shape_updated(self, value):
+        combo = self.filter_shape_combo
+        index = combo.findData(value)
+        if index != -1 and combo.currentIndex() != index:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+
+    def _on_filter_shape_combo_changed(self, index):
+        value = self.filter_shape_combo.currentData()
+        if value is None:
+            return
+        self.worker.set_filter_shape_value(value)
 
     def _on_control_combo_changed(self, key, widget):
         value = widget.currentData()

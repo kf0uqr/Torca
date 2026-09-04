@@ -366,6 +366,20 @@ PBT_DEFINITIONS = {
     "pbt_outer": {"label": "PBT Outer", "civ_sub": 0x08},
 }
 
+# Filter shape (SHARP/SOFT) -- SSB and CW modes only, per the IC-705
+# Basic Manual's "Selecting the IF filter shape" (Misc/
+# IC-705_ENG_Basic_9.pdf p.4-5): SHARP "emphasizes the passband width of
+# the filter... an almost ideal shape factor", SOFT "filter shoulders are
+# rounded... decreases noise components". CI-V 0x16 sub 0x56 (0=SHARP,
+# 1=SOFT) -- confirmed to have the SAME Command29-hardcoding bug as
+# PBT_DEFINITIONS above: rigplane's own get_filter_shape/set_filter_shape
+# (commands/mode.py) hardcode command29=True unconditionally, same
+# pattern, same fix -- see PBT_DEFINITIONS' own comment for the full
+# explanation. RadioWorker sends this via raw send_civ() too, not those
+# two methods.
+FILTER_SHAPE_CIV_SUB = 0x56
+FILTER_SHAPE_OPTIONS = [("SHARP", 0), ("SOFT", 1)]
+
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on
 # a dual-receiver radio. Their real getter/setter DOES accept a
 # receiver= kwarg (confirmed via a full inspect.signature() sweep

@@ -2620,133 +2620,146 @@ class RadioWorker(QThread):
             except Exception:
                 pass
 
-            for key, (get_name, _set_name) in self._control_methods.items():
-                if get_name is None:
-                    continue  # write-only control (e.g. memory_mode) -- no GET variant exists, never poll
-                if key == "split" and self.is_dual_receiver and self._active_receiver == RECEIVER_SUB:
-                    # split is rig-global, not per-receiver (confirmed
-                    # via rigplane's own SplitCapable docstring) -- but
-                    # confirmed live on a real 9700 that get_split()
-                    # returns an unstable/flickering value while Sub is
-                    # the active receiver, making the split button
-                    # visibly flip on and off every poll cycle on its
-                    # own. Makes sense: Sub never transmits at all
-                    # (confirmed hardware limitation, PTT always
-                    # transmits from Main), so "is split on" isn't a
-                    # question with a stable answer for it. Skip polling
-                    # it entirely in that state -- the button just keeps
-                    # showing whatever it last correctly reflected from
-                    # when Main was active.
-                    continue
-                definition = CONTROL_DEFINITIONS[key]
-                try:
+            # Wrapped in self._receiver_switch_lock: this whole
+            # section reads whichever receiver is currently active
+            # (controls/levels/PBT/filter width/shape/preamp) --
+            # root-caused a real "Radio rejected VFO select MAIN" NAK
+            # during Main band-switching to this section racing
+            # against _resolve_receiver_band_conflict()/_select_band()'s
+            # own receiver-select calls, both of which run on the same
+            # CI-V link with nothing previously stopping them from
+            # interleaving. Holding the lock here means a poll cycle and
+            # a band-switch/receiver-select operation can never overlap
+            # -- one waits for the other, rather than both hitting the
+            # radio's receiver-select state machine at the same time.
+            async with self._receiver_switch_lock:
+                for key, (get_name, _set_name) in self._control_methods.items():
+                    if get_name is None:
+                        continue  # write-only control (e.g. memory_mode) -- no GET variant exists, never poll
+                    if key == "split" and self.is_dual_receiver and self._active_receiver == RECEIVER_SUB:
+                        # split is rig-global, not per-receiver (confirmed
+                        # via rigplane's own SplitCapable docstring) -- but
+                        # confirmed live on a real 9700 that get_split()
+                        # returns an unstable/flickering value while Sub is
+                        # the active receiver, making the split button
+                        # visibly flip on and off every poll cycle on its
+                        # own. Makes sense: Sub never transmits at all
+                        # (confirmed hardware limitation, PTT always
+                        # transmits from Main), so "is split on" isn't a
+                        # question with a stable answer for it. Skip polling
+                        # it entirely in that state -- the button just keeps
+                        # showing whatever it last correctly reflected from
+                        # when Main was active.
+                        continue
+                    definition = CONTROL_DEFINITIONS[key]
+                    try:
+                        getter = getattr(self.radio, get_name)
+                        if key == "mode":
+                            # get_mode's receiver param has the exact same
+                            # "selected(0)/unselected(1)" semantic as
+                            # get_frequency (confirmed by reading rigplane's
+                            # source -- both route through _get_..._main /
+                            # _get_unselected_... in the same way) -- NOT a
+                            # Main/Sub identity selector. receiver=0 means
+                            # "whichever receiver is currently selected",
+                            # which is what should always be asked for here.
+                            value = await getter(receiver=RECEIVER_MAIN)
+                        else:
+                            # See _receiver_kwargs's/_poll_receiver_aware's
+                            # docstrings -- confirmed live on a real 9700
+                            # that "vfo" alone wasn't the only control
+                            # causing the flip-flop, and that AGC/Preamp's
+                            # getters outright reject a non-Main receiver at
+                            # runtime rather than just ignoring it.
+                            value = await self._poll_receiver_aware(key, getter)
+                        if definition.get("tuple_result") and isinstance(value, tuple):
+                            value = value[0]
+                        # Generic enum unwrap: any Enum/IntEnum member has a
+                        # .name (plain str/int/bool don't), so this covers
+                        # every control that turns out to return an enum, not
+                        # just AGC (which is where this was actually confirmed
+                        # needed) -- .name is what matches our option values.
+                        if hasattr(value, "name"):
+                            value = value.name
+                        self.control_updated.emit(key, value)
+                        if key == "mode" and self.is_filter_width_capable and value != self._filter_width_range_mode:
+                            self._filter_width_range_mode = value
+                            self.filter_width_range_updated.emit(self._resolve_filter_width_range(value))
+                    except Exception as exc:
+                        self.error.emit(f"{definition['label']}: {exc}")
+
+                for key, (get_name, _set_name) in self._level_methods.items():
+                    definition = LEVEL_DEFINITIONS[key]
                     getter = getattr(self.radio, get_name)
-                    if key == "mode":
-                        # get_mode's receiver param has the exact same
-                        # "selected(0)/unselected(1)" semantic as
-                        # get_frequency (confirmed by reading rigplane's
-                        # source -- both route through _get_..._main /
-                        # _get_unselected_... in the same way) -- NOT a
-                        # Main/Sub identity selector. receiver=0 means
-                        # "whichever receiver is currently selected",
-                        # which is what should always be asked for here.
-                        value = await getter(receiver=RECEIVER_MAIN)
-                    else:
-                        # See _receiver_kwargs's/_poll_receiver_aware's
-                        # docstrings -- confirmed live on a real 9700
-                        # that "vfo" alone wasn't the only control
-                        # causing the flip-flop, and that AGC/Preamp's
-                        # getters outright reject a non-Main receiver at
-                        # runtime rather than just ignoring it.
-                        value = await self._poll_receiver_aware(key, getter)
-                    if definition.get("tuple_result") and isinstance(value, tuple):
-                        value = value[0]
-                    # Generic enum unwrap: any Enum/IntEnum member has a
-                    # .name (plain str/int/bool don't), so this covers
-                    # every control that turns out to return an enum, not
-                    # just AGC (which is where this was actually confirmed
-                    # needed) -- .name is what matches our option values.
-                    if hasattr(value, "name"):
-                        value = value.name
-                    self.control_updated.emit(key, value)
-                    if key == "mode" and self.is_filter_width_capable and value != self._filter_width_range_mode:
-                        self._filter_width_range_mode = value
-                        self.filter_width_range_updated.emit(self._resolve_filter_width_range(value))
-                except Exception as exc:
-                    self.error.emit(f"{definition['label']}: {exc}")
+                    try:
+                        # AF gain/squelch/RF gain's SETTERS don't actually
+                        # respect receiver= at all -- confirmed live on a
+                        # real 9700 that setting always affects whichever
+                        # receiver is active (select_receiver()), not
+                        # self._active_receiver -- but their GETTERS are
+                        # worse than just "ignored": confirmed live to raise
+                        # CommandError for a non-Main receiver outright.
+                        # _poll_receiver_aware handles that (see its
+                        # docstring); see main_window.py's active_receiver_
+                        # button/_level_receiver_suffix for how the UI
+                        # reflects which receiver these end up affecting.
+                        raw_value = await self._poll_receiver_aware(key, getter)
+                        self.level_updated.emit(key, self._normalize_level_value(raw_value))
+                    except Exception as exc:
+                        self.error.emit(f"{definition['label']}: {exc}")
 
-            for key, (get_name, _set_name) in self._level_methods.items():
-                definition = LEVEL_DEFINITIONS[key]
-                getter = getattr(self.radio, get_name)
-                try:
-                    # AF gain/squelch/RF gain's SETTERS don't actually
-                    # respect receiver= at all -- confirmed live on a
-                    # real 9700 that setting always affects whichever
-                    # receiver is active (select_receiver()), not
-                    # self._active_receiver -- but their GETTERS are
-                    # worse than just "ignored": confirmed live to raise
-                    # CommandError for a non-Main receiver outright.
-                    # _poll_receiver_aware handles that (see its
-                    # docstring); see main_window.py's active_receiver_
-                    # button/_level_receiver_suffix for how the UI
-                    # reflects which receiver these end up affecting.
-                    raw_value = await self._poll_receiver_aware(key, getter)
-                    self.level_updated.emit(key, self._normalize_level_value(raw_value))
-                except Exception as exc:
-                    self.error.emit(f"{definition['label']}: {exc}")
-
-            for key, civ_sub in self._pbt_methods.items():
-                definition = PBT_DEFINITIONS[key]
-                try:
-                    # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
-                    # rigplane's own get_pbt_inner/get_pbt_outer -- see
-                    # PBT_DEFINITIONS' comment in constants.py for why.
-                    resp = await self.radio.send_civ(
-                        0x14, sub=civ_sub, wait_response=True, priority=Priority.BACKGROUND
-                    )
-                    if resp is not None and len(resp.data) >= 2:
-                        self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
-                except Exception as exc:
-                    self.error.emit(f"{definition['label']}: {exc}")
-
-            if self.is_filter_width_capable:
-                try:
-                    width_hz = await self.radio.get_filter_width()
-                    self._filter_width_hz = width_hz
-                    self.filter_width_updated.emit(width_hz)
-                except Exception as exc:
-                    self.error.emit(f"Filter width: {exc}")
-
-            if self._filter_shape_available:
-                try:
-                    # Raw CI-V 0x16/0x56 read via send_civ(), NOT
-                    # rigplane's own get_filter_shape() -- see
-                    # FILTER_SHAPE_CIV_SUB's comment in constants.py.
-                    resp = await self.radio.send_civ(
-                        0x16, sub=FILTER_SHAPE_CIV_SUB, wait_response=True, priority=Priority.BACKGROUND
-                    )
-                    if resp is not None and resp.data:
-                        self.filter_shape_updated.emit(resp.data[0])
-                except Exception as exc:
-                    self.error.emit(f"Filter shape: {exc}")
-
-            if self.is_ic705_preamp_att:
-                try:
-                    # Raw CI-V reads via send_civ(), NOT rigplane's own
-                    # get_preamp()/attenuator methods -- see
-                    # PREAMP_CIV_SUB's comment in constants.py.
-                    preamp_resp = await self.radio.send_civ(
-                        0x16, sub=PREAMP_CIV_SUB, wait_response=True, priority=Priority.BACKGROUND
-                    )
-                    atten_resp = await self.radio.send_civ(
-                        ATT_CIV_COMMAND, wait_response=True, priority=Priority.BACKGROUND
-                    )
-                    if preamp_resp is not None and preamp_resp.data and atten_resp is not None and atten_resp.data:
-                        self.preamp_att_updated.emit(
-                            _bcd_decode_byte(preamp_resp.data), _bcd_decode_byte(atten_resp.data)
+                for key, civ_sub in self._pbt_methods.items():
+                    definition = PBT_DEFINITIONS[key]
+                    try:
+                        # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
+                        # rigplane's own get_pbt_inner/get_pbt_outer -- see
+                        # PBT_DEFINITIONS' comment in constants.py for why.
+                        resp = await self.radio.send_civ(
+                            0x14, sub=civ_sub, wait_response=True, priority=Priority.BACKGROUND
                         )
-                except Exception as exc:
-                    self.error.emit(f"Preamp/Attenuator: {exc}")
+                        if resp is not None and len(resp.data) >= 2:
+                            self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
+                    except Exception as exc:
+                        self.error.emit(f"{definition['label']}: {exc}")
+
+                if self.is_filter_width_capable:
+                    try:
+                        width_hz = await self.radio.get_filter_width()
+                        self._filter_width_hz = width_hz
+                        self.filter_width_updated.emit(width_hz)
+                    except Exception as exc:
+                        self.error.emit(f"Filter width: {exc}")
+
+                if self._filter_shape_available:
+                    try:
+                        # Raw CI-V 0x16/0x56 read via send_civ(), NOT
+                        # rigplane's own get_filter_shape() -- see
+                        # FILTER_SHAPE_CIV_SUB's comment in constants.py.
+                        resp = await self.radio.send_civ(
+                            0x16, sub=FILTER_SHAPE_CIV_SUB, wait_response=True, priority=Priority.BACKGROUND
+                        )
+                        if resp is not None and resp.data:
+                            self.filter_shape_updated.emit(resp.data[0])
+                    except Exception as exc:
+                        self.error.emit(f"Filter shape: {exc}")
+
+                if self.is_ic705_preamp_att:
+                    try:
+                        # Raw CI-V reads via send_civ(), NOT rigplane's own
+                        # get_preamp()/attenuator methods -- see
+                        # PREAMP_CIV_SUB's comment in constants.py.
+                        preamp_resp = await self.radio.send_civ(
+                            0x16, sub=PREAMP_CIV_SUB, wait_response=True, priority=Priority.BACKGROUND
+                        )
+                        atten_resp = await self.radio.send_civ(
+                            ATT_CIV_COMMAND, wait_response=True, priority=Priority.BACKGROUND
+                        )
+                        if preamp_resp is not None and preamp_resp.data and atten_resp is not None and atten_resp.data:
+                            self.preamp_att_updated.emit(
+                                _bcd_decode_byte(preamp_resp.data), _bcd_decode_byte(atten_resp.data)
+                            )
+                    except Exception as exc:
+                        self.error.emit(f"Preamp/Attenuator: {exc}")
 
             await asyncio.sleep(SLOW_POLL_INTERVAL_SEC)
 

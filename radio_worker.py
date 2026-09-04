@@ -1798,7 +1798,26 @@ class RadioWorker(QThread):
             self.connection_failed.emit(str(exc))
             return
 
-        self.is_dual_receiver = DualReceiverCapable is not None and isinstance(self.radio, DualReceiverCapable)
+        # isinstance(radio, DualReceiverCapable) alone isn't enough --
+        # confirmed live on an IC-705 (single-receiver): its methods
+        # (swap_main_sub etc.) live on DualRxRuntimeMixin, which every
+        # Icom radio class inherits UNCONDITIONALLY (rigplane/runtime/
+        # radio.py: "class CoreRadio(ScopeRuntimeMixin, AudioRuntimeMixin,
+        # DualRxRuntimeMixin)"), so the isinstance check is structurally
+        # True even on a radio that only has one receiver -- the same
+        # "method exists but isn't functionally real for this model"
+        # trap already hit for PBT/filter shape/preamp elsewhere in this
+        # app. The actual ground truth is the profile's own declared
+        # receiver_count (IC-705's ic705.toml: "receiver_count = 1";
+        # IC-7610/IC-9700: 2) -- both checks are required so a radio that
+        # somehow reports receiver_count > 1 without implementing the
+        # protocol at all still isn't treated as dual-receiver.
+        profile = getattr(self.radio, "profile", None)
+        self.is_dual_receiver = (
+            DualReceiverCapable is not None
+            and isinstance(self.radio, DualReceiverCapable)
+            and getattr(profile, "receiver_count", 1) > 1
+        )
         self.is_pbt_capable = CAP_PBT is not None and CAP_PBT in getattr(self.radio, "capabilities", set())
         self.is_filter_width_capable = (
             CAP_FILTER_WIDTH is not None and CAP_FILTER_WIDTH in getattr(self.radio, "capabilities", set())

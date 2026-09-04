@@ -72,6 +72,21 @@ except ImportError:
     CAP_PBT = None
 
 try:
+    # CAP_FILTER_WIDTH: the profile-declared capability tag for
+    # get_filter_width/set_filter_width (live DSP IF filter width in
+    # Hz). Unlike PBT, these two ARE properly profile-gated inside
+    # rigplane itself (they check profile.supports_cmd29(0x1A, 0x03)
+    # before deciding whether to Command29-wrap, rather than hardcoding
+    # it) -- confirmed by reading rigplane/runtime/radio.py's own
+    # set_filter_width/get_filter_width, which explicitly branch on that
+    # check and send a plain frame on IC-705/IC-9700. No raw-CI-V
+    # workaround needed here, unlike PBT_DEFINITIONS -- see that
+    # constant's own comment in constants.py for the contrast.
+    from rigplane.core.capabilities import CAP_FILTER_WIDTH
+except ImportError:
+    CAP_FILTER_WIDTH = None
+
+try:
     # Confirmed via rigplane's own type signatures: "Radio has two
     # independent receivers (e.g. IC-7610 Main/Sub)" -- the IC-9700 is
     # the other one, per its own docs. Confirmed live (a real 9700 vs.
@@ -229,6 +244,7 @@ class RadioWorker(QThread):
     audio_status = Signal(str)           # informational, not an error
     level_updated = Signal(str, float)   # (level key, value 0.0-1.0)
     pbt_updated = Signal(str, int)       # (pbt key, raw level 0-255, 128=centered) -- see PBT_DEFINITIONS
+    filter_width_updated = Signal(int)   # live DSP IF filter width in Hz, from get_filter_width() polling
     active_receiver_changed = Signal(int)  # dual-receiver only: 0=MAIN, 1=SUB, from get_active_receiver() polling
     scope_span_changed = Signal(int)     # preset index 0-7, from get_scope_span() polling
     scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
@@ -248,6 +264,8 @@ class RadioWorker(QThread):
         self.radio = None      # rigplane Radio, set once connected
         self.is_dual_receiver = False  # set once connected -- see DualReceiverCapable import comment
         self.is_pbt_capable = False  # set once connected -- see CAP_PBT import comment
+        self.is_filter_width_capable = False  # set once connected -- see CAP_FILTER_WIDTH import comment
+        self._filter_width_hz = None  # live DSP filter width, polled -- see _poll_loop
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -1615,6 +1633,9 @@ class RadioWorker(QThread):
 
         self.is_dual_receiver = DualReceiverCapable is not None and isinstance(self.radio, DualReceiverCapable)
         self.is_pbt_capable = CAP_PBT is not None and CAP_PBT in getattr(self.radio, "capabilities", set())
+        self.is_filter_width_capable = (
+            CAP_FILTER_WIDTH is not None and CAP_FILTER_WIDTH in getattr(self.radio, "capabilities", set())
+        )
         self.connected.emit()
         # Everything from here through _poll_loop() is wrapped in one
         # try/finally so self._radio_cm.__aexit__() (closing the actual
@@ -2174,6 +2195,14 @@ class RadioWorker(QThread):
                         self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
+
+            if self.is_filter_width_capable:
+                try:
+                    width_hz = await self.radio.get_filter_width()
+                    self._filter_width_hz = width_hz
+                    self.filter_width_updated.emit(width_hz)
+                except Exception as exc:
+                    self.error.emit(f"Filter width: {exc}")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 

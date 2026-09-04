@@ -675,6 +675,7 @@ class RadioWindow(QWidget):
         self.worker.audio_status.connect(self._on_audio_status)
         self.worker.level_updated.connect(self._on_level_updated)
         self.worker.pbt_updated.connect(self._on_pbt_updated)
+        self.worker.filter_width_updated.connect(self._on_filter_width_updated)
         self.worker.control_updated.connect(self._on_control_updated)
         self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
         self.worker.scope_span_changed.connect(self._on_scope_span_changed)
@@ -934,6 +935,14 @@ class RadioWindow(QWidget):
         outer = self.pbt_sliders["pbt_outer"].value()
         self.spectrum_widget.set_pbt(inner, outer)
         self.filter_shape_widget.set_pbt(inner, outer)
+
+    def _on_filter_width_updated(self, width_hz):
+        """The radio's own live DSP filter width (Hz) -- pushed into both
+        passband-shading widgets so the shading/trapezoids track the
+        actual selected FIL1/2/3 bandwidth instead of MODE_BANDWIDTH_HZ's
+        fixed approximate default. See RadioWorker.is_filter_width_capable."""
+        self.spectrum_widget.set_filter_width_hz(width_hz)
+        self.filter_shape_widget.set_filter_width_hz(width_hz)
 
     def _on_control_combo_changed(self, key, widget):
         value = widget.currentData()

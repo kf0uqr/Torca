@@ -42,6 +42,30 @@ def amplitude_to_color(amp, max_amp=160):
     return QColor(*_COLOR_ANCHORS[-1][1])
 
 
+def _mode_edges_hz(mode, filter_width_hz=None):
+    """(low_hz, high_hz) offsets from the tuned frequency for `mode`'s
+    passband -- MODE_BANDWIDTH_HZ's own default shape, scaled (preserving
+    its low:high ratio -- e.g. USB's all-one-side asymmetry, CW's even
+    split) to match filter_width_hz when given. filter_width_hz is the
+    radio's own LIVE DSP filter width, from RadioWorker's
+    get_filter_width() polling (see is_filter_width_capable) -- using it
+    in place of MODE_BANDWIDTH_HZ's fixed approximate default is what
+    lets the passband shading/trapezoids track FIL1/2/3 selection and
+    any custom bandwidth the operator has actually set, instead of
+    always assuming one fixed per-mode number. Returns None if `mode`
+    has no MODE_BANDWIDTH_HZ entry at all."""
+    if mode not in MODE_BANDWIDTH_HZ:
+        return None
+    low_hz, high_hz = MODE_BANDWIDTH_HZ[mode]
+    if filter_width_hz is None:
+        return low_hz, high_hz
+    default_sum = low_hz + high_hz
+    if default_sum <= 0:
+        return low_hz, high_hz
+    scale = filter_width_hz / default_sum
+    return low_hz * scale, high_hz * scale
+
+
 def _pbt_trapezoid_hz(level, hz_per_level, width_hz, center_hz):
     """One Twin PBT knob's own filter shape: a copy of the mode's full
     default passband (same width_hz, centered at center_hz when the raw
@@ -59,7 +83,7 @@ def _pbt_trapezoid_hz(level, hz_per_level, width_hz, center_hz):
     return shifted_center - width_hz / 2.0, shifted_center + width_hz / 2.0
 
 
-def _pbt_overlap_hz(mode, inner_level, outer_level):
+def _pbt_overlap_hz(mode, inner_level, outer_level, filter_width_hz=None):
     """The actual resulting passband: the OVERLAP of PBT1 (inner) and
     PBT2 (outer)'s own independently-shifted trapezoids (see
     _pbt_trapezoid_hz) -- matches real Twin PBT behavior, where audio
@@ -98,10 +122,16 @@ def _pbt_overlap_hz(mode, inner_level, outer_level):
     MODE_BANDWIDTH_HZ entry. overlap_high_hz is never less than
     overlap_low_hz (clamped to equal when the trapezoids no longer
     overlap at all); check overlap_high_hz > overlap_low_hz before
-    treating the result as an audible (nonzero-width) passband."""
-    if mode not in MODE_BANDWIDTH_HZ:
+    treating the result as an audible (nonzero-width) passband.
+
+    filter_width_hz, when given, overrides MODE_BANDWIDTH_HZ's fixed
+    default total width (scaled via _mode_edges_hz, preserving the
+    mode's own low:high shape) with the radio's own live DSP filter
+    width -- see RadioWorker.is_filter_width_capable."""
+    edges = _mode_edges_hz(mode, filter_width_hz)
+    if edges is None:
         return None
-    default_low_hz, default_high_hz = MODE_BANDWIDTH_HZ[mode]
+    default_low_hz, default_high_hz = edges
     width_hz = default_low_hz + default_high_hz
     center_hz = (default_high_hz - default_low_hz) / 2.0
     hz_per_level = (width_hz / 255.0) if mode in PBT_CAPABLE_MODES else 0.0
@@ -131,6 +161,7 @@ class SpectrumWidget(QWidget):
         self._mode = None           # set via set_mode() -- CONTROL_DEFINITIONS["mode"]'s plain string values (e.g. "USB", "FM")
         self._pbt_inner = None      # set via set_pbt() -- raw 0-255 PBT level, 128=centered; None = no PBT overlay drawn
         self._pbt_outer = None
+        self._filter_width_hz = None  # set via set_filter_width_hz() -- live DSP filter width; None = use MODE_BANDWIDTH_HZ's default
 
     def set_tuned_frequency(self, freq_hz):
         """The actual VFO/receiver frequency the scope is centered on --
@@ -160,6 +191,17 @@ class SpectrumWidget(QWidget):
         shading, unchanged, e.g. on a radio without PBT."""
         self._pbt_inner = inner_level
         self._pbt_outer = outer_level
+        self.update()
+
+    def set_filter_width_hz(self, width_hz):
+        """The radio's own live DSP filter width in Hz, from
+        RadioWorker.filter_width_updated -- see is_filter_width_capable.
+        Scales the passband shading (both the plain per-mode rectangle
+        and the Twin PBT overlap) to match the actual selected FIL1/2/3
+        bandwidth instead of MODE_BANDWIDTH_HZ's fixed approximate
+        default. Pass None (the default) to fall back to that default,
+        e.g. on a radio/connection where this isn't readable."""
+        self._filter_width_hz = width_hz
         self.update()
 
     def set_overlay_widget(self, widget, margin=8, corner="top-right"):
@@ -247,10 +289,12 @@ class SpectrumWidget(QWidget):
         # Passband/bandwidth shading -- drawn BEFORE the amplitude trace
         # so the trace itself stays fully crisp/visible on top of it,
         # rather than the shading obscuring it. Semi-transparent fill,
-        # no border -- just a rough visual hint of occupied bandwidth,
-        # not a precise reading (see MODE_BANDWIDTH_HZ's own comment).
+        # no border. Uses the radio's own live filter width when known
+        # (_filter_width_hz, from RadioWorker.filter_width_updated) --
+        # otherwise MODE_BANDWIDTH_HZ's fixed approximate default (see
+        # that dict's own comment).
         if self._tuned_freq_hz is not None and self._mode in MODE_BANDWIDTH_HZ:
-            low_hz, high_hz = MODE_BANDWIDTH_HZ[self._mode]
+            low_hz, high_hz = _mode_edges_hz(self._mode, self._filter_width_hz)
             x_low = self._freq_to_x(self._tuned_freq_hz - low_hz, w)
             x_high = self._freq_to_x(self._tuned_freq_hz + high_hz, w)
             if x_low is not None and x_high is not None:
@@ -269,7 +313,9 @@ class SpectrumWidget(QWidget):
                 # so both the full default filter and the real PBT
                 # passband stay simultaneously visible.
                 if self._pbt_inner is not None and self._pbt_outer is not None:
-                    overlap = _pbt_overlap_hz(self._mode, self._pbt_inner, self._pbt_outer)
+                    overlap = _pbt_overlap_hz(
+                        self._mode, self._pbt_inner, self._pbt_outer, self._filter_width_hz
+                    )
                     if overlap is not None:
                         overlap_low_hz, overlap_high_hz, *_rest = overlap
                         pbt_x_low = self._freq_to_x(self._tuned_freq_hz + overlap_low_hz, w)
@@ -328,6 +374,7 @@ class FilterShapeWidget(QWidget):
         self._mode = None            # set via set_mode()
         self._pbt_inner = None       # set via set_pbt() -- None means "draw both trapezoids centered"
         self._pbt_outer = None
+        self._filter_width_hz = None  # set via set_filter_width_hz() -- live DSP filter width; None = use MODE_BANDWIDTH_HZ's default
 
     def set_mode(self, mode):
         self._mode = mode
@@ -336,6 +383,12 @@ class FilterShapeWidget(QWidget):
     def set_pbt(self, inner_level, outer_level):
         self._pbt_inner = inner_level
         self._pbt_outer = outer_level
+        self.update()
+
+    def set_filter_width_hz(self, width_hz):
+        """See SpectrumWidget.set_filter_width_hz's docstring -- same
+        live-filter-width override, shared math via _pbt_overlap_hz."""
+        self._filter_width_hz = width_hz
         self.update()
 
     def paintEvent(self, event):
@@ -352,7 +405,7 @@ class FilterShapeWidget(QWidget):
         inner_level = self._pbt_inner if self._pbt_inner is not None else 128
         outer_level = self._pbt_outer if self._pbt_outer is not None else 128
         overlap_low_hz, overlap_high_hz, default_low_hz, default_high_hz, width_hz, center_hz = _pbt_overlap_hz(
-            self._mode, inner_level, outer_level
+            self._mode, inner_level, outer_level, self._filter_width_hz
         )
         hz_per_level = (width_hz / 255.0) if self._mode in PBT_CAPABLE_MODES else 0.0
         pbt1_low_hz, pbt1_high_hz = _pbt_trapezoid_hz(inner_level, hz_per_level, width_hz, center_hz)

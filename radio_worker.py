@@ -167,6 +167,7 @@ from constants import (
     ATT_CIV_COMMAND,
     SWR_CIV_SUB,
     SWR_CALIBRATION,
+    SWR_PROTECTION_THRESHOLD,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
@@ -306,6 +307,7 @@ class RadioWorker(QThread):
     filter_width_range_updated = Signal(object)
     filter_shape_updated = Signal(int)   # 0=SHARP, 1=SOFT -- see FILTER_SHAPE_OPTIONS
     preamp_att_updated = Signal(int, int)  # (preamp_level 0/1/2, attenuator_db) -- IC-705 only, see is_ic705_preamp_att
+    swr_protection_tripped = Signal(float)  # the SWR ratio that triggered an automatic PTT cutoff -- see SWR_PROTECTION_THRESHOLD
     active_receiver_changed = Signal(int)  # dual-receiver only: 0=MAIN, 1=SUB, from get_active_receiver() polling
     scope_span_changed = Signal(int)     # preset index 0-7, from get_scope_span() polling
     scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
@@ -343,6 +345,19 @@ class RadioWorker(QThread):
         # skip polling SWR at all while not transmitting.
         self._ptt_active = False
         self._swr_reset_pending = False  # True right after PTT releases, until one reset value has been emitted
+        # SWR protection -- see SWR_PROTECTION_THRESHOLD's own comment
+        # in constants.py. _tuner_active gates the cutoff off during a
+        # real tune sweep (naturally high SWR, not a fault) regardless
+        # of whether tuning was started from this app's own Tune button
+        # or the radio's front panel -- set optimistically by
+        # _start_tuner() and authoritatively corrected by the tuner-
+        # status polling in _poll_loop_slow either way. A plain
+        # attribute, not asyncio-scheduled -- both are simple bool
+        # flags read/written across the GUI/worker thread boundary,
+        # safe under the GIL for this (a stale-by-one-cycle read is
+        # harmless), same treatment as _ptt_active above.
+        self._tuner_active = False
+        self._swr_protection_enabled = True
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop_slow only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -806,6 +821,16 @@ class RadioWorker(QThread):
     async def _start_tuner(self):
         try:
             await self.radio.set_tuner_status(2)
+            # Optimistic -- gates the SWR protection cutoff off
+            # immediately rather than waiting for the next _poll_loop_
+            # slow tick to notice tuner_status==2 (which, now that
+            # settings poll every SLOW_POLL_INTERVAL_SEC, could
+            # otherwise lag behind the tune sweep's own naturally-high
+            # SWR by a couple seconds). That same polling still
+            # authoritatively corrects/clears this once tuning actually
+            # finishes, and also catches a front-panel-initiated tune
+            # this optimistic set can't see.
+            self._tuner_active = True
         except Exception as exc:
             self.error.emit(f"Tuner: radio.set_tuner_status(2) failed ({exc}).")
 
@@ -1758,6 +1783,11 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Filter shape: send_civ(0x16, 0x56) failed ({exc}).")
 
+    def set_swr_protection_enabled(self, enabled: bool):
+        """Thread-safe: call from the GUI thread. Plain attribute set,
+        no coroutine needed -- see _swr_protection_enabled's own comment."""
+        self._swr_protection_enabled = enabled
+
     def set_preamp_att_value(self, preamp_level: int, atten_db):
         """Thread-safe: call from the GUI thread. preamp_level is 0/1/2;
         atten_db is 0/20 or None to leave the attenuator register alone
@@ -2306,6 +2336,7 @@ class RadioWorker(QThread):
                             if resp is None or not resp.data:
                                 continue
                             value = _interpolate_swr(_bcd_decode_pbt_level(resp.data))
+                            is_calibrated_reading = True
                         else:
                             getter = getattr(self.radio, getter_name)
                             kwargs = (
@@ -2314,6 +2345,28 @@ class RadioWorker(QThread):
                                 else {}
                             )
                             value = await getter(**kwargs)
+                            # Only rigplane's own get_swr() (kind
+                            # "direct") returns a real calibrated ratio;
+                            # the get_swr_meter() raw-byte fallback
+                            # ("linear") is NOT safe to compare against
+                            # SWR_PROTECTION_THRESHOLD -- 2.5 as a raw
+                            # 0-255 byte is nowhere near a real fault.
+                            is_calibrated_reading = definition["kind"] == "direct"
+                        if (
+                            is_calibrated_reading
+                            and self._swr_protection_enabled
+                            and not self._tuner_active
+                            and value > SWR_PROTECTION_THRESHOLD
+                        ):
+                            try:
+                                await self.radio.set_ptt(False)
+                            except Exception as exc:
+                                self.error.emit(
+                                    f"SWR protection: failed to release PTT ({exc}) -- radio may still be keyed!"
+                                )
+                            self._ptt_active = False
+                            self._swr_reset_pending = True
+                            self.swr_protection_tripped.emit(value)
                     else:
                         getter = getattr(self.radio, getter_name)
                         kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
@@ -2411,6 +2464,16 @@ class RadioWorker(QThread):
             # every poll cycle.
             try:
                 tuner_status = await self.radio.get_tuner_status()
+                # Authoritative correction for _tuner_active (SWR
+                # protection's tuning gate, see SWR_PROTECTION_
+                # THRESHOLD's comment) -- catches a front-panel-
+                # initiated tune _start_tuner()'s own optimistic set
+                # can't see, and clears it once tuning genuinely
+                # finishes (whether this app or the front panel started
+                # it). Unconditional, not just on change, so it can't
+                # get stuck stale if the very first poll after tuning
+                # starts happens to already read status==2.
+                self._tuner_active = tuner_status == 2
                 if tuner_status != self._last_observed_tuner_status:
                     self._last_observed_tuner_status = tuner_status
                     self.tuner_status_changed.emit(tuner_status)

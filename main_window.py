@@ -38,6 +38,7 @@ from constants import (
     PREAMP_ATT_OPTIONS_HF,
     PREAMP_ATT_OPTIONS_VHF_UHF,
     VHF_UHF_BANDS,
+    SWR_PROTECTION_THRESHOLD,
     DUAL_RECEIVER_LEVEL_KEYS,
     CONTROL_DEFINITIONS,
     CONTROL_OPTION_EXCLUDED,
@@ -243,6 +244,28 @@ class RadioWindow(QWidget):
         # pair) -- hidden entirely rather than just disabled, since
         # there's no sensible manual PTT action for this role either.
         self.ptt_button.setVisible(self._role != "downlink")
+
+        # SWR protection toggle -- same checkable-toggle style as every
+        # other on/off button in this app (RIT/split/NR/etc), not a
+        # QCheckBox. Default ON; RadioWorker automatically releases PTT
+        # if SWR exceeds SWR_PROTECTION_THRESHOLD during a real
+        # transmission (not during Tune) -- see its own comment in
+        # constants.py.
+        self.swr_protection_button = QPushButton("SWR Protect")
+        self.swr_protection_button.setCheckable(True)
+        self.swr_protection_button.setChecked(True)
+        self.swr_protection_button.setEnabled(False)
+        self.swr_protection_button.setStyleSheet(
+            "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
+        )
+        self.swr_protection_button.setToolTip(
+            f"When enabled (default), automatically releases PTT if SWR exceeds "
+            f"{SWR_PROTECTION_THRESHOLD}:1 during transmission (not during Tune, "
+            "which naturally reads high SWR while it searches for a match). A "
+            "software-side backstop, not a replacement for the radio's own "
+            "hardware foldback protection."
+        )
+        self.swr_protection_button.toggled.connect(self._on_swr_protection_toggled)
 
         # Starts an antenna tuner tune cycle (set_tuner_status(2)) --
         # keys the transmitter briefly, so hidden for "downlink" role
@@ -729,6 +752,7 @@ class RadioWindow(QWidget):
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.ptt_button)
         knob_row.addWidget(self.tune_button)
+        knob_row.addWidget(self.swr_protection_button)
 
         # RIT knob column -- between left_column (ending in the CW/
         # SSTV/RTTY tool buttons) and knob_row (VFO tuning knob/PTT),
@@ -808,6 +832,7 @@ class RadioWindow(QWidget):
         self.worker.filter_width_range_updated.connect(self._on_filter_width_range_updated)
         self.worker.filter_shape_updated.connect(self._on_filter_shape_updated)
         self.worker.preamp_att_updated.connect(self._on_preamp_att_updated)
+        self.worker.swr_protection_tripped.connect(self._on_swr_protection_tripped)
         self.worker.control_updated.connect(self._on_control_updated)
         self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
         self.worker.scope_span_changed.connect(self._on_scope_span_changed)
@@ -853,6 +878,8 @@ class RadioWindow(QWidget):
         self.rit_knob.setEnabled(True)
         self.rit_xit_mode_button.setEnabled(True)
         self.ptt_button.setEnabled(True)
+        self.swr_protection_button.setEnabled(True)
+        self.worker.set_swr_protection_enabled(self.swr_protection_button.isChecked())
         self.tune_button.setEnabled(True)
         self.cw_tool_button.setEnabled(True)
         self.sstv_tool_button.setEnabled(True)
@@ -1248,6 +1275,26 @@ class RadioWindow(QWidget):
                 "QPushButton { background-color: #37373a; color: #dcdcdc; font-weight: bold; border-radius: 4px; }"
                 "QPushButton:disabled { background-color: #2d2d30; color: #777; }"
             )
+
+    def _on_swr_protection_toggled(self, checked):
+        self.worker.set_swr_protection_enabled(checked)
+
+    def _on_swr_protection_tripped(self, swr_value):
+        # blockSignals -- reflect the radio having already been unkeyed
+        # by RadioWorker itself, don't fire _on_ptt_toggled's own
+        # satellite-VFO-swap/stop_ptt() dispatch a second time on top of
+        # what already happened worker-side.
+        self.ptt_button.blockSignals(True)
+        self.ptt_button.setChecked(False)
+        self.ptt_button.setText("PTT")
+        self.ptt_button.blockSignals(False)
+        QMessageBox.warning(
+            self,
+            "High SWR -- Transmission Stopped",
+            f"SWR reached {swr_value:.1f}:1 during transmission.\n\n"
+            "PTT has been released automatically to help protect the radio. "
+            "Check your antenna and feedline before transmitting again.",
+        )
 
     def _on_ptt_toggled(self, checked):
         self.ptt_button.setText("TRANSMITTING" if checked else "PTT")

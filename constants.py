@@ -441,6 +441,18 @@ PREAMP_ATT_OPTIONS_VHF_UHF = [("OFF", 0, None), ("ON", 1, None)]
 SWR_CIV_SUB = 0x12
 SWR_CALIBRATION = [(0, 1.0), (48, 1.5), (80, 2.0), (120, 3.0), (240, 6.0)]
 
+# Automatic TX cutoff (RadioWorker unkeys PTT itself) if SWR exceeds
+# this DURING A REAL TRANSMISSION -- not the antenna tuner's own sweep,
+# which naturally reads high SWR while it's searching for a match (see
+# RadioWorker._tuner_active, which gates this off during tuning
+# regardless of who/what started it). 2.5:1 is a conservative,
+# commonly-cited caution threshold for solid-state HF/VHF finals; this
+# is a software-side backstop on top of whatever hardware foldback
+# protection the radio itself already has, not a replacement for it.
+# Toggleable from the UI (main_window.py's swr_protection_button) via
+# RadioWorker.set_swr_protection_enabled(), default ON.
+SWR_PROTECTION_THRESHOLD = 2.5
+
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on
 # a dual-receiver radio. Their real getter/setter DOES accept a
 # receiver= kwarg (confirmed via a full inspect.signature() sweep

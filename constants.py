@@ -926,4 +926,13 @@ CONTROL_OPTION_EXCLUDED = {
     # a real state this model supports, unlike FAST/MID/SLOW). Excluded
     # here rather than offering a choice that doesn't do what it says.
     ("IC-705", "agc"): {"OFF"},
+    # Same missing-OFF-state story on the IC-9700, confirmed via its own
+    # CI-V Reference Guide (Misc/IC-9700_ENG_CI-V_3a.pdf p.7): "Send/read
+    # the AGC time constant: 01 to 03" -- only FAST/MID/SLOW are valid
+    # values, no 00=OFF -- matching rigplane's own ic9700.toml ([agc]
+    # modes = [1, 2, 3], no 0). Not yet confirmed live on real hardware
+    # (unlike the IC-705 entry above), but the manual and profile agree,
+    # so this is excluded on the same evidence standard as everything
+    # else in this file that hasn't had a live hardware test yet.
+    ("IC-9700", "agc"): {"OFF"},
 }

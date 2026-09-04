@@ -490,6 +490,32 @@ class RadioWindow(QWidget):
             self.pbt_sliders[key] = slider
             self.pbt_labels[key] = label
 
+        # Filter width -- adjusts the CURRENTLY SELECTED FIL1/2/3's own
+        # bandwidth (rigplane's set_filter_width, Hz), same
+        # hidden-until-capable/connected treatment as the PBT sliders
+        # above. Range is per-MODE (SSB/CW/RTTY/AM all have different
+        # min/max/step schedules, and some modes -- FM/WFM/DV -- can't be
+        # adjusted at all), so self.filter_width_values holds the exact
+        # valid Hz values for whatever mode is currently active (built
+        # from RadioWorker.filter_width_range_updated's segments) and
+        # the slider's own range is just an index into that list -- this
+        # guarantees every reachable slider position is a value the
+        # radio will actually accept, since real Icom filter-width
+        # ranges mix step sizes (e.g. SSB: 50 Hz steps below 600 Hz,
+        # 100 Hz steps from 600 Hz up) that a single fixed slider step
+        # can't represent.
+        self.filter_width_values = []  # valid Hz values for the current mode, index-matched to the slider position
+        self.filter_width_slider = QSlider(Qt.Horizontal)
+        self.filter_width_slider.setVisible(False)
+        self.filter_width_slider.setEnabled(False)
+        self.filter_width_slider.valueChanged.connect(self._on_filter_width_changed)
+        self.filter_width_label = QLabel("Filter Width: --")
+        self.filter_width_label.setVisible(False)
+        filter_width_row = QHBoxLayout()
+        filter_width_row.addWidget(self.filter_width_label)
+        filter_width_row.addWidget(self.filter_width_slider)
+        pbt_row.addLayout(filter_width_row)
+
         # Mode/Digital/NR/NB/AGC/Preamp/Filter/VFO -- built generically
         # from CONTROL_DEFINITIONS: a combo box ("combo" type), a
         # checkable toggle button ("toggle" type), or a plain click-to-
@@ -676,6 +702,7 @@ class RadioWindow(QWidget):
         self.worker.level_updated.connect(self._on_level_updated)
         self.worker.pbt_updated.connect(self._on_pbt_updated)
         self.worker.filter_width_updated.connect(self._on_filter_width_updated)
+        self.worker.filter_width_range_updated.connect(self._on_filter_width_range_updated)
         self.worker.control_updated.connect(self._on_control_updated)
         self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
         self.worker.scope_span_changed.connect(self._on_scope_span_changed)
@@ -936,11 +963,71 @@ class RadioWindow(QWidget):
         self.spectrum_widget.set_pbt(inner, outer)
         self.filter_shape_widget.set_pbt(inner, outer)
 
+    @staticmethod
+    def _format_filter_width_hz(width_hz):
+        return f"{width_hz / 1000:.2f}k" if width_hz >= 1000 else str(width_hz)
+
     def _on_filter_width_updated(self, width_hz):
         """The radio's own live DSP filter width (Hz) -- pushed into both
         passband-shading widgets so the shading/trapezoids track the
         actual selected FIL1/2/3 bandwidth instead of MODE_BANDWIDTH_HZ's
-        fixed approximate default. See RadioWorker.is_filter_width_capable."""
+        fixed approximate default. See RadioWorker.is_filter_width_capable.
+        Also reflects the slider position/label, same blockSignals-then-
+        setValue pattern as _on_pbt_updated -- but by NEAREST valid index
+        rather than direct value, since filter_width_values is a sparse
+        list of valid Hz values, not a contiguous 0-N range."""
+        self.spectrum_widget.set_filter_width_hz(width_hz)
+        self.filter_shape_widget.set_filter_width_hz(width_hz)
+        slider = self.filter_width_slider
+        if self.filter_width_values:
+            index = min(
+                range(len(self.filter_width_values)),
+                key=lambda i: abs(self.filter_width_values[i] - width_hz),
+            )
+            if slider.value() != index:
+                slider.blockSignals(True)
+                slider.setValue(index)
+                slider.blockSignals(False)
+        self.filter_width_label.setText(f"Filter Width: {self._format_filter_width_hz(width_hz)}")
+
+    def _on_filter_width_range_updated(self, range_info):
+        """New adjustable-width range for the currently active mode (see
+        RadioWorker._resolve_filter_width_range) -- rebuilds
+        filter_width_values (every valid Hz value across all of this
+        mode's step segments, e.g. SSB's 50 Hz steps below 600 Hz then
+        100 Hz steps above) and resizes the slider to index into it, so
+        every reachable slider position is guaranteed valid -- a single
+        fixed slider step couldn't represent a mixed-step range like
+        that. range_info=None means this mode's width can't be adjusted
+        at all (e.g. FM/WFM/DV) -- the control just hides itself rather
+        than showing a slider that would always fail."""
+        slider = self.filter_width_slider
+        if range_info is None:
+            slider.setVisible(False)
+            slider.setEnabled(False)
+            self.filter_width_label.setVisible(False)
+            self.filter_width_values = []
+            return
+        self.filter_width_values = sorted(
+            {
+                hz
+                for hz_min, hz_max, step_hz in range_info["segments"]
+                for hz in range(hz_min, hz_max + 1, step_hz)
+            }
+        )
+        slider.blockSignals(True)
+        slider.setRange(0, max(0, len(self.filter_width_values) - 1))
+        slider.blockSignals(False)
+        slider.setVisible(True)
+        slider.setEnabled(True)
+        self.filter_width_label.setVisible(True)
+
+    def _on_filter_width_changed(self, index):
+        if not 0 <= index < len(self.filter_width_values):
+            return
+        width_hz = self.filter_width_values[index]
+        self.filter_width_label.setText(f"Filter Width: {self._format_filter_width_hz(width_hz)}")
+        self.worker.set_filter_width_value(width_hz)
         self.spectrum_widget.set_filter_width_hz(width_hz)
         self.filter_shape_widget.set_filter_width_hz(width_hz)
 

@@ -245,6 +245,12 @@ class RadioWorker(QThread):
     level_updated = Signal(str, float)   # (level key, value 0.0-1.0)
     pbt_updated = Signal(str, int)       # (pbt key, raw level 0-255, 128=centered) -- see PBT_DEFINITIONS
     filter_width_updated = Signal(int)   # live DSP IF filter width in Hz, from get_filter_width() polling
+    # Valid adjustable range for the CURRENT mode's filter width, or None
+    # if this mode's width is fixed (can't be adjusted at all) -- a dict
+    # {"min_hz", "max_hz", "segments": [(hz_min, hz_max, step_hz), ...]},
+    # recomputed whenever the polled mode changes. See _refresh_filter_
+    # width_range and main_window.py's _on_filter_width_range_updated.
+    filter_width_range_updated = Signal(object)
     active_receiver_changed = Signal(int)  # dual-receiver only: 0=MAIN, 1=SUB, from get_active_receiver() polling
     scope_span_changed = Signal(int)     # preset index 0-7, from get_scope_span() polling
     scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
@@ -266,6 +272,8 @@ class RadioWorker(QThread):
         self.is_pbt_capable = False  # set once connected -- see CAP_PBT import comment
         self.is_filter_width_capable = False  # set once connected -- see CAP_FILTER_WIDTH import comment
         self._filter_width_hz = None  # live DSP filter width, polled -- see _poll_loop
+        self._filter_width_range_mode = None  # last mode a filter_width_range_updated was computed/emitted for -- avoids recomputing every poll cycle
+        self._filter_width_debounce_task = None  # pending asyncio.Task, for set_filter_width_value()'s debounce
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -1336,6 +1344,9 @@ class RadioWorker(QThread):
                 f"Related attributes found on radio: {', '.join(hints) or '(none)'}"
             )
 
+        if "af_gain" in self._level_methods:
+            self._hint_usb_audio_level_attrs()
+
     async def _setup_pbt(self):
         """Populates self._pbt_methods (pbt key -> CI-V 0x14 sub-command
         byte) when is_pbt_capable is already True (set from the radio's
@@ -1355,8 +1366,33 @@ class RadioWorker(QThread):
         for key, definition in PBT_DEFINITIONS.items():
             self._pbt_methods[key] = definition["civ_sub"]
 
-        if "af_gain" in self._level_methods:
-            self._hint_usb_audio_level_attrs()
+    def _resolve_filter_width_range(self, mode_name):
+        """Looks up the adjustable filter-width range for `mode_name` via
+        rigplane's public radio.profile.resolve_filter_rule() -- the same
+        lookup set_filter_width()/get_filter_width() use internally
+        (there via the private self._profile; .profile is the public
+        equivalent, a plain property). Returns None if this mode's width
+        can't be adjusted at all (no rule, or rule.fixed -- e.g. FM/WFM/
+        DV), else a dict: {"min_hz", "max_hz", "segments": [(hz_min,
+        hz_max, step_hz), ...]} -- segments (not just min/max) so the UI
+        can snap to a valid step instead of guessing, since real Icom
+        filter-width ranges mix step sizes (e.g. SSB: 50 Hz steps below
+        600 Hz, 100 Hz steps from 600 Hz up)."""
+        profile = getattr(self.radio, "profile", None)
+        if profile is None:
+            return None
+        try:
+            rule = profile.resolve_filter_rule(mode_name, data_mode=0)
+        except Exception:
+            return None
+        if rule is None or rule.fixed or not rule.segments:
+            return None
+        segments = [(seg.hz_min, seg.hz_max, seg.step_hz) for seg in rule.segments]
+        return {
+            "min_hz": min(s[0] for s in segments),
+            "max_hz": max(s[1] for s in segments),
+            "segments": segments,
+        }
 
     def _hint_usb_audio_level_attrs(self):
         """The AF gain slider controls the radio's own physical speaker
@@ -1583,6 +1619,38 @@ class RadioWorker(QThread):
             )
         except Exception as exc:
             self.error.emit(f"{definition['label']}: send_civ(0x14, 0x{civ_sub:02x}) failed ({exc}).")
+
+    def set_filter_width_value(self, width_hz: int):
+        """Thread-safe: call from the GUI thread. width_hz should already
+        be snapped to a valid step (see filter_width_range_updated's
+        segments) -- rigplane's own set_filter_width() rejects anything
+        else with a CommandError, caught below same as any other setter
+        failure. Debounced the same way as set_pbt_value/set_level_value."""
+        if self.loop is None or not self.is_filter_width_capable:
+            return
+        asyncio.run_coroutine_threadsafe(self._debounce_filter_width_value(width_hz), self.loop)
+
+    async def _debounce_filter_width_value(self, width_hz: int):
+        existing = self._filter_width_debounce_task
+        if existing is not None and not existing.done():
+            existing.cancel()
+
+        async def _wait_then_apply():
+            try:
+                await asyncio.sleep(LEVEL_DEBOUNCE_SECONDS)
+            except asyncio.CancelledError:
+                return
+            await self._set_filter_width_value(width_hz)
+
+        self._filter_width_debounce_task = asyncio.ensure_future(_wait_then_apply())
+
+    async def _set_filter_width_value(self, width_hz: int):
+        try:
+            await self.radio.set_filter_width(width_hz)
+            self._filter_width_hz = width_hz
+            self.filter_width_updated.emit(width_hz)
+        except Exception as exc:
+            self.error.emit(f"Filter width: set_filter_width({width_hz}) failed ({exc}).")
 
     async def _main(self):
         try:
@@ -2161,6 +2229,9 @@ class RadioWorker(QThread):
                     if hasattr(value, "name"):
                         value = value.name
                     self.control_updated.emit(key, value)
+                    if key == "mode" and self.is_filter_width_capable and value != self._filter_width_range_mode:
+                        self._filter_width_range_mode = value
+                        self.filter_width_range_updated.emit(self._resolve_filter_width_range(value))
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
 

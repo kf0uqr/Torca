@@ -747,6 +747,25 @@ CONTROL_DEFINITIONS = {
         "getter_candidates": ["get_rit_status"],
         "setter_candidates": ["set_rit_status"],
     },
+    "xit": {
+        "label": "XIT",
+        # Same rig-global, no-receiver-arg shape as "rit" above --
+        # rigplane's RitXitCapable protocol docstring confirms RIT and
+        # XIT are a "semantically identical six-method contract" (get/
+        # set_rit_status for RIT, get/set_rit_tx_status for XIT), and
+        # both share the SAME underlying offset register (there's only
+        # one set_rit_frequency, not a separate XIT one) -- XIT just
+        # applies that offset to TX instead of RX. This entry exists
+        # purely so RadioWorker discovers/polls get_rit_tx_status/
+        # set_rit_tx_status the same generic way as every other toggle;
+        # main_window.py deliberately builds NO widget of its own for
+        # it (see its combo/toggle-building loop) -- its live status
+        # feeds the SAME on/off button "rit" already uses, shared
+        # between RIT/XIT display via a mode-select button next to it.
+        "type": "toggle",
+        "getter_candidates": ["get_rit_tx_status"],
+        "setter_candidates": ["set_rit_tx_status"],
+    },
 }
 
 # Radio-specific control-option exclusions, keyed (radio_model, control

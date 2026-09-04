@@ -358,6 +358,25 @@ class RadioWindow(QWidget):
         self.rit_offset_label = QLabel("RIT: +0 Hz")
         self.rit_offset_label.setAlignment(Qt.AlignHCenter)
 
+        # RIT/XIT mode select -- RIT and XIT share this SAME offset
+        # register (rigplane has only one set_rit_frequency; XIT just
+        # applies it to TX instead of RX -- see CONTROL_DEFINITIONS["xit"]'s
+        # comment), so rit_knob above needs no mode-awareness of its own.
+        # What DOES need it: rit_status_button (built by the generic
+        # CONTROL_DEFINITIONS loop for "rit", relocated into rit_column
+        # below) is repurposed to toggle whichever of RIT/XIT is
+        # currently selected here, rather than always RIT -- see
+        # _on_control_toggled's "rit" redirect and _on_control_updated's
+        # "rit"/"xit" branch. _rit_xit_values caches the last-polled
+        # bool for BOTH keys (updated regardless of which is currently
+        # selected) so switching modes can show the right state
+        # immediately instead of waiting for the next poll tick.
+        self._rit_xit_mode = "rit"
+        self._rit_xit_values = {"rit": False, "xit": False}
+        self.rit_xit_mode_button = QPushButton("RIT")
+        self.rit_xit_mode_button.setEnabled(False)
+        self.rit_xit_mode_button.clicked.connect(self._on_rit_xit_mode_clicked)
+
         # Scope span/reference level/sweep speed -- rigplane's
         # set_scope_span/set_scope_ref/set_scope_speed (radio_worker.py),
         # confirmed real via rigplane's own runtime/_scope_runtime.py and
@@ -557,6 +576,13 @@ class RadioWindow(QWidget):
                 self._is_preamp_att_vhf_uhf = False  # last band this combo's options were built for
                 self._update_preamp_att_options(is_vhf_uhf=False)  # HF/6m default until a frequency is known
                 continue
+            if key == "xit":
+                # No widget of its own -- see CONTROL_DEFINITIONS["xit"]'s
+                # own comment. RadioWorker still discovers/polls it
+                # (iterates CONTROL_DEFINITIONS directly, independent of
+                # what gets built here); its live status just feeds
+                # rit_status_button via _on_control_updated instead.
+                continue
             if definition["type"] == "combo":
                 widget = QComboBox()
                 excluded_labels = CONTROL_OPTION_EXCLUDED.get((details["radio_model"], key), set())
@@ -713,6 +739,7 @@ class RadioWindow(QWidget):
         # memories buttons", the latter two living up in buttons_row).
         rit_column = QVBoxLayout()
         rit_column.addStretch()
+        rit_column.addWidget(self.rit_xit_mode_button, alignment=Qt.AlignHCenter)
         rit_column.addWidget(self.rit_knob, alignment=Qt.AlignHCenter)
         rit_column.addWidget(self.rit_offset_label, alignment=Qt.AlignHCenter)
         rit_column.addWidget(self.rit_status_button, alignment=Qt.AlignHCenter)
@@ -818,6 +845,7 @@ class RadioWindow(QWidget):
         self.freq_display.setReadOnly(False)
         self.tuning_knob.setEnabled(True)
         self.rit_knob.setEnabled(True)
+        self.rit_xit_mode_button.setEnabled(True)
         self.ptt_button.setEnabled(True)
         self.tune_button.setEnabled(True)
         self.cw_tool_button.setEnabled(True)
@@ -1174,7 +1202,23 @@ class RadioWindow(QWidget):
         self.worker.set_control_value(key, value)
 
     def _on_control_toggled(self, key, checked):
+        if key == "rit":
+            # rit_status_button is shared between RIT and XIT (see
+            # rit_xit_mode_button's own comment) -- redirect to whichever
+            # is currently selected instead of always writing RIT.
+            key = self._rit_xit_mode
         self.worker.set_control_value(key, checked)
+
+    def _on_rit_xit_mode_clicked(self):
+        self._rit_xit_mode = "xit" if self._rit_xit_mode == "rit" else "rit"
+        label = self._rit_xit_mode.upper()
+        self.rit_xit_mode_button.setText(label)
+        self.rit_offset_label.setText(f"{label}: {self._rit_offset_hz:+d} Hz")
+        checked = self._rit_xit_values[self._rit_xit_mode]
+        self.rit_status_button.blockSignals(True)
+        self.rit_status_button.setChecked(checked)
+        self.rit_status_button.setText(label)
+        self.rit_status_button.blockSignals(False)
 
     def _on_split_button_context_menu(self, pos):
         SplitSettingsDialog(self).exec()
@@ -1653,6 +1697,22 @@ class RadioWindow(QWidget):
         if key == "mode":
             self.spectrum_widget.set_mode(value)
             self.filter_shape_widget.set_mode(value)
+        if key in ("rit", "xit"):
+            # rit_status_button (self.control_widgets["rit"]) is shared
+            # between RIT and XIT display -- cache BOTH keys' latest
+            # value regardless of mode (so switching modes shows the
+            # right state immediately, see _on_rit_xit_mode_clicked),
+            # but only let the currently-selected key's polling actually
+            # touch the visible button, so the other one's background
+            # polling doesn't silently overwrite it underneath the user.
+            self._rit_xit_values[key] = bool(value)
+            if key == self._rit_xit_mode:
+                checked = bool(value)
+                if self.rit_status_button.isChecked() != checked:
+                    self.rit_status_button.blockSignals(True)
+                    self.rit_status_button.setChecked(checked)
+                    self.rit_status_button.blockSignals(False)
+            return
         widget = self.control_widgets.get(key)
         if widget is None:
             return
@@ -1760,7 +1820,7 @@ class RadioWindow(QWidget):
         # locally (relative encoder, same shape as the main knob) and
         # clamped to rigplane's own +-9999 Hz range.
         self._rit_offset_hz = max(-9999, min(9999, self._rit_offset_hz + steps * self._RIT_STEP_HZ))
-        self.rit_offset_label.setText(f"RIT: {self._rit_offset_hz:+d} Hz")
+        self.rit_offset_label.setText(f"{self._rit_xit_mode.upper()}: {self._rit_offset_hz:+d} Hz")
         self.worker.set_rit_frequency(self._rit_offset_hz)
 
     def _on_scope_clicked(self, freq_hz):

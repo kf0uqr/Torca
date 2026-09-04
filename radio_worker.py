@@ -67,6 +67,18 @@ try:
     # actually declare "pbt" in their [capabilities] features list, so
     # that's the only reliable way to know Twin PBT is real on this
     # specific connected radio -- see is_pbt_capable below.
+    #
+    # get_pbt_inner/set_pbt_inner/get_pbt_outer/set_pbt_outer used to
+    # reliably fail (rigplane's leaf command builders hardcoded
+    # command29=True unconditionally, producing malformed frames on the
+    # single-receiver IC-705 and WRONG frames on the genuinely-dual-
+    # receiver IC-9700, whose real per-receiver targeting isn't cmd29 at
+    # all) -- fixed upstream in our own rigplane fork
+    # (kf0uqr/rigplane-core, "torca" branch): the runtime layer now
+    # computes command29 from the connected profile's own
+    # supports_cmd29(), matching get_preamp/set_preamp's own correct
+    # pattern. RadioWorker calls these four methods directly now; see
+    # PBT_DEFINITIONS' own comment in constants.py.
     from rigplane.core.capabilities import CAP_PBT
 except ImportError:
     CAP_PBT = None
@@ -88,13 +100,13 @@ except ImportError:
 
 try:
     # CAP_FILTER_SHAPE: the profile-declared capability tag for SHARP/
-    # SOFT filter shape. Unlike CAP_FILTER_WIDTH, get_filter_shape/
-    # set_filter_shape have the SAME Command29-hardcoding bug as PBT
-    # (confirmed by reading rigplane/commands/mode.py: both leaf command
-    # functions hardcode command29=True unconditionally) -- so, like
-    # PBT_DEFINITIONS, RadioWorker sends this via raw send_civ() rather
-    # than calling those two methods. See FILTER_SHAPE_CIV_SUB's comment
-    # in constants.py.
+    # SOFT filter shape. get_filter_shape/set_filter_shape used to have
+    # the SAME Command29-hardcoding bug as PBT (rigplane's leaf command
+    # builders hardcoded command29=True unconditionally, same as
+    # CAP_PBT's own comment describes) -- fixed upstream in our own
+    # rigplane fork the same way, so RadioWorker now calls those two
+    # methods directly instead of the old raw send_civ() bypass. See
+    # FILTER_SHAPE_CIV_SUB's comment in constants.py.
     from rigplane.core.capabilities import CAP_FILTER_SHAPE
 except ImportError:
     CAP_FILTER_SHAPE = None
@@ -163,16 +175,11 @@ from constants import (
     LEVEL_DEFINITIONS,
     PBT_CAPABLE_MODES,
     PBT_DEFINITIONS,
-    FILTER_SHAPE_CIV_SUB,
     PREAMP_CIV_SUB,
     ATT_CIV_COMMAND,
     SWR_CIV_SUB,
     SWR_CALIBRATION,
     SWR_PROTECTION_THRESHOLD,
-    SCOPE_REF_CIV_SUB,
-    SCOPE_REF_MIN_DB,
-    SCOPE_REF_MAX_DB,
-    SCOPE_REF_WIDE_RANGE_MODELS,
     POWER_CALIBRATION,
     COMP_CALIBRATION,
     VOLTAGE_CALIBRATION_IC9700,
@@ -229,22 +236,15 @@ async def _try_recall_band_stack(radio, band_code, register=BAND_STACKING_REGIST
     return freq_hz, None
 
 
-def _bcd_encode_pbt_level(value: int) -> bytes:
-    """0-255 int -> 2-byte BCD, matching the encoding rigplane's own
-    (broken-for-PBT-on-a-single-receiver-radio, see PBT_DEFINITIONS'
-    comment) get/set_pbt_inner/outer use internally -- reimplemented
-    here, rather than importing rigplane's private _level_bcd_encode,
-    so this app's raw-CI-V PBT workaround doesn't depend on rigplane's
-    internal (underscore-prefixed, no compatibility guarantee) API.
-    Each byte holds two BCD digits: 128 -> b'\\x01\\x28' (0,1 / 2,8)."""
-    if not 0 <= value <= 255:
-        raise ValueError(f"PBT level must be 0-255, got {value}")
-    d = f"{value:04d}"
-    return bytes([(int(d[0]) << 4) | int(d[1]), (int(d[2]) << 4) | int(d[3])])
-
-
-def _bcd_decode_pbt_level(data: bytes) -> int:
-    """Inverse of _bcd_encode_pbt_level."""
+def _bcd_decode_2byte(data: bytes) -> int:
+    """2-byte BCD -> 0-255-ish int (each byte holds two BCD digits,
+    e.g. b'\\x01\\x28' -> 128). Used by the IC-705 SWR raw-CI-V
+    workaround (see SWR_CIV_SUB's comment in constants.py) -- used to
+    also be needed for a PBT raw-CI-V workaround too, before rigplane's
+    own Command29-hardcoding bug for get_pbt_inner/set_pbt_inner/
+    get_pbt_outer/set_pbt_outer was fixed upstream in our fork (see
+    PBT_DEFINITIONS' comment in constants.py); RadioWorker calls those
+    methods directly now, so this helper is SWR-only these days."""
     d0, d1 = data[0], data[1]
     return (d0 >> 4) * 1000 + (d0 & 0x0F) * 100 + (d1 >> 4) * 10 + (d1 & 0x0F)
 
@@ -253,8 +253,10 @@ def _bcd_encode_byte(value: int) -> bytes:
     """0-99 int -> 1-byte BCD (high nibble = tens, low nibble = units),
     matching rigplane's own private _bcd_byte -- used for the IC-705
     Preamp/Attenuator raw-CI-V workaround (see PREAMP_CIV_SUB's comment
-    in constants.py), same reimplemented-rather-than-imported reasoning
-    as _bcd_encode_pbt_level."""
+    in constants.py), reimplemented here rather than importing
+    rigplane's own private helper so this workaround doesn't depend on
+    rigplane's internal (underscore-prefixed, no compatibility
+    guarantee) API."""
     if not 0 <= value <= 99:
         raise ValueError(f"Value must be 0-99, got {value}")
     return bytes([((value // 10) << 4) | (value % 10)])
@@ -300,28 +302,6 @@ def _interpolate_calibration(raw: int, calibration_points) -> float:
             frac = (raw - lo_raw) / (hi_raw - lo_raw)
             return lo_val + frac * (hi_val - lo_val)
     return points[-1][1]  # unreachable given the clamps above
-
-
-def _encode_scope_ref(ref_db: float) -> bytes:
-    """CI-V 0x27/0x19 scope reference level, same wire format as
-    rigplane's own private _scope_ref_encode -- reimplemented locally
-    WITHOUT that function's hardcoded -30.0/+10.0 range check (the
-    IC-7610's own range, applied universally instead of per-model --
-    see SCOPE_REF_MIN_DB/SCOPE_REF_MAX_DB's comment in constants.py for
-    the full story). byte 0: high nibble = 10 dB digit, low nibble =
-    1 dB digit. byte 1: high nibble = 0.1 dB digit, low nibble fixed 0.
-    byte 2: 0x00 = positive, 0x01 = negative."""
-    if not SCOPE_REF_MIN_DB <= ref_db <= SCOPE_REF_MAX_DB:
-        raise ValueError(f"scope ref must be {SCOPE_REF_MIN_DB} to {SCOPE_REF_MAX_DB} dB, got {ref_db}")
-    is_negative = ref_db < 0
-    tenths = int(round(abs(ref_db) * 10))
-    tens_db = tenths // 100
-    ones_db = (tenths // 10) % 10
-    frac_db = tenths % 10
-    b0 = (tens_db << 4) | ones_db
-    b1 = frac_db << 4
-    sign = 0x01 if is_negative else 0x00
-    return bytes([b0, b1, sign])
 
 
 class RadioWorker(QThread):
@@ -384,11 +364,9 @@ class RadioWorker(QThread):
         self._current_mode = None  # last-polled mode name (e.g. "FM", "USB") -- see PBT_CAPABLE_MODES' gate in _poll_loop_slow
         self._filter_width_debounce_task = None  # pending asyncio.Task, for set_filter_width_value()'s debounce
         self.is_filter_shape_capable = False  # set once connected -- see CAP_FILTER_SHAPE import comment
-        self._filter_shape_available = False  # set in _setup_filter_shape() -- send_civ() usable for this radio
+        self._filter_shape_available = False  # set in _setup_filter_shape() -- get/set_filter_shape resolved for this radio
         self.is_ic705_preamp_att = False  # set once connected -- see PREAMP_CIV_SUB's comment in constants.py
         self.is_ic705_swr_workaround = False  # set once connected -- see SWR_CIV_SUB's comment in constants.py
-        self.is_scope_ref_workaround = False  # set once connected -- see SCOPE_REF_WIDE_RANGE_MODELS' comment in constants.py
-        self._scope_receiver = 0  # 0=MAIN, 1=SUB -- tracks set_scope_receiver() so the raw scope-ref bypass targets the right one
         self._power_is_raw_255 = False  # set in _setup_meters() -- Power needs POWER_CALIBRATION applied when True
         # SWR is only meaningful during TX -- confirmed live that
         # without this, the meter just kept showing whatever it last
@@ -556,7 +534,7 @@ class RadioWorker(QThread):
         # poll and looking like the slider "bouncing back". See
         # set_level_value()/_debounce_level_value().
         self._level_debounce_tasks = {}
-        self._pbt_methods = {}  # pbt key -> CI-V 0x14 sub-command byte, populated by _setup_pbt()
+        self._pbt_methods = {}  # pbt key -> (get_name, set_name), populated by _setup_pbt()
         self._pbt_debounce_tasks = {}  # same debounce idea as _level_debounce_tasks, separate dict/keyspace
 
     def run(self):
@@ -1505,32 +1483,35 @@ class RadioWorker(QThread):
             self._hint_usb_audio_level_attrs()
 
     async def _setup_pbt(self):
-        """Populates self._pbt_methods (pbt key -> CI-V 0x14 sub-command
-        byte) when is_pbt_capable is already True (set from the radio's
-        own declared "pbt" capability). Deliberately does NOT use
-        find_method_name to discover rigplane's own get_pbt_inner/
-        set_pbt_inner/get_pbt_outer/set_pbt_outer -- those are confirmed
-        broken on a real (single-receiver) IC-705, see PBT_DEFINITIONS'
-        own comment in constants.py. _set_pbt_value/the poll loop instead
-        send raw CI-V frames directly via rigplane's public send_civ(),
-        which this radio object needs to actually expose -- an object
-        that claims is_pbt_capable via CAP_PBT but has no send_civ (e.g.
-        a future non-CI-V backend) just gets an empty _pbt_methods, same
-        as the old "no working getter+setter found" case."""
+        """Populates self._pbt_methods (pbt key -> (get_name, set_name))
+        when is_pbt_capable is already True (set from the radio's own
+        declared "pbt" capability), discovering rigplane's own
+        get_pbt_inner/set_pbt_inner/get_pbt_outer/set_pbt_outer via the
+        same find_method_name pattern used everywhere else in this file
+        (_setup_levels et al). These four used to be confirmed broken
+        (see PBT_DEFINITIONS' own comment in constants.py for the full
+        Command29 story) -- fixed upstream in our own rigplane fork, so
+        no raw-CI-V bypass is needed here anymore."""
         self._pbt_methods = {}
-        if not self.is_pbt_capable or not hasattr(self.radio, "send_civ"):
+        if not self.is_pbt_capable:
             return
         for key, definition in PBT_DEFINITIONS.items():
-            self._pbt_methods[key] = definition["civ_sub"]
+            get_name = find_method_name(self.radio, definition["getter_candidates"])
+            set_name = find_method_name(self.radio, definition["setter_candidates"])
+            if get_name and set_name:
+                self._pbt_methods[key] = (get_name, set_name)
 
     async def _setup_filter_shape(self):
-        """Same idea as _setup_pbt() -- self._filter_shape_available is
-        just "is_filter_shape_capable AND this radio object exposes
-        send_civ()", since get_filter_shape/set_filter_shape are
-        confirmed broken the same way PBT's were (see FILTER_SHAPE_
-        CIV_SUB's comment in constants.py) and RadioWorker sends raw
-        CI-V directly instead."""
-        self._filter_shape_available = self.is_filter_shape_capable and hasattr(self.radio, "send_civ")
+        """Resolves rigplane's own get_filter_shape/set_filter_shape
+        method names when is_filter_shape_capable is already True (set
+        from the radio's own declared "filter_shape" capability). Used
+        to be confirmed broken the same way PBT's were (see
+        FILTER_SHAPE_CIV_SUB's comment in constants.py) -- fixed
+        upstream in our own rigplane fork, so RadioWorker calls these
+        two methods directly instead of a raw-CI-V bypass."""
+        self._filter_shape_available = self.is_filter_shape_capable and hasattr(
+            self.radio, "get_filter_shape"
+        ) and hasattr(self.radio, "set_filter_shape")
 
     def _resolve_filter_width_range(self, mode_name):
         """Looks up the adjustable filter-width range for `mode_name` via
@@ -1774,17 +1755,14 @@ class RadioWorker(QThread):
         self._pbt_debounce_tasks[key] = asyncio.ensure_future(_wait_then_apply())
 
     async def _set_pbt_value(self, key: str, value: int):
-        civ_sub = self._pbt_methods[key]
+        _get_name, set_name = self._pbt_methods[key]
         definition = PBT_DEFINITIONS[key]
         try:
-            # Raw CI-V 0x14/<civ_sub> write via send_civ(), NOT
-            # rigplane's own set_pbt_inner/set_pbt_outer -- see
-            # PBT_DEFINITIONS' comment in constants.py for why.
-            await self.radio.send_civ(
-                0x14, sub=civ_sub, data=_bcd_encode_pbt_level(value), wait_response=False
-            )
+            setter = getattr(self.radio, set_name)
+            kwargs = self._receiver_kwargs(setter, self._active_receiver) if self.is_dual_receiver else {}
+            await setter(value, **kwargs)
         except Exception as exc:
-            self.error.emit(f"{definition['label']}: send_civ(0x14, 0x{civ_sub:02x}) failed ({exc}).")
+            self.error.emit(f"{definition['label']}: {set_name}({value!r}) failed ({exc}).")
 
     def set_filter_width_value(self, width_hz: int):
         """Thread-safe: call from the GUI thread. width_hz should already
@@ -1830,13 +1808,15 @@ class RadioWorker(QThread):
 
     async def _set_filter_shape_value(self, value: int):
         try:
-            # Raw CI-V 0x16/0x56 write via send_civ(), NOT rigplane's
-            # own set_filter_shape() -- see FILTER_SHAPE_CIV_SUB's
-            # comment in constants.py.
-            await self.radio.send_civ(0x16, sub=FILTER_SHAPE_CIV_SUB, data=bytes([value]), wait_response=False)
+            # rigplane's own set_filter_shape() accepts a plain int
+            # (0=SHARP, 1=SOFT), matching FILTER_SHAPE_OPTIONS directly
+            # -- no enum import/mapping needed.
+            setter = self.radio.set_filter_shape
+            kwargs = self._receiver_kwargs(setter, self._active_receiver) if self.is_dual_receiver else {}
+            await setter(value, **kwargs)
             self.filter_shape_updated.emit(value)
         except Exception as exc:
-            self.error.emit(f"Filter shape: send_civ(0x16, 0x56) failed ({exc}).")
+            self.error.emit(f"Filter shape: set_filter_shape({value!r}) failed ({exc}).")
 
     def set_swr_protection_enabled(self, enabled: bool):
         """Thread-safe: call from the GUI thread. Plain attribute set,
@@ -1957,14 +1937,6 @@ class RadioWorker(QThread):
             self._details.get("radio_model") == "IC-705" and hasattr(self.radio, "send_civ")
         )
         self.is_ic705_swr_workaround = self.is_ic705_preamp_att  # same model+send_civ gate, see SWR_CIV_SUB's comment
-        # Broader than the IC-705-only workarounds above -- confirmed
-        # against BOTH the IC-705's and IC-9700's own CI-V Reference
-        # Guides that the real range is -20.0/+20.0, not rigplane's
-        # IC-7610-specific -30.0/+10.0 default -- see
-        # SCOPE_REF_WIDE_RANGE_MODELS' comment in constants.py.
-        self.is_scope_ref_workaround = (
-            self._details.get("radio_model") in SCOPE_REF_WIDE_RANGE_MODELS and hasattr(self.radio, "send_civ")
-        )
         self.connected.emit()
         # Everything from here through the poll loops is wrapped in one
         # try/finally so self._radio_cm.__aexit__() (closing the actual
@@ -2445,7 +2417,7 @@ class RadioWorker(QThread):
                             resp = await self.radio.send_civ(0x15, sub=SWR_CIV_SUB, wait_response=True)
                             if resp is None or not resp.data:
                                 continue
-                            value = _interpolate_swr(_bcd_decode_pbt_level(resp.data))
+                            value = _interpolate_swr(_bcd_decode_2byte(resp.data))
                             is_calibrated_reading = True
                         else:
                             getter = getattr(self.radio, getter_name)
@@ -2756,17 +2728,17 @@ class RadioWorker(QThread):
                 )
 
                 if mode_allows_pbt_filter:
-                    for key, civ_sub in self._pbt_methods.items():
+                    for key, (get_name, _set_name) in self._pbt_methods.items():
                         definition = PBT_DEFINITIONS[key]
                         try:
-                            # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
-                            # rigplane's own get_pbt_inner/get_pbt_outer -- see
-                            # PBT_DEFINITIONS' comment in constants.py for why.
-                            resp = await self.radio.send_civ(
-                                0x14, sub=civ_sub, wait_response=True
+                            getter = getattr(self.radio, get_name)
+                            kwargs = (
+                                self._receiver_kwargs(getter, self._active_receiver)
+                                if self.is_dual_receiver
+                                else {}
                             )
-                            if resp is not None and len(resp.data) >= 2:
-                                self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
+                            value = await getter(**kwargs)
+                            self.pbt_updated.emit(key, value)
                         except Exception as exc:
                             self.error.emit(f"{definition['label']}: {exc}")
 
@@ -2780,14 +2752,17 @@ class RadioWorker(QThread):
 
                 if mode_allows_pbt_filter and self._filter_shape_available:
                     try:
-                        # Raw CI-V 0x16/0x56 read via send_civ(), NOT
-                        # rigplane's own get_filter_shape() -- see
-                        # FILTER_SHAPE_CIV_SUB's comment in constants.py.
-                        resp = await self.radio.send_civ(
-                            0x16, sub=FILTER_SHAPE_CIV_SUB, wait_response=True
+                        # rigplane's own get_filter_shape() returns a
+                        # FilterShape enum -- int() gives the plain 0/1
+                        # matching FILTER_SHAPE_OPTIONS.
+                        getter = self.radio.get_filter_shape
+                        kwargs = (
+                            self._receiver_kwargs(getter, self._active_receiver)
+                            if self.is_dual_receiver
+                            else {}
                         )
-                        if resp is not None and resp.data:
-                            self.filter_shape_updated.emit(resp.data[0])
+                        shape = await getter(**kwargs)
+                        self.filter_shape_updated.emit(int(shape))
                     except Exception as exc:
                         self.error.emit(f"Filter shape: {exc}")
 
@@ -2937,11 +2912,6 @@ class RadioWorker(QThread):
     async def _set_scope_receiver(self, receiver: int):
         try:
             await self.radio.set_scope_receiver(receiver)
-            # Tracked locally so is_scope_ref_workaround's raw CI-V bypass
-            # (_set_scope_ref) can send the correct 00=Main/01=Sub prefix
-            # byte instead of assuming Main -- rigplane's own ScopeControlsState
-            # doesn't expose this back out for us to read.
-            self._scope_receiver = receiver
         except Exception as exc:
             self.error.emit(f"Select scope receiver ({receiver}) failed: {exc}")
 
@@ -3002,46 +2972,21 @@ class RadioWorker(QThread):
             self.error.emit(f"Set CW pitch ({pitch_hz}) failed: {exc}")
 
     def set_scope_ref(self, ref_db: float):
-        """Thread-safe: call from the GUI thread. -30.0 to +10.0 dB in
-        0.5 dB steps on most radios (rigplane's own set_scope_ref(),
-        confirmed via commands/scope.py's _scope_ref_encode()) -- except
-        the models in SCOPE_REF_WIDE_RANGE_MODELS (IC-705, IC-9700),
-        whose real range is -20.0 to +20.0 dB and get bypassed with a
-        local encoder instead (see is_scope_ref_workaround /
-        SCOPE_REF_WIDE_RANGE_MODELS' comment in constants.py)."""
+        """Thread-safe: call from the GUI thread. Range is profile-
+        driven on rigplane's side now (commands/scope.py's
+        _scope_ref_encode(), fixed upstream in our own rigplane fork --
+        used to hardcode the IC-7610's -30.0/+10.0 dB range for every
+        model; IC-705/IC-9700 both correctly get -20.0/+20.0 dB now via
+        their own profile's [scope] section). No local
+        workaround/encoder needed anymore -- see SCOPE_REF_MIN_DB's
+        comment in constants.py for the confirmation history."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._set_scope_ref(ref_db), self.loop)
 
     async def _set_scope_ref(self, ref_db: float):
         try:
-            if self.is_scope_ref_workaround:
-                # Raw CI-V 0x27/0x19 write via send_civ(), NOT
-                # rigplane's own set_scope_ref() -- see
-                # SCOPE_REF_WIDE_RANGE_MODELS' comment in constants.py for
-                # why. The leading prefix byte is a required receiver-
-                # index (0=MAIN, 1=SUB) that rigplane's own
-                # set_scope_ref() always adds too -- confirmed by reading
-                # its _scope_payload() helper: ScopeControlsState.receiver
-                # defaults to 0 (a real int, never None) even for a
-                # single-receiver radio, so that prefix byte is
-                # unconditional. Confirmed live this was the actual bug
-                # on IC-705: omitting it meant the write silently did
-                # nothing (malformed frame, no error either) while reads
-                # kept working fine through rigplane's own unmodified
-                # get_scope_ref(), which includes the same prefix on its
-                # own get path. self._scope_receiver (kept in sync by
-                # set_scope_receiver()) picks the right byte for a real
-                # dual-receiver radio like the IC-9700 instead of
-                # hardcoding Main.
-                await self.radio.send_civ(
-                    0x27,
-                    sub=SCOPE_REF_CIV_SUB,
-                    data=bytes([self._scope_receiver]) + _encode_scope_ref(ref_db),
-                    wait_response=False,
-                )
-            else:
-                await self.radio.set_scope_ref(ref_db)
+            await self.radio.set_scope_ref(ref_db)
             self._last_observed_scope_ref = ref_db
         except Exception as exc:
             self.error.emit(f"Set scope ref ({ref_db}) failed: {exc}")
@@ -3505,49 +3450,16 @@ class RadioWorker(QThread):
         (which it always is during satellite receive, right up until
         PTT switches to Main)."""
         addressing = RECEIVER_MAIN if receiver == self._active_receiver else RECEIVER_SUB
-        # bypass_cache=True -- confirmed by reading rigplane's own
-        # runtime/_dual_rx_runtime.py: the addressing=RECEIVER_MAIN path
-        # (_get_frequency_main) silently falls back to a STALE cached
-        # frequency on a CI-V timeout rather than raising, as long as the
-        # cache is still "fresh" by its own TTL -- on a congested/slow
-        # link (confirmed live: near-constant CI-V timeouts on this
-        # radio) that means a caller checking for a band conflict could
-        # get a successful-looking but outdated reading and wrongly
-        # conclude there's no conflict when the real hardware state has
-        # since changed. bypass_cache doesn't fully eliminate this (the
-        # stale-on-timeout fallback is gated on a separate update_cache
-        # flag the public API doesn't expose), but it does skip the
-        # dedupe path that could otherwise hand back an even older
-        # in-flight result, so it's worth passing regardless.
+        # bypass_cache=True -- skips both the dedupe path AND (fixed
+        # upstream in our own rigplane fork; used to silently return a
+        # stale cached frequency on a CI-V timeout instead of raising,
+        # despite the public API's own docstring already promising
+        # otherwise) the stale-on-timeout fallback. On a congested/slow
+        # link, a caller checking for a band conflict genuinely wants a
+        # fresh reading or a clear failure here, not a successful-
+        # looking but outdated one that wrongly concludes no conflict
+        # exists when the real hardware state has since changed.
         return await self.radio.get_frequency(receiver=addressing, bypass_cache=True)
-
-    async def _read_other_receiver_frequency(self, other_receiver: int, restore_to: int) -> int:
-        """Genuinely reads `other_receiver`'s real frequency by actually
-        switching to it first, instead of trusting _get_receiver_
-        frequency's addressing=RECEIVER_SUB ("unselected VFO", CI-V 0x25
-        0x01) shortcut -- root-caused a real "Main can't switch to a band
-        Sub is on" report, where Sub genuinely WAS on the conflicting
-        band, to that shortcut being flat-out wrong on the IC-9700: its
-        own CI-V Reference Guide documents command 0x25 as "Selected or
-        unselected VFO frequency settings (Only MAIN band)" and states
-        outright "You cannot set the SUB band frequency" -- meaning
-        0x25/0x01 reads MAIN's OTHER VFO SLOT (A vs B), not Sub's
-        frequency at all, whenever Main is the genuinely active receiver.
-        The conflict check was silently reading garbage and always
-        concluding "no conflict" as a result. Restores `restore_to`
-        (the caller's own intended receiver) before returning, so the
-        caller's own subsequent reads/writes still land correctly.
-        Callers must hold self._receiver_switch_lock across this AND
-        their own follow-up work, same as every other receiver-switching
-        sequence in this file."""
-        try:
-            await self.radio.select_receiver(other_receiver)
-            self._active_receiver = other_receiver
-            freq_hz = await self.radio.get_frequency(receiver=RECEIVER_MAIN, bypass_cache=True)
-        finally:
-            await self.radio.select_receiver(restore_to)
-            self._active_receiver = restore_to
-        return freq_hz
 
     async def _resolve_receiver_band_conflict(self, receiver: int, freq_hz: int):
         """Dual-receiver only. Confirmed live on a real 9700: Main and
@@ -3607,17 +3519,26 @@ class RadioWorker(QThread):
             return
         other_receiver = RECEIVER_MAIN if receiver == RECEIVER_SUB else RECEIVER_SUB
         try:
-            # Genuinely switches to other_receiver, reads it, and
-            # restores `receiver` -- NOT _get_receiver_frequency's
-            # addressing=RECEIVER_SUB ("unselected VFO") shortcut, which
-            # is confirmed broken for this exact check on the IC-9700
-            # (see _read_other_receiver_frequency's own docstring). Under
-            # the lock: this now performs real receiver switches (not
-            # just a read), so it needs the same protection against a
-            # concurrent poll cycle interleaving as every other
-            # receiver-switching sequence in this file.
+            # _get_receiver_frequency() used to be confirmed wrong here
+            # for the IC-9700 specifically -- its own CI-V Reference
+            # Guide documents CI-V 0x25 ("unselected VFO", what
+            # get_frequency(receiver=SUB) sends when Main is active) as
+            # "(Only MAIN band)... You cannot set the SUB band
+            # frequency", meaning it silently read MAIN's OTHER VFO SLOT
+            # instead of Sub's real frequency, so this conflict check
+            # always concluded "no conflict" even when one genuinely
+            # existed. Fixed upstream in our own rigplane fork
+            # (kf0uqr/rigplane-core, "torca" branch): get_freq() now
+            # falls back to the same temporary-VFO-select approach
+            # set_freq() already used for this case, transparently, so
+            # the plain call below is correct again. Still held under
+            # the lock -- that temporary switch is now internal to
+            # rigplane, but still a real receiver switch on the wire,
+            # needing the same protection against a concurrent poll
+            # cycle interleaving as every other receiver-switching
+            # sequence in this file.
             async with self._receiver_switch_lock:
-                other_freq_hz = await self._read_other_receiver_frequency(other_receiver, receiver)
+                other_freq_hz = await self._get_receiver_frequency(other_receiver)
         except Exception as exc:
             self.error.emit(f"Band-conflict check (receiver {other_receiver}) failed: {exc}")
             return

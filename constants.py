@@ -357,27 +357,31 @@ LEVEL_DEFINITIONS = {
 # raises NotImplementedError) -- see RadioWorker.is_pbt_capable, which
 # gates on the profile's declared capability set.
 #
-# "civ_sub": the plain CI-V 0x14 sub-command byte for each (confirmed
-# against the IC-705's own CI-V Reference Guide, Misc/IC-705_ENG_CI-V_4b.
-# pdf p.3: cmd 14 sub 07 = PBT1/inner, sub 08 = PBT2/outer). RadioWorker
-# sends these directly via rigplane's public send_civ() rather than
-# calling rigplane's own get_pbt_inner/set_pbt_inner/get_pbt_outer/
-# set_pbt_outer convenience methods -- confirmed live on a real IC-705
-# (both USB and LAN, both 19200 and 115200 baud, so not a speed issue)
-# that those methods reliably fail (reads time out, writes silently
-# don't reach the radio) because rigplane's commands/levels.py hardcodes
-# command29=True for all four, which wraps the frame in an extra
-# "29 <receiver>" prefix meant for DUAL-RECEIVER radios (see
-# build_cmd29_frame's own docstring: "Command29-wrapped CI-V frame for
-# dual-receiver radios", sourced from IC-7610.rig) -- the single-receiver
-# IC-705 doesn't understand that wrapper at all, and rigplane's own
-# receiver-aware guard (_require_cmd29_route) only checks non-MAIN
-# receivers, so nothing catches this for receiver=MAIN before the
-# malformed frame goes out. send_civ() builds a plain, unwrapped frame
-# instead, matching the real IC-705 CI-V manual exactly.
+# get_pbt_inner/set_pbt_inner/get_pbt_outer/set_pbt_outer (rigplane's own
+# convenience methods) used to reliably fail on a real IC-705 -- reads
+# timed out, writes silently didn't reach the radio -- because rigplane's
+# leaf command builders hardcoded command29=True unconditionally (a
+# "29 <receiver>" wrapper meant for DUAL-RECEIVER radios; the IC-705,
+# single-receiver, doesn't understand it at all, and it also produced
+# WRONG frames on the genuinely-dual-receiver IC-9700, whose real
+# per-receiver targeting scheme isn't cmd29 at all). Fixed upstream in
+# our own rigplane fork (kf0uqr/rigplane-core, "torca" branch): the
+# builders now accept an overridable command29 kwarg, and the runtime
+# layer computes it from the connected profile's own supports_cmd29(),
+# exactly like get_preamp/set_preamp already did correctly. No raw
+# send_civ() bypass needed here anymore -- RadioWorker calls these
+# methods directly.
 PBT_DEFINITIONS = {
-    "pbt_inner": {"label": "PBT Inner", "civ_sub": 0x07},
-    "pbt_outer": {"label": "PBT Outer", "civ_sub": 0x08},
+    "pbt_inner": {
+        "label": "PBT Inner",
+        "getter_candidates": ["get_pbt_inner"],
+        "setter_candidates": ["set_pbt_inner"],
+    },
+    "pbt_outer": {
+        "label": "PBT Outer",
+        "getter_candidates": ["get_pbt_outer"],
+        "setter_candidates": ["set_pbt_outer"],
+    },
 }
 
 # Filter shape (SHARP/SOFT) -- SSB and CW modes only, per the IC-705
@@ -385,13 +389,12 @@ PBT_DEFINITIONS = {
 # IC-705_ENG_Basic_9.pdf p.4-5): SHARP "emphasizes the passband width of
 # the filter... an almost ideal shape factor", SOFT "filter shoulders are
 # rounded... decreases noise components". CI-V 0x16 sub 0x56 (0=SHARP,
-# 1=SOFT) -- confirmed to have the SAME Command29-hardcoding bug as
-# PBT_DEFINITIONS above: rigplane's own get_filter_shape/set_filter_shape
-# (commands/mode.py) hardcode command29=True unconditionally, same
-# pattern, same fix -- see PBT_DEFINITIONS' own comment for the full
-# explanation. RadioWorker sends this via raw send_civ() too, not those
-# two methods.
-FILTER_SHAPE_CIV_SUB = 0x56
+# 1=SOFT) -- had the SAME Command29-hardcoding bug as PBT_DEFINITIONS
+# above, now fixed the same way in our rigplane fork (see that comment).
+# RadioWorker calls rigplane's own get_filter_shape/set_filter_shape
+# directly; set_filter_shape accepts a plain int (0/1), matching
+# FILTER_SHAPE_OPTIONS below, so no enum import/mapping is needed.
+FILTER_SHAPE_CIV_SUB = 0x56  # documentation only -- no longer sent directly
 FILTER_SHAPE_OPTIONS = [("SHARP", 0), ("SOFT", 1)]
 
 # Preamp/Attenuator -- the IC-705 (confirmed live) unifies these into
@@ -957,6 +960,16 @@ CONTROL_OPTION_EXCLUDED = {
 # separate hardware feature, unlike some other Icom rigs -- this isn't
 # a wrong getter guess (like CONTROL_OPTION_EXCLUDED's cases), it's a
 # genuinely absent register, so there's no value in retrying it forever.
+#
+# Also fixed upstream in our own rigplane fork (kf0uqr/rigplane-core,
+# "torca" branch): get_rit_tx_status()/set_rit_tx_status() now check a
+# real "xit" capability (removed from ic9700.toml, which used to
+# declare it right alongside genuinely-real "rit") and raise
+# immediately instead of timing out. This app-level exclusion is kept
+# anyway, on top of that fix, purely as a poll-avoidance optimization
+# -- there's no reason to even attempt (and pay a raised-and-caught
+# exception on) a control this app already knows is absent every single
+# slow-poll cycle.
 CONTROL_UNSUPPORTED = {
     ("IC-9700", "xit"),
 }

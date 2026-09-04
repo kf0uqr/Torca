@@ -3457,7 +3457,21 @@ class RadioWorker(QThread):
         (which it always is during satellite receive, right up until
         PTT switches to Main)."""
         addressing = RECEIVER_MAIN if receiver == self._active_receiver else RECEIVER_SUB
-        return await self.radio.get_frequency(receiver=addressing)
+        # bypass_cache=True -- confirmed by reading rigplane's own
+        # runtime/_dual_rx_runtime.py: the addressing=RECEIVER_MAIN path
+        # (_get_frequency_main) silently falls back to a STALE cached
+        # frequency on a CI-V timeout rather than raising, as long as the
+        # cache is still "fresh" by its own TTL -- on a congested/slow
+        # link (confirmed live: near-constant CI-V timeouts on this
+        # radio) that means a caller checking for a band conflict could
+        # get a successful-looking but outdated reading and wrongly
+        # conclude there's no conflict when the real hardware state has
+        # since changed. bypass_cache doesn't fully eliminate this (the
+        # stale-on-timeout fallback is gated on a separate update_cache
+        # flag the public API doesn't expose), but it does skip the
+        # dedupe path that could otherwise hand back an even older
+        # in-flight result, so it's worth passing regardless.
+        return await self.radio.get_frequency(receiver=addressing, bypass_cache=True)
 
     async def _resolve_receiver_band_conflict(self, receiver: int, freq_hz: int):
         """Dual-receiver only. Confirmed live on a real 9700: Main and
@@ -3951,6 +3965,47 @@ class RadioWorker(QThread):
         # exact race was root-caused, e.g. _set_control_value) and the
         # write itself, so no concurrent receiver-switching poll code can
         # interleave in between.
+        landed = await self._write_main_frequency_with_confirmation(low_edge_hz, band_label)
+        if not landed and self.is_dual_receiver:
+            # The conflict pre-check (_resolve_receiver_band_conflict,
+            # called above) can still occasionally hand back a stale
+            # "no conflict" verdict on a congested link -- confirmed live
+            # as the root cause of a genuinely silent failure (no error,
+            # no "[dual-rx] band conflict" message at all, just the
+            # optimistic UI update snapping back on the next poll): the
+            # write went out fire-and-forget, the radio refused it
+            # because a real conflict still existed, and nothing here
+            # ever found out, because rigplane's own get_frequency() can
+            # silently return a stale CACHED reading on a CI-V timeout
+            # instead of raising (see _get_receiver_frequency's own
+            # comment). One retry, going through the FULL conflict check
+            # again (not just the write), covers that case -- if the
+            # first pass's "no conflict" verdict was stale, this pass
+            # reads fresh and should catch the real conflict this time.
+            self.audio_status.emit(
+                f"Band: Main didn't land on {band_label} on the first try -- rechecking for a "
+                "receiver conflict and retrying once."
+            )
+            await self._resolve_receiver_band_conflict(RECEIVER_MAIN, low_edge_hz)
+            landed = await self._write_main_frequency_with_confirmation(low_edge_hz, band_label)
+        if not landed:
+            self.error.emit(
+                f"Band: Main still hasn't landed on {band_label} after a retry -- the radio may be "
+                "refusing this change for a reason this app can't detect automatically."
+            )
+
+    async def _write_main_frequency_with_confirmation(self, low_edge_hz: int, band_label: str) -> bool:
+        """Writes Main's frequency (reselecting Main first, under the
+        lock -- same pattern used everywhere else this exact race was
+        root-caused) and reads it back afterward to confirm it actually
+        landed on the intended band. The write itself is fire-and-forget
+        (rigplane never ACKs a plain frequency set), so without this
+        there was no way to tell a genuinely successful change from one
+        the radio silently refused -- root-caused a real "band button
+        optimistically shows the new band, then snaps back with nothing
+        printed to the console at all" report to exactly this gap.
+        Returns True once confirmed, False if it never lands within the
+        retry budget."""
         async with self._receiver_switch_lock:
             await self._reselect_main_before_write("band tune")
             try:
@@ -3959,6 +4014,17 @@ class RadioWorker(QThread):
                 await self.radio.set_frequency(low_edge_hz, receiver=RECEIVER_MAIN)
             except Exception as exc:
                 self.error.emit(f"Band: setting frequency failed ({exc}).")
+                return False
+            for _ in range(5):
+                await asyncio.sleep(0.2)
+                try:
+                    confirm_freq_hz = await self._get_receiver_frequency(RECEIVER_MAIN)
+                except Exception:
+                    continue
+                confirm_band = self._find_band(confirm_freq_hz)
+                if confirm_band is not None and confirm_band[0] == band_label:
+                    return True
+            return False
 
     async def _reselect_main_before_write(self, context: str):
         """Explicitly reselect Main and let the radio settle before a

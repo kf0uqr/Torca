@@ -380,6 +380,36 @@ PBT_DEFINITIONS = {
 FILTER_SHAPE_CIV_SUB = 0x56
 FILTER_SHAPE_OPTIONS = [("SHARP", 0), ("SOFT", 1)]
 
+# Preamp/Attenuator -- the IC-705 (confirmed live) unifies these into
+# one control, matching the real front panel's own P.AMP/ATT button:
+# OFF/P.AMP1/P.AMP2/ATT on HF+6m, but only OFF/ON (no P.AMP1/P.AMP2
+# distinction, and no ATT at all) on 2m/70cm -- matching the IC-705 CI-V
+# Reference Guide's own notes: the Preamp command (0x16 sub 0x02) says
+# "In the 144 or 430 MHz bands, 00=OFF, 01=ON", and the Attenuator
+# command (0x11) says "You can set in the HF and 50 MHz bands."
+# rigplane's own set_preamp() is broken on the IC-705 for any
+# level > 0: it runs a DIGI-SEL mutual-exclusion preflight check via
+# get_digisel(), which itself unconditionally raises CommandError on
+# this model ("get_digisel is unsupported by profile IC-705: no cmd29
+# route for command 0x16/0x4E") since the IC-705 doesn't actually have a
+# real DIGI-SEL toggle despite its rig profile listing "digisel" as a
+# capability -- confirmed by reading rigplane/runtime/radio.py's
+# set_preamp/get_digisel directly. RadioWorker bypasses set_preamp()/
+# get_preamp() AND the attenuator methods with raw CI-V (0x16 sub 0x02
+# for preamp, plain 0x11 -- no sub-command -- for attenuator) for
+# consistency and to sidestep that preflight entirely, same pattern as
+# PBT_DEFINITIONS/FILTER_SHAPE_CIV_SUB above.
+PREAMP_CIV_SUB = 0x02
+ATT_CIV_COMMAND = 0x11
+
+# (label, preamp_level, attenuator_db) per combo entry. attenuator_db=
+# None means "leave the attenuator register alone" (only used where
+# it's genuinely unavailable, 2m/70cm's OFF/ON pair) -- every HF/6m
+# option explicitly sets BOTH registers so switching between them
+# always clears whichever of the two isn't the active one.
+PREAMP_ATT_OPTIONS_HF = [("OFF", 0, 0), ("P.AMP1", 1, 0), ("P.AMP2", 2, 0), ("ATT", 0, 20)]
+PREAMP_ATT_OPTIONS_VHF_UHF = [("OFF", 0, None), ("ON", 1, None)]
+
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on
 # a dual-receiver radio. Their real getter/setter DOES accept a
 # receiver= kwarg (confirmed via a full inspect.signature() sweep
@@ -720,16 +750,14 @@ CONTROL_DEFINITIONS = {
 }
 
 # Radio-specific control-option exclusions, keyed (radio_model, control
-# key) -> set of option labels to leave out of that combo entirely.
-# Confirmed bug, not a wrong value guess: on the IC-705, set_preamp() with
-# ANY non-zero value (both P.AMP1=1 and P.AMP2=2) fails with the identical
-# error -- "get_digisel is unsupported by profile IC-705: no cmd29 route
-# for command 0x16/0x4E" -- while 0 (OFF) works fine, and the same control
-# works normally on the IC-9700. This is a rigplane IC-705 profile routing
-# bug; excluding both broken options here rather than offering choices
-# that reliably error, while leaving OFF (the one that works) in place.
+# key) -> set of option labels to leave out of that combo entirely. (The
+# IC-705's Preamp used to have an entry here too, excluding P.AMP1/
+# P.AMP2 because rigplane's set_preamp() reliably failed for any
+# non-zero level -- see PREAMP_ATT_CIV_SUB's comment below for the real
+# cause and its fix: IC-705's Preamp is no longer built through this
+# generic combo/exclusion mechanism at all, so P.AMP1/P.AMP2 work again
+# instead of just being hidden.)
 CONTROL_OPTION_EXCLUDED = {
-    ("IC-705", "preamp"): {"P.AMP1", "P.AMP2"},
     # AGC can't actually be turned off on the IC-705 -- confirmed live:
     # selecting "OFF" doesn't disable AGC on the radio (AgcMode.OFF isn't
     # a real state this model supports, unlike FAST/MID/SLOW). Excluded

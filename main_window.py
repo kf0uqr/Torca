@@ -35,6 +35,9 @@ from constants import (
     LEVEL_DEFINITIONS,
     PBT_DEFINITIONS,
     FILTER_SHAPE_OPTIONS,
+    PREAMP_ATT_OPTIONS_HF,
+    PREAMP_ATT_OPTIONS_VHF_UHF,
+    VHF_UHF_BANDS,
     DUAL_RECEIVER_LEVEL_KEYS,
     CONTROL_DEFINITIONS,
     CONTROL_OPTION_EXCLUDED,
@@ -530,6 +533,30 @@ class RadioWindow(QWidget):
         buttons_row = QHBoxLayout()
         vfo_toggle_column = None  # lazily created; all vfo_toggle-type buttons stack in this one column
         for key, definition in CONTROL_DEFINITIONS.items():
+            if key == "preamp" and details["radio_model"] == "IC-705":
+                # Bespoke combo instead of the generic dispatch below --
+                # rigplane's own set_preamp() is broken on the IC-705 for
+                # any non-zero level (see PREAMP_CIV_SUB's comment in
+                # constants.py), and the real front panel unifies Preamp
+                # with the Attenuator into one control anyway (OFF/
+                # P.AMP1/P.AMP2/ATT on HF+6m, OFF/ON with no ATT on
+                # 2m/70cm) -- see _update_preamp_att_options, which
+                # rebuilds this combo's options whenever the tuned
+                # frequency crosses into/out of 2m or 70cm.
+                widget = QComboBox()
+                widget.setEnabled(False)
+                widget.currentIndexChanged.connect(self._on_preamp_att_combo_changed)
+                label = QLabel(definition["label"])
+                col = QVBoxLayout()
+                col.addWidget(label, alignment=Qt.AlignHCenter)
+                col.addWidget(widget)
+                col.addStretch()
+                dropdowns_row.addLayout(col)
+                dropdowns_row.setAlignment(col, Qt.AlignTop)
+                self.preamp_att_combo = widget
+                self._is_preamp_att_vhf_uhf = False  # last band this combo's options were built for
+                self._update_preamp_att_options(is_vhf_uhf=False)  # HF/6m default until a frequency is known
+                continue
             if definition["type"] == "combo":
                 widget = QComboBox()
                 excluded_labels = CONTROL_OPTION_EXCLUDED.get((details["radio_model"], key), set())
@@ -747,6 +774,7 @@ class RadioWindow(QWidget):
         self.worker.filter_width_updated.connect(self._on_filter_width_updated)
         self.worker.filter_width_range_updated.connect(self._on_filter_width_range_updated)
         self.worker.filter_shape_updated.connect(self._on_filter_shape_updated)
+        self.worker.preamp_att_updated.connect(self._on_preamp_att_updated)
         self.worker.control_updated.connect(self._on_control_updated)
         self.worker.active_receiver_changed.connect(self._on_active_receiver_changed)
         self.worker.scope_span_changed.connect(self._on_scope_span_changed)
@@ -810,6 +838,8 @@ class RadioWindow(QWidget):
             self.filter_shape_combo.setVisible(True)
             self.filter_shape_combo.setEnabled(True)
             self.filter_shape_label.setVisible(True)
+        if hasattr(self, "preamp_att_combo") and self.worker.is_ic705_preamp_att:
+            self.preamp_att_combo.setEnabled(True)
         # Scope controls are NOT enabled here -- is_scope_capable isn't
         # known true yet at this point (see RadioWorker._main's
         # scope_ready docstring); _on_scope_ready handles it once the
@@ -919,6 +949,10 @@ class RadioWindow(QWidget):
         self._set_freq_display_text(f"{freq_hz / 1e6:.6f} MHz")
         self._update_band_button_highlight()
         self.spectrum_widget.set_tuned_frequency(freq_hz)
+        if hasattr(self, "preamp_att_combo"):
+            is_vhf_uhf = any(low_hz <= freq_hz <= high_hz for _label, low_hz, high_hz in VHF_UHF_BANDS[:2])
+            if is_vhf_uhf != self._is_preamp_att_vhf_uhf:
+                self._update_preamp_att_options(is_vhf_uhf)
 
     @Slot(str, int)
     def _on_meter_updated(self, meter_type, level):
@@ -1092,6 +1126,48 @@ class RadioWindow(QWidget):
         if value is None:
             return
         self.worker.set_filter_shape_value(value)
+
+    def _update_preamp_att_options(self, is_vhf_uhf):
+        """Rebuilds preamp_att_combo's items for the current band --
+        PREAMP_ATT_OPTIONS_VHF_UHF (OFF/ON) on 2m/70cm, PREAMP_ATT_
+        OPTIONS_HF (OFF/P.AMP1/P.AMP2/ATT) everywhere else. Called once
+        up front (HF assumed) and again whenever _on_frequency_updated
+        sees the tuned frequency cross into/out of 2m or 70cm."""
+        self._is_preamp_att_vhf_uhf = is_vhf_uhf
+        combo = self.preamp_att_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for option_label, preamp_level, atten_db in (
+            PREAMP_ATT_OPTIONS_VHF_UHF if is_vhf_uhf else PREAMP_ATT_OPTIONS_HF
+        ):
+            combo.addItem(option_label, (preamp_level, atten_db))
+        combo.blockSignals(False)
+
+    def _on_preamp_att_combo_changed(self, index):
+        data = self.preamp_att_combo.itemData(index)
+        if data is None:
+            return
+        preamp_level, atten_db = data
+        self.worker.set_preamp_att_value(preamp_level, atten_db)
+
+    def _on_preamp_att_updated(self, preamp_level, atten_db):
+        combo = self.preamp_att_combo
+        # Exact (preamp_level, atten_db) match first; an entry with
+        # atten_db=None (the VHF/UHF OFF/ON pair, which never tracks the
+        # attenuator register at all) matches on preamp_level alone.
+        target_index = -1
+        for i in range(combo.count()):
+            data = combo.itemData(i)
+            if data is None:
+                continue
+            item_preamp, item_atten = data
+            if item_preamp == preamp_level and (item_atten is None or item_atten == atten_db):
+                target_index = i
+                break
+        if target_index != -1 and combo.currentIndex() != target_index:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(target_index)
+            combo.blockSignals(False)
 
     def _on_control_combo_changed(self, key, widget):
         value = widget.currentData()

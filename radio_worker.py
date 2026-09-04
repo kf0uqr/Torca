@@ -163,6 +163,8 @@ from constants import (
     LEVEL_DEFINITIONS,
     PBT_DEFINITIONS,
     FILTER_SHAPE_CIV_SUB,
+    PREAMP_CIV_SUB,
+    ATT_CIV_COMMAND,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
@@ -233,6 +235,23 @@ def _bcd_decode_pbt_level(data: bytes) -> int:
     return (d0 >> 4) * 1000 + (d0 & 0x0F) * 100 + (d1 >> 4) * 10 + (d1 & 0x0F)
 
 
+def _bcd_encode_byte(value: int) -> bytes:
+    """0-99 int -> 1-byte BCD (high nibble = tens, low nibble = units),
+    matching rigplane's own private _bcd_byte -- used for the IC-705
+    Preamp/Attenuator raw-CI-V workaround (see PREAMP_CIV_SUB's comment
+    in constants.py), same reimplemented-rather-than-imported reasoning
+    as _bcd_encode_pbt_level."""
+    if not 0 <= value <= 99:
+        raise ValueError(f"Value must be 0-99, got {value}")
+    return bytes([((value // 10) << 4) | (value % 10)])
+
+
+def _bcd_decode_byte(data: bytes) -> int:
+    """Inverse of _bcd_encode_byte."""
+    b = data[0]
+    return (b >> 4) * 10 + (b & 0x0F)
+
+
 class RadioWorker(QThread):
     """Owns the asyncio loop and the rigplane radio connection.
 
@@ -266,6 +285,7 @@ class RadioWorker(QThread):
     # width_range and main_window.py's _on_filter_width_range_updated.
     filter_width_range_updated = Signal(object)
     filter_shape_updated = Signal(int)   # 0=SHARP, 1=SOFT -- see FILTER_SHAPE_OPTIONS
+    preamp_att_updated = Signal(int, int)  # (preamp_level 0/1/2, attenuator_db) -- IC-705 only, see is_ic705_preamp_att
     active_receiver_changed = Signal(int)  # dual-receiver only: 0=MAIN, 1=SUB, from get_active_receiver() polling
     scope_span_changed = Signal(int)     # preset index 0-7, from get_scope_span() polling
     scope_ref_changed = Signal(float)    # dB, -30.0 to +10.0, from get_scope_ref() polling
@@ -291,6 +311,7 @@ class RadioWorker(QThread):
         self._filter_width_debounce_task = None  # pending asyncio.Task, for set_filter_width_value()'s debounce
         self.is_filter_shape_capable = False  # set once connected -- see CAP_FILTER_SHAPE import comment
         self._filter_shape_available = False  # set in _setup_filter_shape() -- send_civ() usable for this radio
+        self.is_ic705_preamp_att = False  # set once connected -- see PREAMP_CIV_SUB's comment in constants.py
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -1698,6 +1719,38 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Filter shape: send_civ(0x16, 0x56) failed ({exc}).")
 
+    def set_preamp_att_value(self, preamp_level: int, atten_db):
+        """Thread-safe: call from the GUI thread. preamp_level is 0/1/2;
+        atten_db is 0/20 or None to leave the attenuator register alone
+        (2m/70cm's OFF/ON options -- see PREAMP_ATT_OPTIONS_VHF_UHF in
+        constants.py). Not debounced -- a discrete combo selection, same
+        immediate-dispatch treatment as the Filter Shape combo."""
+        if self.loop is None or not self.is_ic705_preamp_att:
+            return
+        asyncio.run_coroutine_threadsafe(self._set_preamp_att_value(preamp_level, atten_db), self.loop)
+
+    async def _set_preamp_att_value(self, preamp_level: int, atten_db):
+        try:
+            # Raw CI-V writes via send_civ(), NOT rigplane's own
+            # set_preamp()/set_attenuator_level() -- see PREAMP_CIV_SUB's
+            # comment in constants.py.
+            await self.radio.send_civ(
+                0x16, sub=PREAMP_CIV_SUB, data=_bcd_encode_byte(preamp_level), wait_response=False
+            )
+            if atten_db is not None:
+                await self.radio.send_civ(
+                    ATT_CIV_COMMAND, data=_bcd_encode_byte(atten_db), wait_response=False
+                )
+                self.preamp_att_updated.emit(preamp_level, atten_db)
+            else:
+                # atten_db=None (VHF/UHF) -- only preamp changed; keep
+                # whatever the last-known attenuator reading was rather
+                # than emitting a made-up value for a register we didn't
+                # touch.
+                self.preamp_att_updated.emit(preamp_level, 0)
+        except Exception as exc:
+            self.error.emit(f"Preamp/Attenuator: send_civ() failed ({exc}).")
+
     async def _main(self):
         try:
             if self._details.get("connection_type") == "remote":
@@ -1752,6 +1805,13 @@ class RadioWorker(QThread):
         )
         self.is_filter_shape_capable = (
             CAP_FILTER_SHAPE is not None and CAP_FILTER_SHAPE in getattr(self.radio, "capabilities", set())
+        )
+        # Not a rigplane capability flag -- this is a model-specific
+        # workaround (see PREAMP_CIV_SUB's comment in constants.py), so
+        # it's keyed on radio_model directly, same scoping the app
+        # already uses for CONTROL_OPTION_EXCLUDED.
+        self.is_ic705_preamp_att = (
+            self._details.get("radio_model") == "IC-705" and hasattr(self.radio, "send_civ")
         )
         self.connected.emit()
         # Everything from here through _poll_loop() is wrapped in one
@@ -2335,6 +2395,20 @@ class RadioWorker(QThread):
                         self.filter_shape_updated.emit(resp.data[0])
                 except Exception as exc:
                     self.error.emit(f"Filter shape: {exc}")
+
+            if self.is_ic705_preamp_att:
+                try:
+                    # Raw CI-V reads via send_civ(), NOT rigplane's own
+                    # get_preamp()/attenuator methods -- see
+                    # PREAMP_CIV_SUB's comment in constants.py.
+                    preamp_resp = await self.radio.send_civ(0x16, sub=PREAMP_CIV_SUB, wait_response=True)
+                    atten_resp = await self.radio.send_civ(ATT_CIV_COMMAND, wait_response=True)
+                    if preamp_resp is not None and preamp_resp.data and atten_resp is not None and atten_resp.data:
+                        self.preamp_att_updated.emit(
+                            _bcd_decode_byte(preamp_resp.data), _bcd_decode_byte(atten_resp.data)
+                        )
+                except Exception as exc:
+                    self.error.emit(f"Preamp/Attenuator: {exc}")
 
             await asyncio.sleep(POLL_INTERVAL_SEC)
 

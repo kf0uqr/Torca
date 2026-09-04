@@ -168,6 +168,9 @@ from constants import (
     SWR_CIV_SUB,
     SWR_CALIBRATION,
     SWR_PROTECTION_THRESHOLD,
+    SCOPE_REF_CIV_SUB,
+    SCOPE_REF_MIN_DB,
+    SCOPE_REF_MAX_DB,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
@@ -273,6 +276,28 @@ def _interpolate_swr(raw: int) -> float:
     return points[-1][1]  # unreachable given the clamps above
 
 
+def _encode_scope_ref(ref_db: float) -> bytes:
+    """CI-V 0x27/0x19 scope reference level, same wire format as
+    rigplane's own private _scope_ref_encode -- reimplemented locally
+    WITHOUT that function's hardcoded -30.0/+10.0 range check (the
+    IC-7610's own range, applied universally instead of per-model --
+    see SCOPE_REF_MIN_DB/SCOPE_REF_MAX_DB's comment in constants.py for
+    the full story). byte 0: high nibble = 10 dB digit, low nibble =
+    1 dB digit. byte 1: high nibble = 0.1 dB digit, low nibble fixed 0.
+    byte 2: 0x00 = positive, 0x01 = negative."""
+    if not SCOPE_REF_MIN_DB <= ref_db <= SCOPE_REF_MAX_DB:
+        raise ValueError(f"scope ref must be {SCOPE_REF_MIN_DB} to {SCOPE_REF_MAX_DB} dB, got {ref_db}")
+    is_negative = ref_db < 0
+    tenths = int(round(abs(ref_db) * 10))
+    tens_db = tenths // 100
+    ones_db = (tenths // 10) % 10
+    frac_db = tenths % 10
+    b0 = (tens_db << 4) | ones_db
+    b1 = frac_db << 4
+    sign = 0x01 if is_negative else 0x00
+    return bytes([b0, b1, sign])
+
+
 class RadioWorker(QThread):
     """Owns the asyncio loop and the rigplane radio connection.
 
@@ -335,6 +360,7 @@ class RadioWorker(QThread):
         self._filter_shape_available = False  # set in _setup_filter_shape() -- send_civ() usable for this radio
         self.is_ic705_preamp_att = False  # set once connected -- see PREAMP_CIV_SUB's comment in constants.py
         self.is_ic705_swr_workaround = False  # set once connected -- see SWR_CIV_SUB's comment in constants.py
+        self.is_ic705_scope_ref_workaround = False  # set once connected -- see SCOPE_REF_MIN_DB's comment in constants.py
         # SWR is only meaningful during TX -- confirmed live that
         # without this, the meter just kept showing whatever it last
         # read during the previous transmission (the radio's own SWR
@@ -1902,6 +1928,7 @@ class RadioWorker(QThread):
             self._details.get("radio_model") == "IC-705" and hasattr(self.radio, "send_civ")
         )
         self.is_ic705_swr_workaround = self.is_ic705_preamp_att  # same model+send_civ gate, see SWR_CIV_SUB's comment
+        self.is_ic705_scope_ref_workaround = self.is_ic705_preamp_att  # same gate, see SCOPE_REF_MIN_DB's comment
         self.connected.emit()
         # Everything from here through the poll loops is wrapped in one
         # try/finally so self._radio_cm.__aexit__() (closing the actual
@@ -2796,16 +2823,27 @@ class RadioWorker(QThread):
             self.error.emit(f"Set CW pitch ({pitch_hz}) failed: {exc}")
 
     def set_scope_ref(self, ref_db: float):
-        """Thread-safe: call from the GUI thread. rigplane's
-        set_scope_ref() -- confirmed via commands/scope.py's
-        _scope_ref_encode(): -30.0 to +10.0 dB in 0.5 dB steps."""
+        """Thread-safe: call from the GUI thread. -30.0 to +10.0 dB in
+        0.5 dB steps on most radios (rigplane's own set_scope_ref(),
+        confirmed via commands/scope.py's _scope_ref_encode()) -- except
+        the IC-705, whose real range is -20.0 to +20.0 dB and gets
+        bypassed with a local encoder instead (see is_ic705_scope_ref_
+        workaround / SCOPE_REF_MIN_DB's comment in constants.py)."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._set_scope_ref(ref_db), self.loop)
 
     async def _set_scope_ref(self, ref_db: float):
         try:
-            await self.radio.set_scope_ref(ref_db)
+            if self.is_ic705_scope_ref_workaround:
+                # Raw CI-V 0x27/0x19 write via send_civ(), NOT
+                # rigplane's own set_scope_ref() -- see SCOPE_REF_MIN_DB's
+                # comment in constants.py for why.
+                await self.radio.send_civ(
+                    0x27, sub=SCOPE_REF_CIV_SUB, data=_encode_scope_ref(ref_db), wait_response=False
+                )
+            else:
+                await self.radio.set_scope_ref(ref_db)
             self._last_observed_scope_ref = ref_db
         except Exception as exc:
             self.error.emit(f"Set scope ref ({ref_db}) failed: {exc}")

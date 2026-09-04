@@ -39,6 +39,8 @@ from constants import (
     PREAMP_ATT_OPTIONS_VHF_UHF,
     VHF_UHF_BANDS,
     SWR_PROTECTION_THRESHOLD,
+    SCOPE_REF_MIN_DB,
+    SCOPE_REF_MAX_DB,
     DUAL_RECEIVER_LEVEL_KEYS,
     CONTROL_DEFINITIONS,
     CONTROL_OPTION_EXCLUDED,
@@ -420,7 +422,17 @@ class RadioWindow(QWidget):
         self.scope_span_combo.currentIndexChanged.connect(self._on_scope_span_combo_changed)
 
         self.scope_ref_spin = QDoubleSpinBox()
-        self.scope_ref_spin.setRange(-30.0, 10.0)
+        # IC-705's real range is -20.0/+20.0, not the -30.0/+10.0 every
+        # other radio uses -- confirmed live, and confirmed against its
+        # own CI-V Reference Guide (rigplane's set_scope_ref() hardcodes
+        # the IC-7610's range universally instead of per-model; see
+        # SCOPE_REF_MIN_DB's comment in constants.py and RadioWorker's
+        # is_ic705_scope_ref_workaround, which bypasses that for the
+        # actual CI-V write).
+        if details["radio_model"] == "IC-705":
+            self.scope_ref_spin.setRange(SCOPE_REF_MIN_DB, SCOPE_REF_MAX_DB)
+        else:
+            self.scope_ref_spin.setRange(-30.0, 10.0)
         self.scope_ref_spin.setSingleStep(0.5)
         self.scope_ref_spin.setDecimals(1)
         self.scope_ref_spin.setSuffix(" dB")

@@ -453,6 +453,24 @@ SWR_CALIBRATION = [(0, 1.0), (48, 1.5), (80, 2.0), (120, 3.0), (240, 6.0)]
 # RadioWorker.set_swr_protection_enabled(), default ON.
 SWR_PROTECTION_THRESHOLD = 2.5
 
+# Scope reference level -- confirmed live that the IC-705's own front
+# panel offers -20.0 to +20.0 dB, but rigplane's set_scope_ref()
+# rejects anything above +10.0 or below -30.0: its encoder (commands/
+# scope.py's _scope_ref_encode) hardcodes that range and cites "IC-7610
+# CI-V Reference p.15" as its source -- i.e. it applies the IC-7610's
+# own documented range (-30.0/+10.0) universally to every model instead
+# of per-model. The IC-705's own CI-V Reference Guide documents -20.0
+# to +20.0 dB in 0.5 dB steps (Misc/IC-705_ENG_CI-V_4b.pdf p.28). The
+# CI-V command/wire format itself (0x27 sub 0x19) is NOT in question --
+# RadioWorker reimplements just the encoding step locally, without
+# rigplane's wrong range check, for IC-705 only; every other radio
+# keeps using rigplane's own set_scope_ref() unchanged. Reading back
+# (get_scope_ref) is unaffected -- rigplane's decoder has no range
+# validation on that side, confirmed by reading parse_scope_ref_response.
+SCOPE_REF_CIV_SUB = 0x19
+SCOPE_REF_MIN_DB = -20.0
+SCOPE_REF_MAX_DB = 20.0
+
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on
 # a dual-receiver radio. Their real getter/setter DOES accept a
 # receiver= kwarg (confirmed via a full inspect.signature() sweep

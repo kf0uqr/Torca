@@ -332,6 +332,16 @@ class RadioWorker(QThread):
         self._filter_shape_available = False  # set in _setup_filter_shape() -- send_civ() usable for this radio
         self.is_ic705_preamp_att = False  # set once connected -- see PREAMP_CIV_SUB's comment in constants.py
         self.is_ic705_swr_workaround = False  # set once connected -- see SWR_CIV_SUB's comment in constants.py
+        # SWR is only meaningful during TX -- confirmed live that
+        # without this, the meter just kept showing whatever it last
+        # read during the previous transmission (the radio's own SWR
+        # register doesn't reset itself on RX), looking like it had
+        # "frozen" instead of returning to a defined at-rest reading.
+        # Set True/False by _start_ptt()/_stop_ptt() (both PTT entry
+        # points funnel through these), read by _poll_loop() to skip
+        # polling SWR at all while not transmitting.
+        self._ptt_active = False
+        self._swr_reset_pending = False  # True right after PTT releases, until one reset value has been emitted
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -733,6 +743,7 @@ class RadioWorker(QThread):
         try:
             await self.radio.set_ptt(True)
             self.audio_status.emit("PTT: radio.set_ptt(True) succeeded.")
+            self._ptt_active = True
         except Exception as exc:
             self.error.emit(f"PTT: radio.set_ptt(True) failed ({exc}).")
             return
@@ -757,6 +768,13 @@ class RadioWorker(QThread):
         asyncio.run_coroutine_threadsafe(self._stop_ptt(), self.loop)
 
     async def _stop_ptt(self):
+        # Set regardless of what set_ptt(False) below does -- the user
+        # released PTT either way, and that's the signal the SWR meter
+        # needs to stop showing a stale TX reading (see _ptt_active's
+        # own comment), independent of whether the radio actually
+        # unkeyed successfully.
+        self._ptt_active = False
+        self._swr_reset_pending = True
         if self.audio_bridge is not None and self.audio_bridge.has_mic():
             self.audio_bridge.set_tx_active(False)
             await self.audio_bridge.stop_tx_session()
@@ -2323,15 +2341,33 @@ class RadioWorker(QThread):
             for meter_type, getter_name in self._meter_getters.items():
                 definition = self._meter_definitions[meter_type]
                 try:
-                    if meter_type == "swr" and self.is_ic705_swr_workaround:
-                        # Raw CI-V 0x15/0x12 read via send_civ(), NOT
-                        # rigplane's own get_swr() -- see SWR_CIV_SUB's
-                        # comment in constants.py for why.
-                        resp = await self.radio.send_civ(0x15, sub=SWR_CIV_SUB, wait_response=True)
-                        if resp is not None and resp.data:
+                    if meter_type == "swr":
+                        # SWR is only meaningful during TX -- see
+                        # _ptt_active's own comment for why this skips
+                        # polling entirely (rather than just displaying)
+                        # while not transmitting, and emits exactly one
+                        # defined at-rest reading right on PTT release.
+                        if not self._ptt_active:
+                            if self._swr_reset_pending:
+                                self._swr_reset_pending = False
+                                self.meter_updated.emit("swr", definition.get("display_min", 0.0))
+                            continue
+                        if self.is_ic705_swr_workaround:
+                            # Raw CI-V 0x15/0x12 read via send_civ(), NOT
+                            # rigplane's own get_swr() -- see SWR_CIV_SUB's
+                            # comment in constants.py for why.
+                            resp = await self.radio.send_civ(0x15, sub=SWR_CIV_SUB, wait_response=True)
+                            if resp is None or not resp.data:
+                                continue
                             value = _interpolate_swr(_bcd_decode_pbt_level(resp.data))
                         else:
-                            continue
+                            getter = getattr(self.radio, getter_name)
+                            kwargs = (
+                                self._receiver_kwargs(getter, self._active_receiver)
+                                if self.is_dual_receiver
+                                else {}
+                            )
+                            value = await getter(**kwargs)
                     else:
                         getter = getattr(self.radio, getter_name)
                         kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}

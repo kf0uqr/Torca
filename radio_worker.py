@@ -2838,9 +2838,20 @@ class RadioWorker(QThread):
             if self.is_ic705_scope_ref_workaround:
                 # Raw CI-V 0x27/0x19 write via send_civ(), NOT
                 # rigplane's own set_scope_ref() -- see SCOPE_REF_MIN_DB's
-                # comment in constants.py for why.
+                # comment in constants.py for why. The leading b"\x00" is
+                # a required receiver-index prefix byte (0=MAIN) that
+                # rigplane's own set_scope_ref() always adds too --
+                # confirmed by reading its _scope_payload() helper:
+                # ScopeControlsState.receiver defaults to 0 (a real int,
+                # never None) even for a single-receiver radio, so that
+                # prefix byte is unconditional. Confirmed live this was
+                # the actual bug: omitting it meant the write silently
+                # did nothing (malformed frame, no error either) while
+                # reads kept working fine through rigplane's own
+                # unmodified get_scope_ref(), which includes the same
+                # prefix on its own get path.
                 await self.radio.send_civ(
-                    0x27, sub=SCOPE_REF_CIV_SUB, data=_encode_scope_ref(ref_db), wait_response=False
+                    0x27, sub=SCOPE_REF_CIV_SUB, data=b"\x00" + _encode_scope_ref(ref_db), wait_response=False
                 )
             else:
                 await self.radio.set_scope_ref(ref_db)

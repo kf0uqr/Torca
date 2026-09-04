@@ -3520,21 +3520,66 @@ class RadioWorker(QThread):
             f"[dual-rx] band conflict: receiver {other_receiver} is on {other_band[0]}, the "
             f"same band receiver {receiver} needs -- moving it to {safe_label} first."
         )
-        try:
-            await self.radio.select_receiver(other_receiver)
-            await self.radio.set_vfo_slot("A", receiver=other_receiver)
-            await self.radio.set_frequency(safe_low_hz, receiver=other_receiver)
-        except Exception as exc:
-            self.error.emit(f"Moving receiver {other_receiver} to {safe_label} failed: {exc}")
-        finally:
-            # Restore `receiver` as the real radio's active receiver --
-            # see this method's own docstring for the exact bug this
-            # fixes (a bare frequency write, right after this returns,
-            # otherwise silently lands on other_receiver instead).
+        # Whole parking sequence is now under self._receiver_switch_lock
+        # (it wasn't before) -- root-caused a real "Main still can't
+        # switch to Sub's band" report that SURVIVED the earlier fix
+        # locking just the final write (radio_worker.py commit
+        # 9dedae2): that fix only closed the race around the LAST write,
+        # but this parking sequence itself -- select_receiver(other)/
+        # set_vfo_slot/set_frequency, run BEFORE that lock is ever
+        # acquired -- was just as exposed to the same concurrent-poll-
+        # loop-flips-the-active-receiver race, for BOTH directions
+        # equally. It happened to read as "Sub->Main always works, Main-
+        # >Sub never does" only because Sub's own final write (already
+        # locked, see _select_receiver_vfo_and_set_frequency) could
+        # tolerate a botched parking attempt by coincidence far more
+        # often than Main's -- not because the parking step itself was
+        # actually reliable.
+        async with self._receiver_switch_lock:
             try:
-                await self.radio.select_receiver(receiver)
+                await self.radio.select_receiver(other_receiver)
+                await self.radio.set_vfo_slot("A", receiver=other_receiver)
+                await self.radio.set_frequency(safe_low_hz, receiver=other_receiver)
+                # The frequency write above is fire-and-forget (rigplane
+                # never waits for an ACK on a plain frequency set) -- so
+                # unlike the ACK-waited select_receiver/set_vfo_slot
+                # calls just above it, nothing has actually confirmed
+                # other_receiver truly left the conflicting band yet.
+                # Read it back (with a couple of retries -- real
+                # hardware over a serial link doesn't always reflect a
+                # just-sent write on the very next poll) before trusting
+                # it's safe to write the caller's OWN intended receiver/
+                # band next; without this, "moved Sub out of the way" was
+                # sometimes just an assumption, and the caller's
+                # subsequent write into what the radio still considered
+                # a same-band conflict was silently refused -- exactly
+                # matching the "shows the new band for a moment, then
+                # snaps back to the old one on the next poll" symptom
+                # reported live.
+                parked = False
+                for _ in range(3):
+                    await asyncio.sleep(0.15)
+                    confirm_freq_hz = await self._get_receiver_frequency(other_receiver)
+                    confirm_band = self._find_band(confirm_freq_hz)
+                    if confirm_band is not None and confirm_band[0] == safe_label:
+                        parked = True
+                        break
+                if not parked:
+                    self.error.emit(
+                        f"Band conflict: moved receiver {other_receiver} toward {safe_label} but "
+                        f"it hasn't landed there yet -- the intended write may still be refused."
+                    )
             except Exception as exc:
-                self.error.emit(f"Restoring active receiver ({receiver}) after band-conflict resolution failed: {exc}")
+                self.error.emit(f"Moving receiver {other_receiver} to {safe_label} failed: {exc}")
+            finally:
+                # Restore `receiver` as the real radio's active receiver --
+                # see this method's own docstring for the exact bug this
+                # fixes (a bare frequency write, right after this returns,
+                # otherwise silently lands on other_receiver instead).
+                try:
+                    await self.radio.select_receiver(receiver)
+                except Exception as exc:
+                    self.error.emit(f"Restoring active receiver ({receiver}) after band-conflict resolution failed: {exc}")
 
     async def _select_receiver_vfo_and_set_frequency(self, receiver: int, vfo_slot: str, freq_hz: int, check_conflict: bool = True):
         if check_conflict:

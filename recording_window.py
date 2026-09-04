@@ -61,6 +61,7 @@ class RecordingToolWindow(QWidget):
         self._recording_entry = None     # dict being built for the in-progress recording
         self._auto_started = False       # True if the CURRENT recording was satellite-sync-started
         self._last_elevation_up = None   # None until the first satellite tick with a known state
+        self._last_satellite_name = None  # name from the most recent satellite tick, used to resume after a reconnect
         self._populating_table = False   # guards against itemChanged firing during _refresh_table
         self._playing_id = None          # id of the recording currently loaded in the player
 
@@ -161,6 +162,8 @@ class RecordingToolWindow(QWidget):
         radio_window.ptt_button.toggled.connect(self._on_ptt_toggled)
         if radio_window._role != "non_sat":
             radio_window._satellite_session.state_updated.connect(self._on_satellite_state_updated)
+        radio_window.worker.reconnecting.connect(self._on_worker_reconnecting)
+        radio_window.worker.reconnected.connect(self._on_worker_reconnected)
 
         self._refresh_table()
 
@@ -301,6 +304,37 @@ class RecordingToolWindow(QWidget):
         if self._recorder is not None:
             self._recorder.set_tx_active(checked)
 
+    # ---- Reconnect handling ----
+
+    def _on_worker_reconnecting(self, _attempt, _retry_in):
+        """Fires once per reconnect attempt, repeatedly, while the
+        connection is down -- only the FIRST one (while self._recorder
+        is still set) matters here; stopping the recording makes every
+        later firing during the same drop a no-op via the same guard,
+        so there's no separate "just went down" edge to track."""
+        if self._recorder is None:
+            return
+        # Tag the entry as interrupted before _stop_recording() appends
+        # it to the index, so it's visibly distinct in the Name column
+        # -- otherwise a recording truncated by a dropped connection
+        # looks identical in the list to one that ended normally, the
+        # exact ambiguity that made the original "0 second recording"
+        # report hard to diagnose.
+        self._recording_entry["name"] += " (interrupted -- connection lost)"
+        self._stop_recording()
+
+    def _on_worker_reconnected(self):
+        """Resumes satellite-sync recording (as a new file covering the
+        remainder of the pass) if sync is enabled, nothing is currently
+        recording, and the tracked satellite was still above the
+        horizon when the connection dropped -- mirrors a fresh AOS."""
+        if not self.sync_checkbox.isChecked():
+            return
+        if self._recorder is not None:
+            return
+        if self._last_elevation_up:
+            self._start_recording(satellite=self._last_satellite_name, auto=True)
+
     # ---- Satellite sync ----
 
     @Slot(object, object, str, object, object, str)
@@ -311,6 +345,7 @@ class RecordingToolWindow(QWidget):
         elevation_deg = look.get("elevation_deg") if isinstance(look, dict) else None
         if elevation_deg is None:
             return
+        self._last_satellite_name = satellite.get("name") if isinstance(satellite, dict) else str(satellite)
         up = elevation_deg >= 0
         if self._last_elevation_up is None:
             self._last_elevation_up = up

@@ -180,6 +180,41 @@ POLL_INTERVAL_SEC = 0.5  # how often to read frequency/s-meter from the radio
 SLOW_POLL_INTERVAL_SEC = 3.0
 WATERFALL_ROWS = 200     # how many past scope frames the waterfall keeps on screen
 
+# Automatic reconnection -- root-caused a real "left the app running
+# overnight to auto-record ISS passes, the connection died at some
+# point (laptop sleep suspending USB/network), and nothing noticed or
+# recovered" report to this app having NO reconnect/disconnect-
+# detection logic at all. rigplane's own LAN backend has a full
+# watchdog+reconnect system already, just gated behind
+# LanBackendConfig.auto_reconnect (default False, see radio_worker.py's
+# _build_config()); its own watchdog_timeout below is deliberately
+# SHORTER than RECONNECT_WATCHDOG_TIMEOUT_SEC so rigplane's own low-
+# level recovery (which keeps the same radio object alive, self-healing
+# underneath) gets the first attempt, and this app's own backend-
+# agnostic watchdog (radio_worker.py's _poll_loop_fast, needed anyway
+# since serial/Yaesu CAT backends already self-heal without any signal
+# Torca can see, and RemoteWebRadio -- Torca's own client for
+# rigplane's separate web server, not one of rigplane's four backends
+# -- has no reconnect logic of its own at all) only fires as a real
+# backstop, not something fighting rigplane's own recovery on routine
+# blips.
+LAN_AUTO_RECONNECT = True
+LAN_RECONNECT_DELAY_SEC = 2.0
+LAN_RECONNECT_MAX_DELAY_SEC = 30.0
+LAN_WATCHDOG_TIMEOUT_SEC = 15.0
+# This app's own uniform, backend-agnostic watchdog (radio_worker.py's
+# _poll_loop_fast tracks time since the last successful frequency
+# read, its own natural per-cycle heartbeat) -- deliberately longer
+# than LAN_WATCHDOG_TIMEOUT_SEC above, see this section's own comment.
+RECONNECT_WATCHDOG_TIMEOUT_SEC = 45.0
+# Backoff for THIS app's own outer reconnect loop (radio_worker.py's
+# _main()) once the watchdog above has triggered a teardown -- same
+# starting/cap values as the LAN backend's own, for consistency, but
+# applies to every connection type (serial, Yaesu CAT, remote), not
+# just LAN.
+RECONNECT_BACKOFF_START_SEC = 2.0
+RECONNECT_BACKOFF_MAX_SEC = 30.0
+
 # Step sizes offered next to the tuning knob, and how many degrees of knob
 # rotation correspond to one step (one "detent" of a real rotary encoder).
 TUNING_STEPS = [("10 Hz", 10), ("100 Hz", 100), ("1 kHz", 1_000), ("10 kHz", 10_000)]

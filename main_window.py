@@ -844,6 +844,8 @@ class RadioWindow(QWidget):
         self.worker = RadioWorker(details)
         self.worker.connected.connect(self._on_connected)
         self.worker.connection_failed.connect(self._on_connection_failed)
+        self.worker.reconnecting.connect(self._on_reconnecting)
+        self.worker.reconnected.connect(self._on_reconnected)
         self.worker.frequency_updated.connect(self._on_frequency_updated)
         self.worker.meter_updated.connect(self._on_meter_updated)
         self.worker.scope_frame_received.connect(self._on_scope_frame)
@@ -933,6 +935,20 @@ class RadioWindow(QWidget):
             button.setEnabled(True)
         for slider in self.level_sliders.values():
             slider.setEnabled(True)
+
+    @Slot(int, float)
+    def _on_reconnecting(self, attempt: int, retry_in: float):
+        # Deliberately doesn't grey out any controls -- see the reconnect
+        # plan's design notes: leaving them as-is during a brief
+        # reconnect window is an accepted v1 tradeoff, the status label
+        # is the primary signal a drop is happening.
+        self.status_label.setText(
+            f"Connection lost -- reconnecting (attempt {attempt}, retrying in {retry_in:.0f}s)..."
+        )
+
+    @Slot()
+    def _on_reconnected(self):
+        self.status_label.setText(f"Connected to {self._connection_label}")
         for widget in self.control_widgets.values():
             widget.setEnabled(True)
         # Joining mid-pass (e.g. reconnecting a 9700 while satellite

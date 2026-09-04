@@ -10,6 +10,7 @@ import asyncio
 import copy
 import importlib
 import inspect
+import time
 
 from PySide6.QtCore import QThread, Signal
 
@@ -189,6 +190,13 @@ from constants import (
     CONTROL_UNSUPPORTED,
     POLL_INTERVAL_SEC,
     SLOW_POLL_INTERVAL_SEC,
+    LAN_AUTO_RECONNECT,
+    LAN_RECONNECT_DELAY_SEC,
+    LAN_RECONNECT_MAX_DELAY_SEC,
+    LAN_WATCHDOG_TIMEOUT_SEC,
+    RECONNECT_WATCHDOG_TIMEOUT_SEC,
+    RECONNECT_BACKOFF_START_SEC,
+    RECONNECT_BACKOFF_MAX_SEC,
     AUDIO_DEVICE_SYSTEM_DEFAULT,
     AUDIO_TX_PCM_FRAME_BYTES,
 )
@@ -314,6 +322,18 @@ class RadioWorker(QThread):
 
     connected = Signal()
     connection_failed = Signal(str)
+    # Emitted once per reconnect attempt after the connection has been
+    # lost (never for the very first connect -- that's connection_failed
+    # on failure, connected on success). Carries (attempt number,
+    # seconds until the next attempt) so the UI can show real progress
+    # during an unattended overnight drop instead of a frozen status
+    # label. See _main()'s docstring for the full reconnect design.
+    reconnecting = Signal(int, float)
+    # Emitted when a connection succeeds AFTER a previous drop -- distinct
+    # from connected (first-ever connect) so listeners like the Recording
+    # Tool can tell "we just came back" apart from "this is the start of
+    # the session" and react accordingly (e.g. auto-resume a recording).
+    reconnected = Signal()
     frequency_updated = Signal(int)      # Hz
     meter_updated = Signal(str, int)     # (meter_type key, raw value)
     # Emitted once _setup_meters() finishes building this connection's
@@ -489,6 +509,19 @@ class RadioWorker(QThread):
         self._last_observed_active_receiver = None
         self._radio_cm = None
         self._stop_requested = False
+        # True only while a connection is both established AND believed
+        # alive by the watchdog -- see is_connected()/_connection_watchdog_loop.
+        # Before this existed, is_connected() was just `self.radio is not
+        # None`, which lied forever after any drop (self.radio was never
+        # reset), silently letting the app believe it was still connected
+        # to a dead radio indefinitely.
+        self._connection_healthy = False
+        # time.monotonic() of the last successful frequency read --
+        # updated every poll cycle in _poll_loop_fast, read by
+        # _connection_watchdog_loop to decide whether the connection is
+        # still actually alive. Initialized once, right before the poll
+        # loops first start, inside _main().
+        self._last_good_freq_read = 0.0
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
         self._tx_audio_future = None  # concurrent.futures.Future for the in-flight send_tx_audio_pcm coroutine, if any -- see stop_tx_audio_send
         self._tx_stream_push_name = None  # resolved push_audio_tx_pcm/push_tx name while a start_tx_audio_stream()/stop_tx_audio_stream() session is open -- see those methods
@@ -635,6 +668,16 @@ class RadioWorker(QThread):
                 username=d["username"],
                 password=d["password"],
                 model=d.get("radio_model"),
+                # rigplane's own LAN watchdog/reconnect system --
+                # defaults to off (LanBackendConfig.auto_reconnect =
+                # False); see LAN_AUTO_RECONNECT's own comment in
+                # constants.py for why this is the first line of
+                # defense before this app's own backend-agnostic
+                # watchdog (_poll_loop_fast) ever gets involved.
+                auto_reconnect=LAN_AUTO_RECONNECT,
+                reconnect_delay=LAN_RECONNECT_DELAY_SEC,
+                reconnect_max_delay=LAN_RECONNECT_MAX_DELAY_SEC,
+                watchdog_timeout=LAN_WATCHDOG_TIMEOUT_SEC,
             )
             if force_stereo:
                 kwargs["audio_codec"] = AudioCodec.PCM_2CH_16BIT
@@ -1856,151 +1899,278 @@ class RadioWorker(QThread):
             self.error.emit(f"Preamp/Attenuator: send_civ() failed ({exc}).")
 
     async def _main(self):
-        try:
-            if self._details.get("connection_type") == "remote":
-                # Bypasses rigplane's own create_radio()/BackendConfig
-                # dispatch entirely -- RemoteWebRadio isn't one of
-                # rigplane's own four backend types, it's this app's
-                # own client for rigplane's separate `web` server (see
-                # remote_radio.py's own docstring). Everything from
-                # here on (__aenter__, isinstance capability checks,
-                # _setup_audio/_setup_levels/_setup_meters/
-                # _setup_controls, the scope-enable block, the poll loops)
-                # is already fully backend-agnostic and needs no
-                # remote-specific handling at all.
-                self._radio_cm = RemoteWebRadio(
-                    self._details["remote_host"],
-                    self._details["remote_port"],
-                    self._details.get("remote_token", ""),
-                )
-                self.radio = await self._radio_cm.__aenter__()
-            else:
-                config = self._build_config()
-                try:
-                    self._radio_cm = create_radio(config)
+        """Outer connect/setup/poll loop -- runs repeatedly, not just
+        once, so a connection that dies mid-session (root-caused a real
+        "left the app running overnight to auto-record ISS passes, the
+        connection died at some point, and nothing noticed or
+        recovered" report to this app previously having NO reconnect
+        logic at all -- see RECONNECT_WATCHDOG_TIMEOUT_SEC's comment in
+        constants.py for the full story) gets torn down and re-
+        established automatically, indefinitely, instead of leaving the
+        poll loops spinning forever against a dead radio object.
+
+        self.connected/self.reconnected are deliberately separate
+        signals (only the very first successful connection emits
+        connected; every connection after a drop emits reconnected
+        instead) so listeners that care about the distinction -- e.g.
+        the Recording Tool auto-resuming an interrupted satellite-pass
+        recording -- don't have to guess which one just happened from
+        context."""
+        is_first_connect = True
+        backoff = RECONNECT_BACKOFF_START_SEC
+        attempt = 1
+        while not self._stop_requested:
+            try:
+                if self._details.get("connection_type") == "remote":
+                    # Bypasses rigplane's own create_radio()/BackendConfig
+                    # dispatch entirely -- RemoteWebRadio isn't one of
+                    # rigplane's own four backend types, it's this app's
+                    # own client for rigplane's separate `web` server (see
+                    # remote_radio.py's own docstring). Everything from
+                    # here on (__aenter__, isinstance capability checks,
+                    # _setup_audio/_setup_levels/_setup_meters/
+                    # _setup_controls, the scope-enable block, the poll loops)
+                    # is already fully backend-agnostic and needs no
+                    # remote-specific handling at all. RemoteWebRadio also
+                    # has no reconnect logic of its own (unlike every real
+                    # rigplane backend -- see LAN_AUTO_RECONNECT's comment
+                    # in constants.py), so this app's own watchdog below is
+                    # the ONLY thing that will ever notice and recover a
+                    # dropped remote connection.
+                    self._radio_cm = RemoteWebRadio(
+                        self._details["remote_host"],
+                        self._details["remote_port"],
+                        self._details.get("remote_token", ""),
+                    )
                     self.radio = await self._radio_cm.__aenter__()
-                except Exception as exc:
-                    if getattr(config, "audio_codec_explicit", False):
-                        # See _build_config's docstring: an explicit stereo
-                        # request disarms rigplane's own automatic mono-
-                        # retry-on-rejection fallback, so re-implement it
-                        # here -- one retry with the radio profile's own
-                        # (proven-safe) codec default before actually giving
-                        # up. Whatever failure this produces (if any) is
-                        # what actually gets reported below, same as before
-                        # this stereo attempt existed.
-                        self.audio_status.emit(
-                            f"Connect: stereo audio request failed ({exc}) -- retrying "
-                            "with the radio profile's default (mono) codec."
-                        )
-                        config = self._build_config(force_stereo=False)
+                else:
+                    config = self._build_config()
+                    try:
                         self._radio_cm = create_radio(config)
                         self.radio = await self._radio_cm.__aenter__()
-                    else:
-                        raise
-        except Exception as exc:
-            self.connection_failed.emit(str(exc))
-            return
-
-        # isinstance(radio, DualReceiverCapable) alone isn't enough --
-        # confirmed live on an IC-705 (single-receiver): its methods
-        # (swap_main_sub etc.) live on DualRxRuntimeMixin, which every
-        # Icom radio class inherits UNCONDITIONALLY (rigplane/runtime/
-        # radio.py: "class CoreRadio(ScopeRuntimeMixin, AudioRuntimeMixin,
-        # DualRxRuntimeMixin)"), so the isinstance check is structurally
-        # True even on a radio that only has one receiver -- the same
-        # "method exists but isn't functionally real for this model"
-        # trap already hit for PBT/filter shape/preamp elsewhere in this
-        # app. The actual ground truth is the profile's own declared
-        # receiver_count (IC-705's ic705.toml: "receiver_count = 1";
-        # IC-7610/IC-9700: 2) -- both checks are required so a radio that
-        # somehow reports receiver_count > 1 without implementing the
-        # protocol at all still isn't treated as dual-receiver.
-        profile = getattr(self.radio, "profile", None)
-        self.is_dual_receiver = (
-            DualReceiverCapable is not None
-            and isinstance(self.radio, DualReceiverCapable)
-            and getattr(profile, "receiver_count", 1) > 1
-        )
-        self.is_pbt_capable = CAP_PBT is not None and CAP_PBT in getattr(self.radio, "capabilities", set())
-        self.is_filter_width_capable = (
-            CAP_FILTER_WIDTH is not None and CAP_FILTER_WIDTH in getattr(self.radio, "capabilities", set())
-        )
-        self.is_filter_shape_capable = (
-            CAP_FILTER_SHAPE is not None and CAP_FILTER_SHAPE in getattr(self.radio, "capabilities", set())
-        )
-        # Not a rigplane capability flag -- this is a model-specific
-        # workaround (see PREAMP_CIV_SUB's comment in constants.py), so
-        # it's keyed on radio_model directly, same scoping the app
-        # already uses for CONTROL_OPTION_EXCLUDED.
-        self.is_ic705_preamp_att = (
-            self._details.get("radio_model") == "IC-705" and hasattr(self.radio, "send_civ")
-        )
-        self.is_ic705_swr_workaround = self.is_ic705_preamp_att  # same model+send_civ gate, see SWR_CIV_SUB's comment
-        self.connected.emit()
-        # Everything from here through the poll loops is wrapped in one
-        # try/finally so self._radio_cm.__aexit__() (closing the actual
-        # serial/network connection) always runs -- including if stop()
-        # cancels this task while still in setup (_setup_audio/_setup_
-        # levels/etc, or enable_scope's own up-to-5s verification wait),
-        # not just once the poll loops are reached. Without this, closing
-        # the window during a slow real-hardware startup would cancel
-        # cleanly (no more Qt abort -- see stop()'s docstring) but leak
-        # the underlying connection, likely blocking a subsequent
-        # reconnect attempt ("port busy") until the OS reclaims it.
-        try:
-            await self._setup_audio()
-            await self._setup_levels()
-            await self._setup_pbt()
-            await self._setup_filter_shape()
-            self._setup_meters()
-            self.meters_ready.emit(self._meter_definitions)
-            self._setup_controls()
-
-            # Scope data arrives unsolicited over CI-V; register a
-            # callback rather than polling for it. The callback fires
-            # on this thread's event loop, so it must only emit a
-            # signal -- never touch a widget.
-            try:
-                self.radio.on_scope_data(self._handle_scope_frame)
-                await self.radio.enable_scope()
-                self.is_scope_capable = True
-                # is_scope_capable becomes true here, well AFTER connected.emit()
-                # above -- main_window.py's _on_connected (which runs off that
-                # signal) would almost always see it still False, since this
-                # await completes on its own schedule long after the GUI thread
-                # gets queued to enable other controls. Confirmed live: on a
-                # real 9700, the scope itself loaded fine but the span/ref/
-                # speed controls stayed greyed out forever, exactly this race.
-                # A dedicated signal, fired only once this really is known true,
-                # is what main_window.py's scope controls listen for instead.
-                self.scope_ready.emit()
+                    except Exception as exc:
+                        if getattr(config, "audio_codec_explicit", False):
+                            # See _build_config's docstring: an explicit stereo
+                            # request disarms rigplane's own automatic mono-
+                            # retry-on-rejection fallback, so re-implement it
+                            # here -- one retry with the radio profile's own
+                            # (proven-safe) codec default before actually giving
+                            # up. Whatever failure this produces (if any) is
+                            # what actually gets reported below, same as before
+                            # this stereo attempt existed.
+                            self.audio_status.emit(
+                                f"Connect: stereo audio request failed ({exc}) -- retrying "
+                                "with the radio profile's default (mono) codec."
+                            )
+                            config = self._build_config(force_stereo=False)
+                            self._radio_cm = create_radio(config)
+                            self.radio = await self._radio_cm.__aenter__()
+                        else:
+                            raise
             except Exception as exc:
-                self.error.emit(f"Scope unavailable: {exc}")
+                if is_first_connect:
+                    self.connection_failed.emit(str(exc))
+                    return
+                # A RECONNECT attempt failed (as opposed to the very
+                # first connect, handled above) -- back off and try
+                # again, indefinitely, matching the explicit unattended-
+                # overnight use case this exists for.
+                self.error.emit(f"Reconnect attempt {attempt} failed: {exc}")
+                self.reconnecting.emit(attempt, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SEC)
+                attempt += 1
+                continue
 
-            # Two independent loops (own asyncio.sleep cadence each) --
-            # see _poll_loop_slow's docstring for why. gather() so a
-            # genuine failure in either one still propagates/cancels the
-            # other, same all-or-nothing shutdown semantics a single
-            # loop had.
-            await asyncio.gather(self._poll_loop_fast(), self._poll_loop_slow())
-        finally:
-            # Cancel any pending debounced level-value sends -- without
-            # this, a slider drag right before disconnect could leave a
-            # task scheduled to call self.radio well after
-            # _radio_cm.__aexit__() below has torn it down.
-            for task in self._level_debounce_tasks.values():
-                if not task.done():
+            # isinstance(radio, DualReceiverCapable) alone isn't enough --
+            # confirmed live on an IC-705 (single-receiver): its methods
+            # (swap_main_sub etc.) live on DualRxRuntimeMixin, which every
+            # Icom radio class inherits UNCONDITIONALLY (rigplane/runtime/
+            # radio.py: "class CoreRadio(ScopeRuntimeMixin, AudioRuntimeMixin,
+            # DualRxRuntimeMixin)"), so the isinstance check is structurally
+            # True even on a radio that only has one receiver -- the same
+            # "method exists but isn't functionally real for this model"
+            # trap already hit for PBT/filter shape/preamp elsewhere in this
+            # app. The actual ground truth is the profile's own declared
+            # receiver_count (IC-705's ic705.toml: "receiver_count = 1";
+            # IC-7610/IC-9700: 2) -- both checks are required so a radio that
+            # somehow reports receiver_count > 1 without implementing the
+            # protocol at all still isn't treated as dual-receiver.
+            profile = getattr(self.radio, "profile", None)
+            self.is_dual_receiver = (
+                DualReceiverCapable is not None
+                and isinstance(self.radio, DualReceiverCapable)
+                and getattr(profile, "receiver_count", 1) > 1
+            )
+            self.is_pbt_capable = CAP_PBT is not None and CAP_PBT in getattr(self.radio, "capabilities", set())
+            self.is_filter_width_capable = (
+                CAP_FILTER_WIDTH is not None and CAP_FILTER_WIDTH in getattr(self.radio, "capabilities", set())
+            )
+            self.is_filter_shape_capable = (
+                CAP_FILTER_SHAPE is not None and CAP_FILTER_SHAPE in getattr(self.radio, "capabilities", set())
+            )
+            # Not a rigplane capability flag -- this is a model-specific
+            # workaround (see PREAMP_CIV_SUB's comment in constants.py), so
+            # it's keyed on radio_model directly, same scoping the app
+            # already uses for CONTROL_OPTION_EXCLUDED.
+            self.is_ic705_preamp_att = (
+                self._details.get("radio_model") == "IC-705" and hasattr(self.radio, "send_civ")
+            )
+            self.is_ic705_swr_workaround = self.is_ic705_preamp_att  # same model+send_civ gate, see SWR_CIV_SUB's comment
+            self._connection_healthy = True
+            if is_first_connect:
+                self.connected.emit()
+                is_first_connect = False
+            else:
+                self.reconnected.emit()
+            backoff = RECONNECT_BACKOFF_START_SEC
+            attempt = 1
+            # Everything from here through the poll loops is wrapped in one
+            # try/finally so _teardown_connection() (which closes the
+            # actual serial/network connection) always runs -- including
+            # if stop() cancels this task while still in setup
+            # (_setup_audio/_setup_levels/etc, or enable_scope's own
+            # up-to-5s verification wait), not just once the poll loops
+            # are reached. Without this, closing the window during a
+            # slow real-hardware startup would cancel cleanly (no more Qt
+            # abort -- see stop()'s docstring) but leak the underlying
+            # connection, likely blocking a subsequent reconnect attempt
+            # ("port busy") until the OS reclaims it.
+            try:
+                await self._setup_audio()
+                await self._setup_levels()
+                await self._setup_pbt()
+                await self._setup_filter_shape()
+                self._setup_meters()
+                self.meters_ready.emit(self._meter_definitions)
+                self._setup_controls()
+
+                # Scope data arrives unsolicited over CI-V; register a
+                # callback rather than polling for it. The callback fires
+                # on this thread's event loop, so it must only emit a
+                # signal -- never touch a widget.
+                try:
+                    self.radio.on_scope_data(self._handle_scope_frame)
+                    await self.radio.enable_scope()
+                    self.is_scope_capable = True
+                    # is_scope_capable becomes true here, well AFTER connected.emit()
+                    # above -- main_window.py's _on_connected (which runs off that
+                    # signal) would almost always see it still False, since this
+                    # await completes on its own schedule long after the GUI thread
+                    # gets queued to enable other controls. Confirmed live: on a
+                    # real 9700, the scope itself loaded fine but the span/ref/
+                    # speed controls stayed greyed out forever, exactly this race.
+                    # A dedicated signal, fired only once this really is known true,
+                    # is what main_window.py's scope controls listen for instead.
+                    self.scope_ready.emit()
+                except Exception as exc:
+                    self.error.emit(f"Scope unavailable: {exc}")
+
+                # Three independent tasks -- the two original poll loops
+                # (own asyncio.sleep cadence each, see _poll_loop_slow's
+                # docstring for why) plus the connection watchdog (see
+                # RECONNECT_WATCHDOG_TIMEOUT_SEC's comment in
+                # constants.py). asyncio.wait(FIRST_COMPLETED), not
+                # gather(), because we need EXPLICIT control over
+                # cancelling the survivors when the watchdog decides the
+                # connection is dead (gather()'s own automatic sibling-
+                # cancellation only happens when the AWAITING task is
+                # itself cancelled from outside, e.g. stop() -- not when
+                # one gathered coroutine raises on its own, which is
+                # exactly what the watchdog does).
+                self._last_good_freq_read = time.monotonic()
+                fast_task = asyncio.ensure_future(self._poll_loop_fast())
+                slow_task = asyncio.ensure_future(self._poll_loop_slow())
+                watchdog_task = asyncio.ensure_future(self._connection_watchdog_loop())
+                all_tasks = [fast_task, slow_task, watchdog_task]
+                try:
+                    done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
+                except asyncio.CancelledError:
+                    # _main() itself was cancelled (stop()) while waiting
+                    # -- asyncio.wait() does NOT auto-cancel its children
+                    # the way gather() would, so do it explicitly before
+                    # letting this propagate (still unwinds through the
+                    # finally below, same as before this loop existed).
+                    for task in all_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*all_tasks, return_exceptions=True)
+                    raise
+                for task in pending:
                     task.cancel()
-            self._level_debounce_tasks.clear()
-            if self.audio_bridge:
-                await self.audio_bridge.stop()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+            finally:
+                await self._teardown_connection()
+
+            if self._stop_requested:
+                break
+            # The watchdog fired (it returns normally, no exception, once
+            # it decides the connection is dead) -- otherwise a real bug
+            # in one of the poll loops would have raised out of the try
+            # above and propagated past this point instead of reaching
+            # here at all, same as it always did before this loop existed.
+            self._connection_healthy = False
+            self.error.emit(
+                f"Connection appears to be lost (no successful frequency read in over "
+                f"{RECONNECT_WATCHDOG_TIMEOUT_SEC:.0f}s) -- attempting to reconnect."
+            )
+            self.reconnecting.emit(attempt, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SEC)
+            attempt += 1
+
+    async def _teardown_connection(self):
+        """Cleans up everything the current connection's _setup_*()
+        calls / poll loops left behind -- shared by both _main()'s own
+        per-iteration finally (reconnect case) and, transitively, stop()
+        (which cancels _main() and lets this same finally run once more
+        on the way out). Exactly the same steps as before this file had
+        a reconnect loop at all; just factored out so there's one place
+        this logic lives instead of it only existing inline."""
+        # Cancel any pending debounced level-value sends -- without
+        # this, a slider drag right before disconnect could leave a
+        # task scheduled to call self.radio well after
+        # _radio_cm.__aexit__() below has torn it down.
+        for task in self._level_debounce_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._level_debounce_tasks.clear()
+        if self.audio_bridge:
+            await self.audio_bridge.stop()
+        if self.radio is not None:
             try:
                 await self.radio.disable_scope()
                 self.radio.on_scope_data(None)
             except Exception:
                 pass
+        if self._radio_cm is not None:
             await self._radio_cm.__aexit__(None, None, None)
+
+    async def _connection_watchdog_loop(self):
+        """Backend-agnostic backstop: if _poll_loop_fast hasn't managed a
+        single successful frequency read (its own natural per-cycle
+        heartbeat, POLL_INTERVAL_SEC) in over
+        RECONNECT_WATCHDOG_TIMEOUT_SEC, treat the connection as dead and
+        return (no exception -- a deliberate, expected outcome, not a
+        bug) so _main()'s asyncio.wait(FIRST_COMPLETED) unblocks and
+        tears everything down for a fresh reconnect attempt. Deliberately
+        longer than the LAN backend's own watchdog_timeout (see
+        RECONNECT_WATCHDOG_TIMEOUT_SEC's comment in constants.py) so
+        rigplane's own lower-level recovery gets the first attempt on a
+        LAN connection; this only fires as a real backstop, and is the
+        ONLY mechanism at all for backends without their own recovery
+        (RemoteWebRadio)."""
+        while not self._stop_requested:
+            await asyncio.sleep(5.0)
+            if time.monotonic() - self._last_good_freq_read > RECONNECT_WATCHDOG_TIMEOUT_SEC:
+                return
+        # Fell out because _stop_requested became true while sleeping --
+        # nothing to do, the fast/slow loops are exiting on their own too.
 
     def _handle_scope_frame(self, frame):
         """Runs on the worker thread (called from rigplane's CI-V receive
@@ -2393,6 +2563,10 @@ class RadioWorker(QThread):
                 # Main or Sub.
                 freq_hz = await self.radio.get_frequency(receiver=RECEIVER_MAIN)
                 self.frequency_updated.emit(freq_hz)
+                # The natural per-cycle heartbeat _connection_watchdog_loop
+                # watches -- a successful read here means the connection is
+                # genuinely alive, not just that self.radio is non-None.
+                self._last_good_freq_read = time.monotonic()
             except Exception as exc:
                 self.error.emit(str(exc))
 
@@ -2789,9 +2963,12 @@ class RadioWorker(QThread):
     # ---- Thread-safe command entry points (call these from the GUI thread) ----
 
     def is_connected(self):
-        """Thread-safe: call from the GUI thread. True once the radio
-        connection is actually up, not just while it's being attempted."""
-        return self.radio is not None
+        """Thread-safe: call from the GUI thread. True only while the
+        radio connection is both established AND believed alive by the
+        watchdog -- self.radio itself is never reset to None (including
+        across a reconnect), so checking it alone would lie forever after
+        any drop; see _connection_healthy's own comment in __init__."""
+        return self.radio is not None and self._connection_healthy
 
     def control_available(self, key: str) -> bool:
         """Thread-safe: call from the GUI thread. True once a working

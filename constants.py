@@ -490,15 +490,44 @@ SCOPE_REF_MAX_DB = 20.0
 # route around either).
 DUAL_RECEIVER_LEVEL_KEYS = {"af_gain", "squelch", "rf_level"}
 
-# get_s_meter() returns a raw 0-255 value over CI-V (confirmed against
-# Hamlib's IC-7300 backend, which reports RAWSTR range 0..255). The
-# raw-to-S-unit mapping below (S9 ~= 120, full-scale/S9+60dB ~= 241) is the
-# calibration convention used across most Icom CAT tools -- it is NOT
-# something we could confirm rigplane itself documents or that your specific
-# radio is calibrated to. If the meter reads visibly high or low against
-# your radio's own front-panel meter, adjust these two numbers.
+# get_s_meter() returns a raw 0-255 value over CI-V. The raw-to-S-unit
+# mapping below is now CONFIRMED, not just a common-convention guess --
+# it matches the IC-705's own CI-V Reference Guide exactly ("Read
+# S-meter level: 0000=S0, 0120=S9, 0241=S9+60 dB", Misc/
+# IC-705_ENG_CI-V_4b.pdf p.6).
 S_METER_RAW_S9 = 120
 S_METER_RAW_MAX = 241
+
+# Power Output (Po), ALC, Compression (COMP), Voltage (Vd), and Current
+# (Id) meter calibration -- all confirmed against the same CI-V
+# Reference Guide page (p.6). Root-caused real miscalibrations, not
+# just imprecision: Power and Comp are genuinely non-linear curves
+# (piecewise below, not a flat raw/255 ratio); ALC/Voltage/Current were
+# all being scaled against raw_max=255, but none of them actually reach
+# their real maximum at raw byte 255 -- Current in particular was also
+# using a flat-out wrong display_max (25.0 A, sized for a 100W-class
+# base/mobile rig) for a radio whose real max draw is ~4 A on internal
+# battery/12V supply -- a >6x overstatement at full draw.
+#
+# Power Output: "0000=0%, 0143=50%, 0213=100%" -- percent of this
+# radio's own max_watts (RadioWorker._setup_meters()), not raw watts
+# directly; applied only when native_power_unit=="raw_255" (a radio
+# reporting native watts skips this, already real units).
+POWER_CALIBRATION = [(0, 0.0), (143, 50.0), (213, 100.0)]
+# Compression: "0000=0 dB, 0130=15 dB, 0210=25.5 dB" -- a dB reading,
+# not the 0-100% this app previously (wrongly) showed it as.
+COMP_CALIBRATION = [(0, 0.0), (130, 15.0), (210, 25.5)]
+# ALC: "0000=Minimum, 0120=Maximum" -- close enough to linear over that
+# range that a plain raw_max fix (255 -> 120) is sufficient, no
+# piecewise table needed (see METER_DEFINITIONS["alc"]).
+ALC_RAW_MAX = 120
+# Voltage: "0000=0V, 0075=5V, 0241=16V" -- essentially linear across
+# both segments (~0.067 V/raw either half), so just raw_max=241 (see
+# METER_DEFINITIONS["voltage"]) rather than a full piecewise table.
+VOLTAGE_RAW_MAX = 241
+# Current (Id): "0000=0A, 0121=2A, 0241=4A" -- same near-linear shape as
+# Voltage, raw_max=241 (see METER_DEFINITIONS["current"]).
+CURRENT_RAW_MAX = 241
 # Fraction of the meter bar's width devoted to S0-S9 vs. S9-S9+60dB,
 # matching the compressed look of a real Icom meter face.
 S_METER_S9_FRACTION = 0.65
@@ -594,24 +623,34 @@ METER_DEFINITIONS = {
         # the other candidates stay as fallbacks -- just reordered so
         # the confirmed name wins first instead of risking an
         # unrelated-but-present earlier guess (find_method_name takes
-        # the first match in list order).
+        # the first match in list order). raw_max=ALC_RAW_MAX (120), NOT
+        # 255 -- confirmed against the IC-705's own CI-V Reference Guide:
+        # "0000=Minimum, 0120=Maximum" -- see that constant's own comment
+        # in this file. A real "ALC at maximum" reading (raw 120) was
+        # previously showing as only ~47% (120/255).
         "getter": "get_alc_meter",
         "getter_candidates": ["get_alc_meter", "get_alc", "get_alc_level", "read_alc"],
         "kind": "linear",
         "unit": "",
-        "raw_max": 255,
+        "raw_max": ALC_RAW_MAX,
         "display_max": 100,
     },
     "voltage": {
         "label": "Voltage",
         # get_vd_meter confirmed as the real name (MetersCapable: "Get Vd
         # meter reading"). Reordered for the same reason as ALC above.
+        # raw_max=VOLTAGE_RAW_MAX (241), NOT 255 -- confirmed against the
+        # IC-705's own CI-V Reference Guide: "0000=0V, 0075=5V,
+        # 0241=16V" -- see that constant's own comment. display_max=16.0
+        # was already correct (matches the real full-scale point
+        # exactly); only the raw_max denominator was wrong, undercounting
+        # a real 16V reading as ~15.1V.
         "getter": "get_vd_meter",
         "getter_candidates": ["get_vd_meter", "get_voltage", "get_supply_voltage", "get_vd", "get_dc_voltage"],
         "kind": "linear",
         "unit": "V",
-        "raw_max": 255,
-        "display_max": 16.0,  # rough guess at supply-voltage full scale
+        "raw_max": VOLTAGE_RAW_MAX,
+        "display_max": 16.0,
     },
     "comp": {
         "label": "COMP",
@@ -619,28 +658,46 @@ METER_DEFINITIONS = {
         # official TX meter parameters (PO/SWR/ALC/COMP/VD/ID, per the
         # IC-7300 manual). get_comp_meter confirmed as the real name
         # (MetersCapable: "Get compression meter reading"). Reordered
-        # for the same reason as ALC above.
+        # for the same reason as ALC above. "direct" kind, NOT the
+        # previous 0-255->0-100% linear percentage -- confirmed against
+        # the IC-705's own CI-V Reference Guide that COMP is a genuinely
+        # non-linear dB reading ("0000=0 dB, 0130=15 dB, 0210=25.5 dB"),
+        # the WRONG UNIT entirely, not just imprecise scaling. RadioWorker
+        # applies COMP_CALIBRATION (piecewise interpolation) before
+        # emitting -- see constants.py's own comment there and
+        # _poll_loop_fast's meter loop.
         "getter": "get_comp_meter",
         "getter_candidates": ["get_comp_meter", "get_comp", "get_compression"],
-        "kind": "linear",
-        "unit": "",
-        "raw_max": 255,
-        "display_max": 100,
+        "kind": "direct",
+        "unit": " dB",
+        "display_min": 0.0,
+        "display_max": 25.5,
     },
     "current": {
         "label": "Current (ID)",
         # Drain current meter -- the other of Icom's 6 official TX meters
-        # not yet covered. IC-7300/IC-9700 draw up to ~20-25A on TX;
-        # IC-705 much less on internal battery -- display_max is a rough
-        # full-scale guess either way, adjust if it looks off in practice.
-        # get_id_meter confirmed as the real name (MetersCapable: "Get
-        # drive (Id) meter reading"). Reordered for the same reason as
-        # ALC above.
+        # not yet covered. get_id_meter confirmed as the real name
+        # (MetersCapable: "Get drive (Id) meter reading"). Reordered for
+        # the same reason as ALC above. raw_max=CURRENT_RAW_MAX (241),
+        # NOT 255 -- confirmed against the IC-705's own CI-V Reference
+        # Guide: "0000=0A, 0121=2A, 0241=4A". That raw-byte encoding
+        # (0-241 = full scale) matches the SAME convention as S-meter
+        # and Voltage above, so it's applied here as a shared protocol-
+        # level constant -- but display_max (the REAL max current a
+        # given radio draws) is genuinely hardware-specific, not a
+        # protocol constant: the IC-705's own real max is only ~4A
+        # (confirmed by that same 0241=4A calibration point) on internal
+        # battery/12V supply, vs. IC-7300/9700-class 100W rigs drawing
+        # up to ~20-25A on TX -- so display_max stays this
+        # base/mobile-rig default here, and RadioWorker._setup_meters()
+        # corrects it to 4.0 specifically for a connected IC-705, same
+        # per-radio-correction pattern already used for "power"'s
+        # max_watts.
         "getter": "get_id_meter",
         "getter_candidates": ["get_id_meter", "get_current", "get_id", "get_drain_current"],
         "kind": "linear",
         "unit": "A",
-        "raw_max": 255,
+        "raw_max": CURRENT_RAW_MAX,
         "display_max": 25.0,
     },
     "temperature": {

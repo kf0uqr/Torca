@@ -171,6 +171,8 @@ from constants import (
     SCOPE_REF_CIV_SUB,
     SCOPE_REF_MIN_DB,
     SCOPE_REF_MAX_DB,
+    POWER_CALIBRATION,
+    COMP_CALIBRATION,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
@@ -276,6 +278,25 @@ def _interpolate_swr(raw: int) -> float:
     return points[-1][1]  # unreachable given the clamps above
 
 
+def _interpolate_calibration(raw: int, calibration_points) -> float:
+    """Generic version of _interpolate_swr's own piecewise-linear
+    interpolation (raw byte -> real value, clamped at the endpoints),
+    for meters other than SWR that also need it (Power/Comp -- see
+    POWER_CALIBRATION/COMP_CALIBRATION's own comments in constants.py).
+    Not used to refactor _interpolate_swr itself, to avoid touching
+    already-confirmed-working code for no functional gain."""
+    points = sorted(calibration_points)
+    if raw <= points[0][0]:
+        return points[0][1]
+    if raw >= points[-1][0]:
+        return points[-1][1]
+    for (lo_raw, lo_val), (hi_raw, hi_val) in zip(points, points[1:]):
+        if lo_raw <= raw <= hi_raw:
+            frac = (raw - lo_raw) / (hi_raw - lo_raw)
+            return lo_val + frac * (hi_val - lo_val)
+    return points[-1][1]  # unreachable given the clamps above
+
+
 def _encode_scope_ref(ref_db: float) -> bytes:
     """CI-V 0x27/0x19 scope reference level, same wire format as
     rigplane's own private _scope_ref_encode -- reimplemented locally
@@ -361,6 +382,7 @@ class RadioWorker(QThread):
         self.is_ic705_preamp_att = False  # set once connected -- see PREAMP_CIV_SUB's comment in constants.py
         self.is_ic705_swr_workaround = False  # set once connected -- see SWR_CIV_SUB's comment in constants.py
         self.is_ic705_scope_ref_workaround = False  # set once connected -- see SCOPE_REF_MIN_DB's comment in constants.py
+        self._power_is_raw_255 = False  # set in _setup_meters() -- Power needs POWER_CALIBRATION applied when True
         # SWR is only meaningful during TX -- confirmed live that
         # without this, the meter just kept showing whatever it last
         # read during the previous transmission (the radio's own SWR
@@ -2039,11 +2061,26 @@ class RadioWorker(QThread):
             native_unit = getattr(self.radio, "native_power_unit", None)
             if native_unit == "watts":
                 self._meter_definitions["power"]["kind"] = "direct"
+                self._power_is_raw_255 = False
                 self.audio_status.emit("Power meter: radio reports native unit 'watts' -- reading directly.")
             elif native_unit == "raw_255":
-                self._meter_definitions["power"]["kind"] = "linear"
+                # "direct" here too, NOT "linear" -- _poll_loop_fast
+                # applies POWER_CALIBRATION (a genuinely non-linear
+                # piecewise curve, confirmed against the IC-705's own
+                # CI-V Reference Guide -- see that constant's own
+                # comment in constants.py) and converts straight to
+                # watts before emitting, same as the native-watts case
+                # above ends up with. The flat raw/255 linear ratio this
+                # used to fall back to was root-caused to a real
+                # miscalibration: the real 100% point is raw byte 213,
+                # not 255, so even a plain raw_max fix alone wouldn't
+                # have been enough -- the curve itself bulges away from
+                # a straight line in between.
+                self._meter_definitions["power"]["kind"] = "direct"
+                self._power_is_raw_255 = True
                 self.audio_status.emit("Power meter: radio reports native unit 'raw_255' -- scaling from raw.")
             else:
+                self._power_is_raw_255 = False
                 self.audio_status.emit(
                     f"Power meter: native_power_unit is {native_unit!r} (expected 'watts' or "
                     "'raw_255') -- defaulting to raw-scale math; watch the reading for sanity."
@@ -2057,20 +2094,25 @@ class RadioWorker(QThread):
             # QRP-max radio: the IC-705's own profile says max_watts=10
             # (rigs/ic705.toml, [power] section), so the SAME raw meter
             # byte that means "~50% of this radio's real max" was being
-            # read against a scale ten times too wide. get_power_meter()
-            # has no per-model calibration table in this rigplane
-            # version (confirmed -- unlike get_swr, nothing in runtime/
-            # radio.py runs it through interpolate_meter), so this is
-            # still a linear raw/255 approximation, not a true
-            # calibrated curve -- but scaled against the CORRECT ceiling
-            # for this specific radio instead of a one-size-fits-all
-            # 100W guess. Only applies to the "linear" (raw_255) kind --
-            # a "direct"/native-watts reading needs no display_max at
-            # all (already real watts).
-            if self._meter_definitions["power"]["kind"] == "linear":
+            # read against a scale ten times too wide. display_max is
+            # still used the same way now (the 100%-of-max-watts
+            # ceiling POWER_CALIBRATION's percent gets multiplied
+            # against), just via _power_is_raw_255 instead of "kind".
+            if self._power_is_raw_255:
                 max_watts = getattr(getattr(self.radio, "profile", None), "max_watts", None)
                 if max_watts:
                     self._meter_definitions["power"]["display_max"] = max_watts
+
+        # Current (Id) display_max (the real max current a given radio
+        # draws) is hardware-specific, not a shared CI-V protocol
+        # constant like raw_max is -- see CURRENT_RAW_MAX's own comment
+        # in constants.py. Confirmed against the IC-705's own CI-V
+        # Reference Guide ("0000=0A, 0121=2A, 0241=4A") that its real
+        # max is ~4A on internal battery/12V supply, vs. the ~25A
+        # default sized for a 100W-class base/mobile rig -- same per-
+        # radio-correction pattern as power's max_watts above.
+        if "current" in self._meter_getters and self._details.get("radio_model") == "IC-705":
+            self._meter_definitions["current"]["display_max"] = 4.0
 
         # SWR's METER_DEFINITIONS entry defaults to "direct" (get_swr's
         # already-calibrated ratio) -- but if this radio/backend only
@@ -2394,6 +2436,26 @@ class RadioWorker(QThread):
                             self._ptt_active = False
                             self._swr_reset_pending = True
                             self.swr_protection_tripped.emit(value)
+                    elif meter_type == "power" and self._power_is_raw_255:
+                        # POWER_CALIBRATION (percent of max, piecewise
+                        # non-linear) converted straight to watts using
+                        # this radio's own max_watts -- see
+                        # _setup_meters()'s own comment for why this
+                        # isn't just a raw/255 ratio.
+                        getter = getattr(self.radio, getter_name)
+                        kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                        raw = await getter(**kwargs)
+                        percent = _interpolate_calibration(raw, POWER_CALIBRATION)
+                        value = percent / 100.0 * definition["display_max"]
+                    elif meter_type == "comp":
+                        # COMP_CALIBRATION -- a genuinely non-linear dB
+                        # reading, not the 0-100% this app used to show
+                        # it as -- see that constant's own comment in
+                        # constants.py.
+                        getter = getattr(self.radio, getter_name)
+                        kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                        raw = await getter(**kwargs)
+                        value = _interpolate_calibration(raw, COMP_CALIBRATION)
                     else:
                         getter = getattr(self.radio, getter_name)
                         kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}

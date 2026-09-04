@@ -41,6 +41,7 @@ from constants import (
     SWR_PROTECTION_THRESHOLD,
     SCOPE_REF_MIN_DB,
     SCOPE_REF_MAX_DB,
+    SCOPE_REF_WIDE_RANGE_MODELS,
     DUAL_RECEIVER_LEVEL_KEYS,
     CONTROL_DEFINITIONS,
     CONTROL_OPTION_EXCLUDED,
@@ -422,14 +423,14 @@ class RadioWindow(QWidget):
         self.scope_span_combo.currentIndexChanged.connect(self._on_scope_span_combo_changed)
 
         self.scope_ref_spin = QDoubleSpinBox()
-        # IC-705's real range is -20.0/+20.0, not the -30.0/+10.0 every
-        # other radio uses -- confirmed live, and confirmed against its
-        # own CI-V Reference Guide (rigplane's set_scope_ref() hardcodes
-        # the IC-7610's range universally instead of per-model; see
-        # SCOPE_REF_MIN_DB's comment in constants.py and RadioWorker's
-        # is_ic705_scope_ref_workaround, which bypasses that for the
-        # actual CI-V write).
-        if details["radio_model"] == "IC-705":
+        # IC-705's and IC-9700's real range is -20.0/+20.0, not the
+        # -30.0/+10.0 every other radio uses -- confirmed live for the
+        # 705 and against the 9700's own CI-V Reference Guide (rigplane's
+        # set_scope_ref() hardcodes the IC-7610's range universally
+        # instead of per-model; see SCOPE_REF_WIDE_RANGE_MODELS' comment
+        # in constants.py and RadioWorker's is_scope_ref_workaround,
+        # which bypasses that for the actual CI-V write).
+        if details["radio_model"] in SCOPE_REF_WIDE_RANGE_MODELS:
             self.scope_ref_spin.setRange(SCOPE_REF_MIN_DB, SCOPE_REF_MAX_DB)
         else:
             self.scope_ref_spin.setRange(-30.0, 10.0)

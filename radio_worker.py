@@ -171,8 +171,11 @@ from constants import (
     SCOPE_REF_CIV_SUB,
     SCOPE_REF_MIN_DB,
     SCOPE_REF_MAX_DB,
+    SCOPE_REF_WIDE_RANGE_MODELS,
     POWER_CALIBRATION,
     COMP_CALIBRATION,
+    VOLTAGE_CALIBRATION_IC9700,
+    CURRENT_CALIBRATION_IC9700,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
@@ -381,7 +384,8 @@ class RadioWorker(QThread):
         self._filter_shape_available = False  # set in _setup_filter_shape() -- send_civ() usable for this radio
         self.is_ic705_preamp_att = False  # set once connected -- see PREAMP_CIV_SUB's comment in constants.py
         self.is_ic705_swr_workaround = False  # set once connected -- see SWR_CIV_SUB's comment in constants.py
-        self.is_ic705_scope_ref_workaround = False  # set once connected -- see SCOPE_REF_MIN_DB's comment in constants.py
+        self.is_scope_ref_workaround = False  # set once connected -- see SCOPE_REF_WIDE_RANGE_MODELS' comment in constants.py
+        self._scope_receiver = 0  # 0=MAIN, 1=SUB -- tracks set_scope_receiver() so the raw scope-ref bypass targets the right one
         self._power_is_raw_255 = False  # set in _setup_meters() -- Power needs POWER_CALIBRATION applied when True
         # SWR is only meaningful during TX -- confirmed live that
         # without this, the meter just kept showing whatever it last
@@ -1950,7 +1954,14 @@ class RadioWorker(QThread):
             self._details.get("radio_model") == "IC-705" and hasattr(self.radio, "send_civ")
         )
         self.is_ic705_swr_workaround = self.is_ic705_preamp_att  # same model+send_civ gate, see SWR_CIV_SUB's comment
-        self.is_ic705_scope_ref_workaround = self.is_ic705_preamp_att  # same gate, see SCOPE_REF_MIN_DB's comment
+        # Broader than the IC-705-only workarounds above -- confirmed
+        # against BOTH the IC-705's and IC-9700's own CI-V Reference
+        # Guides that the real range is -20.0/+20.0, not rigplane's
+        # IC-7610-specific -30.0/+10.0 default -- see
+        # SCOPE_REF_WIDE_RANGE_MODELS' comment in constants.py.
+        self.is_scope_ref_workaround = (
+            self._details.get("radio_model") in SCOPE_REF_WIDE_RANGE_MODELS and hasattr(self.radio, "send_civ")
+        )
         self.connected.emit()
         # Everything from here through the poll loops is wrapped in one
         # try/finally so self._radio_cm.__aexit__() (closing the actual
@@ -2113,6 +2124,21 @@ class RadioWorker(QThread):
         # radio-correction pattern as power's max_watts above.
         if "current" in self._meter_getters and self._details.get("radio_model") == "IC-705":
             self._meter_definitions["current"]["display_max"] = 4.0
+
+        # IC-9700's Voltage/Current curves are genuinely non-linear
+        # (unlike the IC-705's, a flat display_max fix isn't enough) --
+        # see VOLTAGE_CALIBRATION_IC9700/CURRENT_CALIBRATION_IC9700's own
+        # comment in constants.py. Switched to "direct" (piecewise
+        # interpolation applied in _poll_loop_fast, same pattern as
+        # "comp") instead of "linear"; every other radio keeps the
+        # existing linear raw_max/display_max math unchanged.
+        if self._details.get("radio_model") == "IC-9700":
+            if "voltage" in self._meter_getters:
+                self._meter_definitions["voltage"]["kind"] = "direct"
+                self._meter_definitions["voltage"]["display_max"] = 16.0
+            if "current" in self._meter_getters:
+                self._meter_definitions["current"]["kind"] = "direct"
+                self._meter_definitions["current"]["display_max"] = 20.0
 
         # SWR's METER_DEFINITIONS entry defaults to "direct" (get_swr's
         # already-calibrated ratio) -- but if this radio/backend only
@@ -2456,6 +2482,18 @@ class RadioWorker(QThread):
                         kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
                         raw = await getter(**kwargs)
                         value = _interpolate_calibration(raw, COMP_CALIBRATION)
+                    elif meter_type in ("voltage", "current") and definition["kind"] == "direct":
+                        # IC-9700-only path (_setup_meters() only flips
+                        # these to "direct" for that model) -- applies
+                        # VOLTAGE_CALIBRATION_IC9700/CURRENT_CALIBRATION_
+                        # IC9700 (genuinely non-linear, see their own
+                        # comment in constants.py), same piecewise
+                        # pattern as "comp" above.
+                        getter = getattr(self.radio, getter_name)
+                        kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                        raw = await getter(**kwargs)
+                        table = VOLTAGE_CALIBRATION_IC9700 if meter_type == "voltage" else CURRENT_CALIBRATION_IC9700
+                        value = _interpolate_calibration(raw, table)
                     else:
                         getter = getattr(self.radio, getter_name)
                         kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
@@ -2825,6 +2863,11 @@ class RadioWorker(QThread):
     async def _set_scope_receiver(self, receiver: int):
         try:
             await self.radio.set_scope_receiver(receiver)
+            # Tracked locally so is_scope_ref_workaround's raw CI-V bypass
+            # (_set_scope_ref) can send the correct 00=Main/01=Sub prefix
+            # byte instead of assuming Main -- rigplane's own ScopeControlsState
+            # doesn't expose this back out for us to read.
+            self._scope_receiver = receiver
         except Exception as exc:
             self.error.emit(f"Select scope receiver ({receiver}) failed: {exc}")
 
@@ -2888,32 +2931,40 @@ class RadioWorker(QThread):
         """Thread-safe: call from the GUI thread. -30.0 to +10.0 dB in
         0.5 dB steps on most radios (rigplane's own set_scope_ref(),
         confirmed via commands/scope.py's _scope_ref_encode()) -- except
-        the IC-705, whose real range is -20.0 to +20.0 dB and gets
-        bypassed with a local encoder instead (see is_ic705_scope_ref_
-        workaround / SCOPE_REF_MIN_DB's comment in constants.py)."""
+        the models in SCOPE_REF_WIDE_RANGE_MODELS (IC-705, IC-9700),
+        whose real range is -20.0 to +20.0 dB and get bypassed with a
+        local encoder instead (see is_scope_ref_workaround /
+        SCOPE_REF_WIDE_RANGE_MODELS' comment in constants.py)."""
         if self.loop is None or self.radio is None:
             return
         asyncio.run_coroutine_threadsafe(self._set_scope_ref(ref_db), self.loop)
 
     async def _set_scope_ref(self, ref_db: float):
         try:
-            if self.is_ic705_scope_ref_workaround:
+            if self.is_scope_ref_workaround:
                 # Raw CI-V 0x27/0x19 write via send_civ(), NOT
-                # rigplane's own set_scope_ref() -- see SCOPE_REF_MIN_DB's
-                # comment in constants.py for why. The leading b"\x00" is
-                # a required receiver-index prefix byte (0=MAIN) that
-                # rigplane's own set_scope_ref() always adds too --
-                # confirmed by reading its _scope_payload() helper:
-                # ScopeControlsState.receiver defaults to 0 (a real int,
-                # never None) even for a single-receiver radio, so that
-                # prefix byte is unconditional. Confirmed live this was
-                # the actual bug: omitting it meant the write silently
-                # did nothing (malformed frame, no error either) while
-                # reads kept working fine through rigplane's own
-                # unmodified get_scope_ref(), which includes the same
-                # prefix on its own get path.
+                # rigplane's own set_scope_ref() -- see
+                # SCOPE_REF_WIDE_RANGE_MODELS' comment in constants.py for
+                # why. The leading prefix byte is a required receiver-
+                # index (0=MAIN, 1=SUB) that rigplane's own
+                # set_scope_ref() always adds too -- confirmed by reading
+                # its _scope_payload() helper: ScopeControlsState.receiver
+                # defaults to 0 (a real int, never None) even for a
+                # single-receiver radio, so that prefix byte is
+                # unconditional. Confirmed live this was the actual bug
+                # on IC-705: omitting it meant the write silently did
+                # nothing (malformed frame, no error either) while reads
+                # kept working fine through rigplane's own unmodified
+                # get_scope_ref(), which includes the same prefix on its
+                # own get path. self._scope_receiver (kept in sync by
+                # set_scope_receiver()) picks the right byte for a real
+                # dual-receiver radio like the IC-9700 instead of
+                # hardcoding Main.
                 await self.radio.send_civ(
-                    0x27, sub=SCOPE_REF_CIV_SUB, data=b"\x00" + _encode_scope_ref(ref_db), wait_response=False
+                    0x27,
+                    sub=SCOPE_REF_CIV_SUB,
+                    data=bytes([self._scope_receiver]) + _encode_scope_ref(ref_db),
+                    wait_response=False,
                 )
             else:
                 await self.radio.set_scope_ref(ref_db)

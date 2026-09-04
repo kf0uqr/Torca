@@ -461,15 +461,22 @@ SWR_PROTECTION_THRESHOLD = 2.5
 # own documented range (-30.0/+10.0) universally to every model instead
 # of per-model. The IC-705's own CI-V Reference Guide documents -20.0
 # to +20.0 dB in 0.5 dB steps (Misc/IC-705_ENG_CI-V_4b.pdf p.28). The
-# CI-V command/wire format itself (0x27 sub 0x19) is NOT in question --
-# RadioWorker reimplements just the encoding step locally, without
-# rigplane's wrong range check, for IC-705 only; every other radio
-# keeps using rigplane's own set_scope_ref() unchanged. Reading back
-# (get_scope_ref) is unaffected -- rigplane's decoder has no range
-# validation on that side, confirmed by reading parse_scope_ref_response.
+# IC-9700's own CI-V Reference Guide confirms the SAME -20.0/+20.0
+# range (Misc/IC-9700_ENG_CI-V_3a.pdf p.24, "Adjustable range: -20.0 dB
+# ~ +20.0 dB in 0.5 dB steps"), so this isn't an IC-705 quirk -- it's
+# rigplane's IC-7610-specific default being wrong for both the radios
+# this app has real manual evidence for so far. The CI-V command/wire
+# format itself (0x27 sub 0x19) is NOT in question -- RadioWorker
+# reimplements just the encoding step locally, without rigplane's wrong
+# range check, for the models in SCOPE_REF_WIDE_RANGE_MODELS; every
+# other radio keeps using rigplane's own set_scope_ref() unchanged.
+# Reading back (get_scope_ref) is unaffected -- rigplane's decoder has
+# no range validation on that side, confirmed by reading
+# parse_scope_ref_response.
 SCOPE_REF_CIV_SUB = 0x19
 SCOPE_REF_MIN_DB = -20.0
 SCOPE_REF_MAX_DB = 20.0
+SCOPE_REF_WIDE_RANGE_MODELS = {"IC-705", "IC-9700"}
 
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on
 # a dual-receiver radio. Their real getter/setter DOES accept a
@@ -528,6 +535,25 @@ VOLTAGE_RAW_MAX = 241
 # Current (Id): "0000=0A, 0121=2A, 0241=4A" -- same near-linear shape as
 # Voltage, raw_max=241 (see METER_DEFINITIONS["current"]).
 CURRENT_RAW_MAX = 241
+
+# Voltage/Current calibration is NOT actually a shared protocol constant
+# across radio models -- confirmed against the IC-9700's own CI-V
+# Reference Guide (Misc/IC-9700_ENG_CI-V_3a.pdf p.6), which documents a
+# genuinely different curve from the IC-705's: "Read Vd meter level:
+# 0000=0V, 0013=10V, 0241=16V" and "Read Id meter level: 0000=0A,
+# 0121=10A, 0241=20A". The raw byte 0-241 full-scale ENCODING is shared
+# (same convention as S-meter), but the two segments are wildly
+# non-linear for the 9700 (0-13 covers 0-10V, then 13-241 covers only
+# the remaining 6V) -- nothing like the IC-705's near-linear split. A
+# flat raw_max fix (as used for the 705) would be badly wrong here, so
+# this radio gets its own piecewise table, applied the same way
+# COMP_CALIBRATION is (see RadioWorker._setup_meters()/_poll_loop_fast).
+VOLTAGE_CALIBRATION_IC9700 = [(0, 0.0), (13, 10.0), (241, 16.0)]
+# Current (Id): same "shared raw breakpoints, different real-amps
+# meaning" story -- the IC-9700 is a base/mobile-class 100W dual-bander
+# with real TX current up to ~20A, vs. the IC-705's ~4A QRP/battery
+# draw, despite both hitting their documented midpoint at raw byte 121.
+CURRENT_CALIBRATION_IC9700 = [(0, 0.0), (121, 10.0), (241, 20.0)]
 # Fraction of the meter bar's width devoted to S0-S9 vs. S9-S9+60dB,
 # matching the compressed look of a real Icom meter face.
 S_METER_S9_FRACTION = 0.65

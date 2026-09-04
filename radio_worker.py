@@ -178,6 +178,7 @@ from constants import (
     CURRENT_CALIBRATION_IC9700,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
+    CONTROL_UNSUPPORTED,
     POLL_INTERVAL_SEC,
     SLOW_POLL_INTERVAL_SEC,
     AUDIO_DEVICE_SYSTEM_DEFAULT,
@@ -2175,11 +2176,23 @@ class RadioWorker(QThread):
         Icom's own CI-V reference documents command 0x08 as SELECT-only,
         no GET variant at all) only need a setter to resolve -- the poll
         loop skips these entirely rather than polling something that is
-        guaranteed to fail every single cycle forever."""
+        guaranteed to fail every single cycle forever.
+
+        Entries in CONTROL_UNSUPPORTED for this connected radio_model are
+        skipped altogether -- see that constant's own comment in
+        constants.py. Unlike a missing getter/setter (reported below as
+        an actionable "wrong guess" warning), this is a confirmed-absent
+        hardware register on a rigplane method that resolves fine (so
+        find_method_name would otherwise happily discover it and poll it
+        forever, timing out every single cycle) -- reported as neither
+        missing nor working, just silently left out."""
         missing = []
         self._control_methods = {}
         self._control_enums = {}
+        radio_model = self._details.get("radio_model")
         for key, definition in CONTROL_DEFINITIONS.items():
+            if (radio_model, key) in CONTROL_UNSUPPORTED:
+                continue
             set_name = find_method_name(self.radio, definition["setter_candidates"])
             if definition.get("write_only"):
                 get_name = None  # deliberately never resolved/polled -- see definition's comment

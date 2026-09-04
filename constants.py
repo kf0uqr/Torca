@@ -936,3 +936,27 @@ CONTROL_OPTION_EXCLUDED = {
     # else in this file that hasn't had a live hardware test yet.
     ("IC-9700", "agc"): {"OFF"},
 }
+
+# Radio-specific CONTROL_DEFINITIONS entries to skip resolving/polling
+# entirely (unlike CONTROL_OPTION_EXCLUDED above, which just trims a
+# combo's choices -- this is for a control rigplane's Python API exposes
+# UNIVERSALLY on every Icom radio class (so find_method_name always
+# finds a real getter/setter to call) but whose underlying CI-V register
+# a specific model's real hardware genuinely doesn't implement at all,
+# meaning every single poll attempt times out waiting for a response
+# that will never come. Root-caused a real "XIT: CI-V response timed
+# out" log spam (recurring every slow-poll cycle, ~5-10s) on a real
+# IC-9700 to exactly this: get_rit_tx_status()/set_rit_tx_status() (CI-V
+# 0x21 sub 0x02) are real, callable rigplane methods (RitXitCapable is
+# implemented generically), but the IC-9700's own CI-V Reference Guide
+# (Misc/IC-9700_ENG_CI-V_3a.pdf p.17) documents command 0x21 with ONLY
+# sub-commands 00 (RIT frequency) and 01 (RIT on/off) -- no sub 02 at
+# all -- and the IC-9700's own Basic manual (Misc/IC-9700_ENG_Basic_6.
+# pdf) never mentions "XIT" anywhere, only a RIT button/function (p.
+# 4-1). The IC-9700 simply has no transmit-side RIT offset as a
+# separate hardware feature, unlike some other Icom rigs -- this isn't
+# a wrong getter guess (like CONTROL_OPTION_EXCLUDED's cases), it's a
+# genuinely absent register, so there's no value in retrying it forever.
+CONTROL_UNSUPPORTED = {
+    ("IC-9700", "xit"),
+}

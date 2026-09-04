@@ -730,4 +730,9 @@ CONTROL_DEFINITIONS = {
 # that reliably error, while leaving OFF (the one that works) in place.
 CONTROL_OPTION_EXCLUDED = {
     ("IC-705", "preamp"): {"P.AMP1", "P.AMP2"},
+    # AGC can't actually be turned off on the IC-705 -- confirmed live:
+    # selecting "OFF" doesn't disable AGC on the radio (AgcMode.OFF isn't
+    # a real state this model supports, unlike FAST/MID/SLOW). Excluded
+    # here rather than offering a choice that doesn't do what it says.
+    ("IC-705", "agc"): {"OFF"},
 }

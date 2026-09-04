@@ -3521,6 +3521,34 @@ class RadioWorker(QThread):
         # in-flight result, so it's worth passing regardless.
         return await self.radio.get_frequency(receiver=addressing, bypass_cache=True)
 
+    async def _read_other_receiver_frequency(self, other_receiver: int, restore_to: int) -> int:
+        """Genuinely reads `other_receiver`'s real frequency by actually
+        switching to it first, instead of trusting _get_receiver_
+        frequency's addressing=RECEIVER_SUB ("unselected VFO", CI-V 0x25
+        0x01) shortcut -- root-caused a real "Main can't switch to a band
+        Sub is on" report, where Sub genuinely WAS on the conflicting
+        band, to that shortcut being flat-out wrong on the IC-9700: its
+        own CI-V Reference Guide documents command 0x25 as "Selected or
+        unselected VFO frequency settings (Only MAIN band)" and states
+        outright "You cannot set the SUB band frequency" -- meaning
+        0x25/0x01 reads MAIN's OTHER VFO SLOT (A vs B), not Sub's
+        frequency at all, whenever Main is the genuinely active receiver.
+        The conflict check was silently reading garbage and always
+        concluding "no conflict" as a result. Restores `restore_to`
+        (the caller's own intended receiver) before returning, so the
+        caller's own subsequent reads/writes still land correctly.
+        Callers must hold self._receiver_switch_lock across this AND
+        their own follow-up work, same as every other receiver-switching
+        sequence in this file."""
+        try:
+            await self.radio.select_receiver(other_receiver)
+            self._active_receiver = other_receiver
+            freq_hz = await self.radio.get_frequency(receiver=RECEIVER_MAIN, bypass_cache=True)
+        finally:
+            await self.radio.select_receiver(restore_to)
+            self._active_receiver = restore_to
+        return freq_hz
+
     async def _resolve_receiver_band_conflict(self, receiver: int, freq_hz: int):
         """Dual-receiver only. Confirmed live on a real 9700: Main and
         Sub can't occupy the same band at the same time -- moving one
@@ -3579,7 +3607,17 @@ class RadioWorker(QThread):
             return
         other_receiver = RECEIVER_MAIN if receiver == RECEIVER_SUB else RECEIVER_SUB
         try:
-            other_freq_hz = await self._get_receiver_frequency(other_receiver)
+            # Genuinely switches to other_receiver, reads it, and
+            # restores `receiver` -- NOT _get_receiver_frequency's
+            # addressing=RECEIVER_SUB ("unselected VFO") shortcut, which
+            # is confirmed broken for this exact check on the IC-9700
+            # (see _read_other_receiver_frequency's own docstring). Under
+            # the lock: this now performs real receiver switches (not
+            # just a read), so it needs the same protection against a
+            # concurrent poll cycle interleaving as every other
+            # receiver-switching sequence in this file.
+            async with self._receiver_switch_lock:
+                other_freq_hz = await self._read_other_receiver_frequency(other_receiver, receiver)
         except Exception as exc:
             self.error.emit(f"Band-conflict check (receiver {other_receiver}) failed: {exc}")
             return

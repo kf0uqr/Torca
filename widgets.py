@@ -10,7 +10,7 @@ import math
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QImage, QRadialGradient
-from PySide6.QtWidgets import QWidget, QMenu, QToolTip
+from PySide6.QtWidgets import QWidget, QMenu, QToolTip, QSizePolicy
 
 from constants import (
     METER_DEFINITIONS, S_METER_RAW_S9, S_METER_RAW_MAX, S_METER_S9_FRACTION, DEGREES_PER_KNOB_STEP,
@@ -369,8 +369,16 @@ class FilterShapeWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(150)
-        self.setMinimumHeight(150)
+        # Expanding (not setFixedWidth/a bare minimum) -- lets this
+        # widget actually grow to fill the empty space around it in
+        # main_window.py's filter_shape_column, rather than staying
+        # pinned at a small fixed size while its container is much
+        # bigger. paintEvent already computes everything from
+        # self.width()/self.height() (proportional, not pixel-fixed), so
+        # it scales up cleanly.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumWidth(200)
+        self.setMinimumHeight(200)
         self._mode = None            # set via set_mode()
         self._pbt_inner = None       # set via set_pbt() -- None means "draw both trapezoids centered"
         self._pbt_outer = None

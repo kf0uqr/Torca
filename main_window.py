@@ -672,19 +672,23 @@ class RadioWindow(QWidget):
         # bottom of the window next to the unrelated AF Gain/Squelch/etc
         # level sliders (per explicit instruction).
         filter_shape_column = QVBoxLayout()
-        filter_shape_column.addWidget(self.filter_shape_widget, alignment=Qt.AlignHCenter)
+        # No Qt.AlignHCenter here -- that would size the widget to its
+        # hint and center it instead of letting its Expanding size
+        # policy actually stretch it to fill the column. No trailing
+        # addStretch() either -- filter_shape_widget's own Expanding
+        # policy absorbs the vertical space that used to sit empty below
+        # the sliders, instead of leaving it blank.
+        filter_shape_column.addWidget(self.filter_shape_widget)
         filter_shape_column.addLayout(pbt_row)
-        filter_shape_column.addStretch()
 
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
-        # All the stretch lives here now, between left_column and
-        # rit_column -- rit_column sits snug against knob_row (a fixed,
-        # modest gap, not addStretch()) instead of floating in the
-        # middle, leaving the whole space between left_column and the
-        # RIT/tuning knob pair open for more buttons later.
-        tuning_row.addStretch()
-        tuning_row.addLayout(filter_shape_column)
+        # filter_shape_column takes the stretch itself now (both the
+        # widget's own Expanding size policy and this stretch factor),
+        # filling what used to be a bare addStretch() gap to its left,
+        # per explicit instruction -- rit_column still sits snug against
+        # knob_row (fixed spacing, no stretch of its own).
+        tuning_row.addLayout(filter_shape_column, 1)
         tuning_row.addSpacing(8)
         tuning_row.addLayout(rit_column)
         tuning_row.addSpacing(16)

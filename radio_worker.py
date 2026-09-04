@@ -3538,6 +3538,21 @@ class RadioWorker(QThread):
         async with self._receiver_switch_lock:
             try:
                 await self.radio.select_receiver(other_receiver)
+                # _get_receiver_frequency() (used for the confirmation
+                # read-back below) decides which literal receiver= value
+                # to pass rigplane based on self._active_receiver, NOT
+                # what's genuinely selected on the wire -- root-caused a
+                # real false-negative "hasn't landed there yet" report to
+                # this line being missing: without it, self._active_
+                # receiver was still stale (whatever it was before this
+                # method started, e.g. Main), so the confirmation read
+                # asked rigplane for "the unselected receiver" right
+                # after Sub had actually just become the selected one --
+                # reading Main's own unchanged frequency back instead of
+                # Sub's, which could never match safe_label and made the
+                # confirmation fail every single time regardless of
+                # whether the parking write actually worked.
+                self._active_receiver = other_receiver
                 await self.radio.set_vfo_slot("A", receiver=other_receiver)
                 await self.radio.set_frequency(safe_low_hz, receiver=other_receiver)
                 # The frequency write above is fire-and-forget (rigplane
@@ -3557,8 +3572,8 @@ class RadioWorker(QThread):
                 # snaps back to the old one on the next poll" symptom
                 # reported live.
                 parked = False
-                for _ in range(3):
-                    await asyncio.sleep(0.15)
+                for _ in range(5):
+                    await asyncio.sleep(0.2)
                     confirm_freq_hz = await self._get_receiver_frequency(other_receiver)
                     confirm_band = self._find_band(confirm_freq_hz)
                     if confirm_band is not None and confirm_band[0] == safe_label:
@@ -3576,8 +3591,11 @@ class RadioWorker(QThread):
                 # see this method's own docstring for the exact bug this
                 # fixes (a bare frequency write, right after this returns,
                 # otherwise silently lands on other_receiver instead).
+                # Also restores self._active_receiver to match, for the
+                # same reason it was set to other_receiver above.
                 try:
                     await self.radio.select_receiver(receiver)
+                    self._active_receiver = receiver
                 except Exception as exc:
                     self.error.emit(f"Restoring active receiver ({receiver}) after band-conflict resolution failed: {exc}")
 

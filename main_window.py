@@ -1362,10 +1362,23 @@ class RadioWindow(QWidget):
 
         freq_hz = uplink_hz if checked else downlink_hz
         nominal_freq_hz = base_uplink_hz if checked else base_downlink_hz
-        if freq_hz is None:
+        if freq_hz is None or base_uplink_hz is None:
             # No usable frequency for this direction (e.g. no uplink
             # stored for this transponder) -- key/unkey without a
             # bundled retune, same graceful-degradation as the tick.
+            #
+            # base_uplink_hz is None also covers the single-frequency-
+            # transponder case (apply_satellite_tick's own docstring):
+            # on RELEASE, freq_hz would otherwise be downlink_hz (a real
+            # value, since this transponder has a perfectly good
+            # downlink -- just no separate uplink), which would skip
+            # this branch entirely and fall into the dual-receiver path
+            # below, retuning/reselecting SUB -- wrong here, since
+            # apply_satellite_tick keeps MAIN continuously tracking the
+            # single shared frequency for this transponder type and Sub
+            # is deliberately left alone. Main is already sitting on the
+            # right frequency by the time PTT is pressed OR released, so
+            # there's nothing to retune either way -- just key/unkey.
             if checked:
                 self.worker.start_ptt()
             else:
@@ -1502,6 +1515,25 @@ class RadioWindow(QWidget):
         receiver flip-flop continuously). Main sits wherever PTT last
         left it between transmissions -- see _on_ptt_toggled.
 
+        Exception: a transponder with NO recorded uplink at all
+        (base_uplink_hz is None -- an empty "uplink_mhz" field, per
+        explicit instruction) is a single-frequency bird, not a "we
+        don't know the uplink" gap -- the same frequency serves as both
+        downlink and uplink (common for simple FM/beacon cubesats with
+        no distinct repeater uplink). Splitting Sub (RX)/Main (TX)
+        across two receivers makes no sense for one shared frequency --
+        real transmitting is Main-only regardless (hardware limitation,
+        confirmed live: PTT always transmits from Main), so this case
+        just keeps MAIN continuously re-tuned to the Doppler-corrected
+        downlink every tick, transmitting or not, and leaves Sub alone
+        entirely -- same "always tracked, no TX/RX-dependent gate"
+        approach the dedicated "downlink" role below already uses for
+        its own single VFO. _on_ptt_toggled's existing "no usable
+        uplink frequency -- key without a bundled retune" fallback
+        already does the right thing on PTT press in this case (Main is
+        already sitting on the correct, shared frequency by the time
+        PTT is pressed, so there's nothing left to retune).
+
         "downlink": always re-tuned to the downlink, VFO A, every tick,
         unconditionally -- this role never transmits, so there's no
         "while receiving" gate needed at all.
@@ -1517,33 +1549,43 @@ class RadioWindow(QWidget):
             return ""
         warning_text = ""
         if self._role == "full_duplex":
-            transmitting = self.ptt_button.isChecked()
-            freq_hz = None
-            if transmitting:
-                freq_hz = uplink_hz
-                if freq_hz is not None:
-                    # Per explicit instruction, after several rounds of
-                    # live VFO/mode corruption traced back to switching
-                    # Main's VFO A<->B at all: Main now just stays on
-                    # whichever VFO it started the session on (same as
-                    # Sub already always does) and gets retuned in
-                    # place -- set_receiver_frequency reselects Main as
-                    # active (necessary for reliability -- see its own
-                    # docstring) and writes the frequency directly, no
-                    # VFO-slot switching and no conflict check.
-                    self.worker.set_receiver_frequency(RECEIVER_MAIN, freq_hz)
-            else:
+            if base_uplink_hz is None:
+                # Single-frequency transponder (no recorded uplink at
+                # all) -- see this method's own docstring. Main tracks
+                # the shared downlink/uplink continuously, transmitting
+                # or not; Sub is left alone entirely.
                 freq_hz = downlink_hz
                 if freq_hz is not None:
-                    if not self._sub_vfo_a_selected:
-                        self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, freq_hz)
-                        self._sub_vfo_a_selected = True
-                    else:
-                        self.worker.set_receiver_frequency(RECEIVER_SUB, freq_hz)
+                    self.worker.set_receiver_frequency(RECEIVER_MAIN, freq_hz)
+                nominal_hz = base_downlink_hz
+            else:
+                transmitting = self.ptt_button.isChecked()
+                freq_hz = None
+                if transmitting:
+                    freq_hz = uplink_hz
+                    if freq_hz is not None:
+                        # Per explicit instruction, after several rounds of
+                        # live VFO/mode corruption traced back to switching
+                        # Main's VFO A<->B at all: Main now just stays on
+                        # whichever VFO it started the session on (same as
+                        # Sub already always does) and gets retuned in
+                        # place -- set_receiver_frequency reselects Main as
+                        # active (necessary for reliability -- see its own
+                        # docstring) and writes the frequency directly, no
+                        # VFO-slot switching and no conflict check.
+                        self.worker.set_receiver_frequency(RECEIVER_MAIN, freq_hz)
+                else:
+                    freq_hz = downlink_hz
+                    if freq_hz is not None:
+                        if not self._sub_vfo_a_selected:
+                            self.worker.select_receiver_vfo_and_set_frequency(RECEIVER_SUB, freq_hz)
+                            self._sub_vfo_a_selected = True
+                        else:
+                            self.worker.set_receiver_frequency(RECEIVER_SUB, freq_hz)
+                nominal_hz = base_uplink_hz if transmitting else base_downlink_hz
             if freq_hz is not None:
                 self._current_freq_hz = freq_hz
                 self._set_freq_display_text(f"{freq_hz / 1e6:.6f} MHz")
-                nominal_hz = base_uplink_hz if transmitting else base_downlink_hz
                 if nominal_hz is not None:
                     self.nominal_freq_display.setText(f"{nominal_hz / 1e6:.6f} MHz")
                 self._update_band_button_highlight()

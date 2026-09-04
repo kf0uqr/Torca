@@ -13,7 +13,7 @@ import inspect
 
 from PySide6.QtCore import QThread, Signal
 
-from rigplane import create_radio, LanBackendConfig, CommandError, AudioCodec, Priority
+from rigplane import create_radio, LanBackendConfig, CommandError, AudioCodec
 try:
     # Confirmed by reading rigplane's own source
     # (backends/config.py's SerialBackendConfig.__init__): the real
@@ -2538,13 +2538,34 @@ class RadioWorker(QThread):
         ~20 settings reads every cycle and lag several seconds behind a
         real PTT press. Splitting the loops means the fast loop's own
         requests no longer have to wait for this loop's entire backlog
-        to finish first. Our own raw send_civ() calls here also pass
-        Priority.BACKGROUND, rigplane's own documented mechanism for
-        exactly this ("background pollers pass Priority.BACKGROUND so
-        polls yield to user commands") -- rigplane's higher-level
-        convenience methods (get_mode, get_filter_width, etc.) don't
-        expose a priority knob to pass through, so only our own bespoke
-        raw-CI-V calls (PBT/filter shape/preamp/attenuator) get this."""
+        to finish first.
+
+        Our own raw send_civ() calls here (PBT/filter shape/preamp/
+        attenuator) deliberately do NOT pass priority=Priority.BACKGROUND
+        despite being background-poller reads, unlike what rigplane's own
+        docs suggest ("background pollers pass Priority.BACKGROUND so
+        polls yield to user commands") -- root-caused a real "these four
+        specifically time out on essentially every single poll cycle,
+        while everything else on the same connection works fine" report
+        on a real IC-9700 to exactly this: rigplane's commander is a
+        strict priority queue (IMMEDIATE < NORMAL < BACKGROUND, lower
+        number dispatched first), and EVERYTHING else touching this
+        radio -- _poll_loop_fast's own frequency/meter reads (every
+        POLL_INTERVAL_SEC, forever), this loop's own controls/levels
+        reads, and even user-initiated writes -- goes through at
+        Priority.NORMAL, because rigplane's higher-level convenience
+        methods (get_mode, get_filter_width, select_receiver, etc.) don't
+        expose a priority knob at all and always send NORMAL internally.
+        BACKGROUND was the ONLY thing in this entire app ever sent at
+        that lower tier, meaning it was competing against a continuous,
+        NEVER-ENDING stream of NORMAL-priority traffic (the fast loop
+        alone never stops) -- a lower-priority item behind an endless
+        stream of higher-priority work can be starved indefinitely, not
+        just delayed, which matches the observed 100%-timeout-every-
+        cycle symptom far better than ordinary connection slowness would.
+        Sending these at the same (default) priority as everything else
+        lets them compete fairly (FIFO within the tier) instead of being
+        permanently outranked."""
         while not self._stop_requested:
             if self.is_scope_capable:
                 # Reflects the scope's real settings -- e.g. hand-adjusted
@@ -2715,7 +2736,7 @@ class RadioWorker(QThread):
                         # rigplane's own get_pbt_inner/get_pbt_outer -- see
                         # PBT_DEFINITIONS' comment in constants.py for why.
                         resp = await self.radio.send_civ(
-                            0x14, sub=civ_sub, wait_response=True, priority=Priority.BACKGROUND
+                            0x14, sub=civ_sub, wait_response=True
                         )
                         if resp is not None and len(resp.data) >= 2:
                             self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
@@ -2736,7 +2757,7 @@ class RadioWorker(QThread):
                         # rigplane's own get_filter_shape() -- see
                         # FILTER_SHAPE_CIV_SUB's comment in constants.py.
                         resp = await self.radio.send_civ(
-                            0x16, sub=FILTER_SHAPE_CIV_SUB, wait_response=True, priority=Priority.BACKGROUND
+                            0x16, sub=FILTER_SHAPE_CIV_SUB, wait_response=True
                         )
                         if resp is not None and resp.data:
                             self.filter_shape_updated.emit(resp.data[0])
@@ -2749,10 +2770,10 @@ class RadioWorker(QThread):
                         # get_preamp()/attenuator methods -- see
                         # PREAMP_CIV_SUB's comment in constants.py.
                         preamp_resp = await self.radio.send_civ(
-                            0x16, sub=PREAMP_CIV_SUB, wait_response=True, priority=Priority.BACKGROUND
+                            0x16, sub=PREAMP_CIV_SUB, wait_response=True
                         )
                         atten_resp = await self.radio.send_civ(
-                            ATT_CIV_COMMAND, wait_response=True, priority=Priority.BACKGROUND
+                            ATT_CIV_COMMAND, wait_response=True
                         )
                         if preamp_resp is not None and preamp_resp.data and atten_resp is not None and atten_resp.data:
                             self.preamp_att_updated.emit(

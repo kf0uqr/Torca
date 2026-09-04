@@ -663,6 +663,19 @@ class RadioWindow(QWidget):
         rit_column.addWidget(self.rit_offset_label, alignment=Qt.AlignHCenter)
         rit_column.addWidget(self.rit_status_button, alignment=Qt.AlignHCenter)
 
+        # filter_shape_widget's own column: the graphic on top, PBT
+        # Inner/PBT Outer/Filter Width sliders stacked directly under it
+        # (pbt_row, built above) -- fills the empty space below the
+        # graphic that used to just be blank, and keeps the whole
+        # "twin PBT + filter width" control group visually grouped with
+        # the graphic it drives, rather than separated at the very
+        # bottom of the window next to the unrelated AF Gain/Squelch/etc
+        # level sliders (per explicit instruction).
+        filter_shape_column = QVBoxLayout()
+        filter_shape_column.addWidget(self.filter_shape_widget, alignment=Qt.AlignHCenter)
+        filter_shape_column.addLayout(pbt_row)
+        filter_shape_column.addStretch()
+
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(left_column)
         # All the stretch lives here now, between left_column and
@@ -671,7 +684,7 @@ class RadioWindow(QWidget):
         # middle, leaving the whole space between left_column and the
         # RIT/tuning knob pair open for more buttons later.
         tuning_row.addStretch()
-        tuning_row.addWidget(self.filter_shape_widget, alignment=Qt.AlignVCenter)
+        tuning_row.addLayout(filter_shape_column)
         tuning_row.addSpacing(8)
         tuning_row.addLayout(rit_column)
         tuning_row.addSpacing(16)
@@ -687,7 +700,6 @@ class RadioWindow(QWidget):
         layout.addLayout(self.band_buttons_row)
         layout.addLayout(tuning_row)
         layout.addLayout(levels_row)
-        layout.addLayout(pbt_row)
         layout.addWidget(self.status_label)
         self.setLayout(layout)
 

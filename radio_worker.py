@@ -170,6 +170,7 @@ from constants import (
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
+    SLOW_POLL_EVERY_N_CYCLES,
     AUDIO_DEVICE_SYSTEM_DEFAULT,
     AUDIO_TX_PCM_FRAME_BYTES,
 )
@@ -342,6 +343,7 @@ class RadioWorker(QThread):
         # polling SWR at all while not transmitting.
         self._ptt_active = False
         self._swr_reset_pending = False  # True right after PTT releases, until one reset value has been emitted
+        self._poll_cycle_count = 0  # see is_slow_poll_cycle in _poll_loop
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -2230,6 +2232,21 @@ class RadioWorker(QThread):
         whichever type it's currently showing, rather than the worker
         needing to track which widget wants which type."""
         while not self._stop_requested:
+            # PBT/filter width/filter shape/preamp-attenuator (below)
+            # only need to catch a front-panel change, since this app's
+            # own UI already reflects a locally-set value immediately
+            # (see _update_pbt_overlay et al.) -- unlike frequency/
+            # meters/mode, which genuinely need every-cycle freshness.
+            # Confirmed live that polling all of them every single
+            # POLL_INTERVAL_SEC cycle, on top of everything else this
+            # loop already does, made the sequential CI-V round-trip
+            # chain long enough to cause real timeouts under load (PBT/
+            # filter width/filter shape all timed out in the same
+            # session) -- skipping them most cycles frees that budget
+            # for what actually needs it.
+            is_slow_poll_cycle = self._poll_cycle_count % SLOW_POLL_EVERY_N_CYCLES == 0
+            self._poll_cycle_count += 1
+
             if self.is_dual_receiver:
                 try:
                     observed = await self.radio.get_active_receiver()
@@ -2451,19 +2468,20 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")
 
-            for key, civ_sub in self._pbt_methods.items():
-                definition = PBT_DEFINITIONS[key]
-                try:
-                    # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
-                    # rigplane's own get_pbt_inner/get_pbt_outer -- see
-                    # PBT_DEFINITIONS' comment in constants.py for why.
-                    resp = await self.radio.send_civ(0x14, sub=civ_sub, wait_response=True)
-                    if resp is not None and len(resp.data) >= 2:
-                        self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
-                except Exception as exc:
-                    self.error.emit(f"{definition['label']}: {exc}")
+            if is_slow_poll_cycle:
+                for key, civ_sub in self._pbt_methods.items():
+                    definition = PBT_DEFINITIONS[key]
+                    try:
+                        # Raw CI-V 0x14/<civ_sub> read via send_civ(), NOT
+                        # rigplane's own get_pbt_inner/get_pbt_outer -- see
+                        # PBT_DEFINITIONS' comment in constants.py for why.
+                        resp = await self.radio.send_civ(0x14, sub=civ_sub, wait_response=True)
+                        if resp is not None and len(resp.data) >= 2:
+                            self.pbt_updated.emit(key, _bcd_decode_pbt_level(resp.data))
+                    except Exception as exc:
+                        self.error.emit(f"{definition['label']}: {exc}")
 
-            if self.is_filter_width_capable:
+            if is_slow_poll_cycle and self.is_filter_width_capable:
                 try:
                     width_hz = await self.radio.get_filter_width()
                     self._filter_width_hz = width_hz
@@ -2471,7 +2489,7 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"Filter width: {exc}")
 
-            if self._filter_shape_available:
+            if is_slow_poll_cycle and self._filter_shape_available:
                 try:
                     # Raw CI-V 0x16/0x56 read via send_civ(), NOT
                     # rigplane's own get_filter_shape() -- see
@@ -2482,7 +2500,7 @@ class RadioWorker(QThread):
                 except Exception as exc:
                     self.error.emit(f"Filter shape: {exc}")
 
-            if self.is_ic705_preamp_att:
+            if is_slow_poll_cycle and self.is_ic705_preamp_att:
                 try:
                     # Raw CI-V reads via send_civ(), NOT rigplane's own
                     # get_preamp()/attenuator methods -- see

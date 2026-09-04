@@ -164,6 +164,15 @@ DEFAULT_BAUD_RATE = 19200
 DEFAULT_REMOTE_PORT = 8080  # matches rigplane.web.server.WebConfig's own default port
 
 POLL_INTERVAL_SEC = 0.5  # how often to read frequency/s-meter from the radio
+# How many POLL_INTERVAL_SEC ticks between polls of PBT/filter width/
+# filter shape/preamp-attenuator -- settings that mostly only change via
+# a user action THROUGH THIS APP (which already reflects the value
+# locally/immediately) rather than needing every-cycle freshness like
+# frequency/meters/mode. See radio_worker.py's _poll_loop for why this
+# exists: confirmed live that polling everything every single cycle
+# made the sequential CI-V round-trip chain long enough to cause real
+# timeouts under load.
+SLOW_POLL_EVERY_N_CYCLES = 4  # ~2s at POLL_INTERVAL_SEC=0.5s
 WATERFALL_ROWS = 200     # how many past scope frames the waterfall keeps on screen
 
 # Step sizes offered next to the tuning knob, and how many degrees of knob

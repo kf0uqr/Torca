@@ -207,23 +207,25 @@ MODE_BANDWIDTH_HZ = {
     "DV": (3000, 3000),
 }
 
-# Twin PBT: Hz each PBT1/PBT2 raw-level step (0-255, 128=centered) shifts
-# that knob's own IF passband copy -- taken directly from the IC-705
-# Basic Manual, "Using the Digital Twin PBT": "The PBT is adjustable in
-# 50 Hz steps in the SSB, CW, and RTTY modes, and 200 Hz in the AM
-# mode." (Misc/IC-705_ENG_Basic_9.pdf, p. 4-4) -- a real calibrated
-# figure, unlike MODE_BANDWIDTH_HZ's own defaults. Only covers the modes
-# that same page says Twin PBT actually applies to (SSB, CW, RTTY, AM);
-# FM/WFM/DV aren't listed there at all, so they're deliberately absent
-# here -- see widgets.py's _pbt_overlap_hz, which treats a missing entry
-# as "this knob has no effect in this mode" (hz_per_level=0), not an
+# Twin PBT: modes it actually applies to, per the IC-705 Basic Manual's
+# "Using the Digital Twin PBT" section (SSB, CW, RTTY, AM -- FM/WFM/DV
+# aren't listed there at all). See widgets.py's _pbt_overlap_hz, which
+# treats a mode outside this set as "both knobs have no effect", not an
 # error.
-PBT_HZ_PER_LEVEL = {
-    "LSB": 50, "USB": 50,
-    "CW": 50, "CW_R": 50,
-    "RTTY": 50, "RTTY_R": 50,
-    "AM": 200,
-}
+#
+# Hz per PBT1/PBT2 raw-level step (0-255, 128=centered): NOT the manual's
+# stated "50 Hz steps in SSB/CW/RTTY, 200 Hz in AM" -- confirmed WRONG by
+# live calibration against a real IC-705 (CW, FIL1=1200 Hz): moving PBT1
+# and PBT2 together from minimum to maximum shifted the passband from
+# centered at +100 Hz to +1300 Hz (a real, on-radio-screen-read 1200 Hz
+# total swing across the full 0-255 range) while the width stayed exactly
+# 1200 Hz both times -- i.e. sliding both knobs together shifts without
+# narrowing, exactly as this app already modeled, but at a rate of
+# 1200 Hz / 255 levels =~ 4.7 Hz/level, not 50. That ratio (total shift
+# range across the full raw range == the filter's own width_hz) is used
+# directly instead of a per-mode constant -- see _pbt_trapezoid_hz's
+# hz_per_level = width_hz / 255.0.
+PBT_CAPABLE_MODES = {"LSB", "USB", "CW", "CW_R", "RTTY", "RTTY_R", "AM"}
 
 # Audio format used for the local capture/playback streams. Only raw PCM16
 # mono is handled -- if the radio reports a different codec via its

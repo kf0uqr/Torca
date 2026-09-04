@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QWidget, QMenu, QToolTip
 
 from constants import (
     METER_DEFINITIONS, S_METER_RAW_S9, S_METER_RAW_MAX, S_METER_S9_FRACTION, DEGREES_PER_KNOB_STEP,
-    WATERFALL_ROWS, MODE_BANDWIDTH_HZ, PBT_HZ_PER_LEVEL,
+    WATERFALL_ROWS, MODE_BANDWIDTH_HZ, PBT_CAPABLE_MODES,
 )
 import band_plan
 
@@ -49,12 +49,11 @@ def _pbt_trapezoid_hz(level, hz_per_level, width_hz, center_hz):
     away from center -- confirmed against a real Icom radio (IC-705
     Basic Manual, "Using the Digital Twin PBT"): each PBT knob moves a
     whole filter shape left/right, it does NOT narrow one edge in place
-    (this module's earlier, unconfirmed assumption). hz_per_level is the
-    real, manual-confirmed shift per raw-level step away from 128 (see
-    PBT_HZ_PER_LEVEL) -- NOT scaled to width_hz, so a knob can shift
-    its trapezoid arbitrarily far past the point the two trapezoids
-    stop overlapping at all (matches the real control: turning past
-    that point does nothing further, it doesn't "wrap" or rescale).
+    (this module's earlier, unconfirmed assumption). hz_per_level is
+    width_hz / 255.0 (see _pbt_overlap_hz) -- NOT a fixed per-mode
+    constant, so a knob can still shift its trapezoid past the point the
+    two trapezoids stop overlapping (matches the real control: turning
+    past that point does nothing further, it doesn't "wrap" or rescale).
     Returns (low_hz, high_hz) offsets from the tuned frequency."""
     shifted_center = center_hz + (level - 128) * hz_per_level
     return shifted_center - width_hz / 2.0, shifted_center + width_hz / 2.0
@@ -68,14 +67,30 @@ def _pbt_overlap_hz(mode, inner_level, outer_level):
     centered (128) means both trapezoids sit exactly on the mode's
     default passband, so the overlap IS that default passband, unchanged
     -- same as this app's very first (pre-Twin-PBT) scope shading.
-    Modes Twin PBT doesn't apply to (FM/WFM/DV -- absent from
-    PBT_HZ_PER_LEVEL) get hz_per_level=0, i.e. both knobs have no effect
-    and the overlap is always just the unmodified default passband,
-    rather than treating it as an error. Shared by SpectrumWidget's
-    scope overlay and FilterShapeWidget's dedicated filter-shape
-    display; the trapezoid WIDTH is still only an approximation against
-    MODE_BANDWIDTH_HZ (see that dict's own disclaimer) even though the
-    shift-per-level is now a real, manual-confirmed figure.
+    Modes Twin PBT doesn't apply to (outside PBT_CAPABLE_MODES, e.g.
+    FM/WFM/DV) get hz_per_level=0, i.e. both knobs have no effect and the
+    overlap is always just the unmodified default passband, rather than
+    treating it as an error.
+
+    hz_per_level = width_hz / 255.0 -- NOT the IC-705 Basic Manual's
+    stated "50 Hz steps in SSB/CW/RTTY, 200 Hz in AM" (Misc/
+    IC-705_ENG_Basic_9.pdf p.4-4), which turned out, confirmed by live
+    calibration against a real IC-705, to overstate the actual shift by
+    roughly 10x. Calibration data (CW, FIL1=1200 Hz, PBT1 and PBT2 moved
+    TOGETHER so the overlap is a pure shift with no narrowing -- see
+    _pbt_trapezoid_hz): passband center read at +100 Hz on the radio's
+    own screen with both knobs at their raw minimum, +1300 Hz with both
+    at their raw maximum, and the width stayed exactly 1200 Hz (the
+    mode's own filter width) at both extremes -- a 1200 Hz swing across
+    the 255-level raw range, i.e. exactly one filter-width per full
+    sweep, independent of mode. Shared by SpectrumWidget's scope overlay
+    and FilterShapeWidget's dedicated filter-shape display; the
+    trapezoid WIDTH is still only an approximation against
+    MODE_BANDWIDTH_HZ (see that dict's own disclaimer), and center_hz
+    below (fixed at the mode's nominal midpoint) is known to be off by
+    whatever the radio's actual CW pitch/RTTY mark offset happens to be
+    for CW/RTTY specifically -- confirmed by that same calibration run,
+    whose midpoint (100+1300)/2=700 Hz didn't land on 0 Hz.
 
     Returns (overlap_low_hz, overlap_high_hz, default_low_hz,
     default_high_hz, width_hz, center_hz), all as offsets from the tuned
@@ -89,7 +104,7 @@ def _pbt_overlap_hz(mode, inner_level, outer_level):
     default_low_hz, default_high_hz = MODE_BANDWIDTH_HZ[mode]
     width_hz = default_low_hz + default_high_hz
     center_hz = (default_high_hz - default_low_hz) / 2.0
-    hz_per_level = PBT_HZ_PER_LEVEL.get(mode, 0)
+    hz_per_level = (width_hz / 255.0) if mode in PBT_CAPABLE_MODES else 0.0
     low1, high1 = _pbt_trapezoid_hz(inner_level, hz_per_level, width_hz, center_hz)
     low2, high2 = _pbt_trapezoid_hz(outer_level, hz_per_level, width_hz, center_hz)
     overlap_low_hz = max(low1, low2)
@@ -339,7 +354,7 @@ class FilterShapeWidget(QWidget):
         overlap_low_hz, overlap_high_hz, default_low_hz, default_high_hz, width_hz, center_hz = _pbt_overlap_hz(
             self._mode, inner_level, outer_level
         )
-        hz_per_level = PBT_HZ_PER_LEVEL.get(self._mode, 0)
+        hz_per_level = (width_hz / 255.0) if self._mode in PBT_CAPABLE_MODES else 0.0
         pbt1_low_hz, pbt1_high_hz = _pbt_trapezoid_hz(inner_level, hz_per_level, width_hz, center_hz)
         pbt2_low_hz, pbt2_high_hz = _pbt_trapezoid_hz(outer_level, hz_per_level, width_hz, center_hz)
 

@@ -770,6 +770,12 @@ class RadioWindow(QWidget):
         # per explicit instruction -- rit_column still sits snug against
         # knob_row (fixed spacing, no stretch of its own).
         tuning_row.addLayout(filter_shape_column, 1)
+        # Top-align, same as dropdowns_row's own columns -- without this,
+        # now that filter_shape_widget's height is capped (see its own
+        # setMaximumHeight comment) rather than growing to consume all
+        # of tuning_row's height, Qt centers the shorter column
+        # vertically instead of anchoring it level with left_column.
+        tuning_row.setAlignment(filter_shape_column, Qt.AlignTop)
         tuning_row.addSpacing(8)
         tuning_row.addLayout(rit_column)
         tuning_row.addSpacing(16)

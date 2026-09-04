@@ -379,6 +379,15 @@ class FilterShapeWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumWidth(200)
         self.setMinimumHeight(200)
+        # Capped, unlike width -- an unbounded Expanding HEIGHT let this
+        # widget balloon to fill the entire tuning_row column, pushing
+        # the PBT/filter-width sliders stacked below it (main_window.py's
+        # filter_shape_column) down past the bottom of the window on a
+        # real run, looking like they'd vanished entirely rather than
+        # just having grown out of the visible area. 260px is roughly
+        # what this widget already renders at with room to breathe, not
+        # a tight minimum.
+        self.setMaximumHeight(260)
         self._mode = None            # set via set_mode()
         self._pbt_inner = None       # set via set_pbt() -- None means "draw both trapezoids centered"
         self._pbt_outer = None

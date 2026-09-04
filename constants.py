@@ -410,6 +410,23 @@ ATT_CIV_COMMAND = 0x11
 PREAMP_ATT_OPTIONS_HF = [("OFF", 0, 0), ("P.AMP1", 1, 0), ("P.AMP2", 2, 0), ("ATT", 0, 20)]
 PREAMP_ATT_OPTIONS_VHF_UHF = [("OFF", 0, None), ("ON", 1, None)]
 
+# SWR meter -- confirmed live on an IC-705 that rigplane's own get_swr()
+# always returns exactly 1.0 (the calibration table's own floor value)
+# regardless of true antenna condition, even with SWR pegged during TX.
+# The CI-V command/subcommand (0x15 sub 0x12) and calibration table
+# below are confirmed CORRECT against the IC-705's own CI-V Reference
+# Guide ("12  0000~0255  Read SWR meter level (0000=SWR1.0, 0048=SWR1.5,
+# 0080=SWR2.0, 0120=SWR3.0)", Misc/IC-705_ENG_CI-V_4b.pdf p.6) and match
+# rigplane's own ic705.toml table exactly (plus a documented-by-wfview
+# extra point at 240->6.0) -- the DATA isn't in question, only
+# get_swr()'s own internals are. RadioWorker bypasses it with raw CI-V
+# (send_civ) and applies this same table locally instead, same fix
+# pattern (and same evidentiary bar) as PBT_DEFINITIONS/
+# FILTER_SHAPE_CIV_SUB/PREAMP_CIV_SUB above -- every other rigplane
+# convenience-method bug found this session was fixed the same way.
+SWR_CIV_SUB = 0x12
+SWR_CALIBRATION = [(0, 1.0), (48, 1.5), (80, 2.0), (120, 3.0), (240, 6.0)]
+
 # Which LEVEL_DEFINITIONS keys are genuinely independent per receiver on
 # a dual-receiver radio. Their real getter/setter DOES accept a
 # receiver= kwarg (confirmed via a full inspect.signature() sweep

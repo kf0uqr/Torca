@@ -165,6 +165,8 @@ from constants import (
     FILTER_SHAPE_CIV_SUB,
     PREAMP_CIV_SUB,
     ATT_CIV_COMMAND,
+    SWR_CIV_SUB,
+    SWR_CALIBRATION,
     METER_DEFINITIONS,
     CONTROL_DEFINITIONS,
     POLL_INTERVAL_SEC,
@@ -252,6 +254,23 @@ def _bcd_decode_byte(data: bytes) -> int:
     return (b >> 4) * 10 + (b & 0x0F)
 
 
+def _interpolate_swr(raw: int) -> float:
+    """Raw 0-255 SWR meter byte -> calibrated ratio, via SWR_CALIBRATION
+    (piecewise-linear, clamped at the endpoints) -- see that constant's
+    own comment in constants.py for why this runs locally instead of
+    through rigplane's own get_swr()/interpolate_swr()."""
+    points = sorted(SWR_CALIBRATION)
+    if raw <= points[0][0]:
+        return points[0][1]
+    if raw >= points[-1][0]:
+        return points[-1][1]
+    for (lo_raw, lo_val), (hi_raw, hi_val) in zip(points, points[1:]):
+        if lo_raw <= raw <= hi_raw:
+            frac = (raw - lo_raw) / (hi_raw - lo_raw)
+            return lo_val + frac * (hi_val - lo_val)
+    return points[-1][1]  # unreachable given the clamps above
+
+
 class RadioWorker(QThread):
     """Owns the asyncio loop and the rigplane radio connection.
 
@@ -312,6 +331,7 @@ class RadioWorker(QThread):
         self.is_filter_shape_capable = False  # set once connected -- see CAP_FILTER_SHAPE import comment
         self._filter_shape_available = False  # set in _setup_filter_shape() -- send_civ() usable for this radio
         self.is_ic705_preamp_att = False  # set once connected -- see PREAMP_CIV_SUB's comment in constants.py
+        self.is_ic705_swr_workaround = False  # set once connected -- see SWR_CIV_SUB's comment in constants.py
         self.is_scope_capable = False  # set once connected, True only if enable_scope() (in _main) actually succeeds
         # Last-observed span/ref/speed, so _poll_loop only emits
         # scope_*_changed when the value genuinely changes -- same
@@ -1832,6 +1852,7 @@ class RadioWorker(QThread):
         self.is_ic705_preamp_att = (
             self._details.get("radio_model") == "IC-705" and hasattr(self.radio, "send_civ")
         )
+        self.is_ic705_swr_workaround = self.is_ic705_preamp_att  # same model+send_civ gate, see SWR_CIV_SUB's comment
         self.connected.emit()
         # Everything from here through _poll_loop() is wrapped in one
         # try/finally so self._radio_cm.__aexit__() (closing the actual
@@ -2302,9 +2323,19 @@ class RadioWorker(QThread):
             for meter_type, getter_name in self._meter_getters.items():
                 definition = self._meter_definitions[meter_type]
                 try:
-                    getter = getattr(self.radio, getter_name)
-                    kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
-                    value = await getter(**kwargs)
+                    if meter_type == "swr" and self.is_ic705_swr_workaround:
+                        # Raw CI-V 0x15/0x12 read via send_civ(), NOT
+                        # rigplane's own get_swr() -- see SWR_CIV_SUB's
+                        # comment in constants.py for why.
+                        resp = await self.radio.send_civ(0x15, sub=SWR_CIV_SUB, wait_response=True)
+                        if resp is not None and resp.data:
+                            value = _interpolate_swr(_bcd_decode_pbt_level(resp.data))
+                        else:
+                            continue
+                    else:
+                        getter = getattr(self.radio, getter_name)
+                        kwargs = self._receiver_kwargs(getter, self._active_receiver) if self.is_dual_receiver else {}
+                        value = await getter(**kwargs)
                     self.meter_updated.emit(meter_type, value)
                 except Exception as exc:
                     self.error.emit(f"{definition['label']}: {exc}")

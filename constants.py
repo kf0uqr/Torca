@@ -215,6 +215,19 @@ RECONNECT_WATCHDOG_TIMEOUT_SEC = 45.0
 RECONNECT_BACKOFF_START_SEC = 2.0
 RECONNECT_BACKOFF_MAX_SEC = 30.0
 
+# How old a satellite's stored TLE can get before ham_dashboard.py warns
+# the operator to refresh it from CelesTrak. Root-caused a real "the
+# satellite-sync recording didn't stop at LOS, it ran for 3 hours"
+# report: with a stale-enough TLE, sgp4 propagates a meaningfully wrong
+# orbit, so the computed AOS/LOS times are wrong too (not just a few
+# degrees of pointing error) -- the recording auto-stop was working
+# correctly the whole time, it was just tracking the wrong pass window.
+# CelesTrak's amateur group is typically updated at least every couple
+# of days, so 5 gives a comfortable margin before drift becomes
+# significant for a LEO pass without nagging after every short gap
+# between refreshes.
+TLE_STALE_WARNING_DAYS = 5
+
 # Step sizes offered next to the tuning knob, and how many degrees of knob
 # rotation correspond to one step (one "detent" of a real rotary encoder).
 TUNING_STEPS = [("10 Hz", 10), ("100 Hz", 100), ("1 kHz", 1_000), ("10 kHz", 10_000)]

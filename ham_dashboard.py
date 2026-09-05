@@ -125,7 +125,7 @@ from audio import (
     VIRTUAL_CABLE_TX_NAME,
     VIRTUAL_CABLE_TX_DESC,
 )
-from constants import RADIO_ROLES, HF_6M_BANDS, VHF_UHF_BANDS
+from constants import RADIO_ROLES, HF_6M_BANDS, VHF_UHF_BANDS, TLE_STALE_WARNING_DAYS
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 from satellite_tracking import (
@@ -138,6 +138,7 @@ from satellite_tracking import (
     ground_track_points,
     upcoming_passes,
     format_countdown,
+    tle_age_days,
     SGP4_AVAILABLE,
 )
 
@@ -1609,6 +1610,18 @@ class HamClockWindow(QWidget):
         self.satellite_overlay_label.setWordWrap(True)
         self.satellite_overlay_label.setStyleSheet("color: #ccc; font-size: 18px;")
 
+        # Empty/hidden unless the active satellite's TLE is stale enough
+        # to matter -- see TLE_STALE_WARNING_DAYS' comment in
+        # constants.py for the "recording ran 3 hours past the real
+        # LOS" report this exists to prevent a repeat of. Updated every
+        # tick in _on_satellite_state_updated, so it clears itself
+        # automatically once the operator refreshes TLEs (no separate
+        # wiring needed for that).
+        self.satellite_tle_warning_label = QLabel("")
+        self.satellite_tle_warning_label.setWordWrap(True)
+        self.satellite_tle_warning_label.setStyleSheet("color: #e80; font-size: 13px; font-weight: bold;")
+        self.satellite_tle_warning_label.setVisible(False)
+
         # ---- WSJT-X launch (moved from RadioWindow -- no radio
         # dependency at all, so this is just a relocation) ----
         self.wsjtx_button = QPushButton("Launch WSJT-X")
@@ -1728,6 +1741,7 @@ class HamClockWindow(QWidget):
         layout.addLayout(top_buttons_row)
         layout.addLayout(tracking_row)
         layout.addWidget(self.satellite_overlay_label)
+        layout.addWidget(self.satellite_tle_warning_label)
         layout.addLayout(bottom_row)
         self.setLayout(layout)
 
@@ -2822,6 +2836,7 @@ class HamClockWindow(QWidget):
 
         self._active_satellite = satellite
         self.satellite_name_label.setText(satellite.get("name", "?"))
+        self._update_tle_staleness_warning(satellite)  # don't wait for the first tracking tick
 
         self.transponder_combo.blockSignals(True)
         self.transponder_combo.clear()
@@ -2894,7 +2909,26 @@ class HamClockWindow(QWidget):
             self.tracking_button.blockSignals(False)
             self.tracking_button.setText("Stop Tracking" if tracking else "Start Tracking")
 
+    def _update_tle_staleness_warning(self, satellite):
+        """Shows/hides satellite_tle_warning_label for the currently-
+        tracked satellite -- see TLE_STALE_WARNING_DAYS' comment in
+        constants.py. Runs on every tracking tick (2s), so it reflects
+        a TLE refresh (via Satellites... -> Refresh TLEs from
+        CelesTrak) as soon as the next tick lands, without needing any
+        dedicated wiring into that dialog's own accept/on_change path."""
+        age_days = tle_age_days(satellite.get("line1", "")) if satellite else None
+        if age_days is not None and age_days >= TLE_STALE_WARNING_DAYS:
+            self.satellite_tle_warning_label.setText(
+                f"TLE data for {satellite.get('name', '?')} is {age_days:.0f} days old -- "
+                "AOS/LOS times and Doppler correction may be inaccurate. Refresh from "
+                "Satellites... > Refresh TLEs from CelesTrak."
+            )
+            self.satellite_tle_warning_label.setVisible(True)
+        else:
+            self.satellite_tle_warning_label.setVisible(False)
+
     def _on_satellite_state_updated(self, satellite, look, crossing_text, downlink_doppler_hz, uplink_doppler_hz, warning_text):
+        self._update_tle_staleness_warning(satellite)
         if look is None:
             self.satellite_overlay_label.setText(f"{satellite.get('name', '?')}\nOrbit propagation failed (invalid TLE?)")
             return

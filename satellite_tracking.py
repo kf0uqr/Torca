@@ -795,6 +795,21 @@ def tle_epoch_datetime(line1):
         return None
 
 
+def tle_age_days(line1):
+    """Age of a TLE's epoch in days (float), or None if line1 is
+    unparseable. Used to warn when stored orbital elements are stale
+    enough that sgp4 is propagating a meaningfully wrong orbit --
+    root-caused a real "satellite-sync recording didn't stop at LOS,
+    ran for 3 hours" report: with a stale TLE the computed AOS/LOS
+    times themselves are wrong (not just a few degrees of pointing
+    error), so elevation can appear to stay above the horizon for far
+    longer than the real pass."""
+    epoch = tle_epoch_datetime(line1)
+    if epoch is None:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc) - epoch).total_seconds() / 86400.0
+
+
 def fetch_transponders(norad_cat_id):
     """Fetches known transmitters/transponders for a satellite from
     SatNOGS DB. Returns a list of dicts: {"description", "uplink_mhz",

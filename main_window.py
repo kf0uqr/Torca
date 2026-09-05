@@ -935,6 +935,7 @@ class RadioWindow(QWidget):
             button.setEnabled(True)
         for slider in self.level_sliders.values():
             slider.setEnabled(True)
+        self._enable_control_widgets_and_join_mid_pass()
 
     @Slot(int, float)
     def _on_reconnecting(self, attempt: int, retry_in: float):
@@ -949,6 +950,17 @@ class RadioWindow(QWidget):
     @Slot()
     def _on_reconnected(self):
         self.status_label.setText(f"Connected to {self._connection_label}")
+        self._enable_control_widgets_and_join_mid_pass()
+
+    def _enable_control_widgets_and_join_mid_pass(self):
+        """Shared tail of _on_connected/_on_reconnected -- split out so a
+        reconnect gets exactly the same treatment as the first connect,
+        after a regression where control_widgets (mode/AGC/preamp/
+        filter/digital mode/NR/NB/VFO A-B/split) ended up enabled ONLY
+        on reconnect, staying permanently greyed out on a normal first
+        connect, because this tail got moved into a new _on_reconnected
+        instead of being kept in _on_connected too when reconnection
+        support was added."""
         for widget in self.control_widgets.values():
             widget.setEnabled(True)
         # Joining mid-pass (e.g. reconnecting a 9700 while satellite

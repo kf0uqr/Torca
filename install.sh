@@ -22,6 +22,22 @@
 #   sudo ./install.sh --uninstall -y Uninstall without the confirmation prompt
 set -euo pipefail
 
+# Unset rather than inherited, same reasoning as the launcher script this
+# generates below: a shell-level PYTHONPATH pointing at system/OS
+# dist-packages can make pip's dependency resolver believe a package (seen
+# in practice: PySide6, numpy, sgp4, platformdirs) is "already satisfied"
+# from outside this venv and skip installing it here -- the venv itself
+# ends up missing it entirely, even though the install appears to succeed,
+# and the app then fails at import time once actually launched (the
+# launcher's own PYTHONPATH unset means it can't see that external copy
+# either). Confirmed causing exactly this failure mode on one machine; a
+# second machine hit the same "works during install, ModuleNotFoundError
+# at launch" symptom for platformdirs specifically, consistent with the
+# same root cause. Stripping it here, before any pip install runs, makes
+# the installed venv match what pip would put there with a clean
+# environment, regardless of what the invoking shell happens to export.
+unset PYTHONPATH
+
 INSTALL_DIR="/opt/torca"
 LAUNCHER_PATH="/usr/local/bin/torca"
 SERVER_LAUNCHER_PATH="/usr/local/bin/torca-server"

@@ -161,7 +161,18 @@ class ConnectionDialog(QDialog):
             "capability of its own. Full feature parity with a direct "
             "connection: frequency/mode/PTT/levels/meters. No CI-V address "
             "needed here -- the server already has its own connection to "
-            "the actual radio."
+            "the actual radio.\n\n"
+            "For radios rigplane has no native backend for yet (e.g. "
+            "truSDX), USB (Serial) still applies -- torca runs Hamlib's own "
+            "rigctld in the background for you, so it's just a serial port "
+            "and baud rate here like any other USB radio. Audio for such a "
+            "radio works differently, though: the truSDX (for one) has no "
+            "USB sound card of its own, so pick a real PC sound card/USB "
+            "audio interface below instead, wired to the radio with actual "
+            "audio cables -- and note Input/Output are swapped from a "
+            "normal radio: Audio Input must be cabled to the radio's own "
+            "audio-OUT (speaker/headphone) jack, Audio Output to its "
+            "mic/audio-IN jack."
         )
         self.connection_combo.currentIndexChanged.connect(self._on_connection_type_changed)
 

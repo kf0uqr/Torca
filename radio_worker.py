@@ -168,6 +168,7 @@ except Exception as _yaesu_rigs_dir_patch_exc:
     )
 
 from constants import (
+    RADIO_PROFILES,
     RADIO_BANDS,
     BAND_STACKING_CODES,
     BAND_STACKING_REGISTER_LATEST,
@@ -201,8 +202,10 @@ from constants import (
     AUDIO_TX_PCM_FRAME_BYTES,
 )
 from rig_discovery import find_method_name
-from audio import AudioBridge
+from audio import AudioBridge, PassthroughAudioBridge
 from remote_radio import RemoteWebRadio
+from rigctld_launcher import ManagedRigctld, ManagedRigctldError
+from rigctld_adapter import RigctldRadioAdapter
 
 async def _try_recall_band_stack(radio, band_code, register=BAND_STACKING_REGISTER_LATEST):
     """Confirmed working: radio.get_bsr(band, register) (get_band_stack is
@@ -422,6 +425,7 @@ class RadioWorker(QThread):
         # pitch settings (see set_key_speed/set_cw_pitch below).
         self._last_observed_key_speed = None
         self._last_observed_cw_pitch = None
+        self._is_cw_keyer_capable = False  # resolved once per connection in _main() -- see that flag's own comment
         self._last_observed_tuner_status = None
         # Set by start_cw_decode(), cleared by stop_cw_decode() -- the
         # caller-supplied function _on_cw_decode_frame hands raw PCM
@@ -508,6 +512,7 @@ class RadioWorker(QThread):
         # highlight or the frequency readout.
         self._last_observed_active_receiver = None
         self._radio_cm = None
+        self._managed_rigctld = None  # set in _start_managed_rigctld(), if this radio needs one -- see that method
         self._stop_requested = False
         # True only while a connection is both established AND believed
         # alive by the watchdog -- see is_connected()/_connection_watchdog_loop.
@@ -524,7 +529,7 @@ class RadioWorker(QThread):
         self._last_good_freq_read = 0.0
         self.audio_bridge = None  # set in _setup_audio() once connected, if applicable
         self._tx_audio_future = None  # concurrent.futures.Future for the in-flight send_tx_audio_pcm coroutine, if any -- see stop_tx_audio_send
-        self._tx_stream_push_name = None  # resolved push_audio_tx_pcm/push_tx name while a start_tx_audio_stream()/stop_tx_audio_stream() session is open -- see those methods
+        self._tx_stream_push = None  # resolved push callable (see _tx_push_target()) while a start_tx_audio_stream()/stop_tx_audio_stream() session is open -- see those methods
         # Which receiver's audio the RX virtual cable carries ("mix"/
         # "main"/"sub", see audio._downmix_stereo_to_mono) -- a user
         # preference for feeding an external decoder (e.g. WSJT-X on a
@@ -621,6 +626,52 @@ class RadioWorker(QThread):
         finally:
             self.loop.close()
 
+    def _is_managed_rigctld_radio(self):
+        """True for a USB-connected radio rigplane has no native backend
+        for yet (truSDX -- RADIO_PROFILES["truSDX"]["protocol"] ==
+        "managed_rigctld", see constants.py), meaning _main() needs to
+        start a local rigctld for it (_start_managed_rigctld) and construct
+        a RigctldRadioAdapter (rigctld_adapter.py) pointed at it directly,
+        bypassing _build_config()/create_radio() -- see _main()'s own
+        branch for this and rigctld_adapter.py's docstring for why."""
+        if self._details.get("connection_type") != "usb":
+            return False
+        profile = RADIO_PROFILES.get(self._details.get("radio_model"), {})
+        return profile.get("protocol") == "managed_rigctld"
+
+    async def _start_managed_rigctld(self):
+        """Launches (or re-launches, on reconnect) a local rigctld for
+        this connection's serial port/baud rate -- see
+        rigctld_launcher.py's own docstring for why this exists and how
+        model fallback works. Raises ManagedRigctldError on failure,
+        caught by _main() the same way any other connect failure is."""
+        d = self._details
+        profile = RADIO_PROFILES.get(d.get("radio_model"), {})
+        hamlib_models = profile.get("hamlib_models") or []
+        if not hamlib_models:
+            raise ManagedRigctldError(
+                f"{d.get('radio_model')!r} has protocol=managed_rigctld but no "
+                "hamlib_models list in its RADIO_PROFILES entry."
+            )
+        self._managed_rigctld = ManagedRigctld(
+            d["serial_port"], d["baud_rate"], hamlib_models,
+        )
+        await self._managed_rigctld.start()
+        self.audio_status.emit(
+            f"Started local rigctld (Hamlib model {self._managed_rigctld.model_used}) "
+            f"on 127.0.0.1:{self._managed_rigctld.port} for {d['serial_port']}."
+        )
+
+    async def _stop_managed_rigctld(self):
+        """Counterpart to _start_managed_rigctld() -- called both from
+        _teardown_connection() (the normal connect-then-later-tear-down
+        path) and directly from _main()'s own except block (a connect
+        failure AFTER rigctld already started, which never reaches
+        _teardown_connection at all -- see that call site's comment)."""
+        if self._managed_rigctld is not None:
+            await self._managed_rigctld.stop()
+            self._managed_rigctld = None
+
     def _build_config(self, force_stereo=True):
         """force_stereo (network connections only): request a stereo RX
         codec explicitly instead of silently deferring to the radio
@@ -683,6 +734,12 @@ class RadioWorker(QThread):
                 kwargs["audio_codec"] = AudioCodec.PCM_2CH_16BIT
                 kwargs["audio_codec_explicit"] = True
             return LanBackendConfig(**kwargs)
+        # NOTE: managed-rigctld radios (truSDX) never reach here --
+        # _main() branches on _is_managed_rigctld_radio() BEFORE calling
+        # _build_config() at all, and constructs a RigctldRadioAdapter
+        # directly (bypassing rigplane's create_radio(), same as the
+        # "remote" connection_type above bypasses it for RemoteWebRadio).
+        # See that branch's own comment for why.
         if SerialBackendConfig is None:
             raise RuntimeError(
                 "rigplane has no SerialBackendConfig in this install -- "
@@ -699,12 +756,26 @@ class RadioWorker(QThread):
     async def _setup_audio(self):
         """Builds and starts an AudioBridge if the user selected any
         audio devices and this radio supports rigplane's AudioTransport
-        protocol. See AudioBridge's docstring for what it does and does
-        not guarantee."""
+        protocol -- or a PassthroughAudioBridge, for a radio with no
+        such software audio channel at all (RADIO_PROFILES[radio_model]
+        ["audio_mode"] == "passthrough", e.g. truSDX -- audio travels
+        purely as an analog signal over cables between the radio's own
+        jacks and a real PC sound card; see that class's own docstring
+        in audio.py for the full explanation, including why Input/
+        Output's roles are swapped from the AudioBridge case)."""
         input_device = self._details.get("audio_input_device")
         output_device = self._details.get("audio_output_device")
         if not input_device and not output_device:
             return  # user left both as "None" -- nothing to set up
+
+        profile = RADIO_PROFILES.get(self._details.get("radio_model"), {})
+        if profile.get("audio_mode") == "passthrough":
+            self.audio_bridge = PassthroughAudioBridge(
+                self.loop, input_device, output_device,
+                status_callback=self.audio_status.emit,
+            )
+            await self.audio_bridge.start()
+            return
 
         if AudioTransport is None or not isinstance(self.radio, AudioTransport):
             self.audio_status.emit(
@@ -910,6 +981,26 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Tuner: radio.set_tuner_status(2) failed ({exc}).")
 
+    def _tx_push_target(self):
+        """Returns an async callable(chunk_bytes) -> None that sends one
+        chunk of programmatically-generated TX audio (APRS/PSK31/RTTY
+        send, the browser TX-audio stream) to wherever it actually needs
+        to go for this connection, or None if there's nowhere for it to
+        go at all.
+
+        For a normal AudioTransport-capable radio, this is one of
+        self.radio's own push_audio_tx_pcm/push_tx methods -- same
+        resolution send_tx_audio_pcm always did directly inline before
+        this helper existed. For a PassthroughAudioBridge (a cable-
+        connected radio with no such method on self.radio at all -- see
+        that class's own docstring in audio.py), it's the bridge's own
+        play_tx_pcm(), which writes straight to the physical playback
+        device wired to the radio's mic-in instead."""
+        if isinstance(self.audio_bridge, PassthroughAudioBridge):
+            return self.audio_bridge.play_tx_pcm if self.audio_bridge.has_tx_output() else None
+        push_name = find_method_name(self.radio, ["push_audio_tx_pcm", "push_tx"])
+        return getattr(self.radio, push_name) if push_name else None
+
     def send_tx_audio_pcm(self, pcm_bytes: bytes):
         """Thread-safe: call from the GUI thread. Generic "key PTT,
         stream this pre-synthesized PCM out to the radio, unkey"
@@ -919,24 +1010,26 @@ class RadioWorker(QThread):
         rtty.py/sstv.py could use this same method for their own send
         sides later.
 
-        Deliberately does NOT go through self.audio_bridge (which only
-        ever forwards audio actually captured from a real microphone,
-        see audio.py's own docstring) -- resolves and calls the same
-        underlying rigplane TX-audio methods AudioBridge does
-        (start_audio_tx_pcm/push_audio_tx_pcm/stop_audio_tx_pcm, or the
-        generic start_tx/push_tx/stop_tx fallback) directly on
-        self.radio, confirmed via reading rigplane's own backends
-        (Icom serial/USB, Yaesu CAT, LAN) that push_audio_tx_pcm()
-        just writes raw PCM bytes to a TX audio stream/queue with no
-        microphone involved anywhere in that path -- so a program can
-        feed it synthesized audio exactly the same way. pcm_bytes must
-        already be at AUDIO_TX_PCM_SAMPLE_RATE (48000 Hz, mono,
-        s16le) -- confirmed via a real push_audio_tx_pcm() runtime
-        error ("PCM frame size mismatch: expected 1920 bytes (20ms at
-        48000Hz, 1ch s16le)") that this format is a hard requirement,
-        not just this app's own RX convention -- callers (aprs.py's
-        encoder) generate audio at that rate directly rather than
-        resampling."""
+        Deliberately does NOT go through self.audio_bridge's normal RX/
+        mic pipeline (which only ever forwards audio actually captured
+        from a real microphone, see AudioBridge's own docstring) --
+        resolves and calls the same underlying rigplane TX-audio methods
+        AudioBridge does (start_audio_tx_pcm/push_audio_tx_pcm/
+        stop_audio_tx_pcm, or the generic start_tx/push_tx/stop_tx
+        fallback) directly on self.radio via _tx_push_target(),
+        confirmed via reading rigplane's own backends (Icom serial/USB,
+        Yaesu CAT, LAN) that push_audio_tx_pcm() just writes raw PCM
+        bytes to a TX audio stream/queue with no microphone involved
+        anywhere in that path -- so a program can feed it synthesized
+        audio exactly the same way. (A PassthroughAudioBridge's own
+        play_tx_pcm() is the one exception -- see _tx_push_target()'s
+        own docstring.) pcm_bytes must already be at AUDIO_TX_PCM_
+        SAMPLE_RATE (48000 Hz, mono, s16le) -- confirmed via a real
+        push_audio_tx_pcm() runtime error ("PCM frame size mismatch:
+        expected 1920 bytes (20ms at 48000Hz, 1ch s16le)") that this
+        format is a hard requirement, not just this app's own RX
+        convention -- callers (aprs.py's encoder) generate audio at that
+        rate directly rather than resampling."""
         if self.loop is None or self.radio is None:
             self.error.emit("Send TX audio: not connected yet.")
             return
@@ -961,12 +1054,16 @@ class RadioWorker(QThread):
             self._tx_audio_future.cancel()
 
     async def _send_tx_audio_pcm(self, pcm_bytes: bytes):
-        push_name = find_method_name(self.radio, ["push_audio_tx_pcm", "push_tx"])
-        if push_name is None:
+        push = self._tx_push_target()
+        if push is None:
             self.error.emit("Send TX audio: this radio/connection has no TX audio push method available.")
             return
-        start_name = find_method_name(self.radio, ["start_audio_tx_pcm", "start_tx"])
-        stop_name = find_method_name(self.radio, ["stop_audio_tx_pcm", "stop_tx"])
+        # A PassthroughAudioBridge has no radio-side start/stop session
+        # concept at all (see its own docstring) -- only resolve/call
+        # these for a normal AudioTransport-capable radio.
+        passthrough = isinstance(self.audio_bridge, PassthroughAudioBridge)
+        start_name = None if passthrough else find_method_name(self.radio, ["start_audio_tx_pcm", "start_tx"])
+        stop_name = None if passthrough else find_method_name(self.radio, ["stop_audio_tx_pcm", "stop_tx"])
 
         try:
             await self.radio.set_ptt(True)
@@ -981,16 +1078,19 @@ class RadioWorker(QThread):
             # Pad to a whole number of AUDIO_TX_PCM_FRAME_BYTES-sized
             # frames with trailing silence -- push_audio_tx_pcm()
             # rejects any frame that isn't exactly that size (see this
-            # method's own docstring).
+            # method's own docstring). Harmless, if unnecessary, for a
+            # PassthroughAudioBridge's play_tx_pcm(), which has no such
+            # requirement -- keeping one chunking scheme for both avoids
+            # a second code path here for no real benefit.
             padded = pcm_bytes
             remainder = len(padded) % AUDIO_TX_PCM_FRAME_BYTES
             if remainder:
                 padded += b"\x00" * (AUDIO_TX_PCM_FRAME_BYTES - remainder)
             for i in range(0, len(padded), AUDIO_TX_PCM_FRAME_BYTES):
-                await getattr(self.radio, push_name)(padded[i:i + AUDIO_TX_PCM_FRAME_BYTES])
+                await push(padded[i:i + AUDIO_TX_PCM_FRAME_BYTES])
             if stop_name:
                 await getattr(self.radio, stop_name)()
-            self.audio_status.emit(f"Send TX audio: sent {len(pcm_bytes)} bytes via {push_name}().")
+            self.audio_status.emit(f"Send TX audio: sent {len(pcm_bytes)} bytes.")
         except asyncio.CancelledError:
             self.audio_status.emit("Send TX audio: cancelled.")
             raise
@@ -1023,10 +1123,12 @@ class RadioWorker(QThread):
         asyncio.run_coroutine_threadsafe(self._start_tx_audio_stream(), self.loop)
 
     async def _start_tx_audio_stream(self):
-        self._tx_stream_push_name = find_method_name(self.radio, ["push_audio_tx_pcm", "push_tx"])
-        if self._tx_stream_push_name is None:
+        self._tx_stream_push = self._tx_push_target()
+        if self._tx_stream_push is None:
             self.error.emit("TX audio stream: this radio/connection has no TX audio push method available.")
             return
+        if isinstance(self.audio_bridge, PassthroughAudioBridge):
+            return  # no radio-side session to open -- see _tx_push_target()'s own comment
         start_name = find_method_name(self.radio, ["start_audio_tx_pcm", "start_tx"])
         try:
             if start_name:
@@ -1039,15 +1141,16 @@ class RadioWorker(QThread):
         LIVE stream already opened by start_tx_audio_stream() --
         pcm_bytes must be at AUDIO_TX_PCM_SAMPLE_RATE (48000 Hz, mono,
         s16le), same hard requirement as send_tx_audio_pcm(). A no-op
-        if start_tx_audio_stream() hasn't resolved a push method yet
-        (not connected, or this radio has no TX audio support)."""
-        if self.loop is None or self.radio is None or self._tx_stream_push_name is None:
+        if start_tx_audio_stream() hasn't resolved a push target yet
+        (not connected, or this radio/connection has no TX audio
+        support)."""
+        if self.loop is None or self.radio is None or self._tx_stream_push is None:
             return
         asyncio.run_coroutine_threadsafe(self._push_tx_audio_stream_pcm(pcm_bytes), self.loop)
 
     async def _push_tx_audio_stream_pcm(self, pcm_bytes: bytes):
-        push_name = self._tx_stream_push_name
-        if push_name is None:
+        push = self._tx_stream_push
+        if push is None:
             return
         padded = pcm_bytes
         remainder = len(padded) % AUDIO_TX_PCM_FRAME_BYTES
@@ -1055,7 +1158,7 @@ class RadioWorker(QThread):
             padded += b"\x00" * (AUDIO_TX_PCM_FRAME_BYTES - remainder)
         try:
             for i in range(0, len(padded), AUDIO_TX_PCM_FRAME_BYTES):
-                await getattr(self.radio, push_name)(padded[i:i + AUDIO_TX_PCM_FRAME_BYTES])
+                await push(padded[i:i + AUDIO_TX_PCM_FRAME_BYTES])
         except Exception as exc:
             self.error.emit(f"TX audio stream: push failed ({exc}).")
 
@@ -1070,13 +1173,14 @@ class RadioWorker(QThread):
         asyncio.run_coroutine_threadsafe(self._stop_tx_audio_stream(), self.loop)
 
     async def _stop_tx_audio_stream(self):
-        stop_name = find_method_name(self.radio, ["stop_audio_tx_pcm", "stop_tx"])
-        try:
-            if stop_name:
-                await getattr(self.radio, stop_name)()
-        except Exception as exc:
-            self.error.emit(f"TX audio stream: stop failed ({exc}).")
-        self._tx_stream_push_name = None
+        if not isinstance(self.audio_bridge, PassthroughAudioBridge):
+            stop_name = find_method_name(self.radio, ["stop_audio_tx_pcm", "stop_tx"])
+            try:
+                if stop_name:
+                    await getattr(self.radio, stop_name)()
+            except Exception as exc:
+                self.error.emit(f"TX audio stream: stop failed ({exc}).")
+        self._tx_stream_push = None
 
     def send_cw_text(self, text: str):
         """Thread-safe: call from the GUI thread. Sends `text` via the
@@ -1943,6 +2047,23 @@ class RadioWorker(QThread):
                         self._details.get("remote_token", ""),
                     )
                     self.radio = await self._radio_cm.__aenter__()
+                elif self._is_managed_rigctld_radio():
+                    # Also bypasses rigplane's create_radio()/BackendConfig
+                    # dispatch, same idea as the "remote" branch above --
+                    # RigctldRadioAdapter (rigctld_adapter.py) patches over
+                    # real gaps in rigplane's own RigctldClientRadio
+                    # (missing get_frequency/set_frequency aliases; see
+                    # that module's docstring), so it needs to be
+                    # constructed directly rather than via
+                    # rigplane.create_radio(), which would hand back a
+                    # bare RigctldClientRadio instead.
+                    await self._start_managed_rigctld()
+                    self._radio_cm = RigctldRadioAdapter(
+                        host=self._managed_rigctld.host,
+                        port=self._managed_rigctld.port,
+                        model=self._details.get("radio_model"),
+                    )
+                    self.radio = await self._radio_cm.__aenter__()
                 else:
                     config = self._build_config()
                     try:
@@ -1968,6 +2089,16 @@ class RadioWorker(QThread):
                         else:
                             raise
             except Exception as exc:
+                # If _start_managed_rigctld() succeeded but the actual
+                # radio connection then failed (e.g. right serial port,
+                # wrong baud rate), the rigctld subprocess it launched is
+                # still running at this point -- _teardown_connection()
+                # never runs for a failure in THIS try (that only guards
+                # the later setup/poll-loop stage, see its own comment
+                # below) -- so it has to be cleaned up here explicitly,
+                # or it leaks for the rest of this app's process
+                # lifetime.
+                await self._stop_managed_rigctld()
                 if is_first_connect:
                     self.connection_failed.emit(str(exc))
                     return
@@ -2017,6 +2148,16 @@ class RadioWorker(QThread):
                 self._details.get("radio_model") == "IC-705" and hasattr(self.radio, "send_civ")
             )
             self.is_ic705_swr_workaround = self.is_ic705_preamp_att  # same model+send_civ gate, see SWR_CIV_SUB's comment
+            # get_key_speed/get_cw_pitch used to be polled unconditionally
+            # (comment used to read "confirmed present for every radio
+            # profile this app targets") -- true for every native
+            # rigplane backend, but NOT for RigctldClientRadio/
+            # RigctldRadioAdapter (an intentionally partial backend, see
+            # rigctld_adapter.py), which has neither. Without this check,
+            # a radio missing them spammed one [ERROR] line per poll
+            # cycle forever instead of the poll site just skipping them,
+            # same treatment already given to scope/tuner-status below.
+            self._is_cw_keyer_capable = hasattr(self.radio, "get_key_speed") and hasattr(self.radio, "get_cw_pitch")
             self._connection_healthy = True
             if is_first_connect:
                 self.connected.emit()
@@ -2150,6 +2291,7 @@ class RadioWorker(QThread):
                 pass
         if self._radio_cm is not None:
             await self._radio_cm.__aexit__(None, None, None)
+        await self._stop_managed_rigctld()
 
     async def _connection_watchdog_loop(self):
         """Backend-agnostic backstop: if _poll_loop_fast hasn't managed a
@@ -2743,25 +2885,26 @@ class RadioWorker(QThread):
                     self.error.emit(f"get_scope_speed: {exc}")
 
             # CW keyer speed/pitch -- same change-filtered polling as
-            # scope span/ref/speed above, but unconditional (no
-            # capability flag: get_key_speed/get_cw_pitch are plain
-            # Radio methods, not gated behind a Capable protocol like
-            # scope/audio are, and confirmed present for every radio
-            # profile this app targets).
-            try:
-                key_speed = await self.radio.get_key_speed()
-                if key_speed != self._last_observed_key_speed:
-                    self._last_observed_key_speed = key_speed
-                    self.key_speed_changed.emit(key_speed)
-            except Exception as exc:
-                self.error.emit(f"get_key_speed: {exc}")
-            try:
-                cw_pitch = await self.radio.get_cw_pitch()
-                if cw_pitch != self._last_observed_cw_pitch:
-                    self._last_observed_cw_pitch = cw_pitch
-                    self.cw_pitch_changed.emit(cw_pitch)
-            except Exception as exc:
-                self.error.emit(f"get_cw_pitch: {exc}")
+            # scope span/ref/speed above. Plain Radio methods, not gated
+            # behind a Capable protocol like scope/audio are, and present
+            # on every NATIVE rigplane backend this app targets -- but
+            # NOT on RigctldRadioAdapter (see self._is_cw_keyer_capable's
+            # own comment above), hence the explicit gate here.
+            if self._is_cw_keyer_capable:
+                try:
+                    key_speed = await self.radio.get_key_speed()
+                    if key_speed != self._last_observed_key_speed:
+                        self._last_observed_key_speed = key_speed
+                        self.key_speed_changed.emit(key_speed)
+                except Exception as exc:
+                    self.error.emit(f"get_key_speed: {exc}")
+                try:
+                    cw_pitch = await self.radio.get_cw_pitch()
+                    if cw_pitch != self._last_observed_cw_pitch:
+                        self._last_observed_cw_pitch = cw_pitch
+                        self.cw_pitch_changed.emit(cw_pitch)
+                except Exception as exc:
+                    self.error.emit(f"get_cw_pitch: {exc}")
 
             # Antenna tuner status (0=off, 1=on, 2=tuning) -- same
             # change-filtered polling as key_speed/cw_pitch above.

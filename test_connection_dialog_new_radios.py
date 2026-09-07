@@ -86,12 +86,44 @@ def test_switching_between_two_usb_default_radios_still_refreshes_addr_field():
     print("  PASSED\n")
 
 
+def test_trusdx_defaults_to_usb_and_hides_addr_field():
+    """truSDX (RADIO_PROFILES["truSDX"]["protocol"] == "managed_rigctld",
+    see constants.py) has no native rigplane backend yet -- RadioWorker
+    runs Hamlib's own rigctld for it in the background (see
+    rigctld_launcher.py), so from this dialog's side it looks exactly
+    like any other USB radio: no CI-V address field (same non-CI-V
+    treatment as FTX-1's Yaesu CAT), just the ordinary serial port/baud
+    fields."""
+    print("--- truSDX defaults to USB and hides the addr field ---")
+    dlg = ConnectionDialog()
+    dlg.radio_combo.setCurrentText("truSDX")
+    assert dlg.connection_combo.currentData() == "usb", dlg.connection_combo.currentData()
+    assert not dlg.addr_input.isEnabled(), "truSDX: addr field should be disabled (no CI-V address)"
+    assert dlg.serial_port_input.isEnabled(), "truSDX: serial port field should be enabled"
+
+    dlg.serial_port_input.setText("")  # deliberately empty -- must block accept
+    blocked = []
+    dlg.accept = lambda: blocked.append(True)
+    dlg._on_accept()
+    assert not blocked, "truSDX: accept should have been blocked by an empty serial port field"
+
+    dlg.serial_port_input.setText("/dev/ttyUSB0")
+    accepted = []
+    dlg.accept = lambda: accepted.append(True)
+    dlg._on_accept()
+    assert accepted, "truSDX: accept should succeed once a serial port is given"
+    assert dlg.details["serial_port"] == "/dev/ttyUSB0"
+    assert dlg.details["baud_rate"] == dlg.baud_rate_input.value()
+    print("  PASSED\n")
+
+
 def main():
     ok = True
     try:
         test_civ_radios_show_and_require_addr_field()
         test_ftx1_hides_and_does_not_require_addr_field()
         test_switching_between_two_usb_default_radios_still_refreshes_addr_field()
+        test_trusdx_defaults_to_usb_and_hides_addr_field()
     except AssertionError as exc:
         print(f"FAILED: {exc}")
         ok = False

@@ -1,8 +1,10 @@
 """
 Everything audio-related: the AudioBridge class that streams mic/speaker
-audio to and from the radio via rigplane's AudioTransport protocol, and
-the Linux/PulseAudio "virtual audio cable" helpers used by the Ham
-Dashboard-adjacent Virtual Cables feature in the main window.
+audio to and from the radio via rigplane's AudioTransport protocol,
+PassthroughAudioBridge for radios with no such software audio channel at
+all (audio travels purely as an analog signal over cables -- see its own
+docstring), and the Linux/PulseAudio "virtual audio cable" helpers used
+by the Ham Dashboard-adjacent Virtual Cables feature in the main window.
 """
 
 import asyncio
@@ -11,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from array import array
 
@@ -999,4 +1002,274 @@ class AudioBridge:
         A no-op on a mono (single-receiver) connection, since
         _on_rx_audio only ever consults this when _rx_stereo is True."""
         self._rx_downmix_channel = channel
+
+
+class PassthroughAudioBridge:
+    """For radios with no software audio channel at all -- audio travels
+    purely as an analog signal over cables between the radio's own mic/
+    speaker jacks and a real PC sound card, e.g. the truSDX (see
+    RADIO_PROFILES["truSDX"]'s own comment in constants.py: it has no
+    USB sound card, and its one proprietary way to get audio over the
+    same USB cable can't coexist with this app's rigctld-based CAT
+    control on that same serial port). Opens the same two devices
+    AudioBridge would, but never touches the `radio` object for audio
+    I/O at all -- there's no radio.start_rx()/push_tx() to call, because
+    the audio itself never crosses the CAT connection in the first
+    place.
+
+    Roles are DELIBERATELY SWAPPED from AudioBridge's. There, Input
+    (capture) is the operator's own mic, sent TO the radio for TX, and
+    Output (playback) is the radio's own RX audio, played FOR the
+    operator to hear -- because that radio's audio genuinely does
+    travel over CI-V/LAN, never through any of this app's own sound
+    hardware. Here, there's no such link, so the physical wiring has to
+    do what CI-V/LAN would otherwise do:
+
+    - Input (capture) must be cabled to the RADIO's own audio-out
+      (speaker/headphone) jack -- whatever this app captures there IS
+      the radio's real RX audio, fed straight to CW/PSK31/RTTY/SSTV
+      decode and the recording tool via the exact same add_extra_rx_
+      callback()/add_extra_rx_raw_callback() hooks AudioBridge already
+      offers them, so none of that code needs to know which kind of
+      bridge it's actually talking to.
+    - Output (playback) must be cabled to the radio's own mic/audio-in
+      jack -- playing programmatically-generated TX tones there (PSK31/
+      RTTY send, APRS packets, ...) via play_tx_pcm() is the only way to
+      get audio INTO a cable-connected radio from this app at all. Live
+      voice PTT has no path through this bridge whatsoever -- there's no
+      "operator's mic" input here to capture from -- so has_mic() always
+      reports False; an operator using voice on a cable radio just wires
+      their own mic straight into the radio, entirely bypassing the PC.
+
+    Both streams run at AUDIO_TX_PCM_SAMPLE_RATE (48000 Hz) -- a rate
+    virtually every real PC sound card/USB audio interface supports
+    natively, unlike AUDIO_DEFAULT_SAMPLE_RATE (8000 Hz), which exists
+    for radios whose OWN audio codec already forces a rate this app has
+    no say over. CW/PSK31/RTTY/SSTV decoders all take sample_rate as a
+    plain constructor argument (several *_window.py modules read
+    bridge.sample_rate directly to size their own decoder), so running
+    them at 48000 instead of a lower rate needs no resampling anywhere
+    -- just a bit more CPU per symbol, negligible for this kind of
+    narrow-band tone detection.
+
+    Threading: identical rules to AudioBridge -- sounddevice's callbacks
+    run on PortAudio's own thread, never the asyncio loop or Qt GUI
+    thread. play_tx_pcm() (called from the asyncio loop) and
+    _on_tx_needed (PortAudio's own thread) share the TX playback buffer,
+    so access to it is protected by a plain threading.Lock.
+    """
+
+    def __init__(self, loop, input_device, output_device, status_callback):
+        self.loop = loop
+        self._input_device = input_device
+        self._output_device = output_device
+        self._status = status_callback
+        self.sample_rate = AUDIO_TX_PCM_SAMPLE_RATE
+
+        self._in_stream = None
+        self._out_stream = None
+        self._rx_active = False
+        self._rx_chunk_count = 0
+        self._tx_active = False  # tracked for API parity with AudioBridge; not used to gate play_tx_pcm (see that method's own comment)
+
+        self._extra_rx_callbacks = []
+        self._extra_rx_raw_callbacks = []  # same bytes as _extra_rx_callbacks -- passthrough audio is always plain mono, nothing to downmix
+        self._extra_tx_callbacks = []
+
+        self._tx_lock = threading.Lock()
+        self._tx_playback_buf = bytearray()
+
+    @staticmethod
+    def _device_label(index):
+        return AudioBridge._device_label(index)
+
+    @staticmethod
+    def _resolve_device(device):
+        return AudioBridge._resolve_device(device)
+
+    async def start(self):
+        if not SOUNDDEVICE_AVAILABLE:
+            self._status("sounddevice isn't installed -- run `pip install sounddevice` for audio.")
+            return
+        if self._input_device is not None:
+            self._open_rx_stream()
+        if self._output_device is not None:
+            self._open_tx_stream()
+
+    async def stop(self):
+        self.set_tx_active(False)
+        if self._in_stream:
+            self._in_stream.close()
+            self._in_stream = None
+        self._rx_active = False
+        if self._out_stream:
+            self._out_stream.close()
+            self._out_stream = None
+
+    # ---- RX: captured from a real sound card wired to the radio's own audio-out ----
+
+    def _open_rx_stream(self):
+        try:
+            self._in_stream = sd.RawInputStream(
+                device=self._resolve_device(self._input_device),
+                samplerate=self.sample_rate,
+                channels=AUDIO_CHANNELS,
+                dtype="int16",
+                callback=self._on_rx_captured,
+            )
+            self._in_stream.start()
+            self._rx_active = True
+            self._status(
+                f"Passthrough RX: capturing from {self._device_label(self._input_device)} "
+                f"at {self.sample_rate} Hz -- this must be cabled to the radio's own "
+                "audio-out (speaker/headphone) jack."
+            )
+        except Exception as exc:
+            self._status(f"Passthrough RX: couldn't open {self._device_label(self._input_device)}: {exc}")
+            self._in_stream = None
+
+    def _on_rx_captured(self, indata, frames, time_info, status):
+        """sounddevice callback -- runs on PortAudio's own thread. No
+        queue/jitter-buffer/local playback of its own, unlike AudioBridge's
+        _on_rx_audio -- nothing here plays this audio back out loud; it
+        exists purely to feed torca's own decode/record features (see
+        this class's own docstring)."""
+        data = bytes(indata)
+        if self._rx_chunk_count == 0:
+            self._status(f"Passthrough RX: first chunk captured ({len(data)} bytes).")
+        self._rx_chunk_count += 1
+        for extra_callback in self._extra_rx_callbacks:
+            extra_callback(data)
+        for extra_raw_callback in self._extra_rx_raw_callbacks:
+            extra_raw_callback(data)
+
+    # ---- TX: torca's own generated tones -> a real sound card wired to the radio's mic-in ----
+
+    def _open_tx_stream(self):
+        blocksize = max(1, int(self.sample_rate * (AUDIO_OUTPUT_BLOCK_MS / 1000.0)))
+        try:
+            self._out_stream = sd.RawOutputStream(
+                device=self._resolve_device(self._output_device),
+                samplerate=self.sample_rate,
+                channels=AUDIO_CHANNELS,
+                dtype="int16",
+                blocksize=blocksize,
+                callback=self._on_tx_needed,
+            )
+            self._out_stream.start()
+            self._status(
+                f"Passthrough TX: playing to {self._device_label(self._output_device)} "
+                f"at {self.sample_rate} Hz -- this must be cabled to the radio's own "
+                "mic/audio-in jack."
+            )
+        except Exception as exc:
+            self._status(f"Passthrough TX: couldn't open {self._device_label(self._output_device)}: {exc}")
+            self._out_stream = None
+
+    def _on_tx_needed(self, outdata, frames, time_info, status):
+        """sounddevice callback -- runs on PortAudio's own thread. Same
+        drain-into-a-byte-buffer-then-slice pattern as AudioBridge's own
+        _on_output_needed, minus the jitter-buffer priming -- TX tones
+        are generated in full ahead of time (build_psk31_pcm etc.) or
+        arrive as a live but already-paced stream (the browser TX audio
+        path), neither of which needs to absorb the same kind of network/
+        USB timing jitter RX from a live radio does."""
+        needed = frames * AUDIO_SAMPLE_WIDTH * AUDIO_CHANNELS
+        with self._tx_lock:
+            buf = self._tx_playback_buf
+            if len(buf) >= needed:
+                outdata[:needed] = bytes(buf[:needed])
+                del buf[:needed]
+            else:
+                outdata[:len(buf)] = bytes(buf)
+                outdata[len(buf):needed] = b"\x00" * (needed - len(buf))
+                buf.clear()
+
+    async def play_tx_pcm(self, pcm_bytes: bytes):
+        """The passthrough counterpart to radio.push_audio_tx_pcm()/
+        push_tx() -- called from RadioWorker's own _send_tx_audio_pcm()/
+        _push_tx_audio_stream_pcm() instead of pushing to a radio object
+        that has no such method at all (see RadioWorker._tx_push_target()).
+        Deliberately NOT gated on _tx_active/set_tx_active(), unlike
+        AudioBridge's mic-capture path -- those callers already key PTT
+        themselves before calling this, the same way rigplane's own
+        push_audio_tx_pcm()/push_tx() don't check PTT state internally
+        either; it's the caller's job to key first. No fixed frame-size
+        requirement either (unlike rigplane's push_audio_tx_pcm(), which
+        rejects anything but an exact 1920-byte frame) -- this just
+        appends to the same kind of byte-buffer AudioBridge's own RX
+        playback already uses, sliced to whatever PortAudio's callback
+        asks for."""
+        if self._out_stream is None:
+            return
+        for extra_tx_callback in self._extra_tx_callbacks:
+            extra_tx_callback(pcm_bytes)
+        with self._tx_lock:
+            self._tx_playback_buf.extend(pcm_bytes)
+
+    # ---- Shared surface with AudioBridge, so callers (RadioWorker, the decode/recording windows) don't need to care which kind of bridge this is ----
+
+    def has_mic(self):
+        """Always False -- see this class's own docstring: there is no
+        operator-mic capture path through a passthrough bridge at all,
+        live voice PTT on a cable-connected radio bypasses the PC
+        entirely. Digimode TX (play_tx_pcm(), called from RadioWorker's
+        own send/stream methods) doesn't consult this at all, so it
+        works regardless of what this reports."""
+        return False
+
+    def has_tx_output(self):
+        """Whether this bridge actually has a playback device open for
+        play_tx_pcm() to write to -- checked by RadioWorker._tx_push_
+        target() before treating this bridge as a valid TX audio
+        destination."""
+        return self._out_stream is not None
+
+    def has_rx_stream(self):
+        return self._rx_active
+
+    def is_rx_stereo(self):
+        return False
+
+    def set_rx_downmix_channel(self, channel: str):
+        pass  # nothing to downmix -- passthrough audio is always plain mono
+
+    def set_tx_active(self, active: bool):
+        self._tx_active = active
+
+    async def start_tx_session(self):
+        pass  # no radio-side session to open -- see this class's own docstring
+
+    async def stop_tx_session(self):
+        pass
+
+    def add_extra_rx_callback(self, callback):
+        if callback not in self._extra_rx_callbacks:
+            self._extra_rx_callbacks.append(callback)
+
+    def remove_extra_rx_callback(self, callback):
+        try:
+            self._extra_rx_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def add_extra_rx_raw_callback(self, callback):
+        if callback not in self._extra_rx_raw_callbacks:
+            self._extra_rx_raw_callbacks.append(callback)
+
+    def remove_extra_rx_raw_callback(self, callback):
+        try:
+            self._extra_rx_raw_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def add_extra_tx_callback(self, callback):
+        if callback not in self._extra_tx_callbacks:
+            self._extra_tx_callbacks.append(callback)
+
+    def remove_extra_tx_callback(self, callback):
+        try:
+            self._extra_tx_callbacks.remove(callback)
+        except ValueError:
+            pass
 

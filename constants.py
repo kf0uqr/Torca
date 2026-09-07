@@ -54,6 +54,58 @@ RADIO_PROFILES = {
     # "usb" (serial) is not just the default here, it's the only
     # connection type that can actually work.
     "FTX-1": {"addr_hex": "", "default_connection": "usb", "protocol": "yaesu_cat", "default_baud": 38400},
+    # (tr)uSDX: a tiny QRP HF transceiver whose CAT is an ASCII, semicolon-
+    # terminated Kenwood-ish protocol -- the same protocol family as the
+    # TX-500 above, for which rigplane's own rigs/tx500.toml notes there
+    # is NO native kenwood_cat backend yet. Rather than block on writing
+    # one, RadioWorker runs Hamlib's own `rigctld` itself in the
+    # background (see rigctld_launcher.py) and talks to it over TCP via
+    # rigplane's already-shipped RigctldClientRadio -- so from the
+    # operator's side this looks exactly like every other USB radio: pick
+    # "truSDX", give it a serial port + baud rate, done. No CI-V address
+    # ("protocol": "managed_rigctld" hides that field, same as
+    # "yaesu_cat" does for FTX-1 -- see _current_radio_protocol in
+    # connection_dialog.py) and no rigctld host/port to enter by hand.
+    # hamlib_models: tried in order -- 2055 is Hamlib's own dedicated
+    # (tr)uSDX personality (added in a relatively recent Hamlib; not
+    # guaranteed present on an older install), 2028 is the Kenwood TS-480
+    # the truSDX's stock firmware emulates (confirmed against DL2MAN's own
+    # (tr)uSDX manual/details pages: "ID; ... 020 = TS-480 which is
+    # emulated") and works on any Hamlib. default_baud=115200 matches
+    # firmware 2.00t+ (that same source: 38400 on older firmware --
+    # change the Baud Rate field in the connection dialog if needed).
+    #
+    # Audio does NOT work like the other USB radios above -- confirmed
+    # against that same source that the truSDX has NO separate USB sound
+    # card at all. Its own manual documents a second option -- a
+    # proprietary digital-audio-over-the-same-serial-port mode (CAT
+    # extension commands UA0/UA1/UA2, its own 7825 Hz RX / 11520 Hz
+    # 8-bit sample format, interleaved with CAT bytes on the wire) meant
+    # for a dedicated streaming driver -- but that's NOT usable at the
+    # same time as this app's rigctld-based CAT, since both would need
+    # exclusive use of the one real serial connection, so it's not
+    # supported here.
+    #
+    # "audio_mode": "passthrough" instead: real analog audio cables from
+    # the truSDX's own mic/speaker jacks into a normal PC sound
+    # card/USB audio interface, with THAT interface picked in Audio
+    # Input/Output below -- see PassthroughAudioBridge's own docstring
+    # in audio.py for the full explanation, including why Input/Output's
+    # roles are swapped from a normal radio's (Input must be cabled to
+    # the truSDX's audio-OUT jack, Output to its audio-IN/mic jack).
+    # Also strictly better fidelity than option (2) above would have
+    # been even if it were supported here -- the streaming mode is
+    # still limited by the truSDX's own 8-bit ADC/DAC, whereas analog
+    # cables into a real PC sound card use whatever quality interface is
+    # actually plugged in.
+    "truSDX": {
+        "addr_hex": "",
+        "default_connection": "usb",
+        "protocol": "managed_rigctld",
+        "audio_mode": "passthrough",
+        "default_baud": 115200,
+        "hamlib_models": [2055, 2028],
+    },
 }
 
 # Which role a connected radio plays in satellite Doppler control, chosen
@@ -124,6 +176,13 @@ RADIO_BANDS = {
     # doesn't -- YaesuCatRadio has no such method), band buttons cleanly
     # fall back to tuning the low edge instead, see RadioWorker._select_band.
     "FTX-1": HF_6M_BANDS + VHF_UHF_BANDS[:2],
+    # truSDX: BEST-EFFORT like FTX-1 above, not confirmed against real
+    # hardware -- different builds/LPF revisions cover different subsets
+    # of HF, so this offers the full HF_6M_BANDS "jump to" list rather
+    # than guessing which bands one particular unit's low-pass filters
+    # actually support. rigctld (not this app) is what actually enforces
+    # any real hardware limit if a band button here doesn't apply.
+    "truSDX": HF_6M_BANDS,
 }
 
 # Confirmed two ways: (1) Icom's own IC-7300 CI-V reference manual lists

@@ -10,7 +10,8 @@ import os
 import shutil
 import uuid
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Slot
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -20,7 +21,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -28,6 +28,12 @@ from PySide6.QtWidgets import (
 )
 
 import recording
+
+# Amplitude (post mono-average, in [-1, 1]) below which a waveform bucket
+# is painted as "silence" rather than "audio" -- chosen well above pure
+# digital silence so quantization noise on a quiet RX squelch-open still
+# reads as silence, but any real voice/CW/data audio clears it easily.
+_SILENCE_THRESHOLD = 0.02
 
 _SOURCE_LABELS = {"rx": "RX", "tx": "TX", "both": "Both (RX+TX)"}
 _SOURCE_VALUES = {v: k for k, v in _SOURCE_LABELS.items()}
@@ -46,6 +52,129 @@ def _format_duration(seconds):
 
 def _format_ms(ms):
     return _format_duration((ms or 0) / 1000.0)
+
+
+class WaveformSeekBar(QWidget):
+    """Drop-in replacement for the playback QSlider: paints the loaded
+    recording as a min/max amplitude waveform (via
+    recording.compute_waveform_peaks) instead of a blank progress bar,
+    so the operator can see at a glance which parts of a pass actually
+    contain audio -- e.g. to skip past a long silent stretch of a
+    satellite recording -- rather than scrubbing blind. Exposes just the
+    slice of QSlider's API that recording_window.py actually used
+    (setRange/setValue/isSliderDown/setEnabled) plus a `sought` signal
+    in place of sliderMoved, so it drops into the existing playback wiring
+    unchanged."""
+
+    sought = Signal(int)  # emitted with a target position in ms, same role as QSlider.sliderMoved
+
+    _BG_COLOR = QColor(20, 20, 22)
+    _AUDIO_COLOR = QColor(90, 180, 255)
+    _SILENCE_COLOR = QColor(90, 90, 95)
+    _PLAYHEAD_COLOR = QColor(255, 255, 255)
+    _DISABLED_BG_COLOR = QColor(35, 35, 38)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(64)
+        self.setEnabled(False)
+        self._peaks = None  # (N, 2) float32 array of (min, max) in [-1, 1], or None if nothing loaded
+        self._duration_ms = 0
+        self._position_ms = 0
+        self._dragging = False
+
+    def load_recording(self, path):
+        """Reads and downsamples `path`'s waveform for painting. Duration
+        comes from setRange()/durationChanged as before (the actual
+        QMediaPlayer duration is the source of truth for seeking); this
+        is peaks-for-drawing only."""
+        peaks, _duration_ms = recording.compute_waveform_peaks(path)
+        self._peaks = peaks if peaks.size else None
+        self.update()
+
+    def clear(self):
+        self._peaks = None
+        self._position_ms = 0
+        self.update()
+
+    # ---- QSlider-compatible surface ----
+
+    def setRange(self, minimum, maximum):
+        self._duration_ms = max(0, maximum - minimum)
+        self.update()
+
+    def setValue(self, position_ms):
+        if not self._dragging:
+            self._position_ms = position_ms
+            self.update()
+
+    def value(self):
+        return self._position_ms
+
+    def isSliderDown(self):
+        return self._dragging
+
+    # ---- Mouse seeking ----
+
+    def _ms_at_x(self, x):
+        if self._duration_ms <= 0 or self.width() <= 0:
+            return 0
+        fraction = min(1.0, max(0.0, x / self.width()))
+        return int(round(fraction * self._duration_ms))
+
+    def mousePressEvent(self, event):
+        if not self.isEnabled() or self._duration_ms <= 0:
+            return
+        self._dragging = True
+        self._position_ms = self._ms_at_x(event.position().x())
+        self.update()
+        self.sought.emit(self._position_ms)
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging:
+            return
+        self._position_ms = self._ms_at_x(event.position().x())
+        self.update()
+        self.sought.emit(self._position_ms)
+
+    def mouseReleaseEvent(self, event):
+        if not self._dragging:
+            return
+        self._dragging = False
+        self._position_ms = self._ms_at_x(event.position().x())
+        self.update()
+        self.sought.emit(self._position_ms)
+
+    # ---- Painting ----
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        width = self.width()
+        height = self.height()
+        mid_y = height / 2.0
+
+        painter.fillRect(self.rect(), self._BG_COLOR if self.isEnabled() else self._DISABLED_BG_COLOR)
+
+        if self._peaks is not None and self.isEnabled():
+            bucket_count = self._peaks.shape[0]
+            for x in range(width):
+                bucket = min(bucket_count - 1, int(x / width * bucket_count))
+                lo, hi = self._peaks[bucket]
+                is_audio = (hi - lo) >= _SILENCE_THRESHOLD or max(abs(lo), abs(hi)) >= _SILENCE_THRESHOLD
+                painter.setPen(QPen(self._AUDIO_COLOR if is_audio else self._SILENCE_COLOR, 1))
+                top = mid_y - hi * mid_y
+                bottom = mid_y - lo * mid_y
+                if bottom - top < 1:
+                    top, bottom = mid_y - 0.5, mid_y + 0.5
+                painter.drawLine(x, int(top), x, int(bottom))
+        else:
+            painter.setPen(QPen(self._SILENCE_COLOR, 1))
+            painter.drawLine(0, int(mid_y), width, int(mid_y))
+
+        if self.isEnabled() and self._duration_ms > 0:
+            playhead_x = int(self._position_ms / self._duration_ms * width)
+            painter.setPen(QPen(self._PLAYHEAD_COLOR, 2))
+            painter.drawLine(playhead_x, 0, playhead_x, height)
 
 
 class RecordingToolWindow(QWidget):
@@ -136,9 +265,9 @@ class RecordingToolWindow(QWidget):
         self.play_pause_button = QPushButton("▶")
         self.play_pause_button.setEnabled(False)
         self.play_pause_button.clicked.connect(self._on_play_pause_clicked)
-        self.seek_slider = QSlider(Qt.Horizontal)
+        self.seek_slider = WaveformSeekBar()
         self.seek_slider.setEnabled(False)
-        self.seek_slider.sliderMoved.connect(self._player.setPosition)
+        self.seek_slider.sought.connect(self._player.setPosition)
         self.position_label = QLabel("0:00 / 0:00")
 
         playback_row = QHBoxLayout()
@@ -440,10 +569,11 @@ class RecordingToolWindow(QWidget):
             return
         self.status_label.setText("")
         self._playing_id = entry["id"]
+        self.seek_slider.setEnabled(True)
+        self.seek_slider.load_recording(path)
         self._player.setSource(QUrl.fromLocalFile(str(path)))
         self._player.play()
         self.play_pause_button.setEnabled(True)
-        self.seek_slider.setEnabled(True)
 
     def _on_play_pause_clicked(self):
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -505,6 +635,7 @@ class RecordingToolWindow(QWidget):
             self._player.setSource(QUrl())
             self.play_pause_button.setEnabled(False)
             self.seek_slider.setEnabled(False)
+            self.seek_slider.clear()
             self._playing_id = None
         path = recording.RECORDINGS_DIR / entry["filename"]
         try:

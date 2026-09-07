@@ -219,6 +219,46 @@ class Recorder:
         return duration
 
 
+def compute_waveform_peaks(path, target_buckets=1200):
+    """Downsamples a recorded .wav into (min, max) amplitude pairs, one
+    per "bucket" of the file, for the recording tool's waveform seek bar
+    to paint (see recording_window.py's WaveformSeekBar) -- multichannel
+    files are averaged to mono first since the seek bar only ever shows
+    one trace. Returns (peaks, duration_ms), where peaks is an (N, 2)
+    float32 array in [-1, 1] with N <= target_buckets (fewer only if the
+    file itself has fewer samples than that). An empty/unreadable file
+    yields an empty peaks array and duration_ms=0 rather than raising --
+    callers should treat that the same as "nothing to draw yet"."""
+    try:
+        with wave.open(str(path), "rb") as wav:
+            channels = wav.getnchannels()
+            rate = wav.getframerate()
+            n_frames = wav.getnframes()
+            raw = wav.readframes(n_frames)
+    except (OSError, wave.Error):
+        return np.zeros((0, 2), dtype=np.float32), 0
+    if not raw or not rate:
+        return np.zeros((0, 2), dtype=np.float32), 0
+
+    samples = np.frombuffer(raw, dtype=np.int16)
+    if channels > 1:
+        usable = samples.size - (samples.size % channels)
+        samples = samples[:usable].reshape(-1, channels).mean(axis=1)
+    samples = samples.astype(np.float32) / 32768.0
+
+    total = samples.size
+    duration_ms = int(round((total / rate) * 1000))
+    if total == 0:
+        return np.zeros((0, 2), dtype=np.float32), duration_ms
+
+    buckets = min(target_buckets, total)
+    bucket_size = total // buckets
+    usable = bucket_size * buckets
+    trimmed = samples[:usable].reshape(buckets, bucket_size)
+    peaks = np.stack([trimmed.min(axis=1), trimmed.max(axis=1)], axis=1)
+    return peaks.astype(np.float32), duration_ms
+
+
 def export_recording(src_wav_path, dest_path):
     """Copies (WAV) or transcodes (anything else, via system ffmpeg)
     src_wav_path to dest_path. Raises RuntimeError with a clear message

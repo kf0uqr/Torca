@@ -105,6 +105,8 @@ Installs the app and its own Python virtual environment to `/opt/torca`, and add
 
 ### Manual (any platform)
 
+On Windows specifically, see [WINDOWS_ID5100_SETUP.md](WINDOWS_ID5100_SETUP.md) for a full from-scratch walkthrough of the steps below plus CI-V USB driver setup, aimed at connecting an Icom ID-5100.
+
 ```bash
 # 1. Clone the repository
 git clone https://github.com/kf0uqr/Torca.git

@@ -47,7 +47,7 @@ Click **Save Profile...** to save the whole thing under a name, so a shared stat
 
 From the Ham Dashboard, click **Radios**, then **Connect New Radio...**. Pick:
 
-- **Radio** -- IC-7300, IC-9700, IC-705, IC-7610, Xiegu X6200, or Yaesu FTX-1. **The last three (IC-7610, X6200, FTX-1) have not been tested against real hardware by this project** -- see [README.md's "Supported radios"](README.md#supported-radios) for what that means in practice before relying on one. Selecting FTX-1 hides the CI-V Address field (it uses Yaesu's own CAT protocol instead) and only offers a USB connection.
+- **Radio** -- IC-7300, IC-9700, IC-705, IC-7610, Xiegu X6200, Icom ID-5100, or Yaesu FTX-1. **IC-7610, X6200, ID-5100, and FTX-1 have not been tested against real hardware by this project** -- see [README.md's "Supported radios"](README.md#supported-radios) for what that means in practice before relying on one. Selecting FTX-1 hides the CI-V Address field (it uses Yaesu's own CAT protocol instead) and only offers a USB connection. ID-5100 is USB-only and only supports FM/FM-N/AM/AM-N/DV modes with no scope/DSP controls -- it's a 2m/70cm mobile, not an SDR-class rig.
 - **Satellite Role** -- Non-Sat (default), Satellite Full Duplex (one dual-receiver radio), or Satellite Downlink/Uplink (a pair of separate radios). Only roles that still make sense given already-connected radios are offered.
 - **Connection** -- Network (LAN), USB (Serial), or Remote Server (see [Connecting a radio over the network](#connecting-a-radio-over-the-network)).
 - **Audio Input/Output** -- which PortAudio devices to use for RX/TX, or "None" to skip audio entirely.

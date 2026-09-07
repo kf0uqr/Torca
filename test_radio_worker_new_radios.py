@@ -73,6 +73,7 @@ def test_serial_model_routes_to_correct_backend_class():
         "IC-705": "Ic705SerialRadio",
         "IC-7610": "Icom7610SerialRadio",
         "X6200": "Ic705SerialRadio",  # shares the IC-705 CI-V personality, see x6200.toml
+        "ID-5100": "Ic705SerialRadio",  # generic transport class, see id5100.toml/factory.py
     }
     for radio_model, expected_class in expectations.items():
         worker = RadioWorker({

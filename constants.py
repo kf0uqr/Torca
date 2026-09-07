@@ -106,6 +106,18 @@ RADIO_PROFILES = {
         "default_baud": 115200,
         "hamlib_models": [2055, 2028],
     },
+    # ID-5100 (Icom's own name for what's commonly called "IC-5100"): a
+    # 2m/70cm FM/D-STAR-only mobile, a completely different class of radio
+    # from every SDR-class rig above -- no scope, no PBT/NR/NB/notch, no
+    # attenuator/preamp, no RIT/XIT, no tuner, no LAN, no 115200 baud (its
+    # CI-V baud options top out at 19200; see rigplane's own id5100.toml).
+    # civ_addr 0x8C is this radio's documented default per its own manual
+    # ("Remote jack (CI-V) information", ID-5100_ENG_CD_3.pdf p.13-16:
+    # "The ID-5100A/E's default address is 8Ch") -- not shared with any
+    # other radio in this table. USB-only: it has no LAN audio/control
+    # interface, only a wired CI-V/CAT connection via an OPC-478-class
+    # cable, same class of connection as the IC-7300.
+    "ID-5100": {"addr_hex": "8C", "default_connection": "usb", "protocol": "civ", "default_baud": 19200},
 }
 
 # Which role a connected radio plays in satellite Doppler control, chosen
@@ -183,6 +195,11 @@ RADIO_BANDS = {
     # actually support. rigctld (not this app) is what actually enforces
     # any real hardware limit if a band button here doesn't apply.
     "truSDX": HF_6M_BANDS,
+    # ID-5100: 2m/70cm FM/D-STAR mobile, no HF/6m/23cm coverage at all
+    # (manual's own spec table, USA version: RX 118-174/375-550 MHz, TX
+    # 144-148/430-450 MHz -- no HF, and 375-550 MHz doesn't reach 23cm's
+    # 1240-1300 MHz allocation).
+    "ID-5100": VHF_UHF_BANDS[:2],
 }
 
 # Confirmed two ways: (1) Icom's own IC-7300 CI-V reference manual lists

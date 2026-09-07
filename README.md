@@ -1,6 +1,6 @@
 # TORCA -- That One Radio Control App - v0.0.1a
 
-A PySide6 GUI for controlling amateur radios via [rigplane](https://pypi.org/project/rigplane/) -- Icom CI-V (IC-7300, IC-9700, IC-7610, IC-705, Xiegu X6200) and Yaesu CAT (FTX-1) -- built around a Ham Dashboard (satellite tracking, world map, QSO log, spot networks) and one window per connected radio (spectrum/waterfall, meters, memories, and a full set of digital-mode tools), with a dedicated worker thread handling all async radio I/O. **See [Supported radios](#supported-radios) below -- three of these have never been tested against real hardware by this project.**
+A PySide6 GUI for controlling amateur radios via [rigplane](https://pypi.org/project/rigplane/) -- Icom CI-V (IC-7300, IC-9700, IC-7610, IC-705, ID-5100, Xiegu X6200) and Yaesu CAT (FTX-1) -- built around a Ham Dashboard (satellite tracking, world map, QSO log, spot networks) and one window per connected radio (spectrum/waterfall, meters, memories, and a full set of digital-mode tools), with a dedicated worker thread handling all async radio I/O. **See [Supported radios](#supported-radios) below -- several of these have never been tested against real hardware by this project.**
 
 **See [USAGE.md](USAGE.md) for step-by-step instructions on every feature below.**
 
@@ -56,6 +56,7 @@ A PySide6 GUI for controlling amateur radios via [rigplane](https://pypi.org/pro
 | IC-7610 | Icom CI-V | Network (LAN) or USB | **Not tested against real hardware** |
 | Xiegu X6200 | Icom CI-V (subset) | USB | **Not tested against real hardware** |
 | Yaesu FTX-1 | Yaesu CAT | USB | **Not tested against real hardware** |
+| Icom ID-5100 | Icom CI-V (subset) | USB | **Not tested against real hardware** |
 
 The first three were added and verified against real radios over the course of this project (including real bugs found and fixed on real hardware -- see the commit history). **IC-7610, X6200, and FTX-1 were added purely because [rigplane](https://pypi.org/project/rigplane/) (the library this app is built on) already ships a working profile/backend for each of them -- none of the three has been connected to real hardware by this project.** Concretely, that means:
 
@@ -65,6 +66,8 @@ The first three were added and verified against real radios over the course of t
 - The Yaesu FTX-1 uses a completely different wire protocol (Yaesu CAT, not CI-V) from every other supported radio, so it exercises an almost entirely separate code path in rigplane.
 
 If you own one of these three radios, connecting it and reporting back (what works, what doesn't) is genuinely useful -- that's exactly how the first three radios went from "should work" to "confirmed working."
+
+**Icom ID-5100 (marketed in some contexts as "IC-5100")** is a different case from the three above: rigplane had no profile for it at all, so `rigs/id5100.toml` was written from scratch against Icom's own ID-5100A/E CI-V reference (the "Remote jack (CI-V) information" section of the full manual), not against existing rigplane/wfview code the way IC-7610/X6200/FTX-1 were. It's also a genuinely different class of radio -- a 2m/70cm FM/D-STAR-only mobile, not an SDR-class HF/VHF rig -- so only what the manual's own CI-V command table documents is wired up: frequency, mode (FM/FM-N/AM/AM-N/DV), AF level, squelch, RF power, mic gain, VOX, S-meter/power-meter, PTT, and repeater tone/TSQL. No scope, no PBT/NR/NB/notch, no attenuator/preamp, no RIT/XIT, no tuner -- none of those exist on this radio. D-STAR-specific features (MY callsign, DV memory, GPS/D-PRS) are also out of scope for now; they'd need new UI, not just a rig profile. Being both untested against real hardware *and* a hand-written-from-the-manual profile (rather than one inherited from an existing library), this one carries more risk than IC-7610/X6200/FTX-1 above -- treat it as the least-proven entry in this table.
 
 **Not currently supported at all: Xiegu X6100 and Lab599 TX-500.** Both have a declarative rigplane profile (`rigs/x6100.toml`, `rigs/tx500.toml`) describing their CI-V/CAT command sets, but neither has an actual backend implementation wired up in the installed rigplane version -- attempting to connect either one raises an immediate `Unsupported serial model` error (TX-500's own profile file even says so directly: "the TX-500 has no backend yet"). Revisit if/when rigplane ships real backends for them.
 
@@ -139,7 +142,7 @@ torca-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web    
 ./torca-server --backend serial --serial-port /dev/ttyUSB0 --model IC-7300 web  # manual/dev checkout
 ```
 
-- **`--model` is required.** Without it, rigplane's serial backend silently defaults to `IC-7610` and talks to your radio with the wrong CI-V address -- it'll connect, but frequency reads back as 0 Hz and tuning commands are silently ignored. Match it to your actual radio (`IC-7300`, `IC-9700`, `IC-7610`, `IC-705`, `X6200`, `FTX-1`). See [Supported radios](#supported-radios) above -- `IC-7610`/`X6200`/`FTX-1` haven't been tested against real hardware by this project.
+- **`--model` is required.** Without it, rigplane's serial backend silently defaults to `IC-7610` and talks to your radio with the wrong CI-V address -- it'll connect, but frequency reads back as 0 Hz and tuning commands are silently ignored. Match it to your actual radio (`IC-7300`, `IC-9700`, `IC-7610`, `IC-705`, `X6200`, `ID-5100`, `FTX-1`). See [Supported radios](#supported-radios) above -- `IC-7610`/`X6200`/`ID-5100`/`FTX-1` haven't been tested against real hardware by this project.
 - Connection flags (`--backend`, `--serial-port`, `--model`, etc.) go *before* `web`, not after -- `web`'s own arguments only cover LAN radios (`--radio-host` etc.), not serial ones.
 - Defaults to port 8080 with no auth token (LAN-trusted). Add `--auth-token YOURTOKEN` to require one, and `--port` to use a different port.
 - Run `torca-server --help` (or `rigplane --help` / `rigplane web --help`) for the full flag list -- audio bridge options, TLS, etc.

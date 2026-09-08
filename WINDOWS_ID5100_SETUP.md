@@ -69,7 +69,12 @@ pip install -r requirements.txt
 
 Your prompt should now start with `(venv)`. This install pulls in PySide6 (the GUI), rigplane (radio control, including the new ID-5100 support), and several other packages -- it'll take a minute or two.
 
-**A likely snag:** `opuslib` (used for Remote Access audio streaming, not needed for basic radio control) is a Python wrapper around a native `libopus` library that Windows doesn't ship with. If `pip install` fails specifically on `opuslib`, or the app errors on launch mentioning `opus`, download `libopus` for Windows (e.g. from [the opus-tools Windows builds](http://opus-codec.org/downloads/) or a prebuilt `opus.dll`) and drop `opus.dll` into the `Torca` folder (same folder as `main.py`) or somewhere on your `PATH`. This only affects Remote Access's audio streaming -- CI-V frequency/mode/PTT/meter testing below doesn't touch it.
+**A likely snag:** `opuslib` (used for Remote Access audio streaming, not needed for basic radio control) is a Python wrapper around a native `libopus` library that Windows doesn't ship with. It finds that library via the OS's standard DLL search order, which means the file has to go in one of two places, not just anywhere in the project folder:
+
+- **`venv\Scripts\opus.dll`** -- the same folder as `python.exe` inside the virtual environment. This is the most reliable option.
+- Any folder already on your **PATH** environment variable.
+
+Dropping it into the `Torca` project folder next to `main.py` does *not* reliably work -- the current working directory is a lower-priority part of Windows' DLL search order. Get a prebuilt `opus.dll` (e.g. from [the opus-tools Windows builds](http://opus-codec.org/downloads/)) and place it in `venv\Scripts\`. This only affects Remote Access's audio streaming -- CI-V frequency/mode/PTT/meter testing below doesn't touch it.
 
 ## 6. Before connecting: radio-side CI-V settings
 

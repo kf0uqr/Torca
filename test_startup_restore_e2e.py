@@ -83,3 +83,110 @@ def test_arrangement_survives_a_real_restart_of_the_app(tmp_path):
     assert saved.exists(), "nothing was saved"
     second = _run(SECOND, tmp_path, "second")
     assert second.returncode == 0 and "OK" in second.stdout, second.stdout + second.stderr
+
+
+# ---- switching profiles saves the one you are leaving ----
+
+SWITCH_PRELUDE = textwrap.dedent('''
+    import os, sys, json
+    sys.path.insert(0, %r)
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    app = QApplication([])
+    import operator_profile
+    from operator_profile import ensure_active_profile, save_operator_profiles, apply_profile, active_profile_name
+    base = {"name": "Pat", "address": "", "lat": 38.2, "lon": -97.5, "elevation_m": 450.0}
+    if os.environ.get("PHASE") == "A":
+        save_operator_profiles({"Home": dict(base, callsign="KF0UQR"), "POTA": dict(base, callsign="KF0UQR/P")})
+        apply_profile("Home")                                   # Home is the profile in use at launch
+    from workspace_host import WorkspaceHost
+    from workspace_persistence import WorkspacePersistence
+    from ham_dashboard import HamClockWindow
+    import workspace_state
+    profile = ensure_active_profile()
+    host = WorkspaceHost(); dash = HamClockWindow()
+    host.add_dashboard(dash); host.resize(1500, 800); host.show()
+    persistence = WorkspacePersistence(host, dash, profile)
+    problems = persistence.start()
+    def settle():
+        for _ in range(10):
+            app.processEvents()
+    settle()
+    pages = {title: page for title, page in dash._data_pages}
+    def saved(name):
+        return workspace_state.load_state(name)
+''' % os.path.dirname(os.path.abspath(__file__)))
+
+SWITCH_A = SWITCH_PRELUDE + textwrap.dedent('''
+    assert profile == "Home"
+    host.add_workspace(0, "right")
+    host.open_in(pages["Parks"], 1)
+    host.open_in(pages["Contests"], 0)
+    settle()
+
+    # --- the user picks the POTA profile in the Profile dialog and accepts the restart ---
+    import updater
+    relaunches = []
+    updater.schedule_relaunch_after_exit = lambda: relaunches.append(1)          # don't really spawn a new TORCA
+    QApplication.quit = staticmethod(lambda: None)
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+    host._dashboard = None                                        # skip the dashboard's slow network-worker teardown; the save is what is tested
+    apply_profile("POTA")                                         # what accepting the dialog does: POTA becomes the active profile
+    dash._offer_profile_switch("Home", "POTA")
+
+    assert relaunches == [1], "a restart was not scheduled"
+    home = saved("Home")
+    assert home is not None, "Home's workspace was NOT saved when switching away"
+    assert home["layout"] == ["h", [0, 1]]
+    assert "page:Parks" in home["workspaces"]["1"]["tabs"] and "page:Contests" in home["workspaces"]["0"]["tabs"]
+    assert saved("POTA") is None, "the new profile must not be given the old one's workspace"
+    assert active_profile_name() == "POTA"
+    print("OK")
+    sys.stdout.flush()
+    os._exit(0)
+''')
+
+SWITCH_B = SWITCH_PRELUDE + textwrap.dedent('''
+    assert profile == "POTA", profile                              # the restarted app loads the new profile without asking
+    assert problems == [] and host.workspace_count == 1            # POTA has no saved workspace yet: a normal start
+    assert host.pane_of(pages["Parks"]) is None and host.pane_of(pages["Contests"]) is None
+    host.add_workspace(0, "below")
+    host.open_in(pages["Satellites"], 1)
+    settle()
+    assert persistence.save_now()
+    print("OK")
+    sys.stdout.flush()
+    os._exit(0)
+''')
+
+SWITCH_C = SWITCH_PRELUDE + textwrap.dedent('''
+    assert profile == "Home", profile                              # switched back
+    assert problems == []
+    assert host._tree == ("h", (0, 1)), host._tree                  # Home's own layout, not POTA's
+    assert host.pane_of(pages["Parks"]) == 1 and host.pane_of(pages["Contests"]) == 0
+    assert host.pane_of(pages["Satellites"]) is None                 # POTA's tab did not leak into Home
+    pota = saved("POTA")
+    assert pota is not None and pota["layout"] == ["v", [0, 1]]      # and POTA's was kept intact, separately
+    print("OK")
+    sys.stdout.flush()
+    os._exit(0)
+''')
+
+
+def _run_phase(script, home, phase, extra_env=None):
+    env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "cfg"), XDG_CACHE_HOME=str(home / "cache"),
+               QT_QPA_PLATFORM="offscreen", PHASE=phase)
+    env.update(extra_env or {})
+    env.pop("PYTHONPATH", None)
+    return subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=180)
+
+
+def test_switching_profiles_saves_the_old_workspace_and_each_profile_keeps_its_own(tmp_path):
+    a = _run_phase(SWITCH_A, tmp_path, "A")
+    assert a.returncode == 0 and "OK" in a.stdout, a.stdout + a.stderr
+    b = _run_phase(SWITCH_B, tmp_path, "B")                         # the app "restarts" into POTA
+    assert b.returncode == 0 and "OK" in b.stdout, b.stdout + b.stderr
+
+    # switch back to Home (what the in-app switch does before restarting), then relaunch
+    switch_back = SWITCH_C.replace('profile = ensure_active_profile()', 'apply_profile("Home"); profile = ensure_active_profile()', 1)
+    c = _run_phase(switch_back, tmp_path, "C")
+    assert c.returncode == 0 and "OK" in c.stdout, c.stdout + c.stderr

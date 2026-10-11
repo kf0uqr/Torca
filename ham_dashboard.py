@@ -1734,6 +1734,13 @@ class HamClockWindow(QWidget):
         self.satellite_passes_page = QWidget()
         upcoming_passes_column = QVBoxLayout(self.satellite_passes_page)
         upcoming_passes_column.setContentsMargins(0, 0, 0, 0)
+        # The satellite controls (selected satellite / transponder /
+        # Start-Stop Tracking, the live El/Az/Doppler readout, and the
+        # stale-TLE warning) live with the passes list on this page
+        # rather than under the map.
+        upcoming_passes_column.addLayout(tracking_row)
+        upcoming_passes_column.addWidget(self.satellite_overlay_label)
+        upcoming_passes_column.addWidget(self.satellite_tle_warning_label)
         upcoming_passes_column.addLayout(passes_header_row)
         upcoming_passes_column.addWidget(self.upcoming_passes_table)
 
@@ -1745,22 +1752,16 @@ class HamClockWindow(QWidget):
         layout = QVBoxLayout()
         # clocks_row (UTC/local time plus SFI/SSN/K-index, per explicit
         # instruction) and map_buttons_row (satellite/QSO Map toggles,
-        # in their own row) both above the map. Map itself still with
-        # no stretch factor -- it claims only what its own (letterboxed,
-        # aspect-correct) heightForWidth calls for, rather than
-        # greedily taking all extra vertical space in the window (which
-        # is what a stretch factor of 1 here used to do, and the only
-        # thing keeping the map from severely distorting once
-        # HamClockWindow started occupying a tall/narrow half-screen
-        # region). Leaves more room below for the band-conditions/
-        # passes rows -- and for whatever gets added there later.
+        # in their own row) both above the map. The map takes all spare
+        # height (stretch 1): it is a real tiled map now, so it simply
+        # fills its container instead of needing an aspect-correct box
+        # (see world_map.py's docstring). The satellite controls
+        # (tracking row, live readout, TLE warning) live on the
+        # Satellites page with the passes list, not under the map.
         layout.addLayout(clocks_row)
         layout.addLayout(map_buttons_row)
-        layout.addWidget(self.map_widget)
+        layout.addWidget(self.map_widget, 1)  # the map takes all spare height (it is a real tiled map: no aspect to preserve)
         layout.addLayout(top_buttons_row)
-        layout.addLayout(tracking_row)
-        layout.addWidget(self.satellite_overlay_label)
-        layout.addWidget(self.satellite_tle_warning_label)
         layout.addLayout(bottom_row)
         self.setLayout(layout)
 
@@ -2504,7 +2505,6 @@ class HamClockWindow(QWidget):
         self._bottom_row.removeWidget(self.satellite_passes_page)
         self.layout().removeItem(self._bottom_row)
         tabs.hide()
-        self.layout().addStretch(1)  # keep the map/buttons at the top now that nothing sits below them
 
         # The park marker used to follow "Parks is the selected tab of
         # band_data_tabs"; with Parks its own host tab, that is simply

@@ -70,6 +70,7 @@ from PySide6.QtWidgets import (
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
 from workspace_host import present_window, retire_button
+from update_progress_dialog import UpdateProgressDialog
 from world_map import WorldMapWidget
 from connection_dialog import ConnectionDialog
 from operator_profile import OperatorProfileDialog
@@ -1579,6 +1580,7 @@ class HamClockWindow(QWidget):
         # install) and why neither needs a root/sudo prompt from here.
         self._update_check_worker = None
         self._update_perform_worker = None
+        self._update_progress_dialog = None  # UpdateProgressDialog while an update is running
         self.update_button = QPushButton("Check for Updates...")
         self.update_button.setToolTip("Checks GitHub for a newer version of TORCA, and can update in place.")
         self.update_button.clicked.connect(self._on_update_button_clicked)
@@ -3342,6 +3344,8 @@ class HamClockWindow(QWidget):
     def _start_update(self):
         self.update_button.setEnabled(False)
         self.update_button.setText("Updating...")
+        self._update_progress_dialog = UpdateProgressDialog(self)
+        self._update_progress_dialog.show()
         worker = UpdatePerformWorker(self)
         worker.status.connect(self._on_update_status)
         worker.succeeded.connect(self._on_update_succeeded)
@@ -3351,8 +3355,16 @@ class HamClockWindow(QWidget):
 
     def _on_update_status(self, message):
         self.update_button.setText(f"Updating: {message}")
+        if self._update_progress_dialog is not None:
+            self._update_progress_dialog.set_status(message)
+
+    def _close_update_progress_dialog(self):
+        dialog, self._update_progress_dialog = self._update_progress_dialog, None
+        if dialog is not None:
+            dialog.finish()
 
     def _on_update_succeeded(self):
+        self._close_update_progress_dialog()  # before the restart prompt, so the two never stack
         self.update_button.setEnabled(True)
         self.update_button.setText("Check for Updates...")
         box = QMessageBox(self)
@@ -3389,6 +3401,7 @@ class HamClockWindow(QWidget):
         QApplication.quit()
 
     def _on_update_failed(self, message):
+        self._close_update_progress_dialog()
         self.update_button.setEnabled(True)
         self.update_button.setText("Check for Updates...")
         QMessageBox.critical(self, "Update Failed", f"Couldn't complete the update:\n{message}")

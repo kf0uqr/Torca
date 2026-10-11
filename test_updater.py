@@ -91,7 +91,9 @@ def _prompt_harness(monkeypatch, choose_restart, schedule_error=None):
     fake = types.SimpleNamespace(
         update_button=types.SimpleNamespace(setEnabled=lambda *_: None, setText=lambda *_: None),
         close=lambda: events.append("close"),
+        _update_progress_dialog=None,  # no progress dialog open
     )
+    fake._close_update_progress_dialog = cls._close_update_progress_dialog.__get__(fake)
     fake.window = lambda: fake  # unhosted: the dashboard is its own top-level window
     fake._restart_application = cls._restart_application.__get__(fake)
     return cls._on_update_succeeded.__get__(fake), events, FakeBox
@@ -114,3 +116,85 @@ def test_update_prompt_does_not_quit_if_relaunch_cannot_be_scheduled(monkeypatch
     succeeded, events, _ = _prompt_harness(monkeypatch, choose_restart=True, schedule_error=OSError("no exec"))
     succeeded()
     assert events == ["warned"]  # told to restart by hand; never quit without a restart queued
+
+
+# ---- update progress dialog ----
+
+def _qapp():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def test_progress_dialog_shows_status_and_an_animated_busy_bar():
+    _qapp()
+    from update_progress_dialog import UpdateProgressDialog
+    dialog = UpdateProgressDialog()
+    dialog.show()
+    assert dialog.status_label.text() == "Starting..."
+    assert (dialog.bar.minimum(), dialog.bar.maximum()) == (0, 0)        # indeterminate: keeps animating
+    dialog.set_status("Pulling the latest changes...")
+    assert dialog.status_label.text() == "Pulling the latest changes..."
+    assert dialog._timer.isActive()
+    dialog.finish()
+    assert not dialog._timer.isActive() and not dialog.isVisible()
+
+
+def test_progress_dialog_cannot_be_dismissed_until_the_update_ends():
+    _qapp()
+    from PySide6.QtGui import QCloseEvent
+    from update_progress_dialog import UpdateProgressDialog
+    dialog = UpdateProgressDialog()
+    dialog.show()
+    dialog.reject()                                  # what Esc does
+    assert dialog.isVisible()
+    event = QCloseEvent()
+    dialog.closeEvent(event)                         # window-manager close
+    assert not event.isAccepted() and dialog.isVisible()
+    dialog.finish()
+    assert not dialog.isVisible()
+
+
+def test_progress_dialog_elapsed_clock_formats_minutes_and_seconds():
+    from update_progress_dialog import format_elapsed
+    assert [format_elapsed(s) for s in (0, 5, 59, 60, 61, 125, -3)] == ["0:00", "0:05", "0:59", "1:00", "1:01", "2:05", "0:00"]
+
+
+def test_dashboard_update_flow_opens_progress_dialog_relays_status_and_closes_it(monkeypatch):
+    import types
+    _qapp()
+    import ham_dashboard
+    from update_progress_dialog import UpdateProgressDialog
+
+    class FakeWorker:
+        def __init__(self, parent=None):
+            self.status = types.SimpleNamespace(connect=lambda f: setattr(self, "on_status", f))
+            self.succeeded = types.SimpleNamespace(connect=lambda f: setattr(self, "on_succeeded", f))
+            self.failed = types.SimpleNamespace(connect=lambda f: setattr(self, "on_failed", f))
+        def start(self): pass
+
+    monkeypatch.setattr(ham_dashboard, "UpdatePerformWorker", FakeWorker)
+    cls = ham_dashboard.HamClockWindow
+    for outcome in ("succeeded", "failed"):
+        events = []
+        fake = types.SimpleNamespace(
+            _update_progress_dialog=None, _update_perform_worker=None,
+            update_button=types.SimpleNamespace(setEnabled=lambda *_: None, setText=lambda *_: None),
+        )
+        fake._on_update_status = cls._on_update_status.__get__(fake)
+        fake._close_update_progress_dialog = cls._close_update_progress_dialog.__get__(fake)
+        fake._restart_application = lambda: events.append("restart")
+        fake._on_update_succeeded = lambda: (fake._close_update_progress_dialog(), events.append("prompt"))
+        fake._on_update_failed = lambda m: (fake._close_update_progress_dialog(), events.append("error"))
+        parent = None
+        monkeypatch.setattr(ham_dashboard, "UpdateProgressDialog", lambda p=None: UpdateProgressDialog())
+        cls._start_update(fake)
+        dialog = fake._update_progress_dialog
+        assert isinstance(dialog, UpdateProgressDialog) and dialog.isVisible()   # appears as soon as "Yes" is chosen
+        fake._update_perform_worker.on_status("Installing any new dependencies...")
+        assert dialog.status_label.text() == "Installing any new dependencies..."
+        (fake._update_perform_worker.on_succeeded() if outcome == "succeeded"
+         else fake._update_perform_worker.on_failed("boom"))
+        assert not dialog.isVisible() and fake._update_progress_dialog is None   # gone BEFORE the prompt / error box
+        assert events == (["prompt"] if outcome == "succeeded" else ["error"])

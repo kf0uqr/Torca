@@ -27,7 +27,7 @@ this through present_window() below, which falls back to the old
 show()/raise_() behaviour when no host exists (tests, headless use).
 """
 
-from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -47,6 +47,11 @@ from PySide6.QtWidgets import (
 )
 
 MAX_WORKSPACES = 4
+
+PLUS_BUTTON_STYLE = (
+    "QToolButton { font-weight: bold; font-size: 16px; padding: 0 8px; }"
+    "QToolButton::menu-indicator { image: none; }"
+)
 DEFAULT_WORKSPACES = 2
 
 _SETTINGS_ORG = "IcomRadioApp"
@@ -96,10 +101,63 @@ class _Entry:
         self.floating = False  # popped out into its own top-level window
 
 
+class _AddTabBar(QTabBar):
+    """A tab bar with a "+" button that sits immediately after the last
+    tab (Qt has no built-in "new tab" button, and a corner widget can
+    only be pinned to the far edge of the bar). The button is a child of
+    the bar, repositioned whenever the tabs are laid out or the bar is
+    resized.
+
+    When there are so many tabs that the bar scrolls, there is no free
+    spot inside the bar for it (the tabs fill everything up to Qt's
+    scroll arrows), so the in-bar button hides and overflowChanged(True)
+    tells the pane to show its corner "+" instead."""
+
+    overflowChanged = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._overflowing = False
+        self.add_button = QToolButton(self)
+        self.add_button.setText("+")
+        self.add_button.setToolTip("Add a tab to this workspace")
+        self.add_button.setAutoRaise(True)
+        self.add_button.setPopupMode(QToolButton.InstantPopup)
+        self.add_button.setStyleSheet(PLUS_BUTTON_STYLE)
+
+    def reposition_add_button(self):
+        button = self.add_button
+        button.adjustSize()
+        count = self.count()
+        last_right = self.tabRect(count - 1).right() + 1 if count else 0
+        x = last_right + 2
+        overflowing = x + button.width() > self.width()
+        if overflowing != self._overflowing:
+            self._overflowing = overflowing
+            self.overflowChanged.emit(overflowing)
+        button.setVisible(not overflowing)
+        if not overflowing:
+            button.move(x, max(0, (self.height() - button.height()) // 2))
+            button.raise_()
+
+    def tabLayoutChange(self):
+        super().tabLayoutChange()
+        self.reposition_add_button()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.reposition_add_button()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.reposition_add_button()
+
+
 class WorkspacePane(QTabWidget):
     def __init__(self, index, parent=None):
         super().__init__(parent)
         self.index = index
+        self.setTabBar(_AddTabBar(self))
         self.setDocumentMode(True)
         self.setMovable(True)
         self.setTabsClosable(True)
@@ -111,19 +169,25 @@ class WorkspacePane(QTabWidget):
 
         self._badge = QLabel()
         self._badge.setContentsMargins(8, 0, 8, 0)
-        self._add_button = QToolButton()
-        self._add_button.setText("+")
-        self._add_button.setToolTip("Add a tab to this workspace")
-        self._add_button.setPopupMode(QToolButton.InstantPopup)
-        self._add_button.setStyleSheet("QToolButton { font-weight: bold; font-size: 16px; padding: 0 8px; }"
-                                       "QToolButton::menu-indicator { image: none; }")
-        self._add_button.setMenu(QMenu(self._add_button))
-        self._add_button.menu().aboutToShow.connect(lambda: self._fill_menu(self._add_button.menu()))
+        # The "+" normally lives in the tab bar, right after the last tab.
+        # A second one in the corner (beside the workspace label) takes
+        # over only while the tabs overflow and the bar has no room for it.
+        self._corner_add_button = QToolButton()
+        self._corner_add_button.setText("+")
+        self._corner_add_button.setToolTip("Add a tab to this workspace")
+        self._corner_add_button.setAutoRaise(True)
+        self._corner_add_button.setStyleSheet(PLUS_BUTTON_STYLE)
+        self._corner_add_button.hide()
+        for button in (self.tabBar().add_button, self._corner_add_button):
+            button.setPopupMode(QToolButton.InstantPopup)
+            button.setMenu(QMenu(button))
+            button.menu().aboutToShow.connect(lambda b=button: self._fill_menu(b.menu()))
+        self.tabBar().overflowChanged.connect(self._corner_add_button.setVisible)
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(0, 0, 0, 0)
         corner_layout.setSpacing(0)
-        corner_layout.addWidget(self._add_button)
+        corner_layout.addWidget(self._corner_add_button)
         corner_layout.addWidget(self._badge)
         self.setCornerWidget(corner, Qt.TopRightCorner)
 

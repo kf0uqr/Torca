@@ -498,3 +498,64 @@ def test_retired_buttons_stay_alive_but_hidden(app):
     button.clicked.connect(lambda: clicks.append(1))
     button.click()                                   # still works as a state/signal holder
     assert clicks == [1]
+
+
+# ---- "+" button placement ----
+
+def _plus_x_and_last_tab_right(host, app, pane_index=0):
+    _settle(app)
+    pane = host.panes[pane_index]
+    bar = pane.tabBar()
+    return bar.add_button.x(), bar.tabRect(bar.count() - 1).right(), bar
+
+
+def test_plus_button_sits_directly_after_the_last_tab_and_follows_it(host, app):
+    host.resize(1400, 700)
+    host.show()
+    _dashboard(host)
+    x, last_right, bar = _plus_x_and_last_tab_right(host, app)
+    assert last_right < x <= last_right + 8, (x, last_right)            # hugging the last tab
+    assert x < bar.width() // 2                                          # nowhere near the workspace label / right edge
+
+    for i in range(3):
+        host.open_in(HideOnClose(f"Another tab {i}"), 0)
+    x2, last_right2, bar = _plus_x_and_last_tab_right(host, app)
+    assert x2 > x and last_right2 < x2 <= last_right2 + 8                # moved right with the new tabs
+
+    pane = host.panes[0]
+    host._on_tab_close_requested(pane, pane.count() - 1)
+    _settle(app)
+    x3, last_right3, bar = _plus_x_and_last_tab_right(host, app)
+    assert x3 < x2 and last_right3 < x3 <= last_right3 + 8               # and back left when one closes
+
+
+def test_plus_moves_to_the_corner_when_tabs_overflow_and_never_overlaps_a_tab(host, app):
+    host.set_workspace_count(4)                                          # narrow workspaces
+    host.resize(900, 700)
+    host.show()
+    _dashboard(host)
+    pane = host.panes[0]
+    bar = pane.tabBar()
+    _settle(app)
+    assert bar.add_button.isVisible() and not pane._corner_add_button.isVisible()   # plenty of room
+
+    for i in range(12):
+        host.open_in(HideOnClose(f"A fairly long tab title number {i}"), 0)
+    _settle(app)
+    assert not bar.add_button.isVisible()                                # would sit on top of the last tab
+    assert pane._corner_add_button.isVisible()                           # so the corner one is offered instead
+
+    for _ in range(12):                                                  # close every extra tab: only the dashboard fits
+        host._on_tab_close_requested(pane, pane.count() - 1)
+        _settle(app)
+    assert pane.count() == 1
+    assert bar.add_button.isVisible() and not pane._corner_add_button.isVisible()
+
+
+def test_both_plus_buttons_open_the_same_menu(host, app):
+    dash = FakeDashboard()
+    host.add_dashboard(dash)
+    pane = host.panes[0]
+    for button in (pane.tabBar().add_button, pane._corner_add_button):
+        pane._fill_menu(button.menu())
+        assert [a.text() for a in button.menu().actions() if not a.isSeparator()][:2] == ["Band Conditions", "Contests"]

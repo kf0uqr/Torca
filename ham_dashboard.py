@@ -38,7 +38,7 @@ import platform
 import sqlite3
 import time
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot, QSettings
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot, QSettings, QEvent
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -1729,13 +1729,18 @@ class HamClockWindow(QWidget):
         passes_header_row.addWidget(QLabel("Min El:"))
         passes_header_row.addWidget(self.min_elevation_spin)
 
-        upcoming_passes_column = QVBoxLayout()
+        # A real widget (not just a layout) so take_data_pages() can hand
+        # it to the workspace host as its own "Satellites" tab.
+        self.satellite_passes_page = QWidget()
+        upcoming_passes_column = QVBoxLayout(self.satellite_passes_page)
+        upcoming_passes_column.setContentsMargins(0, 0, 0, 0)
         upcoming_passes_column.addLayout(passes_header_row)
         upcoming_passes_column.addWidget(self.upcoming_passes_table)
 
         bottom_row = QHBoxLayout()
         bottom_row.addWidget(self.band_data_tabs)
-        bottom_row.addLayout(upcoming_passes_column)
+        bottom_row.addWidget(self.satellite_passes_page)
+        self._bottom_row = bottom_row
 
         layout = QVBoxLayout()
         # clocks_row (UTC/local time plus SFI/SSN/K-index, per explicit
@@ -2464,6 +2469,57 @@ class HamClockWindow(QWidget):
         self._selected_park = {"lat": park["lat"], "lon": park["lon"]}
         self.map_widget.set_selected_park_marker(self._selected_park)
         self.map_widget.center_on(park["lat"], park["lon"])
+
+    def take_data_pages(self):
+        """Detaches the reference-data sections from the dashboard's own
+        bottom row and returns them as [(title, widget)] -- Band
+        Conditions, Contests, DX Spots, Parks, Satellites (upcoming
+        passes) -- for the workspace host to dock as their own tabs
+        beside the dashboard (see WorkspaceHost.add_dashboard). The
+        dashboard keeps owning every widget and timer in them; this only
+        changes where they are shown. Without a host (tests, headless)
+        nothing calls this and the dashboard looks exactly as before.
+
+        The fixed heights these had were sized for the old shared bottom
+        row; cleared so each page fills its tab."""
+        tabs = self.band_data_tabs
+        try:
+            tabs.currentChanged.disconnect(self._on_band_data_tab_changed)
+        except (RuntimeError, TypeError):
+            pass
+        pages = []
+        while tabs.count():
+            title, page = tabs.tabText(0), tabs.widget(0)
+            tabs.removeTab(0)
+            pages.append((title, page))
+        pages.append(("Satellites", self.satellite_passes_page))
+        for _title, page in pages:
+            page.setMinimumHeight(0)
+            page.setMaximumHeight(16777215)
+        for table in (self.upcoming_passes_table, self.band_conditions_table):
+            table.setMinimumHeight(0)
+            table.setMaximumHeight(16777215)
+
+        self._bottom_row.removeWidget(tabs)
+        self._bottom_row.removeWidget(self.satellite_passes_page)
+        self.layout().removeItem(self._bottom_row)
+        tabs.hide()
+        self.layout().addStretch(1)  # keep the map/buttons at the top now that nothing sits below them
+
+        # The park marker used to follow "Parks is the selected tab of
+        # band_data_tabs"; with Parks its own host tab, that is simply
+        # "the Parks page is visible" (it is hidden while another tab of
+        # its workspace is selected, or its workspace is hidden).
+        self.parks_tab.installEventFilter(self)
+        return pages
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "parks_tab", None):
+            if event.type() == QEvent.Show:
+                self.map_widget.set_selected_park_marker(self._selected_park)
+            elif event.type() == QEvent.Hide:
+                self.map_widget.set_selected_park_marker(None)
+        return super().eventFilter(obj, event)
 
     def _on_band_data_tab_changed(self, index):
         # The park marker is only meaningful while the Parks tab is

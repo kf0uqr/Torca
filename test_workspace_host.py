@@ -262,3 +262,33 @@ def test_hosted_qthread_survives_layout_changes(host, app):
     finally:
         thread.quit()
         thread.wait(5000)
+
+
+def test_add_dashboard_docks_data_pages_beside_it_in_the_same_workspace(host, app):
+    class FakeDashboard(RealClose):
+        def take_data_pages(self):
+            self.pages = [(t, QWidget()) for t in ("Band Conditions", "Contests", "DX Spots", "Parks", "Satellites")]
+            return self.pages
+
+    host.set_workspace_count(3)
+    dash = FakeDashboard("Ham Dashboard")
+    host.add_dashboard(dash, pane_index=1)
+    pane = host.panes[1]
+    assert [pane.tabText(i) for i in range(pane.count())] == [
+        "Ham Dashboard", "Band Conditions", "Contests", "DX Spots", "Parks", "Satellites"]
+    assert all(host.pane_of(page) == 1 for _t, page in dash.pages)
+    assert pane.currentWidget() is host._entries[dash].page      # dashboard itself is left selected
+    assert host.panes[0].count() == 0 and host.panes[2].count() == 0
+    # none of them can be closed or popped out
+    for _t, page in dash.pages:
+        host.pop_out(page)
+        assert host.pane_of(page) == 1
+    # and closing the host still runs the dashboard's shutdown
+    host.close()
+    assert dash.closed
+
+
+def test_add_dashboard_works_for_a_dashboard_without_data_pages(host):
+    dash = RealClose("Ham Dashboard")
+    host.add_dashboard(dash)
+    assert host.pane_of(dash) == 0 and host.panes[0].count() == 1

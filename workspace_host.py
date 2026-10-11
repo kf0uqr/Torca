@@ -298,6 +298,21 @@ class WorkspaceHost(QMainWindow):
         self._dock(entry, pane)
         return entry
 
+    def add_dashboard(self, dashboard, pane_index=0):
+        """Docks the dashboard (non-closable) and, if it offers
+        take_data_pages(), its reference-data sections as their own
+        non-closable tabs in the SAME workspace, then leaves the
+        dashboard itself selected. Closing the host runs the dashboard's
+        shutdown (see set_dashboard)."""
+        self.add_window(dashboard, closable=False, pane_index=pane_index)
+        self.set_dashboard(dashboard)
+        take = getattr(dashboard, "take_data_pages", None)
+        if take is not None:
+            for title, page in take():
+                page.setWindowTitle(title)
+                self.add_window(page, closable=False, pane_index=pane_index)
+        self.present(dashboard)
+
     def present(self, widget):
         """Shows `widget`: selects its tab if docked, raises it if
         floating, otherwise docks it per the placement rule."""

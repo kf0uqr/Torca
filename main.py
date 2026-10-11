@@ -86,8 +86,7 @@ def main():
     # full shutdown.
     host = WorkspaceHost()
     window = HamClockWindow()
-    host.add_window(window, closable=False, pane_index=0)
-    host.set_dashboard(window)
+    host.add_dashboard(window)
     host.showMaximized()
     sys.exit(app.exec())
 

@@ -9,7 +9,6 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QWidget
 
 import workspace_host
@@ -43,10 +42,7 @@ def app():
 
 
 @pytest.fixture
-def host(app, tmp_path, monkeypatch):
-    # Never touch the real user's QSettings.
-    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path))
-    monkeypatch.setattr(workspace_host, "_SETTINGS_ORG", "TorcaTestOrg")
+def host(app):
     h = WorkspaceHost()
     h.show()
     yield h
@@ -75,14 +71,15 @@ def _dashboard(host):
     return dash
 
 
-def test_default_is_two_workspaces_and_dashboard_in_first(host):
+def test_starts_with_a_single_workspace_holding_the_dashboard(host):
     dash = _dashboard(host)
-    assert host.workspace_count == 2
-    assert host.pane_of(dash) == 0
-    assert host.panes[0].count() == 1 and host.panes[1].count() == 0
+    assert host.workspace_count == 1
+    assert [p.index for p in host.visible_panes()] == [0]
+    assert host.pane_of(dash) == 0 and host.panes[0].count() == 1
 
 
 def test_new_window_takes_next_empty_workspace_else_tab_in_current(host):
+    host.set_workspace_count(2)
     dash = _dashboard(host)
     radio1, radio2, radio3 = RealClose("R1"), RealClose("R2"), RealClose("R3")
     host.present(radio1)
@@ -133,10 +130,12 @@ def test_reducing_workspaces_moves_tabs_instead_of_closing_them(host, app):
 
 
 def test_closing_a_singleton_tool_removes_tab_but_keeps_widget_reusable(host, app):
+    host.set_workspace_count(2)
     _dashboard(host)
     tool = HideOnClose("CW Tool")
     host.present(tool)
     pane = host.panes[host.pane_of(tool)]
+    assert pane.index == 1
     host._on_tab_close_requested(pane, pane.indexOf(host._entries[tool].page))
     _settle(app)
     assert host.pane_of(tool) is None and pane.count() == 0
@@ -202,11 +201,6 @@ def test_tab_title_follows_window_title(host):
     radio.setWindowTitle("TORCA -- IC-7300")
     pane = host.panes[host.pane_of(radio)]
     assert pane.tabText(pane.indexOf(host._entries[radio].page)) == "TORCA -- IC-7300"
-
-
-def test_workspace_count_is_remembered(host, app):
-    host.set_workspace_count(3)
-    assert int(QSettings("TorcaTestOrg", workspace_host._SETTINGS_APP).value("workspace_count")) == 3
 
 
 def test_closing_host_runs_dashboard_shutdown(host, app):
@@ -559,3 +553,130 @@ def test_both_plus_buttons_open_the_same_menu(host, app):
     for button in (pane.tabBar().add_button, pane._corner_add_button):
         pane._fill_menu(button.menu())
         assert [a.text() for a in button.menu().actions() if not a.isSeparator()][:2] == ["Band Conditions", "Contests"]
+
+
+# ---- growing the workspace grid: add right / below, close ----
+
+def _menu_for(host, index):
+    pane = host.panes[index]
+    pane._fill_workspace_menu()
+    return [a.text() for a in pane._badge.menu().actions() if not a.isSeparator()], pane._badge.menu()
+
+
+def _trigger(menu, text):
+    next(a for a in menu.actions() if a.text() == text).trigger()
+
+
+def test_workspace_one_offers_right_and_below_and_each_choice_places_the_new_one(host):
+    texts, menu = _menu_for(host, 0)
+    assert texts == ["Add Workspace Right", "Add Workspace Below"]
+    _trigger(menu, "Add Workspace Right")
+    assert host._slots == {0: (0, 0), 1: (0, 1)}
+    texts, menu = _menu_for(host, 0)
+    assert texts == ["Add Workspace Below"]                                  # right is taken now
+    _trigger(menu, "Add Workspace Below")
+    assert host._slots == {0: (0, 0), 1: (0, 1), 2: (1, 0)}
+    texts, _ = _menu_for(host, 0)
+    assert texts == ["Add more from the other workspaces' menus"]            # workspace 1 is boxed in, but 3 < 4...
+    host.add_workspace(1, "below")
+    texts, _ = _menu_for(host, 0)
+    assert texts == ["All 4 workspaces are in use"]                          # ...until the grid is actually full
+
+
+def test_menu_options_follow_the_square_grid_rules(host):
+    # top-left only
+    assert host.can_add_workspace(0, "right") and host.can_add_workspace(0, "below")
+    host.add_workspace(0, "right")                                           # workspace 2, top-right
+    assert not host.can_add_workspace(1, "right")                            # nothing further right of a square
+    assert host.can_add_workspace(1, "below")                                # top-right can add below it
+    texts, _ = _menu_for(host, 1)
+    assert texts == ["Add Workspace Below", "Close Workspace"]
+    host.add_workspace(0, "below")                                           # workspace 3, bottom-left
+    assert host.can_add_workspace(2, "right") and not host.can_add_workspace(2, "below")
+    texts, _ = _menu_for(host, 2)
+    assert texts == ["Add Workspace Right", "Close Workspace"]
+    assert host.add_workspace(2, "right") == 3                               # workspace 4, bottom-right
+    assert host.workspace_count == 4
+    texts, _ = _menu_for(host, 3)
+    assert texts == ["Close Workspace"]                                      # the corner can only be closed
+    assert host.add_workspace(1, "below") is None and host.add_workspace(0, "right") is None   # full / taken
+
+
+def test_only_workspaces_two_to_four_can_be_closed(host):
+    host.set_workspace_count(4)
+    texts, _ = _menu_for(host, 0)
+    assert "Close Workspace" not in texts
+    assert host.close_workspace(0) is False and host.workspace_count == 4
+    for index in (1, 2, 3):
+        texts, _ = _menu_for(host, index)
+        assert "Close Workspace" in texts
+
+
+def test_new_workspace_takes_the_lowest_free_number(host):
+    assert host.add_workspace(0, "below") == 1                               # first one added is "Workspace 2"
+    assert host._slots[1] == (1, 0)
+    assert host.add_workspace(0, "right") == 2
+    host.close_workspace(1)
+    assert host.add_workspace(2, "below") == 1                               # number 2 is reused, now top... right-below
+    assert host._slots[1] == (1, 1)
+
+
+def test_closing_a_workspace_moves_its_tabs_into_the_others_and_keeps_everything_running(host, app):
+    dash = _dashboard(host)
+    host.set_workspace_count(3)
+    radios = [RealClose(f"R{i}") for i in range(2)]
+    for r in radios:
+        host.present(r)                                                       # workspaces 2 and 3
+    assert sorted(host.pane_of(r) for r in radios) == [1, 2]
+    host.close_workspace(1)
+    _settle(app)
+    assert host.workspace_count == 2 and 1 not in host._slots
+    assert all(host.pane_of(r) in (0, 2) for r in radios)
+    assert sum(p.count() for p in host.panes) == 3                            # nothing lost
+    assert not any(r.closed for r in radios)
+    assert not host.panes[1].isVisibleTo(host)
+
+
+def test_closing_the_active_workspace_makes_workspace_one_active(host):
+    host.set_workspace_count(2)
+    host._set_active_pane(host.panes[1])
+    host.close_workspace(1)
+    assert host._active_pane is host.panes[0]
+
+
+def test_layout_follows_the_slots_and_a_lone_row_spans_the_full_width(host, app):
+    host.resize(1200, 800)
+    host.show()
+    host.add_workspace(0, "below")                                            # slots: (0,0) and (1,0)
+    host.add_workspace(1, "right")                                            # ... plus (1,1): top row has ONE workspace
+    _settle(app)
+    top, bottom_left, bottom_right = host.panes[0], host.panes[1], host.panes[2]
+    assert top.width() >= host._layout_root.width() - 4                       # lone top row spans the full width
+    assert top.y() < bottom_left.mapTo(host, bottom_left.rect().topLeft()).y()
+    assert abs(bottom_left.width() - bottom_right.width()) <= 8               # bottom row split evenly
+    assert bottom_left.mapTo(host, bottom_left.rect().topLeft()).x() < bottom_right.mapTo(host, bottom_right.rect().topLeft()).x()
+
+
+def test_empty_workspace_still_shows_a_clickable_workspace_label(host, app):
+    host.resize(1200, 800)
+    host.show()
+    host.add_workspace(0, "right")
+    _settle(app)
+    badge = host.panes[1]._badge
+    assert host.panes[1].count() == 0
+    assert badge.isVisible() and badge.height() > 0 and badge.text() == "Workspace 2"
+
+
+def test_changing_the_grid_never_destroys_panes_or_hosted_windows(host, app):
+    from shiboken6 import isValid
+    dash = _dashboard(host)
+    tool = HideOnClose("Tool")
+    host.present(tool)
+    steps = [("add", 0, "right"), ("add", 0, "below"), ("add", 1, "below"), ("close", 2), ("close", 3),
+             ("close", 1), ("add", 0, "below"), ("close", 1)]
+    for step in steps:
+        host.add_workspace(step[1], step[2]) if step[0] == "add" else host.close_workspace(step[1])
+        _settle(app)
+        _flush_deletes(app)
+        assert all(isValid(p) for p in host.panes) and isValid(dash) and isValid(tool), step
+        assert sum(p.count() for p in host.panes) == 2

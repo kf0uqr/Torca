@@ -27,13 +27,11 @@ this through present_window() below, which falls back to the old
 show()/raise_() behaviour when no host exists (tests, headless use).
 """
 
-from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QHBoxLayout,
-    QLabel,
     QMainWindow,
     QMenu,
     QPushButton,
@@ -48,15 +46,14 @@ from PySide6.QtWidgets import (
 
 MAX_WORKSPACES = 4
 
+# Workspaces sit in a 2x2 grid: slot = (row, column). Workspace 1 is always
+# top-left; others are added to the right of / below an existing one.
+SLOT_ORDER = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
 PLUS_BUTTON_STYLE = (
     "QToolButton { font-weight: bold; font-size: 16px; padding: 0 8px; }"
     "QToolButton::menu-indicator { image: none; }"
 )
-DEFAULT_WORKSPACES = 2
-
-_SETTINGS_ORG = "IcomRadioApp"
-_SETTINGS_APP = "RadioControl"
-_SETTINGS_KEY = "workspace_count"
 
 _TAB_TITLE_MAX = 28
 
@@ -140,6 +137,19 @@ class _AddTabBar(QTabBar):
             button.move(x, max(0, (self.height() - button.height()) // 2))
             button.raise_()
 
+    # A tab bar with no tabs reports zero height, and QTabWidget sizes the
+    # bar (and the corner label beside it) from the size hint -- so an
+    # empty workspace would lose its "Workspace N" menu button.
+    _MIN_BAR_HEIGHT = 28
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        return QSize(hint.width(), max(hint.height(), self._MIN_BAR_HEIGHT))
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        return QSize(hint.width(), max(hint.height(), self._MIN_BAR_HEIGHT))
+
     def tabLayoutChange(self):
         super().tabLayoutChange()
         self.reposition_add_button()
@@ -167,8 +177,15 @@ class WorkspacePane(QTabWidget):
 
         self._menu_builder = None  # set by the host: fills a QMenu with what can be opened here
 
-        self._badge = QLabel()
-        self._badge.setContentsMargins(8, 0, 8, 0)
+        # "Workspace N" doubles as the menu for adding/closing workspaces.
+        self._badge = QToolButton()
+        self._badge.setAutoRaise(True)
+        self._badge.setPopupMode(QToolButton.InstantPopup)
+        self._badge.setToolTip("Add or close workspaces")
+        self._badge.setMenu(QMenu(self._badge))
+        self._badge.menu().aboutToShow.connect(self._fill_workspace_menu)
+        self._workspace_menu_builder = None
+
         # The "+" normally lives in the tab bar, right after the last tab.
         # A second one in the corner (beside the workspace label) takes
         # over only while the tabs overflow and the bar has no room for it.
@@ -201,6 +218,18 @@ class WorkspacePane(QTabWidget):
 
     def set_menu_builder(self, builder):
         self._menu_builder = builder
+
+    def set_workspace_menu_builder(self, builder):
+        self._workspace_menu_builder = builder
+
+    def _fill_workspace_menu(self):
+        menu = self._badge.menu()
+        menu.clear()
+        menu.setToolTipsVisible(True)
+        if self._workspace_menu_builder is not None:
+            self._workspace_menu_builder(menu)
+        if menu.isEmpty():
+            menu.addAction("(nothing to change)").setEnabled(False)
 
     def _fill_menu(self, menu):
         menu.clear()
@@ -236,7 +265,9 @@ class WorkspacePane(QTabWidget):
     def set_active(self, active):
         self._badge.setText(f"Workspace {self.index + 1}")
         self._badge.setStyleSheet(
-            "color: #e8a33d; font-weight: bold;" if active else "color: #888;"
+            "QToolButton { color: %s; %s padding: 0 8px; }" % (
+                ("#e8a33d", "font-weight: bold;") if active else ("#888", "")
+            )
         )
 
     def paintEvent(self, event):
@@ -310,26 +341,13 @@ class WorkspaceHost(QMainWindow):
             )
             pane.tabCloseRequested.connect(lambda i, p=pane: self._on_tab_close_requested(p, i))
             pane.set_menu_builder(lambda menu, p=pane: self._fill_add_menu(menu, p))
+            pane.set_workspace_menu_builder(lambda menu, p=pane: self._fill_workspace_menu(menu, p))
             pane.currentChanged.connect(lambda _i, p=pane: self._set_active_pane(p))
         self._active_pane = self.panes[0]
 
-        # ---- Top bar: workspace-count selector + floating-window menu ----
+        # ---- Top bar: floating-window menu ----
         bar = QHBoxLayout()
         bar.setContentsMargins(6, 4, 6, 2)
-        bar.addWidget(QLabel("Workspaces:"))
-        self._count_group = QButtonGroup(self)
-        self._count_buttons = {}
-        for n in range(1, MAX_WORKSPACES + 1):
-            button = QPushButton(str(n))
-            button.setCheckable(True)
-            button.setFixedWidth(34)
-            button.setStyleSheet("QPushButton:checked { background-color: #c33; color: white; font-weight: bold; }")
-            button.setToolTip(f"Show {n} workspace{'s' if n > 1 else ''}")
-            self._count_group.addButton(button, n)
-            self._count_buttons[n] = button
-            bar.addWidget(button)
-        self._count_group.idClicked.connect(self.set_workspace_count)
-        bar.addSpacing(12)
         self._floating_button = QToolButton()
         self._floating_button.setText("Floating windows")
         self._floating_button.setPopupMode(QToolButton.InstantPopup)
@@ -351,13 +369,10 @@ class WorkspaceHost(QMainWindow):
         outer.addWidget(self._layout_root, stretch=1)
         self.setCentralWidget(central)
 
-        self._count = 0
-        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-        try:
-            saved = int(settings.value(_SETTINGS_KEY, DEFAULT_WORKSPACES))
-        except (TypeError, ValueError):
-            saved = DEFAULT_WORKSPACES
-        self.set_workspace_count(min(max(saved, 1), MAX_WORKSPACES), persist=False)
+        # Start with a single workspace; the operator grows the grid from
+        # each workspace's own "Workspace N" menu.
+        self._slots = {0: SLOT_ORDER[0]}  # workspace index -> (row, column)
+        self._build_layout()
 
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
         _HOST = self
@@ -368,29 +383,102 @@ class WorkspaceHost(QMainWindow):
 
     @property
     def workspace_count(self):
-        return self._count
+        return len(self._slots)
 
     def visible_panes(self):
-        return self.panes[: self._count]
+        return [self.panes[i] for i in sorted(self._slots)]
 
-    def set_workspace_count(self, n, persist=True):
-        """Shows `n` (1-4) workspaces. Tabs in workspaces that go away
-        are MOVED into the remaining ones (the one with the fewest tabs
-        each time) -- nothing is closed, radios keep running."""
-        n = min(max(int(n), 1), MAX_WORKSPACES)
-        for pane in self.panes[n:]:
-            for entry in [e for e in self._entries.values() if e.pane is pane]:
-                target = min(self.panes[:n], key=lambda p: (p.count(), p.index))
-                self._move_to_pane(entry, target)
-        self._count = n
-        self._count_buttons[n].setChecked(True)
-        self._build_layout(n)
-        if self._active_pane not in self.panes[:n]:
+    def can_add_workspace(self, index, direction):
+        """True if workspace `index` can grow a neighbour 'right' or
+        'below' it: the target grid slot must exist and be free. The grid
+        is 2x2, so only the left column can add to the right and only the
+        top row can add below -- which is what makes the result a square."""
+        return self._target_slot(index, direction) is not None
+
+    def _target_slot(self, index, direction):
+        if index not in self._slots:
+            return None
+        row, col = self._slots[index]
+        if direction == "right" and col == 0:
+            target = (row, 1)
+        elif direction == "below" and row == 0:
+            target = (1, col)
+        else:
+            return None
+        return target if target not in self._slots.values() else None
+
+    def add_workspace(self, index, direction):
+        """Adds an empty workspace to the right of / below workspace
+        `index` (see can_add_workspace). The new one takes the lowest
+        unused workspace number. Returns its index, or None if not allowed."""
+        target = self._target_slot(index, direction)
+        if target is None:
+            return None
+        new_index = min(i for i in range(MAX_WORKSPACES) if i not in self._slots)
+        self._slots[new_index] = target
+        self._build_layout()
+        return new_index
+
+    def close_workspace(self, index):
+        """Removes workspace `index` (never workspace 1). Its tabs are
+        MOVED into the remaining workspaces -- the one with the fewest
+        tabs each time -- nothing is closed and radios keep running."""
+        if index == 0 or index not in self._slots:
+            return False
+        del self._slots[index]
+        remaining = self.visible_panes()
+        for entry in [e for e in self._entries.values() if e.pane is self.panes[index]]:
+            self._move_to_pane(entry, min(remaining, key=lambda p: (p.count(), p.index)))
+        self._build_layout()
+        if self._active_pane is self.panes[index]:
             self._set_active_pane(self.panes[0])
-        if persist:
-            QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(_SETTINGS_KEY, n)
+        return True
 
-    def _build_layout(self, n):
+    def set_workspace_count(self, n):
+        """Programmatic arrangement of the first `n` grid slots (top-left,
+        top-right, bottom-left, bottom-right), moving tabs out of any
+        workspace that goes away. The UI itself grows and shrinks the grid
+        one workspace at a time (add_workspace / close_workspace)."""
+        n = min(max(int(n), 1), MAX_WORKSPACES)
+        for index in range(n, MAX_WORKSPACES):
+            if index in self._slots:
+                self._slots.pop(index)
+                remaining = [self.panes[i] for i in sorted(self._slots)] or [self.panes[0]]
+                for entry in [e for e in self._entries.values() if e.pane is self.panes[index]]:
+                    self._move_to_pane(entry, min(remaining, key=lambda p: (p.count(), p.index)))
+        self._slots = {i: SLOT_ORDER[i] for i in range(n)}
+        self._build_layout()
+        if self._active_pane.index not in self._slots:
+            self._set_active_pane(self.panes[0])
+
+    def _fill_workspace_menu(self, menu, pane):
+        """The menu behind a workspace's "Workspace N" label."""
+        index = pane.index
+        if self.can_add_workspace(index, "right"):
+            menu.addAction("Add Workspace Right").triggered.connect(
+                lambda _c=False: self.add_workspace(index, "right"))
+        if self.can_add_workspace(index, "below"):
+            menu.addAction("Add Workspace Below").triggered.connect(
+                lambda _c=False: self.add_workspace(index, "below"))
+        if index != 0:
+            if not menu.isEmpty():
+                menu.addSeparator()
+            action = menu.addAction("Close Workspace")
+            action.setToolTip("Its tabs move to the other workspaces; nothing is closed.")
+            action.triggered.connect(lambda _c=False: self.close_workspace(index))
+        elif menu.isEmpty():
+            full = len(self._slots) >= MAX_WORKSPACES
+            action = menu.addAction(
+                f"All {MAX_WORKSPACES} workspaces are in use" if full
+                else "Add more from the other workspaces' menus"
+            )
+            action.setEnabled(False)
+
+    def _build_layout(self):
+        """Arranges the visible workspaces in rows by their grid slots: a
+        row with two workspaces is split left/right, and when both rows
+        exist they are stacked top/bottom. A row holding a single
+        workspace gives it the full width."""
         for pane in self.panes:
             pane.setParent(self._holder)  # detach from any old splitter before it is discarded
             pane.hide()
@@ -405,33 +493,27 @@ class WorkspaceHost(QMainWindow):
             old_body.hide()
             old_body.setParent(None)
             old_body.deleteLater()
-        p = self.panes
-        if n == 1:
-            body = p[0]
-        elif n == 2:
-            body = self._splitter(Qt.Horizontal, p[0], p[1])
-        elif n == 3:
-            # One large workspace on the left, two stacked on the right.
-            body = self._splitter(Qt.Horizontal, p[0], self._splitter(Qt.Vertical, p[1], p[2]))
-        else:
-            body = self._splitter(
-                Qt.Vertical,
-                self._splitter(Qt.Horizontal, p[0], p[1]),
-                self._splitter(Qt.Horizontal, p[2], p[3]),
-            )
+
+        rows = []
+        for row in (0, 1):
+            in_row = sorted((slot[1], index) for index, slot in self._slots.items() if slot[0] == row)
+            panes = [self.panes[index] for _col, index in in_row]
+            if panes:
+                rows.append(panes[0] if len(panes) == 1 else self._splitter(Qt.Horizontal, *panes))
+        body = rows[0] if len(rows) == 1 else self._splitter(Qt.Vertical, *rows)
         self._body = body
         self._layout_box.addWidget(body)
-        for pane in p[:n]:
+        for pane in self.visible_panes():
             pane.show()
         body.show()
 
     @staticmethod
-    def _splitter(orientation, first, second):
+    def _splitter(orientation, *children):
         splitter = QSplitter(orientation)
         splitter.setChildrenCollapsible(False)
-        splitter.addWidget(first)
-        splitter.addWidget(second)
-        splitter.setSizes([1, 1])
+        for child in children:
+            splitter.addWidget(child)
+        splitter.setSizes([1] * len(children))
         return splitter
 
     # ------------------------------------------------------------------

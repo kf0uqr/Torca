@@ -3207,6 +3207,7 @@ class HamClockWindow(QWidget):
         window = RadioWindow(details, self.satellite_session)
         window.closed.connect(self._on_radio_window_closed)
         window.aprs_packet_decoded.connect(self._on_aprs_packet_decoded)
+        window.ft8_qso_logged.connect(self._on_wsjtx_qso_logged)   # same path as WSJT-X auto-logging
         # Remote Access identity + state cache -- must be created here,
         # on the GUI thread, NOT lazily from the web server's own
         # thread later (see web_remote/bridge.py's own docstring for

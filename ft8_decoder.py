@@ -53,6 +53,14 @@ DECODER_RATE = 12000  # the only rate decode_ft8 reads correctly
 # transmission (it would be missing its first symbols), so it is not decoded.
 MIN_DECODABLE_FRACTION = 0.8
 
+# A transmission is over this long after its slot starts (it begins 0.5 s in and
+# lasts 12.64 s for FT8, 5.04 s for FT4), so the slot can be decoded this early
+# -- the answer is then ready in time to reply in the very next slot.
+EARLY_DECODE_SECONDS = {"FT8": 13.8, "FT4": 5.8}
+TX_START_OFFSET = 0.5          # seconds into its slot that a transmission begins
+SYMBOL_PERIOD = {"FT8": 0.16, "FT4": 0.048}
+SYMBOLS = {"FT8": 79, "FT4": 105}
+
 # Matches decode_ft8's printf: "%02d%02d%02d %+05.1f %+4.2f %4.0f ~  %s\n"
 #   HHMMSS  SNR(dB)  dt(s)  freq(Hz) ~  message
 _LINE_RE = re.compile(
@@ -76,6 +84,19 @@ def is_available():
     return decoder_path() is not None
 
 
+def generator_path():
+    """Path of the gen_ft8 program (turns a message into audio), or None."""
+    local = VENDOR_DIR / "gen_ft8"
+    if local.is_file() and os.access(local, os.X_OK):
+        return local
+    found = shutil.which("gen_ft8")
+    return pathlib.Path(found) if found else None
+
+
+def can_transmit():
+    return generator_path() is not None
+
+
 def can_build():
     return shutil.which("make") is not None and (shutil.which("cc") or shutil.which("gcc")) is not None
 
@@ -88,10 +109,10 @@ def build_decoder(timeout=300):
     if not can_build():
         return False, "Building the FT8 decoder needs make and a C compiler. On Debian/Ubuntu: sudo apt install build-essential"
     try:
-        result = subprocess.run(["make", "decode_ft8"], cwd=VENDOR_DIR, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(["make", "decode_ft8", "gen_ft8"], cwd=VENDOR_DIR, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as exc:
         return False, f"Building the FT8 decoder failed: {exc}"
-    if result.returncode != 0 or not is_available():
+    if result.returncode != 0 or not is_available() or not can_transmit():
         tail = (result.stderr or result.stdout).strip().splitlines()[-3:]
         return False, "Building the FT8 decoder failed:\n" + "\n".join(tail)
     return True, "FT8 decoder built."
@@ -142,10 +163,15 @@ def parse_output(stdout, slot_start, mode="FT8"):
 def to_decoder_rate(pcm, sample_rate):
     """Mono 16-bit little-endian PCM at `sample_rate` -> the same at 12 kHz
     (FFT resampling: exact for the band-limited audio of a voice channel)."""
-    if sample_rate == DECODER_RATE or not pcm:
+    return resample(pcm, sample_rate, DECODER_RATE)
+
+
+def resample(pcm, from_rate, to_rate):
+    """Mono 16-bit little-endian PCM from one sample rate to another."""
+    if from_rate == to_rate or not pcm:
         return pcm
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
-    n_out = int(round(len(samples) * DECODER_RATE / sample_rate))
+    n_out = int(round(len(samples) * to_rate / from_rate))
     spectrum = np.fft.rfft(samples)
     resized = np.zeros(n_out // 2 + 1, dtype=np.complex128)
     keep = min(len(spectrum), len(resized))
@@ -193,6 +219,8 @@ class Ft8SlotCapture:
         self._leftover = b""          # an odd trailing byte of the previous chunk
         self._slot_start = None       # epoch of the slot currently being filled
         self._fraction = 1.0          # how much of that slot is real audio
+        self._early_done = False      # the early snapshot of the current slot has been taken
+        self._early = []              # CapturedSlot snapshots waiting for take_early()
 
     def _buffered_end(self):
         return self._slot_start + len(self._buffer) / 2 / self.sample_rate
@@ -203,6 +231,7 @@ class Ft8SlotCapture:
         pad_samples = int(round(elapsed * self.sample_rate))
         self._buffer = bytearray(pad_samples * 2)
         self._fraction = max(0.0, 1.0 - elapsed / self.slot_seconds)
+        self._early_done = False
 
     def feed(self, pcm_bytes):
         """Adds audio; returns a list (usually empty) of CapturedSlot completed."""
@@ -216,13 +245,33 @@ class Ft8SlotCapture:
         if self._slot_start is None or abs(self._buffered_end() - chunk_start) > self.RESYNC_SECONDS:
             self._anchor(chunk_start)
         self._buffer.extend(data)
+        self._snapshot_if_early()
         completed = []
         while len(self._buffer) >= self._bytes_per_slot:
             completed.append(CapturedSlot(self._slot_start, bytes(self._buffer[: self._bytes_per_slot]), self._fraction))
             del self._buffer[: self._bytes_per_slot]
             self._slot_start += self.slot_seconds
             self._fraction = 1.0
+            self._early_done = False
+            self._snapshot_if_early()
         return completed
+
+    def _snapshot_if_early(self):
+        """Once enough of the slot has arrived that its whole transmission is in
+        (see EARLY_DECODE_SECONDS), keeps a copy of it, padded with silence to a
+        full slot, for take_early(). The completed slot still comes back from feed()."""
+        if self._early_done or self._fraction < MIN_DECODABLE_FRACTION:
+            return
+        if len(self._buffer) / 2 / self.sample_rate < EARLY_DECODE_SECONDS[self.mode]:
+            return
+        self._early_done = True
+        padded = bytes(self._buffer[: self._bytes_per_slot]).ljust(self._bytes_per_slot, b"\x00")
+        self._early.append(CapturedSlot(self._slot_start, padded, self._fraction))
+
+    def take_early(self):
+        """The early snapshots (usually none) taken since the last call."""
+        early, self._early = self._early, []
+        return early
 
 
 def seconds_to_next_slot(mode, clock=time.time):
@@ -260,3 +309,38 @@ def decode_slot(slot, sample_rate, mode, timeout=30.0):
             os.remove(wav_path)
         except OSError:
             pass
+
+
+# ---- encoding (transmit) ----------------------------------------------------------
+
+def encode_message(text, mode, audio_hz, timeout=15.0):
+    """Turns a message ("CQ KF0UQR EM17", "W1AW KF0UQR -10", ...) into the audio of
+    one transmission: mono 16-bit little-endian PCM at 12 kHz holding just the
+    signal (12.64 s of FT8, 5.04 s of FT4), its lowest tone at `audio_hz`.
+    Raises ValueError if the message cannot be encoded (not a valid FT8/FT4
+    message, or too long) and RuntimeError if the generator is not built."""
+    binary = generator_path()
+    if binary is None:
+        raise RuntimeError("The FT8 encoder has not been built (use Build Decoder in the FT8 Tool).")
+    text = " ".join(text.upper().split())
+    if not text:
+        raise ValueError("Nothing to send.")
+    fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix=f"torca_tx_{mode.lower()}_")
+    try:
+        os.close(fd)
+        command = [str(binary), text, wav_path, f"{float(audio_hz):.1f}"] + (["-ft4"] if mode == "FT4" else [])
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0 or "Cannot parse" in result.stdout:
+            raise ValueError(f"'{text}' is not a message FT8/FT4 can send.")
+        with wave.open(wav_path, "rb") as wav:
+            frames = wav.readframes(wav.getnframes())
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+    # gen_ft8 centres the signal in a whole slot; keep only the signal itself,
+    # so the caller decides exactly when it starts.
+    signal_samples = int(0.5 + SYMBOLS[mode] * SYMBOL_PERIOD[mode] * DECODER_RATE)
+    silence = int((SLOT_SECONDS[mode] * DECODER_RATE - signal_samples) / 2)
+    return frames[silence * 2: (silence + signal_samples) * 2]

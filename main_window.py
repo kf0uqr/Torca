@@ -132,6 +132,7 @@ class RadioWindow(QWidget):
     # whether the operator ever opens the APRS Tool window itself. See
     # _on_aprs_tool_clicked for where this actually gets forwarded.
     aprs_packet_decoded = Signal(dict)
+    ft8_qso_logged = Signal(dict)              # a contact made in the FT8 tool: ADIF fields for the Log Book
     rigctld_requested = Signal(object)         # carries self -- the dashboard opens the Rigctld dialog for this radio
     virtual_cables_requested = Signal(object)  # likewise, for the Virtual Cables dialog
 
@@ -1119,6 +1120,7 @@ class RadioWindow(QWidget):
     def ensure_ft8_tool_window(self):
         if self.ft8_window is None:
             self.ft8_window = Ft8ToolWindow(self)
+            self.ft8_window.qso_logged.connect(self.ft8_qso_logged)
             self.ft8_window.workspace_key = self._tool_key("FT8 Tool")
         return self.ft8_window
 

@@ -138,7 +138,7 @@ def _rebuild_ft8_decoder(status_callback):
         return
     status_callback("Building the FT8 decoder...")
     try:
-        _run(["make", "decode_ft8"], cwd=makefile_dir, timeout=300)
+        _run(["make", "decode_ft8", "gen_ft8"], cwd=makefile_dir, timeout=300)
     except Exception:
         pass
 

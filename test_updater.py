@@ -214,7 +214,7 @@ def test_update_rebuilds_the_ft8_decoder_best_effort(tmp_path, monkeypatch):
     calls, messages = [], []
     monkeypatch.setattr(updater, "_run", lambda args, cwd=None, timeout=30: calls.append((args, cwd)))
     updater._rebuild_ft8_decoder(messages.append)
-    assert calls == [(["make", "decode_ft8"], tmp_path / "vendor" / "ft8_lib")]
+    assert calls == [(["make", "decode_ft8", "gen_ft8"], tmp_path / "vendor" / "ft8_lib")]
     assert messages == ["Building the FT8 decoder..."]
 
 

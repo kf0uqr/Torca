@@ -5,11 +5,20 @@ hide-not-destroy pattern as CwToolWindow/RttyToolWindow/Psk31ToolWindow/
 AprsToolWindow -- closeEvent stops any active decode tap before hiding, so the
 same instance can be reopened freely without losing its list of decodes.
 
-Receive only: it listens to the radio's audio (the radio should be on an FT8
-or FT4 frequency in USB / USB-D, e.g. 14.074 MHz) and lists every message it
-decodes, one batch after each time slot (15 s for FT8, 7.5 s for FT4). See
-ft8_decoder.py for how slots are captured and decoded -- and for the caveat
-that the SNR column is the decoder's rough estimate, not WSJT-X's.
+It listens to the radio's audio (the radio should be on an FT8 or FT4
+frequency in USB / USB-D, e.g. 14.074 MHz) and lists every message it decodes,
+one batch after each time slot (15 s for FT8, 7.5 s for FT4). See ft8_decoder.py
+for how slots are captured and decoded -- and for the caveat that the SNR
+column is the decoder's rough estimate, not WSJT-X's.
+
+It can also make contacts. Double-click a decoded message to answer it (or
+use Call CQ) and the conversation (ft8_qso.py) is run for you: each decode
+that belongs to the contact picks the next message, which is sent in the next
+slot of the right parity, through the radio's TX audio. The finished contact
+is logged to the Log Book. Transmitting is always an explicit act -- Enable TX
+-- and Halt TX stops it at once; a watchdog also switches it off after
+WATCHDOG_SECONDS with nothing heard for the contact (as WSJT-X does), so the
+station can never transmit unattended indefinitely.
 
 Decoding takes a second or two of CPU per slot, so it runs on a worker thread:
 the audio callback (which runs on the radio's own asyncio thread) only cuts
@@ -20,6 +29,7 @@ Messages calling CQ are shown in green, and anything involving the operator's
 own callsign (a reply to you, a QSO in progress) stands out in amber.
 """
 
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -28,19 +38,24 @@ from PySide6.QtCore import Qt, QSettings, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QWidget,
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
 )
 
+import adif
 import ft8_decoder as ft8
-from constants import AUDIO_DEFAULT_SAMPLE_RATE
+import ft8_qso
+from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
 
 _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
@@ -57,6 +72,16 @@ _AUDIO_STALL_SECONDS = 5.0
 # further behind real time.
 _MAX_PENDING_DECODES = 2
 
+# Transmitting switches itself off when nothing has been heard for the contact in
+# this long (WSJT-X's "Tx watchdog" does the same, default six minutes).
+WATCHDOG_SECONDS = 6 * 60
+
+# A transmission starts this long after its slot starts (see ft8_decoder), with
+# the PTT keyed a little before the audio. Too late into the slot, it waits for
+# the next slot of the right parity instead.
+_TX_KEY_LEAD = 0.25
+_TX_TOO_LATE = 1.5
+
 _COLOR_CQ = QColor("#5fd068")
 _COLOR_MINE = QColor("#ffb347")
 
@@ -66,6 +91,8 @@ class Ft8ToolWindow(QWidget):
     _decoded = Signal(float, list, bool)
     # Build thread -> GUI thread
     _build_finished = Signal(bool, str)
+    # A contact is complete: the ADIF fields to log (RadioWindow forwards it to the dashboard)
+    qso_logged = Signal(dict)
 
     def __init__(self, radio_window, clock=time.time):
         super().__init__()
@@ -84,6 +111,13 @@ class Ft8ToolWindow(QWidget):
         self._slots_decoded = 0
         self._last_slot_summary = ""
         self._closing_for_real = False
+        self._seen = {}               # slot start -> texts already listed (an early and a final decode overlap)
+        self._qso = None              # ft8_qso.Qso, built when transmitting is first used
+        self._qso_started = None      # epoch of the first moment of the contact in progress
+        self._last_tx_slot = None     # index of the slot we last transmitted in
+        self._sending = False
+        self._tx_cache = (None, None)  # (text, mode, hz) -> pcm already encoded
+        self._tx_last_activity = None  # for the watchdog
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(ft8.MODES)
@@ -123,6 +157,63 @@ class Ft8ToolWindow(QWidget):
         self.audio_warning_label.setStyleSheet("color: #e8a33d; font-weight: bold;")
         self.audio_warning_label.setVisible(False)
 
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        self.dx_call_edit = QLineEdit()
+        self.dx_call_edit.setPlaceholderText("DX call")
+        self.dx_call_edit.setMaximumWidth(110)
+        self.dx_call_edit.setReadOnly(True)
+        self.dx_call_edit.setToolTip("The station you are working. Double-click a decoded message to choose one.")
+        self.tx_freq_spin = QSpinBox()
+        self.tx_freq_spin.setRange(200, 3000)
+        self.tx_freq_spin.setSuffix(" Hz")
+        self.tx_freq_spin.setValue(int(settings.value("ft8_tx_hz", 1500) or 1500))
+        self.tx_freq_spin.setToolTip("Audio frequency of your transmission (its lowest tone). Pick a quiet spot in the passband.")
+        self.tx_parity_combo = QComboBox()
+        self.tx_parity_combo.addItem("1st (even)", 0)
+        self.tx_parity_combo.addItem("2nd (odd)", 1)
+        self.tx_parity_combo.setToolTip(
+            "Which slots you transmit in. Answering a station sets this to the opposite of theirs; "
+            "choose it yourself when calling CQ.")
+        self.tx_level_spin = QSpinBox()
+        self.tx_level_spin.setRange(1, 100)
+        self.tx_level_spin.setSuffix(" %")
+        self.tx_level_spin.setValue(int(settings.value("ft8_tx_level", 30) or 30))
+        self.tx_level_spin.setToolTip(
+            "Audio level sent to the radio. FT8 must be clean: set it (and the radio's USB audio input level) "
+            "so the ALC meter barely moves, and run reduced power.")
+        self.tx_enable_button = QPushButton("Enable TX")
+        self.tx_enable_button.setCheckable(True)
+        self.tx_enable_button.setStyleSheet("QPushButton:checked { background-color: #a02020; color: white; font-weight: bold; }")
+        self.tx_enable_button.toggled.connect(self._on_tx_enable_toggled)
+        self.halt_button = QPushButton("Halt TX")
+        self.halt_button.clicked.connect(self.halt_tx)
+        self.cq_button = QPushButton("Call CQ")
+        self.cq_button.clicked.connect(self._on_cq_clicked)
+        self.tx_message_edit = QLineEdit()
+        self.tx_message_edit.setPlaceholderText("Next message -- chosen for you as the contact proceeds")
+        self.tx_message_edit.setToolTip("What will be sent in the next slot. You can edit it before it goes out.")
+        self.tx_status_label = QLabel("")
+        self.tx_status_label.setStyleSheet("color: #aaa;")
+
+        tx_row = QHBoxLayout()
+        tx_row.addWidget(self.tx_enable_button)
+        tx_row.addWidget(self.halt_button)
+        tx_row.addWidget(self.cq_button)
+        tx_row.addWidget(QLabel("DX:"))
+        tx_row.addWidget(self.dx_call_edit)
+        tx_row.addWidget(QLabel("Tx:"))
+        tx_row.addWidget(self.tx_freq_spin)
+        tx_row.addWidget(self.tx_parity_combo)
+        tx_row.addWidget(QLabel("Level:"))
+        tx_row.addWidget(self.tx_level_spin)
+        tx_row.addStretch()
+        self.tx_group = QWidget()
+        tx_box = QVBoxLayout(self.tx_group)
+        tx_box.setContentsMargins(0, 0, 0, 0)
+        tx_box.addLayout(tx_row)
+        tx_box.addWidget(self.tx_message_edit)
+        tx_box.addWidget(self.tx_status_label)
+
         self.table = QTableWidget(0, len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(_COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
@@ -131,12 +222,14 @@ class Ft8ToolWindow(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
+        self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
 
         layout = QVBoxLayout()
         layout.addLayout(buttons_row)
         layout.addWidget(self.hint_label)
         layout.addWidget(self.status_label)
         layout.addWidget(self.audio_warning_label)
+        layout.addWidget(self.tx_group)
         layout.addWidget(self.table, stretch=1)
         self.setLayout(layout)
 
@@ -148,15 +241,23 @@ class Ft8ToolWindow(QWidget):
         self._tick_timer.setInterval(1000)
         self._tick_timer.timeout.connect(self._on_tick)
 
+        # Drives transmissions (and the watchdog) while TX is enabled.
+        self._tx_timer = QTimer(self)
+        self._tx_timer.setInterval(100)
+        self._tx_timer.timeout.connect(lambda: self._tx_tick())
+
         self._refresh_availability()
 
     # ---- decoder availability ----
 
     def _refresh_availability(self):
         available = ft8.is_available()
-        self.build_button.setVisible(not available)
-        if not available:
-            if ft8.can_build():
+        self.tx_group.setEnabled(available and ft8.can_transmit())
+        self.build_button.setVisible(not (available and ft8.can_transmit()))
+        if not (available and ft8.can_transmit()):
+            if available:
+                self.status_label.setText("Transmitting needs the FT8 encoder, which has not been built yet -- click Build Decoder (it builds both).")
+            elif ft8.can_build():
                 self.status_label.setText("The FT8 decoder has not been built yet -- click Build Decoder.")
             else:
                 self.status_label.setText(
@@ -213,7 +314,7 @@ class Ft8ToolWindow(QWidget):
             self._capture = None
             self._tick_timer.stop()
             self.audio_warning_label.setVisible(False)
-            self.mode_combo.setEnabled(True)
+            self.mode_combo.setEnabled(not self.tx_enable_button.isChecked())
             self.decode_toggle_button.setText("Start Decoding")
             self.status_label.setText("Not decoding.")
 
@@ -232,6 +333,8 @@ class Ft8ToolWindow(QWidget):
         if capture is None:
             return
         for slot in capture.feed(pcm_bytes):
+            self._submit_decode(slot, capture.sample_rate, capture.mode)
+        for slot in capture.take_early():   # ready early enough to reply in the very next slot
             self._submit_decode(slot, capture.sample_rate, capture.mode)
 
     def _submit_decode(self, slot, sample_rate, mode):
@@ -256,14 +359,22 @@ class Ft8ToolWindow(QWidget):
     def _on_decoded(self, slot_start, messages, decodable):
         if not decodable:
             return  # the partial slot at the start: nothing could be decoded from it
-        self._slots_decoded += 1
         mine = (QSettings(_SETTINGS_ORG, _SETTINGS_APP).value("operator_callsign", "") or "").strip()
-        for message in messages:
+        seen = self._seen.setdefault(slot_start, set())
+        fresh = [m for m in messages if m.text not in seen]   # the early and the final decode of a slot overlap
+        if len(seen) == 0:
+            self._slots_decoded += 1
+        seen.update(m.text for m in fresh)
+        for old in sorted(self._seen)[:-8]:
+            del self._seen[old]
+        for message in fresh:
             self._append_row(message, mine)
-        count = len(messages)
+        count = len(seen)
         self._last_slot_summary = f"last slot: {count} decode{'s' if count != 1 else ''}"
-        if messages:
+        if fresh:
             self.table.scrollToBottom()
+        for message in fresh:
+            self._react_to(message)
 
     def _append_row(self, message, my_callsign):
         row = self.table.rowCount()
@@ -282,6 +393,232 @@ class Ft8ToolWindow(QWidget):
         excess = self.table.rowCount() - _MAX_ROWS
         for _ in range(max(excess, 0)):
             self.table.removeRow(0)
+
+    # ---- making contacts ----
+
+    def _my_call_and_grid(self):
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        call = (settings.value("operator_callsign", "") or "").strip().upper()
+        try:
+            grid = ft8_qso.latlon_to_grid(float(settings.value("operator_lat", 0.0) or 0.0),
+                                          float(settings.value("operator_lon", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            grid = ""
+        return call, grid
+
+    def _ensure_qso(self):
+        """The conversation state, rebuilt if the callsign or location changed."""
+        call, grid = self._my_call_and_grid()
+        if self._qso is None or (self._qso.my_call, self._qso.my_grid) != (call, grid):
+            self._qso = ft8_qso.Qso(call, grid)
+        return self._qso
+
+    def _slot_parity(self, slot_start):
+        return int(slot_start // ft8.SLOT_SECONDS[self.mode_combo.currentText()]) % 2
+
+    def _on_row_double_clicked(self, row, _column):
+        item = self.table.item(row, 0)
+        message = item.data(Qt.UserRole) if item is not None else None
+        parsed = ft8_qso.parse(message.text) if message is not None else None
+        qso = self._ensure_qso()
+        if parsed is None or not qso.my_call:
+            self.tx_status_label.setText(
+                "Set your callsign first (Profile)." if not qso.my_call else "That message is not part of a standard exchange.")
+            return
+        if ft8_qso._base(parsed.sender) == ft8_qso._base(qso.my_call):
+            return
+        qso.work(parsed, message.snr, self._slot_parity(message.slot_start), message.freq)
+        self._qso_started = self._clock()
+        self._after_qso_change()
+        self.tx_enable_button.setChecked(True)
+
+    def _on_cq_clicked(self):
+        qso = self._ensure_qso()
+        if not qso.my_call:
+            self.tx_status_label.setText("Set your callsign first (Profile).")
+            return
+        qso.call_cq(parity=self.tx_parity_combo.currentData())
+        self._qso_started = None
+        self._after_qso_change()
+        self.tx_enable_button.setChecked(True)
+
+    def _after_qso_change(self):
+        """Show what the conversation now says to send."""
+        qso = self._qso
+        self.dx_call_edit.setText(qso.dx_call or "")
+        self.tx_message_edit.setText(qso.message() or "")
+        self.tx_parity_combo.setCurrentIndex(qso.tx_parity)
+
+    def _react_to(self, message):
+        qso = self._qso
+        if qso is None or not qso.my_call:
+            return
+        parsed = ft8_qso.parse(message.text)
+        had_dx = qso.dx_call
+        if qso.heard(parsed, message.snr, self._slot_parity(message.slot_start), message.freq):
+            self._tx_last_activity = self._clock()      # the other station is still there
+            if had_dx is None and self._qso_started is None:
+                self._qso_started = self._clock()
+            self._after_qso_change()
+            if qso.complete:
+                self._finish_contact()
+
+    def _on_tx_enable_toggled(self, enabled):
+        self.mode_combo.setEnabled(not enabled and not self.decode_toggle_button.isChecked())
+        if enabled:
+            qso = self._ensure_qso()
+            if not qso.my_call:
+                self.tx_status_label.setText("Set your callsign first (Profile).")
+                self._uncheck_tx()
+                return
+            if not self.tx_message_edit.text().strip():
+                self.tx_status_label.setText("Nothing to send yet: double-click a decoded message, or Call CQ.")
+                self._uncheck_tx()
+                return
+            self._tx_last_activity = self._clock()
+            self._tx_timer.start()
+            self.tx_status_label.setText("TX enabled -- waiting for the next slot.")
+        else:
+            self._tx_timer.stop()
+            if self._sending:
+                self._radio_window.worker.stop_tx_audio_send()
+                self._sending = False
+            self.tx_status_label.setText("TX off.")
+
+    def _uncheck_tx(self):
+        self.tx_enable_button.blockSignals(True)
+        self.tx_enable_button.setChecked(False)
+        self.tx_enable_button.blockSignals(False)
+        self.mode_combo.setEnabled(not self.decode_toggle_button.isChecked())
+
+    def halt_tx(self):
+        """Stops transmitting immediately (and keys the radio off)."""
+        self.tx_enable_button.setChecked(False)
+
+    def _tx_tick(self, now=None):
+        """Called ten times a second while TX is enabled: the watchdog, and
+        starting a transmission when the right slot comes round."""
+        now = self._clock() if now is None else now
+        if not self.tx_enable_button.isChecked():
+            return
+        if self._tx_last_activity is not None and now - self._tx_last_activity > WATCHDOG_SECONDS:
+            self.halt_tx()
+            self.tx_status_label.setText("TX switched off: nothing heard for the contact in %d minutes." % (WATCHDOG_SECONDS // 60))
+            return
+        if self._sending:
+            return
+        mode = self.mode_combo.currentText()
+        slot = ft8.SLOT_SECONDS[mode]
+        index = math.floor(now / slot)
+        into = now - index * slot
+        if index % 2 != self.tx_parity_combo.currentData():
+            self.tx_status_label.setText(f"TX enabled -- next transmission in {self._seconds_until_tx(now, slot):.0f} s")
+            return
+        if index == self._last_tx_slot or into < ft8.TX_START_OFFSET - _TX_KEY_LEAD or into > _TX_TOO_LATE:
+            return
+        text = self.tx_message_edit.text().strip()
+        if not text:
+            return
+        self._start_transmission(text, mode, index, slot)
+
+    def _seconds_until_tx(self, now, slot):
+        index = math.floor(now / slot)
+        wanted = self.tx_parity_combo.currentData()
+        start = (index + 1 if index % 2 != wanted else index + 2) * slot
+        return start + ft8.TX_START_OFFSET - now
+
+    def _build_tx_audio(self, text, mode):
+        """The message as 48 kHz PCM at the chosen level, or raises ValueError / RuntimeError."""
+        hz = self.tx_freq_spin.value()
+        key = (text, mode, hz, self.tx_level_spin.value())
+        if self._tx_cache[0] == key:
+            return self._tx_cache[1]
+        import numpy as np
+        pcm12 = ft8.encode_message(text, mode, hz)
+        samples = np.frombuffer(pcm12, dtype="<i2").astype(np.float64) * (self.tx_level_spin.value() / 100.0)
+        pcm = ft8.resample(np.rint(samples).astype("<i2").tobytes(), ft8.DECODER_RATE, AUDIO_TX_PCM_SAMPLE_RATE)
+        self._tx_cache = (key, pcm)
+        return pcm
+
+    def _start_transmission(self, text, mode, index, slot):
+        try:
+            pcm = self._build_tx_audio(text, mode)
+        except (ValueError, RuntimeError) as exc:
+            self.halt_tx()
+            self.tx_status_label.setText(str(exc))
+            return
+        worker = self._radio_window.worker
+        self._last_tx_slot = index
+        self._sending = True
+        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue("ft8_tx_hz", self.tx_freq_spin.value())
+        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue("ft8_tx_level", self.tx_level_spin.value())
+        worker.send_tx_audio_pcm(pcm)
+        duration = len(pcm) / (AUDIO_TX_PCM_SAMPLE_RATE * 2)
+        self.tx_status_label.setText(f"TRANSMITTING: {text}")
+        QTimer.singleShot(int((duration + 0.3) * 1000), lambda t=text: self._on_tx_finished(t))
+
+    def _on_tx_finished(self, text):
+        if not self._sending:
+            return   # halted meanwhile
+        self._sending = False
+        qso = self._qso
+        if qso is None:
+            return
+        if self.tx_message_edit.text().strip() == text:
+            done = qso.sent()
+        else:
+            done = False   # the operator sent something of their own
+        self.tx_status_label.setText(f"Sent: {text}")
+        if done:
+            self._finish_contact()
+        elif qso.gave_up:
+            self.halt_tx()
+            self.tx_status_label.setText(f"No answer from {qso.dx_call} -- gave up.")
+            qso.reset()
+            self._after_qso_change()
+        else:
+            self._after_qso_change()
+
+    def _finish_contact(self):
+        """The exchange is done: log it, then carry on (back to CQ) or stop."""
+        qso = self._qso
+        fields = self._qso_fields(qso)
+        if fields is not None:
+            self.qso_logged.emit(fields)
+            self.tx_status_label.setText(f"Logged {qso.dx_call}.")
+        qso.after_complete()
+        self._qso_started = None
+        self._after_qso_change()
+        if qso.message() is None:
+            self.halt_tx()
+            self.tx_status_label.setText(self.tx_status_label.text() + " TX off.")
+
+    def _qso_fields(self, qso):
+        if not qso.dx_call:
+            return None
+        started = time.gmtime(self._qso_started or self._clock())
+        mode = self.mode_combo.currentText()
+        freq_hz = getattr(self._radio_window, "_current_freq_hz", None) or 0
+        fields = {
+            "CALL": qso.dx_call,
+            "QSO_DATE": time.strftime("%Y%m%d", started),
+            "TIME_ON": time.strftime("%H%M%S", started),
+            "MODE": "FT8" if mode == "FT8" else "MFSK",
+            "RST_SENT": qso.rst_sent,
+            "RST_RCVD": qso.rst_rcvd,
+            "STATION_CALLSIGN": qso.my_call,
+            "MY_GRIDSQUARE": qso.my_grid,
+        }
+        if mode == "FT4":
+            fields["SUBMODE"] = "FT4"
+        if qso.dx_grid:
+            fields["GRIDSQUARE"] = qso.dx_grid
+        if freq_hz:
+            fields["FREQ"] = f"{freq_hz / 1e6:.6f}"
+            band = adif.band_for_freq_hz(freq_hz)
+            if band:
+                fields["BAND"] = band
+        return fields
 
     # ---- status ----
 
@@ -337,6 +674,8 @@ class Ft8ToolWindow(QWidget):
         # Singleton -- hidden, not destroyed -- but an active decode tap is a real side effect
         # (an abandoned radio.start_rx() tap would keep running with nothing consuming it)
         # that must be stopped first, same as the other tools.
+        if self.tx_enable_button.isChecked():
+            self.halt_tx()   # never leave a transmitter running behind a hidden window
         if self.decode_toggle_button.isChecked():
             self.decode_toggle_button.setChecked(False)  # synchronously runs _on_decode_toggled(False)
         if self._closing_for_real:

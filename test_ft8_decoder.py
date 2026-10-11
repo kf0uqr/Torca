@@ -352,3 +352,35 @@ def test_build_decoder_explains_what_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(ft8, "can_build", lambda: False)
     ok, message = ft8.build_decoder()
     assert not ok and "build-essential" in message
+
+
+def test_an_early_snapshot_is_taken_once_the_whole_transmission_is_in():
+    rate = 8000
+    clock = Clock(1_000_050.0 - (1_000_050.0 % 15.0))
+    capture = Ft8SlotCapture("FT8", rate, clock=clock)
+    second = b"\x01\x00" * rate
+    for _ in range(13):
+        clock.now += 1
+        capture.feed(second)
+    assert capture.take_early() == []                       # 13 s in: the signal is not all there yet
+    clock.now += 1
+    capture.feed(second)
+    early = capture.take_early()
+    assert len(early) == 1 and early[0].slot_start == clock.now - 14 and len(early[0].pcm) == 15 * rate * 2
+    assert capture.take_early() == []                       # once per slot
+    clock.now += 1
+    done = capture.feed(second)
+    assert len(done) == 1                                    # the normal end-of-slot slot still arrives
+    assert capture.take_early() == []
+
+
+def test_encoding_rejects_what_ft8_cannot_send(built):
+    original = ft8.VENDOR_DIR
+    ft8.VENDOR_DIR = built
+    try:
+        with pytest.raises(ValueError):
+            ft8.encode_message("THIS IS FAR TOO LONG FOR ANY FT8 MESSAGE", "FT8", 1500)
+        with pytest.raises(ValueError):
+            ft8.encode_message("   ", "FT8", 1500)
+    finally:
+        ft8.VENDOR_DIR = original

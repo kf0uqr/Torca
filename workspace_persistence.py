@@ -2,8 +2,10 @@
 back on the next launch.
 
 What is restored (see workspace_state.py for the format):
-- the workspace layout (how many workspaces, how they are split),
-- which tabs were open in which workspace, their order and the selected tab,
+- every WINDOW (the main one and any extra ones), each on the monitor it was on,
+- each window's workspace layout (how many workspaces, how they are split),
+- which tabs were open in which workspace of which window, their order and the
+  selected tab,
 - the radios that were connected: each is reconnected from its entry in the
   saved connection profiles (matched by model + where it connects), and its
   tool tabs (CW, APRS, ...) reopen in place,
@@ -34,7 +36,8 @@ SAVE_DELAY_MS = 1500
 class WorkspacePersistence(QObject):
     def __init__(self, host, dashboard, profile_name, state_path=None, parent=None):
         super().__init__(parent)
-        self._host = host
+        self._host = host                # the main window
+        self._manager = host.manager     # all windows
         self._dashboard = dashboard
         self.profile_name = profile_name
         self._state_path = state_path
@@ -52,8 +55,8 @@ class WorkspacePersistence(QObject):
         saving changes. Returns a list of human-readable problems (radios
         that could not be reconnected) for the caller to show."""
         problems = self.restore()
-        self._host.layout_changed.connect(self._schedule_save)
-        self._host.closing.connect(self._on_closing)
+        self._manager.layout_changed.connect(self._schedule_save)   # a change in ANY window
+        self._host.closing.connect(self._on_closing)                # the main window closing = the app closing
         return problems
 
     def _schedule_save(self):
@@ -69,7 +72,7 @@ class WorkspacePersistence(QObject):
     # ---- saving ----
 
     def capture(self):
-        state = self._host.capture_state()
+        state = self._manager.capture_state()
         state["radios"] = [
             {"key": window.workspace_key, "identity": window.identity}
             for window in self._dashboard.workspace_radios()
@@ -90,13 +93,15 @@ class WorkspacePersistence(QObject):
         problems = []
         self._restoring = True
         try:
-            if not self._host.restore_state(state):
+            if not self._manager.restore_state(state):
                 return []
-            wanted = {key for workspace in state["workspaces"].values() for key in workspace["tabs"]}
+            wanted = {key for window in [state, *state.get("windows", [])]
+                      for workspace in window["workspaces"].values() for key in workspace["tabs"]}
 
-            # Windows that already exist (the map, the reference-data pages).
-            for widget in list(self._host.window_keys().values()):
-                self._host.place_by_hint(widget)
+            # Windows that already exist (the map, the reference-data pages),
+            # wherever the saved arrangement had them -- possibly another window.
+            for widget in list(self._manager.window_keys().values()):
+                self._manager.place_by_hint(widget)
 
             # Radios, in the order they were saved; each docks where it was.
             radios = {}
@@ -120,7 +125,7 @@ class WorkspacePersistence(QObject):
             if "logbook" in wanted:
                 self._dashboard.open_log_book()
 
-            self._host.finish_restore(state)
+            self._manager.finish_restore(state)
         finally:
             self._restoring = False
         return problems

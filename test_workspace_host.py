@@ -166,33 +166,12 @@ def test_switching_tabs_is_not_mistaken_for_closing(host, app):
     assert host.pane_of(a) == 0 and host.pane_of(b) == 0 and host.panes[0].count() == 3
 
 
-def test_dashboard_tab_cannot_be_closed_or_popped_out(host, app):
+def test_dashboard_tab_has_no_close_button_but_can_move_to_another_window(host, app):
     dash = _dashboard(host)
     assert host.panes[0].tabBar().tabButton(0, workspace_host.QTabBar.RightSide) is None
-    host.pop_out(dash)
-    assert host.pane_of(dash) == 0 and not host._entries[dash].floating
-
-
-def test_pop_out_and_dock_back(host, app):
-    _dashboard(host)
-    tool = HideOnClose("APRS Tool")
-    host.present(tool)
-    host.pop_out(tool)
-    _settle(app)
-    assert host.pane_of(tool) is None and host._entries[tool].floating and tool.isWindow() and tool.isVisible()
-    host.dock_floating(tool)
-    _settle(app)
-    assert host.pane_of(tool) is not None and not tool.isWindow() and tool.isVisible()
-
-
-def test_presenting_a_floating_window_just_raises_it(host, app):
-    _dashboard(host)
-    tool = HideOnClose()
-    host.present(tool)
-    host.pop_out(tool)
-    host.present(tool)
-    assert host._entries[tool].floating and host.pane_of(tool) is None
-
+    menu = host._tab_menu(host.panes[0], 0)
+    assert "Close" not in [a.text() for a in menu.actions()]                       # no Close ...
+    assert "Move to Window" in [a.text() for a in menu.actions()]                  # ... but it can still go to another window
 
 def test_tab_title_follows_window_title(host):
     _dashboard(host)
@@ -829,7 +808,7 @@ def test_changing_the_layout_never_destroys_panes_or_hosted_windows(host, app):
 
 # ---- widgets the dashboard hands to the host's top bar (Kill All Remote TX) ----
 
-def test_top_bar_widget_goes_to_the_far_right_of_the_floating_windows_row(host, app):
+def test_top_bar_widget_goes_to_the_far_right_of_the_windows_menu_row(host, app):
     from PySide6.QtWidgets import QPushButton
 
     class DashboardWithTopBarButton(RealClose):
@@ -845,7 +824,7 @@ def test_top_bar_widget_goes_to_the_far_right_of_the_floating_windows_row(host, 
     dash = DashboardWithTopBarButton()
     host.add_dashboard(dash)
     _settle(app)
-    kill, floating = dash.kill, host._floating_button
+    kill, floating = dash.kill, host._windows_button
     assert kill.isVisible() and kill.window() is host
     assert abs(kill.mapTo(host, kill.rect().center()).y() - floating.mapTo(host, floating.rect().center()).y()) <= 4   # same row
     assert kill.mapTo(host, kill.rect().topRight()).x() >= host.width() - 12                                           # far right
@@ -985,3 +964,218 @@ def test_add_dashboard_gives_the_dashboard_and_its_pages_keys(host):
     host.add_dashboard(dash)
     assert dash.workspace_key == "map"
     assert set(host.window_keys()) == {"map", "page:Band Conditions", "page:Contests"}
+
+
+# ---- several windows ----
+
+from workspace_host import WindowManager
+
+
+def _new_window(host):
+    return host.manager.new_window()
+
+
+def test_new_window_is_a_second_host_numbered_and_titled(host, app):
+    assert host.manager.main_host is host and host.windowTitle() == "TORCA"
+    second = _new_window(host)
+    third = _new_window(host)
+    assert host.manager.hosts == [host, second, third]
+    assert [h.windowTitle() for h in host.manager.hosts] == ["TORCA", "TORCA - Window 2", "TORCA - Window 3"]
+    assert second.workspace_count == 1 and second.isVisible()
+    second.close()
+    assert host.manager.hosts == [host, third] and third.windowTitle() == "TORCA - Window 2"      # renumbered
+
+
+def test_a_tab_can_move_to_another_window_and_back_without_being_closed(host, app):
+    _dashboard(host)
+    radio = _keyed(RealClose, "radio:r")
+    host.present(radio)
+    second = _new_window(host)
+    host.manager.move_widget(radio, second)
+    _settle(app)
+    assert host.manager.host_of(radio) is second and second.pane_of(radio) == 0
+    assert host.pane_of(radio) is None                                       # no longer in the main window
+    assert not radio.closed and radio.isVisible()
+    assert second.panes[0].tabText(0) == "radio:r"
+    host.manager.move_widget(radio, host)
+    _settle(app)
+    assert host.manager.host_of(radio) is host and second.pane_of(radio) is None and not radio.closed
+
+
+def test_every_window_operation_keeps_every_tab(host, app):
+    dash = _keyed(RealClose, "map")
+    host.add_window(dash, closable=False, pane_index=0)
+    host.set_dashboard(dash)
+    tabs = [_keyed(HideOnClose, f"page:{i}") for i in range(4)]
+    for tab in tabs:
+        host.present(tab)
+    second = _new_window(host)
+    for tab in tabs[:2]:
+        host.manager.move_widget(tab, second)
+    third = _new_window(host)
+    host.manager.move_widget(tabs[0], third)
+    host.manager.move_widget(dash, second)
+
+    def docked():
+        return sorted(k for h in host.manager.hosts for k in
+                      (getattr(e.widget, "workspace_key", None) for e in host.manager.entries.values() if e.host is h))
+    assert docked() == sorted(["map"] + [t.workspace_key for t in tabs])
+    third.close()
+    second.close()                                                             # closing windows must not lose or close a thing
+    _settle(app)
+    assert docked() == sorted(["map"] + [t.workspace_key for t in tabs])
+    assert all(host.manager.host_of(w) is host for w in [dash, *tabs])
+
+
+def test_closing_a_secondary_window_hands_its_tabs_to_the_main_window_in_order(host, app):
+    _dashboard(host)
+    second = _new_window(host)
+    radio, tool = _keyed(RealClose, "radio:r"), _keyed(HideOnClose, "tool:r:CW")
+    second.add_window(radio, pane_index=0)
+    second.open_in(tool, 0)
+    second.close()
+    _settle(app)
+    assert host.manager.hosts == [host]
+    assert host.manager.host_of(radio) is host and host.manager.host_of(tool) is host
+    assert not radio.closed                                                    # moved, not closed
+    pane = host.panes[host.pane_of(radio)]
+    texts = [pane.tabText(i) for i in range(pane.count())]
+    assert texts.index("radio:r") < texts.index("tool:r:CW")
+
+
+def test_closing_the_main_window_closes_every_window_and_runs_the_shutdown_once(host, app):
+    dash = _dashboard(host)
+    second = _new_window(host)
+    third = _new_window(host)
+    radio = _keyed(RealClose, "radio:r")
+    second.add_window(radio, pane_index=0)
+    seen = []
+    host.closing.connect(lambda: seen.append("closing"))
+    workspace_host._HOST = None
+    host.close()
+    _settle(app)
+    from shiboken6 import isValid
+    assert seen == ["closing"] and dash.closed
+    assert all(not isValid(w) or not w.isVisible() for w in (second, third))      # closed (and deleted)
+    assert host.manager.hosts == [host] and host.manager.shutting_down
+
+
+def test_new_tabs_go_to_an_empty_workspace_in_any_window_before_stacking(host, app):
+    _dashboard(host)                                                           # main's only workspace is now occupied
+    second = _new_window(host)                                                 # ... but the new window has an empty one
+    first_tab, next_tab = _keyed(HideOnClose, "page:a"), _keyed(HideOnClose, "page:b")
+    host.present(first_tab)
+    assert host.manager.host_of(first_tab) is second and second.pane_of(first_tab) == 0
+    host.present(next_tab)                                                     # nothing empty anywhere now: stack in the active window
+    assert host.manager.host_of(next_tab) is host
+
+
+def test_presenting_a_tab_open_in_another_window_selects_it_there(host, app):
+    _dashboard(host)
+    second = _new_window(host)
+    tab = _keyed(HideOnClose, "page:a")
+    second.add_window(tab, pane_index=0)
+    other = _keyed(HideOnClose, "page:b")
+    second.open_in(other, 0)
+    second.panes[0].setCurrentWidget(second._entries[other].page)
+    host.present(tab)                                                          # asked from the MAIN window
+    assert host.manager.host_of(tab) is second and second.panes[0].currentWidget() is second._entries[tab].page
+
+
+def test_plus_menus_are_shared_and_open_into_the_window_they_were_clicked_in(host, app):
+    class Dash(RealClose):
+        def take_data_pages(self):
+            self.pages = [("Parks", QWidget())]
+            return self.pages
+
+        def populate_workspace_menu(self, menu, ctx):
+            for title, page in self.pages:
+                menu.addAction(ctx.label(title, page)).triggered.connect(lambda _c=False, p=page: ctx.open(p))
+
+    dash = Dash("Map")
+    host.add_dashboard(dash)
+    second = _new_window(host)
+    texts, menu = _menu_texts(second, 0)
+    assert texts == ["Parks"]                                                   # the second window offers the same entries
+    next(a for a in menu.actions() if a.text() == "Parks").trigger()
+    parks = dash.pages[0][1]
+    assert host.manager.host_of(parks) is second
+    texts_main, menu_main = _menu_texts(host, 0)
+    assert texts_main == ["Parks  (Window 2, Workspace 1)"]                     # and says where it already is
+    next(a for a in menu_main.actions() if a.text().startswith("Parks")).trigger()
+    assert host.manager.host_of(parks) is host and second.pane_of(parks) is None   # picking it from here moves it here
+
+
+def test_tab_context_menu_offers_move_to_window_with_new_window_and_each_other_window(host, app):
+    _dashboard(host)
+    tab = _keyed(HideOnClose, "page:a")
+    host.present(tab)
+    menu = host._tab_menu(host.panes[0], host.panes[0].indexOf(host._entries[tab].page))
+    move = next(a for a in menu.actions() if a.text() == "Move to Window").menu()
+    assert [a.text() for a in move.actions()] == ["New Window"]
+    second = _new_window(host)
+    menu = host._tab_menu(host.panes[0], host.panes[0].indexOf(host._entries[tab].page))
+    move = next(a for a in menu.actions() if a.text() == "Move to Window").menu()
+    assert [a.text() for a in move.actions()] == ["New Window", "Window 2"]
+    next(a for a in move.actions() if a.text() == "Window 2").trigger()
+    assert host.manager.host_of(tab) is second
+    # and from the second window the main one is offered as "Window 1"
+    menu2 = second._tab_menu(second.panes[0], second.panes[0].indexOf(second._entries[tab].page))
+    move2 = next(a for a in menu2.actions() if a.text() == "Move to Window").menu()
+    assert [a.text() for a in move2.actions()] == ["New Window", "Window 1"]
+    next(a for a in move2.actions() if a.text() == "New Window").trigger()
+    assert len(host.manager.hosts) == 3 and host.manager.host_of(tab) is host.manager.hosts[2]
+
+
+def test_windows_menu_lists_windows_and_can_open_and_close_them(host, app):
+    texts = lambda h: [a.text() for a in (h._rebuild_windows_menu() or h._windows_button.menu().actions()) if not a.isSeparator()]
+    assert texts(host) == ["New Window", "Window 1  (main)  ✓ this one"]
+    _trigger(host._windows_button.menu(), "New Window")
+    assert len(host.manager.hosts) == 2
+    second = host.manager.hosts[1]
+    assert texts(second) == ["New Window", "Window 1  (main)", "Window 2  ✓ this one",
+                             "Close This Window (its tabs move to Window 1)"]
+    _trigger(second._windows_button.menu(), "Close This Window (its tabs move to Window 1)")
+    _settle(app)
+    assert host.manager.hosts == [host]
+    assert "Close This Window (its tabs move to Window 1)" not in texts(host)         # the main window can't be "closed" this way
+
+
+def test_each_new_window_gets_its_own_kill_button_that_runs_the_same_handler(host, app):
+    from PySide6.QtWidgets import QPushButton
+
+    class Dash(RealClose):
+        def __init__(self):
+            super().__init__("Map")
+            self.kills = 0
+            self.kill = QPushButton("Kill All Remote TX")
+
+        def take_top_bar_widgets(self):
+            return [self.kill]
+
+        def make_top_bar_widgets(self):
+            button = QPushButton("Kill All Remote TX")
+            button.clicked.connect(lambda: setattr(self, "kills", self.kills + 1))
+            return [button]
+
+    dash = Dash()
+    host.add_dashboard(dash)
+    second = _new_window(host)
+    third = _new_window(host)
+    buttons = [second.findChildren(QPushButton), third.findChildren(QPushButton)]
+    for found in buttons:
+        kill = next(b for b in found if b.text() == "Kill All Remote TX")
+        kill.click()
+    assert dash.kills == 2                                                      # both reach the handler
+    assert dash.kill.window() is host                                           # the original stays in the main window
+    assert buttons[0][0] is not buttons[1][0]
+
+
+def test_secondary_windows_are_deleted_when_closed_and_do_not_leak(host, app):
+    from shiboken6 import isValid
+    second = _new_window(host)
+    second.close()
+    _settle(app)
+    _flush_deletes(app)
+    assert not isValid(second)
+    assert host.manager.hosts == [host]

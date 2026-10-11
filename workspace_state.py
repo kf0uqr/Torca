@@ -7,11 +7,18 @@ profiles, as {"version": 1, "profiles": {<profile name>: <state>}}.
 A state is:
 
     {
-      "layout":     the workspace split tree (see workspace_host.tree_*),
+      "layout":     the MAIN window's workspace split tree (see workspace_host.tree_*),
       "workspaces": {"0": {"tabs": [<tab key>, ...], "current": <tab key>}, ...},
       "active":     index of the last-used workspace,
+      "geometry":   where the main window was (screen + position, see below) or None,
+      "windows":    [{"layout", "workspaces", "active", "geometry"}, ...]  -- the EXTRA
+                    windows, in order (window 2, 3, ...); each is laid out like the main one,
       "radios":     [{"key": <tab key>, "identity": {...}}, ...],
     }
+
+Tab keys are unique across all windows. A "geometry" is
+{"screen": <name>, "x", "y", "width", "height", "maximized"} so a window comes
+back on the monitor it was on (and falls back sensibly if that monitor is gone).
 
 Every restorable tab has a stable string key: "map", "page:Contests",
 "logbook", "radio:<identity>", "tool:<identity>:<tool name>". A radio's
@@ -28,6 +35,7 @@ import pathlib
 STATE_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "workspace_state.json"
 STATE_VERSION = 1
 MAX_WORKSPACES = 4
+MAX_EXTRA_WINDOWS = 7   # a sanity cap on the number of extra windows read back from a file
 MAX_COLUMNS = 2   # at most two workspaces side by side ...
 MAX_ROWS = 2      # ... and two stacked: a 2x2 box
 
@@ -96,18 +104,35 @@ def _leaves(tree):
 
 # ---- validating a whole saved state -----------------------------------------
 
-def clean_state(state):
-    """Returns a sanitized copy of a loaded state, or None if it is unusable.
-    Anything malformed inside an otherwise good state is dropped rather than
-    failing the whole restore."""
-    if not isinstance(state, dict):
+def clean_geometry(geometry):
+    """A sanitized window geometry, or None."""
+    if not isinstance(geometry, dict):
         return None
-    layout = tree_from_json(state.get("layout"))
+    cleaned = {}
+    for key in ("x", "y", "width", "height"):
+        value = geometry.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        cleaned[key] = value
+    if cleaned["width"] < 100 or cleaned["height"] < 100:
+        return None
+    screen = geometry.get("screen")
+    cleaned["screen"] = screen if isinstance(screen, str) else ""
+    cleaned["maximized"] = bool(geometry.get("maximized", False))
+    return cleaned
+
+
+def _clean_window(window):
+    """One window's cleaned layout / tabs / active / geometry, or None if its
+    layout is unusable. Anything malformed inside is dropped, not fatal."""
+    if not isinstance(window, dict):
+        return None
+    layout = tree_from_json(window.get("layout"))
     if layout is None:
         return None
     leaves = set(_leaves(layout))
     workspaces = {}
-    raw_workspaces = state.get("workspaces")
+    raw_workspaces = window.get("workspaces")
     for index_text, workspace in (raw_workspaces.items() if isinstance(raw_workspaces, dict) else []):
         try:
             index = int(index_text)
@@ -118,17 +143,35 @@ def clean_state(state):
         tabs = [key for key in workspace.get("tabs", []) if isinstance(key, str)]
         current = workspace.get("current")
         workspaces[str(index)] = {"tabs": tabs, "current": current if current in tabs else None}
-    radios = []
-    for radio in state.get("radios", []) if isinstance(state.get("radios"), list) else []:
-        if isinstance(radio, dict) and isinstance(radio.get("key"), str) and isinstance(radio.get("identity"), dict):
-            radios.append({"key": radio["key"], "identity": radio["identity"]})
-    active = state.get("active")
+    active = window.get("active")
     return {
         "layout": tree_to_json(layout),
         "workspaces": workspaces,
         "active": active if isinstance(active, int) and active in leaves else 0,
-        "radios": radios,
+        "geometry": clean_geometry(window.get("geometry")),
     }
+
+
+def clean_state(state):
+    """Returns a sanitized copy of a loaded state, or None if it is unusable
+    (the main window's layout is bad). Extra windows with a bad layout are
+    dropped; their tabs simply open in the normal place."""
+    main = _clean_window(state) if isinstance(state, dict) else None
+    if main is None:
+        return None
+    extras = []
+    raw_windows = state.get("windows")
+    for window in (raw_windows if isinstance(raw_windows, list) else [])[:MAX_EXTRA_WINDOWS]:
+        cleaned = _clean_window(window)
+        if cleaned is not None:
+            extras.append(cleaned)
+    radios = []
+    for radio in state.get("radios", []) if isinstance(state.get("radios"), list) else []:
+        if isinstance(radio, dict) and isinstance(radio.get("key"), str) and isinstance(radio.get("identity"), dict):
+            radios.append({"key": radio["key"], "identity": radio["identity"]})
+    main["windows"] = extras
+    main["radios"] = radios
+    return main
 
 
 # ---- the file ----------------------------------------------------------------

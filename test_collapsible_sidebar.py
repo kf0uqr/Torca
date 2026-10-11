@@ -145,7 +145,7 @@ def test_real_dashboard_hands_its_kill_tx_button_to_the_hosts_top_bar(tmp_path):
             app.processEvents()
         assert dash.windowTitle() == "Map" and host.panes[0].tabText(0) == "Map", host.panes[0].tabText(0)
         kill = dash.kill_remote_tx_button
-        floating = host._floating_button
+        floating = host._windows_button
         assert kill.window() is host and kill.isVisible(), "button not in the host"
         assert abs(kill.mapTo(host, kill.rect().center()).y() - floating.mapTo(host, floating.rect().center()).y()) <= 4, "not on the same row"
         assert kill.mapTo(host, kill.rect().topRight()).x() >= host.width() - 12, "not at the far right"

@@ -142,3 +142,55 @@ def test_a_saved_layout_wider_or_taller_than_2x2_is_rejected_on_load():
     assert ws.tree_from_json(["h", [0, 1]]) == ("h", (0, 1))
     assert ws.clean_state({"layout": ["h", [0, 1, 2]], "workspaces": {}}) is None   # so a whole such state is simply not restored
 
+
+
+# ---- extra windows and geometry ----
+
+GEOMETRY = {"screen": "DP-1", "x": 100, "y": 50, "width": 1280, "height": 720, "maximized": False}
+
+
+def test_extra_windows_and_geometry_survive_cleaning():
+    state = {
+        "layout": ["h", [0, 1]], "workspaces": {"0": {"tabs": ["map"], "current": "map"}}, "active": 0,
+        "geometry": GEOMETRY,
+        "windows": [
+            {"layout": 0, "workspaces": {"0": {"tabs": ["page:Parks", 5], "current": "page:Parks"}}, "active": 0, "geometry": GEOMETRY},
+            {"layout": ["v", [0, 1]], "workspaces": {"1": {"tabs": ["logbook"], "current": None}}, "active": 1},
+        ],
+    }
+    cleaned = ws.clean_state(state)
+    assert cleaned["geometry"] == GEOMETRY
+    assert len(cleaned["windows"]) == 2
+    assert cleaned["windows"][0]["workspaces"]["0"] == {"tabs": ["page:Parks"], "current": "page:Parks"}
+    assert cleaned["windows"][0]["geometry"] == GEOMETRY and cleaned["windows"][1]["geometry"] is None
+    assert cleaned["windows"][1]["layout"] == ["v", [0, 1]] and cleaned["windows"][1]["active"] == 1
+
+
+def test_a_file_from_before_multiple_windows_still_loads_as_one_window():
+    old = {"layout": ["h", [0, 1]], "workspaces": {"0": {"tabs": ["map"], "current": "map"}}, "active": 0, "radios": []}
+    cleaned = ws.clean_state(old)
+    assert cleaned["windows"] == [] and cleaned["geometry"] is None and cleaned["layout"] == ["h", [0, 1]]
+
+
+def test_a_bad_extra_window_is_dropped_but_the_rest_is_kept():
+    state = {"layout": 0, "workspaces": {}, "windows": [
+        {"layout": ["h", [0, 1, 2]], "workspaces": {}},          # too wide
+        "junk",
+        {"layout": 0, "workspaces": {"0": {"tabs": ["logbook"], "current": "logbook"}}},
+    ]}
+    cleaned = ws.clean_state(state)
+    assert len(cleaned["windows"]) == 1 and cleaned["windows"][0]["workspaces"]["0"]["tabs"] == ["logbook"]
+
+
+def test_the_number_of_extra_windows_is_capped():
+    state = {"layout": 0, "workspaces": {}, "windows": [{"layout": 0, "workspaces": {}} for _ in range(40)]}
+    assert len(ws.clean_state(state)["windows"]) == ws.MAX_EXTRA_WINDOWS
+
+
+def test_geometry_is_validated():
+    assert ws.clean_geometry(GEOMETRY) == GEOMETRY
+    assert ws.clean_geometry(None) is None and ws.clean_geometry("x") is None
+    assert ws.clean_geometry(dict(GEOMETRY, width=10)) is None                # silly size
+    assert ws.clean_geometry(dict(GEOMETRY, x="0")) is None and ws.clean_geometry(dict(GEOMETRY, x=True)) is None
+    missing_screen = {k: v for k, v in GEOMETRY.items() if k != "screen"}
+    assert ws.clean_geometry(missing_screen)["screen"] == ""

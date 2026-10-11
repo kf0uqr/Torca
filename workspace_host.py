@@ -1,11 +1,14 @@
-"""WorkspaceHost: the single main window that holds everything TORCA
-used to open as separate top-level windows (Ham Dashboard, one window
-per radio, the CW/APRS/SSTV/... tools, the Log Book).
+"""WorkspaceHost: a TORCA window holding up to four workspaces, and the
+WindowManager that lets there be several of them.
 
-The host shows 1-4 "workspaces" (WorkspacePane, a QTabWidget each); any
-hosted window is a tab in exactly one workspace and can be moved to
-another from the tab's right-click menu, or popped out into a floating
-window and docked back.
+Everything TORCA used to open as separate top-level windows (the map, one
+window per radio, the CW/APRS/SSTV/... tools, the Log Book) is a TAB inside a
+workspace (WorkspacePane, a QTabWidget each). A window shows 1-4 workspaces
+(at most two wide and two tall); a tab can be moved to another workspace, or
+to another WINDOW, from its right-click menu. Each window can be put on a
+different monitor, so a lot can be on screen at once. The first window is the
+main one: closing it closes the app; closing any other window just hands its
+tabs to the main one.
 
 Placement rule for a newly presented window (see present()): the first
 EMPTY visible workspace, otherwise a new tab in the workspace the
@@ -24,10 +27,11 @@ page instead, so it is NOT mistaken for closed.
 
 Qt-only, no radio/app imports -- the dashboard and radio windows reach
 this through present_window() below, which falls back to the old
-show()/raise_() behaviour when no host exists (tests, headless use).
+show()/raise_() behaviour when no window exists (tests, headless use).
 """
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtGui import QPainter
 from workspace_state import fits_grid, tree_from_json, tree_to_json
 from PySide6.QtWidgets import (
@@ -123,15 +127,16 @@ PLUS_BUTTON_STYLE = (
 
 _TAB_TITLE_MAX = 34
 
-_HOST = None  # the live WorkspaceHost, if any -- see present_window()
+_HOST = None  # the MAIN window (a WorkspaceHost), if any -- see present_window()
 
 
 def present_window(widget):
-    """Shows and focuses `widget`, wherever it lives: inside the host
-    (selecting its tab, or placing it per the placement rule) when a
-    WorkspaceHost exists, else as a plain top-level window."""
+    """Shows and focuses `widget`, wherever it lives: in whichever window
+    already has it, else placed per the placement rule across all windows
+    (see WindowManager.present); with no windows at all, as a plain
+    top-level window."""
     if _HOST is not None:
-        _HOST.present(widget)
+        _HOST.manager.present(widget)
         return
     widget.show()
     widget.raise_()
@@ -161,7 +166,7 @@ class _Entry:
         self.closable = closable
         self.page = None       # the QScrollArea wrapping it while docked
         self.pane = None       # the WorkspacePane holding that page while docked
-        self.floating = False  # popped out into its own top-level window
+        self.host = None       # the WorkspaceHost (window) it is docked in, or None while closed
 
 
 class _AddTabBar(QTabBar):
@@ -353,13 +358,13 @@ class _HideWatcher(QObject):
     itself (what a window's closeEvent does, or a completed close) means
     "the operator closed it" -- ask the host to drop its tab."""
 
-    def __init__(self, host):
-        super().__init__(host)
-        self._host = host
+    def __init__(self, manager):
+        super().__init__(manager)
+        self._manager = manager
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Hide and obj.isHidden():
-            self._host._widget_hidden(obj)
+            self._manager.widget_hidden(obj)
         return False
 
 
@@ -377,10 +382,264 @@ class _MenuContext:
         self._host.open_in(widget, self._pane.index)
 
     def label(self, title, widget=None):
-        where = self._host.pane_of(widget) if widget is not None else None
-        if where is None:
+        """`title`, plus where the widget is already open if that is not right
+        here: "(Workspace 2)" in this window, "(Window 2, Workspace 1)" in another."""
+        host = self._host.manager.host_of(widget) if widget is not None else None
+        if host is None:
             return title
-        return title if where == self._pane.index else f"{title}  (Workspace {where + 1})"
+        if host is not self._host:
+            entry = host.manager.entries.get(widget)
+            return f"{title}  (Window {host.manager.number_of(host)}, Workspace {entry.pane.index + 1})"
+        where = self._host.pane_of(widget)
+        return title if where is None or where == self._pane.index else f"{title}  (Workspace {where + 1})"
+
+
+class WindowManager(QObject):
+    """Everything shared by TORCA's windows. Each window is a WorkspaceHost
+    (up to four workspaces, two wide and two tall); a tab lives in exactly one
+    of them and can be moved to another -- typically so the windows can sit on
+    different monitors and show a lot at once. The first window is the MAIN
+    window: closing it closes the app; closing any other window just hands its
+    tabs to the main one.
+
+    The manager owns the registry of tabs (a tab is registered once, whichever
+    window shows it), the "+" menu providers, the placement rule across windows,
+    and saving / restoring the arrangement of all windows."""
+
+    layout_changed = Signal()   # any window's arrangement changed
+    windows_changed = Signal()  # a window was opened or closed
+
+    def __init__(self):
+        super().__init__()
+        self.hosts = []              # main window first
+        self.entries = {}            # widget -> _Entry, for every registered tab
+        self.menu_providers = []     # fn(menu, ctx), see add_menu_provider
+        self.top_bar_factory = None  # () -> new widgets for a NEW window's top bar (e.g. a Kill TX button)
+        self.shutting_down = False
+        self._hide_watcher = _HideWatcher(self)
+
+    # ---- windows ----
+
+    @property
+    def main_host(self):
+        return self.hosts[0] if self.hosts else None
+
+    def register_host(self, host):
+        self.hosts.append(host)
+        host.layout_changed.connect(self.layout_changed)
+        self._retitle()
+        self.windows_changed.emit()
+
+    def unregister_host(self, host):
+        if host in self.hosts:
+            self.hosts.remove(host)
+        self._retitle()
+        self.windows_changed.emit()
+        self.layout_changed.emit()
+
+    def number_of(self, host):
+        return self.hosts.index(host) + 1
+
+    def _retitle(self):
+        for number, host in enumerate(self.hosts, start=1):
+            host.setWindowTitle("TORCA" if number == 1 else f"TORCA - Window {number}")
+
+    def new_window(self, place=True):
+        """Opens another window (empty, one workspace). Placed on a monitor not
+        already showing one of ours if there is one (maximized there); with only
+        one monitor it is an ordinary, slightly offset window so it does not
+        cover the others. `place=False` leaves the geometry to the caller."""
+        host = WorkspaceHost(self)
+        host.setAttribute(Qt.WA_DeleteOnClose, True)
+        if self.top_bar_factory is not None:
+            for widget in self.top_bar_factory():
+                host._top_bar.addWidget(widget)
+        if place:
+            self._place_on_free_screen(host)
+        host.show()
+        return host
+
+    def _place_on_free_screen(self, host):
+        screens = QGuiApplication.screens()
+        busy = {other.screen() for other in self.hosts if other is not host and other.isVisible()}
+        free = [screen for screen in screens if screen not in busy]
+        if free:
+            host.setScreen(free[0])
+            host.setGeometry(free[0].availableGeometry())
+            host.setWindowState(host.windowState() | Qt.WindowMaximized)
+            return
+        anchor = self.main_host.screen() if self.main_host is not None else (screens[0] if screens else None)
+        if anchor is not None:
+            area = anchor.availableGeometry()
+            offset = 40 * (len(self.hosts) - 1)
+            host.setGeometry(area.x() + offset, area.y() + offset, int(area.width() * 0.8), int(area.height() * 0.8))
+
+    def activate(self, host):
+        host.showNormal() if host.isMinimized() else None
+        host.raise_()
+        host.activateWindow()
+
+    # ---- the registry of tabs ----
+
+    def register_window(self, widget, closable=True):
+        """Makes `widget` known WITHOUT showing it anywhere yet."""
+        entry = self.entries.get(widget)
+        if entry is None:
+            entry = _Entry(widget, closable)
+            self.entries[widget] = entry
+            widget.installEventFilter(self._hide_watcher)
+            widget.windowTitleChanged.connect(lambda _t, w=widget: self._refresh_title(w))
+        return entry
+
+    def _refresh_title(self, widget):
+        entry = self.entries.get(widget)
+        if entry is not None and entry.host is not None:
+            entry.host._refresh_title(widget)
+
+    def widget_hidden(self, widget):
+        entry = self.entries.get(widget)
+        if entry is not None and entry.host is not None:
+            entry.host._widget_hidden(widget)
+
+    def host_of(self, widget):
+        entry = self.entries.get(widget)
+        return entry.host if entry is not None else None
+
+    def window_keys(self):
+        """{key: widget} for every registered tab that has a workspace_key."""
+        return {key: entry.widget for entry in self.entries.values()
+                if (key := getattr(entry.widget, "workspace_key", None))}
+
+    def add_menu_provider(self, provider):
+        self.menu_providers.append(provider)
+
+    # ---- placing and moving tabs across windows ----
+
+    def present(self, widget, prefer=None):
+        """Shows `widget`: in the window that already has it, else in the window
+        picked by _choose_host. Brings that window forward if it is not `prefer`."""
+        host = self.host_of(widget) or self._choose_host(widget, prefer)
+        host._present_here(widget)
+        if host is not prefer and len(self.hosts) > 1:
+            self.activate(host)
+
+    def _active_host(self, prefer=None):
+        if prefer is not None:
+            return prefer
+        active = QApplication.activeWindow()
+        return active if active in self.hosts else self.main_host
+
+    def _choose_host(self, widget, prefer=None):
+        """Which window a tab that is not open anywhere goes to: the one it had
+        in a saved arrangement; else the active window if it has an empty
+        workspace; else any window with one; else the active window."""
+        key = getattr(widget, "workspace_key", None)
+        if key:
+            for host in self.hosts:
+                if key in host._placement_hints:
+                    return host
+        active = self._active_host(prefer)
+        if active.has_empty_workspace():
+            return active
+        for host in self.hosts:
+            if host.has_empty_workspace():
+                return host
+        return active
+
+    def move_widget(self, widget, target, pane_index=None):
+        """Moves a tab to window `target` (to workspace `pane_index`, else the
+        window's usual placement) -- from whichever window it is in, or from
+        closed."""
+        entry = self.register_window(widget)
+        if entry.host is target:
+            if pane_index is not None:
+                target.move_window(widget, pane_index)
+            return
+        if entry.host is not None:
+            entry.host._release(entry)
+        index = pane_index if pane_index is not None else target._choose_pane().index
+        target.open_in(widget, index)
+
+    # ---- the saved arrangement of all windows ----
+
+    @staticmethod
+    def geometry_of(host):
+        geometry = host.normalGeometry() if host.isMaximized() else host.geometry()
+        screen = host.screen()
+        return {
+            "screen": screen.name() if screen is not None else "",
+            "x": geometry.x(), "y": geometry.y(), "width": geometry.width(), "height": geometry.height(),
+            "maximized": host.isMaximized(),
+        }
+
+    @staticmethod
+    def apply_geometry(host, geometry):
+        """Puts a window back where it was -- on the same monitor if it is still
+        there. A rectangle that would land off every current monitor (a monitor
+        was unplugged) is ignored, leaving the window where it already is."""
+        if not geometry:
+            return
+        screens = QGuiApplication.screens()
+        screen = next((s for s in screens if s.name() == geometry.get("screen")), None)
+        rect = QRect(geometry["x"], geometry["y"], geometry["width"], geometry["height"])
+        if screen is None and not any(s.geometry().intersects(rect) for s in screens):
+            return
+        if screen is not None:
+            host.setScreen(screen)
+        if geometry.get("maximized"):
+            if screen is not None:
+                host.setGeometry(screen.availableGeometry())
+            host.setWindowState(host.windowState() | Qt.WindowMaximized)
+        else:
+            host.setWindowState(host.windowState() & ~Qt.WindowMaximized)
+            host.setGeometry(rect)
+
+    def capture_state(self):
+        """The arrangement of every window as plain data: the main window's keys
+        at the top level (see workspace_state.py), the others under "windows"."""
+        main, *others = self.hosts
+        state = main.capture_state()
+        state["geometry"] = self.geometry_of(main)
+        state["windows"] = [dict(host.capture_state(), geometry=self.geometry_of(host)) for host in others]
+        return state
+
+    def restore_state(self, state):
+        """Applies a (cleaned) saved arrangement's LAYOUTS: the main window's,
+        and a new window for each extra one saved. Tabs are placed afterwards
+        (place_by_hint, or when first shown)."""
+        main = self.main_host
+        if not main.restore_state(state):
+            return False
+        self.apply_geometry(main, state.get("geometry"))
+        for window_state in state.get("windows", []):
+            host = self.new_window(place=False)
+            if not host.restore_state(window_state):
+                host.close()
+                continue
+            if window_state.get("geometry"):
+                self.apply_geometry(host, window_state["geometry"])
+            else:
+                self._place_on_free_screen(host)
+        return True
+
+    def place_by_hint(self, widget):
+        """Puts an already-registered tab where the saved arrangement had it --
+        in whichever window and workspace; returns True if it had it open."""
+        key = getattr(widget, "workspace_key", None)
+        for host in self.hosts:
+            if key and key in host._placement_hints:
+                index = host._placement_hints.pop(key)
+                if index not in tree_leaves(host._tree):
+                    return False
+                self.move_widget(widget, host, index)
+                return True
+        return False
+
+    def finish_restore(self, state):
+        main, *others = self.hosts
+        main.finish_restore(state)
+        for host, window_state in zip(others, state.get("windows", [])):
+            host.finish_restore(window_state)
 
 
 class WorkspaceHost(QMainWindow):
@@ -392,18 +651,18 @@ class WorkspaceHost(QMainWindow):
     # the owner can save the arrangement while it is still intact.
     closing = Signal()
 
-    def __init__(self):
+    def __init__(self, manager=None):
         global _HOST
         super().__init__()
         self.setWindowTitle("TORCA")
-        self._entries = {}       # widget -> _Entry
-        self._menu_providers = []  # fn(menu, ctx) -> None, see add_menu_provider
+        # A host built on its own is the main window of its own little world;
+        # further windows are created through WindowManager.new_window().
+        self.manager = manager if manager is not None else WindowManager()
+        self._entries = self.manager.entries   # shared: widget -> _Entry (each knows which window it is in)
         self._placement_hints = {}  # tab key -> workspace index, from a saved arrangement (see restore_state)
-        self._floating_menu_items = []
         self._dashboard = None
         self._active_pane = None
         self._closing = False
-        self._hide_watcher = _HideWatcher(self)
 
         # Hidden parent for panes that are not part of the current layout.
         self._holder = QWidget(self)
@@ -422,15 +681,16 @@ class WorkspaceHost(QMainWindow):
             pane.tabBar().tabMoved.connect(lambda _a, _b: self.layout_changed.emit())
         self._active_pane = self.panes[0]
 
-        # ---- Top bar: floating-window menu ----
+        # ---- Top bar: the Windows menu ----
         bar = QHBoxLayout()
         bar.setContentsMargins(6, 4, 6, 2)
-        self._floating_button = QToolButton()
-        self._floating_button.setText("Floating windows")
-        self._floating_button.setPopupMode(QToolButton.InstantPopup)
-        self._floating_button.setMenu(QMenu(self._floating_button))
-        self._floating_button.menu().aboutToShow.connect(self._rebuild_floating_menu)
-        bar.addWidget(self._floating_button)
+        self._windows_button = QToolButton()
+        self._windows_button.setText("Windows")
+        self._windows_button.setToolTip("Open another window (e.g. for a second monitor) or switch between windows")
+        self._windows_button.setPopupMode(QToolButton.InstantPopup)
+        self._windows_button.setMenu(QMenu(self._windows_button))
+        self._windows_button.menu().aboutToShow.connect(self._rebuild_windows_menu)
+        bar.addWidget(self._windows_button)
         bar.addStretch()
         self._top_bar = bar  # widgets handed over by the dashboard are added at its right end
 
@@ -453,7 +713,9 @@ class WorkspaceHost(QMainWindow):
         self._build_layout()
 
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
-        _HOST = self
+        self.manager.register_host(self)
+        if self.manager.main_host is self:
+            _HOST = self
 
     # ------------------------------------------------------------------
     # Layout
@@ -645,35 +907,30 @@ class WorkspaceHost(QMainWindow):
     # ------------------------------------------------------------------
 
     def register_window(self, widget, closable=True):
-        """Makes `widget` known to the host WITHOUT showing it anywhere
-        yet -- for tabs the operator opens later from a workspace's "+"
-        menu."""
-        entry = self._entries.get(widget)
-        if entry is None:
-            entry = _Entry(widget, closable)
-            self._entries[widget] = entry
-            widget.installEventFilter(self._hide_watcher)
-            widget.windowTitleChanged.connect(lambda _t, w=widget: self._refresh_title(w))
-        return entry
+        """Makes `widget` known WITHOUT showing it anywhere yet -- for tabs the
+        operator opens later from a workspace's "+" menu."""
+        return self.manager.register_window(widget, closable)
 
     def add_window(self, widget, closable=True, pane_index=None):
-        """Registers `widget` and docks it (without stealing focus
-        rules from present()). closable=False (the dashboard) removes
-        the tab's close button and the pop-out menu item."""
+        """Registers `widget` and docks it in THIS window (without stealing
+        focus rules from present()). closable=False (the dashboard) removes
+        the tab's close button."""
         entry = self.register_window(widget, closable)
+        if entry.host is not None and entry.host is not self:
+            entry.host._release(entry)
         pane = self.panes[pane_index] if pane_index is not None else self._pane_for(widget)
         self._dock(entry, pane)
         return entry
 
     def open_in(self, widget, pane_index):
-        """Opens `widget` as a tab in a SPECIFIC workspace (what picking
-        something from that workspace's "+" menu does): docks it there
-        if it isn't open, otherwise moves its tab there."""
+        """Opens `widget` as a tab in a SPECIFIC workspace of THIS window (what
+        picking something from that workspace's "+" menu does): docks it there
+        if it isn't open, otherwise moves its tab there -- even from another
+        window."""
         entry = self.register_window(widget)
         pane = self.panes[pane_index]
-        if entry.floating:
-            self.dock_floating(widget)
-            entry = self._entries[widget]
+        if entry.host is not None and entry.host is not self:
+            entry.host._release(entry)
         if entry.pane is None:
             self._dock(entry, pane)
         elif entry.pane is not pane:
@@ -682,18 +939,22 @@ class WorkspaceHost(QMainWindow):
         self._set_active_pane(pane)
         widget.show()
 
+    def has_empty_workspace(self):
+        return any(pane.count() == 0 for pane in self.visible_panes())
+
     def add_menu_provider(self, provider):
         """provider(menu, ctx) is called each time a workspace's "+" menu
         opens and adds its own actions/submenus to `menu`; an action
         opens a widget in that workspace via ctx.open(widget). ctx.label(
         title, widget) marks entries already open elsewhere. Providers
         build widgets lazily (inside the action's handler), so listing
-        something here costs nothing until it is picked."""
-        self._menu_providers.append(provider)
+        something here costs nothing until it is picked. Shared by every
+        window."""
+        self.manager.add_menu_provider(provider)
 
     def _fill_add_menu(self, menu, pane):
         ctx = _MenuContext(self, pane)
-        for provider in self._menu_providers:
+        for provider in self.manager.menu_providers:
             if not menu.isEmpty():
                 menu.addSeparator()
             provider(menu, ctx)
@@ -720,24 +981,26 @@ class WorkspaceHost(QMainWindow):
         take_top_bar = getattr(dashboard, "take_top_bar_widgets", None)
         if take_top_bar is not None:
             for widget in take_top_bar():
-                self._top_bar.addWidget(widget)  # after the stretch: right-aligned, same row as "Floating windows"
+                self._top_bar.addWidget(widget)  # after the stretch: right-aligned, same row as the Windows menu
+        # Windows opened later get their own copies (a button is one widget in one
+        # window), so the safety control is reachable wherever you are looking.
+        self.manager.top_bar_factory = getattr(dashboard, "make_top_bar_widgets", None)
         populate = getattr(dashboard, "populate_workspace_menu", None)
         if populate is not None:
             self.add_menu_provider(populate)
         self.present(dashboard)
 
     def present(self, widget):
-        """Shows `widget`: selects its tab if docked, raises it if
-        floating, otherwise docks it per the placement rule."""
-        entry = self._entries.get(widget)
-        if entry is None:
-            entry = self.add_window(widget)
-        elif entry.floating:
-            widget.show()
-            widget.raise_()
-            widget.activateWindow()
-            return
-        elif entry.pane is None:
+        """Shows `widget`: selects its tab wherever it is docked (bringing that
+        window forward), otherwise docks it per the placement rule -- preferring
+        this window. See WindowManager.present."""
+        self.manager.present(widget, prefer=self)
+
+    def _present_here(self, widget):
+        """Shows `widget` in THIS window: selects its tab if docked here,
+        otherwise docks it per the placement rule."""
+        entry = self.register_window(widget)
+        if entry.pane is None:
             self._dock(entry, self._pane_for(widget))
         entry.pane.setCurrentWidget(entry.page)
         self._set_active_pane(entry.pane)
@@ -764,8 +1027,7 @@ class WorkspaceHost(QMainWindow):
 
     def _dock(self, entry, pane):
         widget = entry.widget
-        if entry.floating:
-            entry.floating = False
+        entry.host = self
         page = QScrollArea()
         page.setWidgetResizable(True)
         page.setFrameShape(QScrollArea.NoFrame)
@@ -793,13 +1055,14 @@ class WorkspaceHost(QMainWindow):
 
     def move_window(self, widget, pane_index):
         entry = self._entries.get(widget)
-        if entry is not None and entry.pane is not None:
+        if entry is not None and entry.host is self and entry.pane is not None:
             self._move_to_pane(entry, self.panes[pane_index])
             self._set_active_pane(self.panes[pane_index])
 
     def pane_of(self, widget):
+        """Which workspace of THIS window shows `widget` (None if not here)."""
         entry = self._entries.get(widget)
-        return entry.pane.index if entry is not None and entry.pane is not None else None
+        return entry.pane.index if entry is not None and entry.host is self and entry.pane is not None else None
 
     def _refresh_title(self, widget):
         entry = self._entries.get(widget)
@@ -825,58 +1088,55 @@ class WorkspaceHost(QMainWindow):
 
     def _widget_hidden(self, widget):
         entry = self._entries.get(widget)
-        if entry is None or entry.floating or entry.pane is None or self._closing:
+        if entry is None or entry.host is not self or entry.pane is None or self.manager.shutting_down:
             return
         QTimer.singleShot(0, lambda: self._undock(entry))
 
     def _undock(self, entry):
         """Drops the tab of a window that has hidden itself, leaving the
         widget alive (hidden, parentless) so it can be presented again."""
-        if entry.pane is None or not entry.widget.isHidden():
-            return  # re-shown in the meantime
+        if entry.pane is None or entry.host is not self or not entry.widget.isHidden():
+            return  # re-shown (or moved to another window) in the meantime
         pane, page = entry.pane, entry.page
         pane.removeTab(pane.indexOf(page))
         page.takeWidget()
         entry.widget.setParent(None)
         page.deleteLater()
         entry.pane = entry.page = None
+        entry.host = None
         self.layout_changed.emit()
 
-    # ---- floating ----
-
-    def pop_out(self, widget):
-        entry = self._entries.get(widget)
-        if entry is None or entry.pane is None or not entry.closable:
+    def _release(self, entry):
+        """Takes a tab out of this window WITHOUT closing it (the widget stays
+        shown-ready), so another window can dock it. Used to move tabs between
+        windows."""
+        if entry.pane is None:
+            entry.host = None
             return
-        size = widget.size()
         pane, page = entry.pane, entry.page
         pane.removeTab(pane.indexOf(page))
         page.takeWidget()
         page.deleteLater()
         entry.pane = entry.page = None
-        entry.floating = True
-        widget.setParent(None)
-        widget.resize(size)
-        widget.show()
-        widget.raise_()
+        entry.host = None
         self.layout_changed.emit()
 
-    def dock_floating(self, widget):
-        entry = self._entries.get(widget)
-        if entry is not None and entry.floating:
-            widget.hide()
-            self._dock(entry, self._choose_pane())
+    # ---- the Windows menu ----
 
-    def _rebuild_floating_menu(self):
-        menu = self._floating_button.menu()
+    def _rebuild_windows_menu(self):
+        menu = self._windows_button.menu()
         menu.clear()
-        floating = [e for e in self._entries.values() if e.floating and not e.widget.isHidden()]
-        if not floating:
-            menu.addAction("(none)").setEnabled(False)
-            return
-        for entry in floating:
-            menu.addAction(f"Dock: {entry.widget.windowTitle()}").triggered.connect(
-                lambda _c=False, w=entry.widget: self.dock_floating(w)
+        manager = self.manager
+        menu.addAction("New Window").triggered.connect(lambda _c=False: manager.new_window())
+        menu.addSeparator()
+        for number, host in enumerate(manager.hosts, start=1):
+            label = f"Window {number}" + ("  (main)" if number == 1 else "") + ("  \u2713 this one" if host is self else "")
+            action = menu.addAction(label)
+            action.triggered.connect(lambda _c=False, h=host: manager.activate(h))
+        if manager.main_host is not self:
+            menu.addSeparator()
+            menu.addAction("Close This Window (its tabs move to Window 1)").triggered.connect(
+                lambda _c=False: self.close()
             )
 
     # ---- tab context menu ----
@@ -885,24 +1145,37 @@ class WorkspaceHost(QMainWindow):
         index = pane.tabBar().tabAt(pos)
         if index < 0:
             return
+        menu = self._tab_menu(pane, index)
+        if menu is not None:
+            menu.exec(pane.tabBar().mapToGlobal(pos))
+
+    def _tab_menu(self, pane, index):
+        """The right-click menu for the tab at `index` of `pane`: move it to
+        another workspace or window, or close it."""
         entry = next((e for e in self._entries.values() if e.page is pane.widget(index)), None)
         if entry is None:
-            return
+            return None
         menu = QMenu(self)
         for target in self.visible_panes():
             if target is not pane:
                 menu.addAction(f"Move to Workspace {target.index + 1}").triggered.connect(
                     lambda _c=False, w=entry.widget, i=target.index: self.move_window(w, i)
                 )
+        menu.addSeparator()
+        move_menu = menu.addMenu("Move to Window")
+        move_menu.addAction("New Window").triggered.connect(
+            lambda _c=False, w=entry.widget: self.manager.move_widget(w, self.manager.new_window())
+        )
+        for number, host in enumerate(self.manager.hosts, start=1):
+            if host is not self:
+                move_menu.addAction(f"Window {number}").triggered.connect(
+                    lambda _c=False, w=entry.widget, h=host: self.manager.move_widget(w, h)
+                )
         if entry.closable:
-            menu.addSeparator()
-            menu.addAction("Pop Out to Window").triggered.connect(
-                lambda _c=False, w=entry.widget: self.pop_out(w)
-            )
             menu.addAction("Close").triggered.connect(
                 lambda _c=False, p=pane, w=entry.widget: self._on_tab_close_requested(p, p.indexOf(self._entries[w].page))
             )
-        menu.exec(pane.tabBar().mapToGlobal(pos))
+        return menu
 
     # ---- active workspace ----
 
@@ -924,14 +1197,15 @@ class WorkspaceHost(QMainWindow):
     # ------------------------------------------------------------------
 
     def window_keys(self):
-        """{key: widget} for every hosted window that has a workspace_key."""
-        return {key: entry.widget for entry in self._entries.values()
-                if (key := getattr(entry.widget, "workspace_key", None))}
+        """{key: widget} for every registered tab that has a workspace_key, in
+        any window."""
+        return self.manager.window_keys()
 
     def capture_state(self):
         """The current arrangement as plain data: the layout tree, and per
         workspace its docked tabs (by key, in order) and selected tab. Only
-        windows with a workspace_key are recorded; floating ones are not."""
+        tabs with a workspace_key are recorded. (One window; see
+        WindowManager.capture_state for all of them.)"""
         workspaces = {}
         for index in tree_leaves(self._tree):
             pane = self.panes[index]
@@ -1015,16 +1289,34 @@ class WorkspaceHost(QMainWindow):
         (HamClockWindow): closing the host runs it."""
         self._dashboard = dashboard
 
+    def _hand_tabs_to_main(self):
+        """Closing a secondary window: its tabs move to the main window (in their
+        order) rather than being closed -- radios stay connected."""
+        main = self.manager.main_host
+        for index in tree_leaves(self._tree):
+            pane = self.panes[index]
+            widgets = [entry.widget for position in range(pane.count())
+                       for entry in self._entries.values() if entry.page is pane.widget(position)]
+            for widget in widgets:
+                self.manager.move_widget(widget, main)
+
     def closeEvent(self, event):
         global _HOST
+        manager = self.manager
+        if manager.main_host is not self:
+            # A secondary window: its tabs go to the main window; the app carries on.
+            if not manager.shutting_down:
+                self._hand_tabs_to_main()
+            manager.unregister_host(self)
+            event.accept()
+            return
         self.closing.emit()  # first: lets the owner save the arrangement while it is still intact
+        manager.shutting_down = True
         self._closing = True
         if self._dashboard is not None:
             self._dashboard.close()  # radios, servers, worker threads -- see HamClockWindow.closeEvent
-        for entry in list(self._entries.values()):
-            if entry.floating:
-                entry.widget.close()
-                entry.widget.hide()
+        for other in list(manager.hosts[1:]):
+            other.close()
         if _HOST is self:
             _HOST = None
         event.accept()

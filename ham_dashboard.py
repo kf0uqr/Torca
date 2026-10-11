@@ -2545,6 +2545,17 @@ class HamClockWindow(QWidget):
         self.layout().removeItem(self._top_buttons_row)
         return [self.kill_remote_tx_button]
 
+    def make_top_bar_widgets(self):
+        """A NEW "Kill All Remote TX" button for another window's top bar (a
+        widget can be in only one window, and this safety control should be
+        reachable from whichever window you are looking at). Same look, tooltip
+        and handler as the original."""
+        button = QPushButton(self.kill_remote_tx_button.text())
+        button.setStyleSheet(self.kill_remote_tx_button.styleSheet())
+        button.setToolTip(self.kill_remote_tx_button.toolTip())
+        button.clicked.connect(self._on_kill_all_remote_tx)
+        return [button]
+
     def populate_workspace_menu(self, menu, ctx):
         """Fills a workspace's "+" menu (see WorkspaceHost.add_menu_
         provider): the reference-data pages, the Log Book, and a submenu

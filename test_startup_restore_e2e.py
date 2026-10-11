@@ -190,3 +190,53 @@ def test_switching_profiles_saves_the_old_workspace_and_each_profile_keeps_its_o
     switch_back = SWITCH_C.replace('profile = ensure_active_profile()', 'apply_profile("Home"); profile = ensure_active_profile()', 1)
     c = _run_phase(switch_back, tmp_path, "C")
     assert c.returncode == 0 and "OK" in c.stdout, c.stdout + c.stderr
+
+
+# ---- two windows, end to end ----
+
+TWO_WINDOWS_FIRST = PRELUDE.replace("from ham_dashboard import HamClockWindow", "from ham_dashboard import HamClockWindow\nkills = []\nHamClockWindow._on_kill_all_remote_tx = lambda self, *a: kills.append(1)") + textwrap.dedent('''
+    assert problems == [] and len(host.manager.hosts) == 1
+    second = host.manager.new_window()
+    host.manager.move_widget(pages["Parks"], second, 0)
+    host.manager.move_widget(pages["Contests"], second, 0)
+    second.add_workspace(0, "right")
+    dash.open_log_book()
+    host.manager.move_widget(dash.log_book_window, second, 1)
+    settle()
+
+    # the second window has its own Kill TX button, wired to the same handler
+    from PySide6.QtWidgets import QPushButton
+    second_kill = next(b for b in second.findChildren(QPushButton) if b.text() == "Kill All Remote TX")
+    assert second_kill is not dash.kill_remote_tx_button and second_kill.window() is second
+    second_kill.click()
+    assert kills == [1], kills
+
+    assert host.manager.host_of(pages["Parks"]) is second and host.pane_of(pages["Parks"]) is None
+    assert persistence.save_now()
+    print("OK")
+    sys.stdout.flush()
+    os._exit(0)
+''')
+
+TWO_WINDOWS_SECOND = PRELUDE + textwrap.dedent('''
+    assert problems == [], problems
+    assert len(host.manager.hosts) == 2, len(host.manager.hosts)
+    second = host.manager.hosts[1]
+    assert second.workspace_count == 2 and second._tree == ("h", (0, 1))
+    assert host.manager.host_of(pages["Parks"]) is second and second.pane_of(pages["Parks"]) == 0
+    assert host.manager.host_of(pages["Contests"]) is second and second.pane_of(pages["Contests"]) == 0
+    assert host.manager.host_of(dash.log_book_window) is second and second.pane_of(dash.log_book_window) == 1
+    assert host.pane_of(dash) == 0 and host.pane_of(pages["Parks"]) is None                          # the map stayed in window 1
+    from PySide6.QtWidgets import QPushButton
+    assert any(b.text() == "Kill All Remote TX" for b in second.findChildren(QPushButton))           # and it has its own safety button again
+    print("OK")
+    sys.stdout.flush()
+    os._exit(0)
+''')
+
+
+def test_two_windows_survive_a_real_restart_and_each_has_its_own_kill_button(tmp_path):
+    first = _run(TWO_WINDOWS_FIRST, tmp_path, "first")
+    assert first.returncode == 0 and "OK" in first.stdout, first.stdout + first.stderr
+    second = _run(TWO_WINDOWS_SECOND, tmp_path, "second")
+    assert second.returncode == 0 and "OK" in second.stdout, second.stdout + second.stderr

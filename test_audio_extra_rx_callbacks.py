@@ -23,6 +23,7 @@ from audio import AudioBridge
 def make_bare_bridge():
     bridge = object.__new__(AudioBridge)
     bridge._extra_rx_callbacks = []
+    bridge._extra_rx_raw_callbacks = []  # added to AudioBridge after this fixture was written
     bridge._rx_stereo = False
     bridge._rx_stereo_remainder = b""
     bridge._rx_unrecognized_reported = False

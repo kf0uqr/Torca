@@ -356,6 +356,8 @@ class FakeWorker:
             scope_frame_received = Signal(object)
             active_receiver_changed = Signal(int)
             level_updated = Signal(str, float)
+            tuner_status_changed = Signal(int)
+            scope_span_changed = Signal(int)
 
         self._obj = _Worker()
 

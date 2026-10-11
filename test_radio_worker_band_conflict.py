@@ -36,17 +36,27 @@ class FakeRadio:
     """Tracks every select_receiver/set_vfo_slot/set_frequency call
     (receiver-addressed or bare) in one ordered list, plus a small
     per-receiver frequency table _resolve_receiver_band_conflict reads
-    via get_frequency(receiver=...) to detect the conflict at all."""
+    via get_frequency(receiver=...) to detect the conflict at all.
+
+    get_frequency models rigplane's real GET addressing (see
+    RadioWorker._get_receiver_frequency): receiver=0 means "whichever
+    receiver is currently selected", receiver=1 means "the unselected
+    one" -- NOT a Main/Sub identity -- so which table entry it reads
+    follows select_receiver()."""
 
     def __init__(self, main_freq_hz, sub_freq_hz):
         self.freqs = {RECEIVER_MAIN: main_freq_hz, RECEIVER_SUB: sub_freq_hz}
+        self.selected = RECEIVER_MAIN
         self.calls = []
 
-    async def get_frequency(self, receiver=0):
-        return self.freqs[receiver]
+    async def get_frequency(self, receiver=0, bypass_cache=False):
+        selected = self.selected
+        unselected = RECEIVER_SUB if selected == RECEIVER_MAIN else RECEIVER_MAIN
+        return self.freqs[selected if receiver == 0 else unselected]
 
     async def select_receiver(self, receiver):
         self.calls.append(("select_receiver", receiver))
+        self.selected = receiver
 
     async def set_vfo_slot(self, slot, receiver=0):
         self.calls.append(("set_vfo_slot", slot, receiver))
@@ -61,6 +71,9 @@ def make_worker(main_freq_hz, sub_freq_hz):
     worker.radio = FakeRadio(main_freq_hz, sub_freq_hz)
     worker.is_dual_receiver = True
     worker._active_receiver = RECEIVER_MAIN
+    # Normally created by RadioWorker's own run loop (radio_worker.py,
+    # "_receiver_switch_lock"), which these tests bypass.
+    worker._receiver_switch_lock = asyncio.Lock()
     return worker
 
 

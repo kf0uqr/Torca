@@ -51,7 +51,9 @@ def make_worker(native_power_unit, max_watts):
 def test_ic705_style_radio_gets_10w_display_max():
     worker = make_worker("raw_255", 10)
     worker._setup_meters()
-    assert worker._meter_definitions["power"]["kind"] == "linear"
+    # "direct", not "linear": radio_worker applies POWER_CALIBRATION (a real
+    # piecewise curve) instead of a flat raw/255 ratio -- see _setup_meters.
+    assert worker._meter_definitions["power"]["kind"] == "direct"
     assert worker._meter_definitions["power"]["display_max"] == 10, worker._meter_definitions["power"]
 
 

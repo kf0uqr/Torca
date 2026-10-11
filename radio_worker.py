@@ -4484,7 +4484,10 @@ class RadioWorker(QThread):
         leaving Qt to destroy a still-running QThread (a hard abort)."""
         self._stop_requested = True
         if self.loop is not None and self._main_task is not None:
-            self.loop.call_soon_threadsafe(self._main_task.cancel)
+            try:
+                self.loop.call_soon_threadsafe(self._main_task.cancel)
+            except RuntimeError:
+                pass  # the loop has already ended (e.g. the connection failed): nothing left to cancel
         # wait_for_thread (QThread.wait) is called by the GUI after this
 
 

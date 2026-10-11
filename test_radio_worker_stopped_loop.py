@@ -48,3 +48,11 @@ def test_helper_returns_none_for_missing_or_closed_loop_and_future_otherwise():
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5)
         loop.close()
+
+
+def test_stop_on_a_worker_whose_connection_already_failed_does_not_raise():
+    # Closing the tab of a radio that never connected must still close it.
+    worker = _stopped_worker()
+    worker._main_task = type("T", (), {"cancel": lambda self: None})()
+    worker.stop()
+    assert worker._stop_requested

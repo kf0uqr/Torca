@@ -60,6 +60,14 @@ def _settle(app):
     app.processEvents()
 
 
+def _flush_deletes(app):
+    """Actually run pending deleteLater() calls (a plain processEvents
+    does not)."""
+    from PySide6.QtCore import QEvent
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+    app.processEvents()
+
+
 def _dashboard(host):
     dash = RealClose("Ham Dashboard")
     host.add_window(dash, closable=False, pane_index=0)
@@ -213,3 +221,44 @@ def test_present_window_without_host_falls_back_to_plain_show(app):
     present_window(w)
     assert w.isVisible()
     w.hide()
+
+
+def test_changing_layouts_never_destroys_panes_or_hosted_windows(host, app):
+    """Regression: going 1 -> 2 workspaces deleted pane 0 (it was the
+    previous layout's 'body'), taking the dashboard and its running
+    QThreads with it -- "QThread: Destroyed while thread is still running"."""
+    from shiboken6 import isValid
+
+    dash = _dashboard(host)
+    tool = HideOnClose("Tool")
+    host.present(tool)
+    for count in (1, 2, 3, 4, 3, 2, 1, 2, 1, 4, 2):
+        host.set_workspace_count(count)
+        _settle(app)
+        _flush_deletes(app)
+        assert all(isValid(p) for p in host.panes), f"a pane was destroyed switching to {count}"
+        assert isValid(dash) and isValid(tool), f"a hosted window was destroyed switching to {count}"
+        assert sum(p.count() for p in host.panes) == 2
+
+
+def test_hosted_qthread_survives_layout_changes(host, app):
+    """The actual crash: a QThread parented to a hosted widget must still
+    be alive and running after switching workspace counts."""
+    from PySide6.QtCore import QThread
+
+    class Busy(QThread):
+        def run(self):
+            self.exec()
+
+    dash = _dashboard(host)
+    thread = Busy(dash)
+    thread.start()
+    try:
+        for count in (1, 2, 1, 2):
+            host.set_workspace_count(count)
+            _settle(app)
+            _flush_deletes(app)
+        assert thread.isRunning()
+    finally:
+        thread.quit()
+        thread.wait(5000)

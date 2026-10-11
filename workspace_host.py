@@ -241,7 +241,13 @@ class WorkspaceHost(QMainWindow):
             pane.setParent(self._holder)  # detach from any old splitter before it is discarded
             pane.hide()
         old_body, self._body = self._body, None
-        if old_body is not None:
+        # Only splitters are throwaway. With one workspace the "body" IS
+        # pane 0 itself -- a persistent pane holding the dashboard and its
+        # running worker threads -- and must never be deleted (doing so
+        # aborted the app: "QThread: Destroyed while thread is still
+        # running"). The panes were already detached above, so a discarded
+        # splitter tree no longer owns any of them.
+        if isinstance(old_body, QSplitter):
             old_body.hide()
             old_body.setParent(None)
             old_body.deleteLater()

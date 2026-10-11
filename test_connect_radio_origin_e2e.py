@@ -73,13 +73,6 @@ SCRIPT = textwrap.dedent('''
     assert where(dash.workspace_radios()[-1]) == (1, 1), where(dash.workspace_radios()[-1])
     assert PARENTS[-1] is host                                            # ... and from window 1 it opens over window 1
 
-    # 4. via the Radios dialog opened from window 2, workspace 2: its Connect button lands there too
-    trigger(second, 1, "Radios")
-    dash.connect_radio_button.click(); settle()
-    assert where(dash.workspace_radios()[-1]) == (2, 2), where(dash.workspace_radios()[-1])
-
-    assert PARENTS[-1] is second                                         # the dialog opened from the Radios dialog: same window
-
     # 5. a different menu later: the origin follows the most recent one
     trigger(host, 1, "Connect New Radio...")
     assert where(dash.workspace_radios()[-1]) == (1, 2), where(dash.workspace_radios()[-1])
@@ -94,25 +87,13 @@ SCRIPT = textwrap.dedent('''
         assert seen["profile"].window() is window, (label, seen["profile"])
         trigger(window, 0, "WSJT-X Auto-Log UDP Port...")
         assert seen["autolog"].window() is window, (label, seen["autolog"])
-    # the shared Radios dialog is moved under, and centred over, the window that asked
-    for window in (second, host, second):
-        trigger(window, 0, "Radios")
-        radios = dash.radios_dialog
-        assert radios.isVisible() and radios.parentWidget() is dash, "the dialog must stay owned by the dashboard"
-        centre = radios.frameGeometry().center()
-        assert window.frameGeometry().contains(centre), (window.frameGeometry(), centre)
-        radios.hide()
     trigger(second, 1, "Connect New Radio...")                            # leave the origin on window 2 for the next step
     host.add_workspace(0, "right") if host.workspace_count < 2 else None
 
-    # 6. the window it was started from is gone: falls back to normal placement, no error --
-    #    and the shared Radios dialog (and its Connect button) must survive that window closing
-    trigger(second, 0, "Radios")
+    # 6. the window it was started from is gone: falls back to normal placement, no error
     second.close(); settle()
-    from shiboken6 import isValid
-    assert isValid(dash.radios_dialog) and isValid(dash.connect_radio_button) and isValid(dash.connected_radios_list)
     count = len(dash.workspace_radios())
-    dash.connect_radio_button.click(); settle()
+    dash._on_connect_radio_clicked(); settle()
     assert len(dash.workspace_radios()) == count + 1
     assert host.manager.host_of(dash.workspace_radios()[-1]) is host
 

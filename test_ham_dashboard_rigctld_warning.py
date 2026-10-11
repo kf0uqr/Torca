@@ -40,11 +40,8 @@ class FakeDashboard(QWidget):
     def __init__(self):
         super().__init__()
         self._rigctld_servers = {}
-        self._selected_window = None
+        self._connected_radios = []
         self._on_rigctld_button_clicked = MagicMock()  # instance attribute -- see module docstring
-
-    def _selected_radio_window(self):
-        return self._selected_window
 
 
 class ClickingQMessageBox(QMessageBox):
@@ -112,24 +109,23 @@ def test_cancel_aborts():
     print("  PASSED\n")
 
 
-def test_open_rigctld_with_radio_selected_opens_dialog_and_aborts_this_launch():
-    print("--- Open Rigctld... (radio selected) -> opens dialog, aborts this launch ---")
+def test_open_rigctld_with_a_radio_connected_opens_its_dialog_and_aborts_this_launch():
+    print("--- Open Rigctld... (radio connected) -> opens its dialog, aborts this launch ---")
     dash = FakeDashboard()
-    dash._selected_window = "fake_window"
+    dash._connected_radios = ["fake_window"]
     result = _run_with_clicked_label(dash, "Open Rigctld...")
     assert result is False, result
-    assert dash._on_rigctld_button_clicked.called
+    dash._on_rigctld_button_clicked.assert_called_once_with("fake_window")
     print("  PASSED\n")
 
 
-def test_open_rigctld_with_no_radio_selected_nudges_and_aborts():
-    print("--- Open Rigctld... (no radio selected) -> nudges to select one, aborts ---")
+def test_open_rigctld_with_no_radio_connected_nudges_and_aborts():
+    print("--- Open Rigctld... (no radio connected) -> nudges to connect one, aborts ---")
     dash = FakeDashboard()
-    dash._selected_window = None
     result = _run_with_clicked_label(dash, "Open Rigctld...")
     assert result is False, result
-    assert dash._on_rigctld_button_clicked.called
-    assert ClickingQMessageBox.information_calls, "should have nudged the user to select a radio"
+    assert not dash._on_rigctld_button_clicked.called
+    assert ClickingQMessageBox.information_calls, "should have nudged the user to connect a radio"
     print("  PASSED\n")
 
 
@@ -139,8 +135,8 @@ def main():
         test_server_already_running_proceeds_with_no_prompt()
         test_continue_without_it_proceeds()
         test_cancel_aborts()
-        test_open_rigctld_with_radio_selected_opens_dialog_and_aborts_this_launch()
-        test_open_rigctld_with_no_radio_selected_nudges_and_aborts()
+        test_open_rigctld_with_a_radio_connected_opens_its_dialog_and_aborts_this_launch()
+        test_open_rigctld_with_no_radio_connected_nudges_and_aborts()
     except AssertionError as exc:
         print(f"FAILED: {exc}")
         ok = False

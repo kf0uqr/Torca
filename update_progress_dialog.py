@@ -29,8 +29,8 @@ class UpdateProgressDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Updating TORCA")
         self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)  # title bar, no close button
-        self.setMinimumWidth(420)
         self._finished = False
+        self.setFixedWidth(460)
         self._started = time.monotonic()
 
         self.heading = QLabel("Updating TORCA...")
@@ -42,7 +42,7 @@ class UpdateProgressDialog(QDialog):
         self.bar.setTextVisible(False)
         self.elapsed_label = QLabel(f"Elapsed: {format_elapsed(0)}")
         self.elapsed_label.setStyleSheet("color: #aaa;")
-        hint = QLabel("You can keep using TORCA while this runs. Please don't close it until the update finishes.")
+        self.hint_label = hint = QLabel("You can keep using TORCA while this runs. Please don't close it until the update finishes.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #aaa;")
 
@@ -60,6 +60,20 @@ class UpdateProgressDialog(QDialog):
 
     def set_status(self, message):
         self.status_label.setText(message)
+        self._fit_wrapped_labels()
+
+    def _fit_wrapped_labels(self):
+        # Word-wrapped labels report a height for one width only; give each the
+        # height its text needs at the width it will really get.
+        width = self.width() - self.layout().contentsMargins().left() - self.layout().contentsMargins().right()
+        for label in (self.status_label, self.hint_label):
+            label.setMinimumHeight(label.heightForWidth(width))
+        self.layout().activate()
+        self.setFixedHeight(self.layout().totalMinimumSize().height())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit_wrapped_labels()
 
     def _tick(self):
         self.elapsed_label.setText(f"Elapsed: {format_elapsed(time.monotonic() - self._started)}")

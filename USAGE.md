@@ -165,11 +165,11 @@ A read-only table of upcoming contests (WA7BNM's own published calendar) -- doub
 
 ## Virtual Cables
 
-Linux/PulseAudio or PipeWire only (needs `pactl`). Select a radio in the Radios list, then **Virtual Cables...** to independently choose which radio's RX (Main/Sub/mixed) feeds a virtual audio input, and which radio's TX pulls from a virtual audio output -- letting an external app (WSJT-X, fldigi, etc.) send/receive audio through the radio without touching real hardware devices. RX and TX can be different radios, e.g. decoding one radio's downlink while transmitting through a separate uplink radio.
+Linux/PulseAudio or PipeWire only (needs `pactl`). In a radio's tab, click **Virtual Cables...** (below SWR Protect) to independently choose which radio's RX (Main/Sub/mixed) feeds a virtual audio input, and which radio's TX pulls from a virtual audio output -- letting an external app (WSJT-X, fldigi, etc.) send/receive audio through the radio without touching real hardware devices. RX and TX can be different radios, e.g. decoding one radio's downlink while transmitting through a separate uplink radio.
 
 ## rigctld
 
-Select a radio in the Radios list, then **Rigctld...** to start a minimal Hamlib `rigctld`-compatible TCP server for it -- point any CAT-aware app at `127.0.0.1:<port>` with rig model "Hamlib NET rigctl" (model 2). Each radio needs its own port if you're running more than one.
+In a radio's tab, click **Rigctld...** (below SWR Protect) to start a minimal Hamlib `rigctld`-compatible TCP server for it -- point any CAT-aware app at `127.0.0.1:<port>` with rig model "Hamlib NET rigctl" (model 2). Each radio needs its own port if you're running more than one.
 
 ## Updating
 

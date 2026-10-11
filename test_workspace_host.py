@@ -399,7 +399,7 @@ def _fake_dashboard_for_actions(app):
 
     calls = []
     fake = types.SimpleNamespace(_data_pages=[], log_book_window=None, _connected_radios=[])
-    for name in ("radios", "new_qso", "profile", "wsjtx", "js8call", "remote_access", "update"):
+    for name in ("new_qso", "profile", "wsjtx", "js8call", "remote_access", "update"):
         button = QPushButton({"update": "Check for Updates..."}.get(name, name))
         button.setToolTip(f"{name} tip")
         button.clicked.connect(lambda _c=False, n=name: calls.append(n))
@@ -427,16 +427,15 @@ def test_dashboard_actions_section_replaces_the_button_row(app):
     cls.populate_workspace_menu(fake, menu, ctx)
     texts = [a.text() for a in menu.actions() if not a.isSeparator()]
     assert texts == [
-        "Log Book", "Connect New Radio...", "radios", "new_qso", "profile", "wsjtx", "js8call",
+        "Log Book", "Connect New Radio...", "new_qso", "profile", "wsjtx", "js8call",
         "WSJT-X Auto-Log", "WSJT-X Auto-Log UDP Port...", "remote_access", "Check for Updates..."]
     assert any(a.isSeparator() and a.text() == "Actions" for a in menu.actions())  # a Qt "section" is a labeled separator
     for a in menu.actions():
-        if a.text() in ("Connect New Radio...", "radios", "profile", "WSJT-X Auto-Log UDP Port..."):
+        if a.text() in ("Connect New Radio...", "profile", "WSJT-X Auto-Log UDP Port..."):
             a.trigger()
     # connecting from a workspace's menu remembers THAT workspace first (so the radio opens there),
-    # for the direct entry and for the Radios dialog's own Connect button
-    assert calls == ["origin", "connect", "origin", "radios", "origin", "profile", "origin", "autolog_port"]
-    assert fake.origins == [ctx] * 4          # EVERY action remembers its menu: that is the window its dialogs open over
+    assert calls == ["origin", "connect", "origin", "profile", "origin", "autolog_port"]
+    assert fake.origins == [ctx] * 3          # EVERY action remembers its menu: that is the window its dialogs open over
 
 
 def test_actions_mirror_button_state_and_toggle_autolog(app):

@@ -235,3 +235,16 @@ def test_ft8_rebuild_is_skipped_without_make_or_the_source_and_never_fails_the_u
         raise updater.subprocess.CalledProcessError(2, "make")
     monkeypatch.setattr(updater, "_run", failing)
     updater._rebuild_ft8_decoder(lambda m: None)                       # a failed build must not raise
+
+
+def test_progress_dialog_wrapped_text_is_never_clipped():
+    app = _qapp()
+    from update_progress_dialog import UpdateProgressDialog
+    dialog = UpdateProgressDialog()
+    dialog.show()
+    dialog.set_status("Installing Python dependencies, this can take a minute or two on a slow connection. " * 2)
+    app.processEvents()
+    for label in (dialog.status_label, dialog.hint_label):
+        assert label.height() >= label.heightForWidth(label.width()), label.text()
+    assert dialog.hint_label.geometry().bottom() <= dialog.rect().bottom()
+    dialog.finish()

@@ -132,6 +132,8 @@ class RadioWindow(QWidget):
     # whether the operator ever opens the APRS Tool window itself. See
     # _on_aprs_tool_clicked for where this actually gets forwarded.
     aprs_packet_decoded = Signal(dict)
+    rigctld_requested = Signal(object)         # carries self -- the dashboard opens the Rigctld dialog for this radio
+    virtual_cables_requested = Signal(object)  # likewise, for the Virtual Cables dialog
 
     def __init__(self, details, satellite_session):
         super().__init__()
@@ -314,6 +316,20 @@ class RadioWindow(QWidget):
         # if SWR exceeds SWR_PROTECTION_THRESHOLD during a real
         # transmission (not during Tune) -- see its own comment in
         # constants.py.
+        self.rigctld_button = QPushButton("Rigctld...")
+        self.rigctld_button.setToolTip(
+            "Configure a rigctld server for this radio so other CAT-aware apps (WSJT-X, JTDX, "
+            "fldigi, ...) can control it -- select \"Hamlib NET rigctl\" (rig model 2) and "
+            "127.0.0.1:<port> in that app. Each radio needs its own port."
+        )
+        self.rigctld_button.clicked.connect(lambda _c=False: self.rigctld_requested.emit(self))
+        self.virtual_cable_button = QPushButton("Virtual Cables...")
+        self.virtual_cable_button.setToolTip(
+            "Configure virtual audio devices (Linux/PulseAudio or PipeWire only) for this radio, "
+            "so an external app (WSJT-X, etc.) can send/receive audio through it -- RX and TX "
+            "can be different radios."
+        )
+        self.virtual_cable_button.clicked.connect(lambda _c=False: self.virtual_cables_requested.emit(self))
         self.swr_protection_button = QPushButton("SWR Protect")
         self.swr_protection_button.setCheckable(True)
         self.swr_protection_button.setChecked(True)
@@ -848,6 +864,8 @@ class RadioWindow(QWidget):
         tx_column.addWidget(self.ptt_button)
         tx_column.addWidget(self.tune_button)
         tx_column.addWidget(self.swr_protection_button)
+        tx_column.addWidget(self.rigctld_button)
+        tx_column.addWidget(self.virtual_cable_button)
         tx_column.addStretch()
 
         vfo_column = QVBoxLayout()
@@ -1451,6 +1469,12 @@ class RadioWindow(QWidget):
                 "QPushButton { background-color: #37373a; color: #dcdcdc; font-weight: bold; border-radius: 4px; }"
                 "QPushButton:disabled { background-color: #2d2d30; color: #777; }"
             )
+
+    def set_service_status(self, rigctld, cables):
+        """Shows what is running for this radio on its buttons: the rigctld
+        port, and which virtual-cable direction(s) (RX / TX) it carries."""
+        self.rigctld_button.setText(f"Rigctld: {rigctld}" if rigctld else "Rigctld...")
+        self.virtual_cable_button.setText(f"Virtual Cables: {cables}" if cables else "Virtual Cables...")
 
     def _on_swr_protection_toggled(self, checked):
         self.worker.set_swr_protection_enabled(checked)

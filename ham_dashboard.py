@@ -5,9 +5,8 @@ night world map, live clocks, solar-terrestrial data, HF band
 conditions, satellite tracking, and now (see below) radio connection
 management, satellite Doppler control, Virtual Cables, rigctld, and
 WSJT-X launching. Constructed directly by main.py; no radio connects at
-startup any more -- radios are added from the Radios dialog
-(RadiosDialog, opened via the "Radios" button -- "Connect New
-Radio..." lives there now), each assigned a satellite role
+startup any more -- radios are added from a workspace's "+" menu
+(Actions -> Connect New Radio...), each assigned a satellite role
 (RADIO_ROLES in constants.py) in ConnectionDialog, and get their own
 RadioWindow (main_window.py).
 
@@ -54,7 +53,6 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QListWidget,
-    QListWidgetItem,
     QCheckBox,
     QComboBox,
     QSpinBox,
@@ -152,10 +150,10 @@ from satellite_tracking import (
 
 class VirtualCableDialog(QDialog):
     """Configures virtual cables for ONE radio -- selected beforehand
-    in RadiosDialog's connected-radios list, per explicit instruction
+    from that radio's own window, per explicit instruction
     (this used to let you pick RX radio/TX radio/mix all from one
     dialog with two independent combo boxes; now the radio itself is
-    chosen by list selection first, and this dialog just asks which
+    chosen by opening it from that radio's window, and this dialog just asks which
     direction(s) THAT radio should handle).
 
     RX and TX are independent checkboxes, not a single on/off --
@@ -241,10 +239,10 @@ class VirtualCableDialog(QDialog):
 
 
 class RigctldDialog(QDialog):
-    """Configures rigctld for ONE radio -- selected beforehand in
-    RadiosDialog's connected-radios list, per explicit instruction
+    """Configures rigctld for ONE radio -- opened from that
+    radio's own window, per explicit instruction
     (this used to be one row per connected radio in a single dialog;
-    now the radio itself is chosen by list selection first). rigctld
+    now it is opened from the radio's own window). rigctld
     is inherently one-radio-per-port, so a real multi-radio setup
     (e.g. WSJT-X reaching both an uplink and a downlink radio) still
     needs a separate server, on a separate port, per radio -- just
@@ -923,58 +921,6 @@ class PskReporterSettingsDialog(QDialog):
         return pskreporter.DIRECTION_HEARD_YOU
 
 
-class RadiosDialog(QDialog):
-    """The connected-radios list plus "Connect New Radio..." button --
-    per explicit instruction, moved out of the main dashboard's own
-    layout into this dedicated dialog (opened via the dashboard's
-    "Radios" button) so the dashboard itself stays less cluttered.
-
-    Doesn't own connected_radios_list/connect_radio_button/
-    rigctld_button/virtual_cable_button itself -- HamClockWindow still
-    constructs and owns them (and every method that reads/mutates
-    them, e.g. _on_connect_radio_clicked, _on_radio_window_closed,
-    _on_rigctld_button_clicked, _on_virtual_cable_button_clicked),
-    exactly as before this dialog existed. This just reparents those
-    same widget instances into its own layout, so nothing about the
-    connect/disconnect/rigctld/virtual-cable logic needed to change at
-    all -- Rigctld/Virtual Cables act on whichever radio is currently
-    SELECTED in the list (see HamClockWindow._selected_radio_window),
-    each radio's own live status (rigctld port if running, RX/TX if
-    part of the virtual cables) shown right in its row -- see
-    HamClockWindow._refresh_connected_radios_list_status.
-
-    Non-modal (exec() would block the rest of the dashboard while
-    open -- e.g. double-clicking a connected radio in the list to
-    bring its window forward should work without closing this dialog
-    first) -- singleton, hide-not-destroy on close, same pattern as
-    LogBookWindow."""
-
-    def __init__(self, parent_window):
-        super().__init__(parent_window)
-        self.setWindowTitle("Radios")
-
-        header = QHBoxLayout()
-        header.addWidget(QLabel("Connected Radios:"))
-        header.addStretch()
-        header.addWidget(parent_window.connect_radio_button)
-
-        service_buttons_row = QHBoxLayout()
-        service_buttons_row.addWidget(parent_window.rigctld_button)
-        service_buttons_row.addWidget(parent_window.virtual_cable_button)
-        service_buttons_row.addStretch()
-
-        layout = QVBoxLayout()
-        layout.addLayout(header)
-        layout.addWidget(parent_window.connected_radios_list)
-        layout.addLayout(service_buttons_row)
-        self.setLayout(layout)
-        self.resize(480, 260)
-
-    def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-
-
 class HamClockWindow(QWidget):
     """The Ham Dashboard window -- see the module comment above this
     section for what's in scope and why."""
@@ -1414,32 +1360,9 @@ class HamClockWindow(QWidget):
         # qso_band_filter_combo) already exists.
         self.map_layers_remote_state = MapLayersRemoteState(self)
 
-        # ---- Connected radios (list + Connect New Radio... button
-        # live in RadiosDialog, opened via self.radios_button below --
-        # still constructed/owned here since every method that reads/
-        # mutates them (e.g. _on_connect_radio_clicked, _on_radio_
-        # window_closed) is a HamClockWindow method, unchanged) ----
-        self.connect_radio_button = QPushButton("Connect New Radio...")
-        self.connect_radio_button.setToolTip(
-            "Opens the connection dialog for another radio -- pick its "
-            "satellite role there (Full Duplex / Downlink / Uplink / "
-            "Non-Sat). Each connected radio gets its own window."
-        )
-        self.connect_radio_button.clicked.connect(self._on_connect_radio_clicked)
-
-        self.connected_radios_list = QListWidget()
-        self.connected_radios_list.setSelectionMode(QListWidget.SingleSelection)
-        self.connected_radios_list.setToolTip(
-            "Double-click to bring that radio's window to the front. Select a radio, then use "
-            "Rigctld/Virtual Cables below to configure that service for it -- each radio's own "
-            "status (rigctld port if running, RX/TX if part of the virtual cables) shows in its row."
-        )
-        self.connected_radios_list.itemDoubleClicked.connect(self._on_connected_radio_item_double_clicked)
-        self.connected_radios_list.itemSelectionChanged.connect(self._update_radio_service_buttons_enabled)
-
         # ---- Virtual Cables (moved from RadioWindow -- opens a dialog
-        # scoped to whichever radio is currently selected in
-        # connected_radios_list, per explicit instruction. RX and TX
+        # scoped to the radio whose window
+        # button was clicked, per explicit instruction. RX and TX
         # are independent per-radio checkboxes in that dialog (not
         # picked from two combo boxes here anymore), so a "poor man's
         # full duplex" setup -- one radio for RX, a different one for
@@ -1456,25 +1379,7 @@ class HamClockWindow(QWidget):
         self._virtual_cable_sink_input_ids = []
         self._virtual_cable_source_output_ids = []
 
-        self.virtual_cable_button = QPushButton("Virtual Cables...")
-        self.virtual_cable_button.setEnabled(False)
-        self.virtual_cable_button.setToolTip(
-            "Configure virtual audio devices (Linux/PulseAudio or PipeWire "
-            "only) for the SELECTED radio above, so an external app (WSJT-X, "
-            "etc.) can send/receive audio through it -- RX and TX can be "
-            "different radios, e.g. decoding one radio's downlink while "
-            "transmitting through a separate uplink radio (configure each "
-            "radio's direction from its own selection)."
-        )
-        self.virtual_cable_button.clicked.connect(self._on_virtual_cable_button_clicked)
 
-        # ---- Rigctld (moved from RadioWindow -- opens a dialog scoped
-        # to whichever radio is currently selected in
-        # connected_radios_list, per explicit instruction. rigctld is
-        # inherently one-radio-per-port, so a real multi-radio setup
-        # (e.g. WSJT-X reaching both an uplink and a downlink radio)
-        # still needs a separate server, on a separate port, per
-        # radio -- just configured one radio's dialog at a time now.) ----
         # ---- Remote Access (Ham Dashboard + per-radio pages over the
         # web, tunneled out via Cloudflare -- see web_remote/ and
         # cloudflare_tunnel.py) ----
@@ -1535,16 +1440,6 @@ class HamClockWindow(QWidget):
         self._rigctld_servers = {}  # RadioWindow -> running RigctldServer
         self._rigctld_ports = {}    # RadioWindow -> remembered port (kept even while stopped)
 
-        self.rigctld_button = QPushButton("Rigctld...")
-        self.rigctld_button.setEnabled(False)
-        self.rigctld_button.setToolTip(
-            "Configure a rigctld server for the SELECTED radio above so "
-            "other CAT-aware apps (WSJT-X, JTDX, fldigi, ...) can control "
-            "it -- select \"Hamlib NET rigctl\" (rig model 2) and "
-            "127.0.0.1:<port> in that app. Each radio needs its own port."
-        )
-        self.rigctld_button.clicked.connect(self._on_rigctld_button_clicked)
-
         # Reopens the same startup operator-profile dialog (callsign +
         # location, save/load/delete by name) -- see operator_profile.py's
         # own docstring for why this lives here instead of the radio
@@ -1555,13 +1450,6 @@ class HamClockWindow(QWidget):
         self.profile_button.setToolTip("Set your callsign and location, or switch to a saved profile.")
         self.profile_button.clicked.connect(self._on_profile_button_clicked)
         retire_button(self, self.profile_button)  # now an entry in a workspace's "+" menu (Actions)
-
-        # Singleton, non-modal -- see RadiosDialog's own docstring.
-        self.radios_dialog = RadiosDialog(self)
-        self.radios_button = QPushButton("Radios")
-        self.radios_button.setToolTip("Connect a new radio, or bring an already-connected one's window to the front.")
-        self.radios_button.clicked.connect(self._on_radios_button_clicked)
-        retire_button(self, self.radios_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # Singleton, non-modal, tracked as self.log_book_window rather
         # than a list (unlike RadioWindow, only one is ever open) --
@@ -2591,10 +2479,7 @@ class HamClockWindow(QWidget):
         menu.addAction("Connect New Radio...").triggered.connect(
             lambda _c=False: (self._remember_menu_origin(ctx), self._on_connect_radio_clicked())
         )
-        # The Radios dialog has its own Connect button, clicked later: remember
-        # where it was opened from so that radio lands there too.
         origin = lambda: self._remember_menu_origin(ctx)
-        self._add_action_for_button(menu, self.radios_button, before=origin)
         for button in (self.new_qso_button, self.profile_button):
             self._add_action_for_button(menu, button, before=origin)
         menu.addSeparator()
@@ -3211,22 +3096,6 @@ class HamClockWindow(QWidget):
 
     # ---- Connected radios ----
 
-    def _on_radios_button_clicked(self):
-        dialog = self.radios_dialog
-        window = self._action_parent().window()
-        # One shared, non-modal dialog. It stays owned by the dashboard -- re-parenting
-        # it to the asking window would have it (and its Connect button and radio list)
-        # destroyed when that window closes -- and is only POSITIONED over that window,
-        # so it appears on that window's monitor.
-        dialog.adjustSize()
-        dialog.move(window.frameGeometry().center() - dialog.rect().center())
-        dialog.show()
-        handle, parent_handle = dialog.windowHandle(), window.windowHandle()
-        if handle is not None and parent_handle is not None:
-            handle.setTransientParent(parent_handle)  # stacks above that window; cleared by Qt if it goes away
-        dialog.raise_()
-        dialog.activateWindow()
-
     def _on_profile_button_clicked(self):
         before = active_profile_name()
         accepted = OperatorProfileDialog.run(self._action_parent())
@@ -3334,11 +3203,8 @@ class HamClockWindow(QWidget):
         window.aprs_remote_state = AprsRemoteState(window.aprs_window)
         self._connected_radios.append(window)
 
-        item = QListWidgetItem(self._radio_list_base_label(details))
-        item.setData(Qt.UserRole, window)
-        self.connected_radios_list.addItem(item)
-
-        self._update_radio_service_buttons_enabled()
+        window.rigctld_requested.connect(self._on_rigctld_button_clicked)
+        window.virtual_cables_requested.connect(self._on_virtual_cable_button_clicked)
         (place or present_window)(window)  # `place`: the workspace the connect was started from, if any
         return window
 
@@ -3367,42 +3233,21 @@ class HamClockWindow(QWidget):
         connection_label = details.get("host") or details.get("serial_port") or details.get("remote_host") or "?"
         return f"{details['radio_model']} ({role_label}) -- {connection_label}"
 
-    def _selected_radio_window(self):
-        items = self.connected_radios_list.selectedItems()
-        if not items:
-            return None
-        return items[0].data(Qt.UserRole)
-
     def _radio_status_suffix(self, window):
-        """Rigctld/Virtual Cables status for one radio's row in
-        connected_radios_list -- per explicit instruction, each row
-        shows its own live status directly rather than needing the
-        Rigctld/Virtual Cables dialogs opened to check."""
-        parts = []
-        if window in self._rigctld_servers:
-            parts.append(f"Rigctld:{self._rigctld_ports.get(window, '?')}")
+        """Rigctld/Virtual Cables status for one radio, shown on its own
+        buttons (see RadioWindow.set_service_status)."""
+        rigctld = f"port {self._rigctld_ports.get(window, '?')}" if window in self._rigctld_servers else ""
         vc_roles = []
         if window is self._virtual_cable_rx_window:
             vc_roles.append("RX")
         if window is self._virtual_cable_tx_window:
             vc_roles.append("TX")
-        if vc_roles:
-            parts.append(f"VC:{'+'.join(vc_roles)}")
-        return f"  [{', '.join(parts)}]" if parts else ""
+        return rigctld, "+".join(vc_roles)
 
-    def _refresh_connected_radios_list_status(self):
-        for row in range(self.connected_radios_list.count()):
-            item = self.connected_radios_list.item(row)
-            window = item.data(Qt.UserRole)
-            if window is None:
-                continue
-            base = self._radio_list_base_label(window._details)
-            item.setText(base + self._radio_status_suffix(window))
-
-    def _on_connected_radio_item_double_clicked(self, item):
-        window = item.data(Qt.UserRole)
-        if window is not None:
-            present_window(window)
+    def _refresh_radio_service_status(self):
+        for window in self._connected_radios:
+            rigctld, cables = self._radio_status_suffix(window)
+            window.set_service_status(rigctld, cables)
 
     def _on_log_book_clicked(self):
         present_window(self._ensure_log_book_window())
@@ -3546,11 +3391,6 @@ class HamClockWindow(QWidget):
         effort guarantee those calls already carry on their own."""
         if window in self._connected_radios:
             self._connected_radios.remove(window)
-        for row in range(self.connected_radios_list.count()):
-            item = self.connected_radios_list.item(row)
-            if item.data(Qt.UserRole) is window:
-                self.connected_radios_list.takeItem(row)
-                break
         if window is self._virtual_cable_rx_window or window is self._virtual_cable_tx_window:
             # Reconfigure without the closing radio -- drops it from
             # whichever side(s) it held; the OTHER side (if it's a
@@ -3560,32 +3400,17 @@ class HamClockWindow(QWidget):
             self._apply_virtual_cable_config(new_rx, new_tx, self._virtual_cable_channel)
         self._stop_rigctld_for_window(window)
         self._rigctld_ports.pop(window, None)
-        self._update_radio_service_buttons_enabled()
-
-    def _update_radio_service_buttons_enabled(self):
-        """Rigctld/Virtual Cables act on whichever radio is currently
-        SELECTED in connected_radios_list (see _selected_radio_window)
-        -- both buttons stay disabled until something's actually
-        selected for them to act on. Connected to itemSelectionChanged
-        as well as called after connect/disconnect (a disconnect can
-        clear the selection out from under an open dialog's target)."""
-        has_selection = self._selected_radio_window() is not None
-        self.virtual_cable_button.setEnabled(has_selection)
-        self.rigctld_button.setEnabled(has_selection)
 
     # ---- Virtual Cables ----
 
-    def _on_virtual_cable_button_clicked(self):
-        window = self._selected_radio_window()
-        if window is None:
-            return  # button is disabled without a selection -- defensive only
+    def _on_virtual_cable_button_clicked(self, window):
         is_rx = window is self._virtual_cable_rx_window
         is_tx = window is self._virtual_cable_tx_window
         dialog = VirtualCableDialog(
             self._radio_list_base_label(window._details), is_rx, is_tx, self._virtual_cable_channel,
             on_apply=lambda rx, tx, channel, w=window: self._on_virtual_cable_dialog_apply(w, rx, tx, channel),
             on_stop=lambda w=window: self._on_virtual_cable_dialog_apply(w, False, False, self._virtual_cable_channel),
-            parent=self,
+            parent=window.window(),
         )
         dialog.exec()  # Apply/Stop inside already applied whatever was clicked -- Close just dismisses
 
@@ -3613,7 +3438,7 @@ class HamClockWindow(QWidget):
         self._teardown_virtual_cables()
 
         if rx_window is None and tx_window is None:
-            self._refresh_connected_radios_list_status()
+            self._refresh_radio_service_status()
             return
 
         if not pactl_available():
@@ -3624,7 +3449,7 @@ class HamClockWindow(QWidget):
                 "like VB-CABLE or BlackHole instead, then select it directly "
                 "in each radio's own connection dialog."
             )
-            self._refresh_connected_radios_list_status()
+            self._refresh_radio_service_status()
             return
 
         try:
@@ -3632,7 +3457,7 @@ class HamClockWindow(QWidget):
             tx_module = create_null_sink(VIRTUAL_CABLE_TX_NAME, VIRTUAL_CABLE_TX_DESC)
         except Exception as exc:
             QMessageBox.critical(self, "Virtual Cables", f"Couldn't create sinks ({exc}).")
-            self._refresh_connected_radios_list_status()
+            self._refresh_radio_service_status()
             return
         self._virtual_cable_modules = (rx_module, tx_module)
 
@@ -3678,7 +3503,7 @@ class HamClockWindow(QWidget):
         self._virtual_cable_move_timer.start(300)
         self._try_move_virtual_cable_streams()  # also try immediately -- no need to wait a full 300ms for the first attempt
 
-        self._refresh_connected_radios_list_status()
+        self._refresh_radio_service_status()
 
     def _try_move_virtual_cable_streams(self):
         my_pid = os.getpid()
@@ -3742,10 +3567,7 @@ class HamClockWindow(QWidget):
 
     # ---- Rigctld ----
 
-    def _on_rigctld_button_clicked(self):
-        window = self._selected_radio_window()
-        if window is None:
-            return  # button is disabled without a selection -- defensive only
+    def _on_rigctld_button_clicked(self, window):
         is_running = window in self._rigctld_servers
         if window in self._rigctld_ports:
             default_port = self._rigctld_ports[window]
@@ -3758,7 +3580,7 @@ class HamClockWindow(QWidget):
             self._radio_list_base_label(window._details), is_running, default_port,
             on_start=lambda port, w=window: self._on_rigctld_dialog_start(w, port),
             on_stop=lambda w=window: self._on_rigctld_dialog_stop(w),
-            parent=self,
+            parent=window.window(),
         )
         dialog.exec()  # already started/stopped its own server directly -- Close just dismisses
 
@@ -3784,12 +3606,12 @@ class HamClockWindow(QWidget):
             return False
         self._rigctld_servers[window] = server
         self._rigctld_ports[window] = port
-        self._refresh_connected_radios_list_status()
+        self._refresh_radio_service_status()
         return True
 
     def _on_rigctld_dialog_stop(self, window):
         self._stop_rigctld_for_window(window)
-        self._refresh_connected_radios_list_status()
+        self._refresh_radio_service_status()
 
     def _stop_rigctld_for_window(self, window):
         server = self._rigctld_servers.pop(window, None)
@@ -3943,12 +3765,13 @@ class HamClockWindow(QWidget):
         if clicked is cancel_button:
             return False
         if clicked is open_button:
-            self._on_rigctld_button_clicked()
-            if self._selected_radio_window() is None:
+            if self._connected_radios:
+                self._on_rigctld_button_clicked(self._connected_radios[0])
+            else:
                 QMessageBox.information(
                     self, "Rigctld",
-                    "Select a connected radio in the Radios list first, then use "
-                    "Rigctld... to start a server for it.",
+                    "Connect a radio first, then use the Rigctld... button in its "
+                    "window to start a server for it.",
                 )
             return False  # opening the dialog replaces this click's launch, not followed by one
         return True  # "Continue Without It"

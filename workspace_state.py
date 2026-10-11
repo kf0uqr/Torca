@@ -28,6 +28,8 @@ import pathlib
 STATE_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "workspace_state.json"
 STATE_VERSION = 1
 MAX_WORKSPACES = 4
+MAX_COLUMNS = 2   # at most two workspaces side by side ...
+MAX_ROWS = 2      # ... and two stacked: a 2x2 box
 
 
 # ---- layout tree <-> JSON ----------------------------------------------------
@@ -62,7 +64,28 @@ def tree_from_json(data):
         return None
     if any(not 0 <= leaf < MAX_WORKSPACES for leaf in leaves):
         return None
+    if not fits_grid(tree):
+        return None  # e.g. three side by side, from a version that allowed it
     return tree
+
+
+def tree_extent(tree):
+    """(columns, rows) a layout needs: side-by-side splits add columns and
+    take the tallest child's rows; stacked splits add rows and take the
+    widest child's columns."""
+    if isinstance(tree, int):
+        return 1, 1
+    orientation, children = tree
+    extents = [tree_extent(child) for child in children]
+    if orientation == "h":
+        return sum(c for c, _ in extents), max(r for _, r in extents)
+    return max(c for c, _ in extents), sum(r for _, r in extents)
+
+
+def fits_grid(tree):
+    """True if the layout fits the 2x2 limit (and has at most four workspaces)."""
+    columns, rows = tree_extent(tree)
+    return columns <= MAX_COLUMNS and rows <= MAX_ROWS and len(_leaves(tree)) <= MAX_WORKSPACES
 
 
 def _leaves(tree):

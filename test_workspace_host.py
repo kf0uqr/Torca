@@ -618,23 +618,18 @@ def test_the_first_workspace_offers_right_and_below(host):
     assert host._tree == (H, (0, 1)) and host.workspace_count == 2
 
 
-def test_with_two_workspaces_the_third_can_go_beside_or_below_this_one_or_both(host):
+def test_with_two_side_by_side_the_third_can_only_go_below_this_one_or_both(host):
     host.add_workspace(0, "right")                                            # [1 | 2]
     texts, menu = _menu_for(host, 0)
-    assert texts == ["Add Workspace Right of This", "Add Workspace Right of Both",
-                     "Add Workspace Below This", "Add Workspace Below Both"]
+    assert texts == ["Add Workspace Below This", "Add Workspace Below Both"]  # no 3rd column: max 2 wide
     texts_ws2, _ = _menu_for(host, 1)
-    assert texts_ws2 == ["Add Workspace Right",                              # right of this == right of both: shown once
-                         "Add Workspace Below This", "Add Workspace Below Both", "Close Workspace"]
-
+    assert texts_ws2 == ["Add Workspace Below This", "Add Workspace Below Both", "Close Workspace"]
     _trigger(menu, "Add Workspace Below Both")                                # WS3 across the bottom
     assert host._tree == (V, ((H, (0, 1)), 2))
 
 
 def test_each_third_workspace_option_gives_its_layout(host):
     expected = {
-        "Add Workspace Right of This": (H, (0, 2, 1)),
-        "Add Workspace Right of Both": (H, (0, 1, 2)),
         "Add Workspace Below This": (H, ((V, (0, 2)), 1)),
         "Add Workspace Below Both": (V, ((H, (0, 1)), 2)),
     }
@@ -645,6 +640,70 @@ def test_each_third_workspace_option_gives_its_layout(host):
         _trigger(menu, label)
         assert host._tree == tree, label
         assert host.workspace_count == 3
+    # stacked first, then the third can only go beside
+    host.set_workspace_count(1)
+    host.add_workspace(0, "below")
+    texts, menu = _menu_for(host, 0)
+    assert texts == ["Add Workspace Right of This", "Add Workspace Right of Both"]
+    _trigger(menu, "Add Workspace Right of This")
+    assert host._tree == (V, ((H, (0, 2)), 1))                                # WS1 and WS3 side by side over WS2
+    host.set_workspace_count(1)
+    host.add_workspace(0, "below")
+    _texts, menu = _menu_for(host, 0)
+    _trigger(menu, "Add Workspace Right of Both")
+    assert host._tree == (H, ((V, (0, 1)), 2))                                # WS3 beside the whole stack
+
+
+def test_a_third_column_or_row_is_refused_everywhere(host):
+    host.add_workspace(0, "right")                                            # two columns
+    for scope in ("this", "all"):
+        for index in (0, 1):
+            assert host.add_workspace(index, "right", scope) is None          # would be a third column
+            assert not host.can_add_workspace(index, "right", scope)
+    assert host.workspace_count == 2 and host._tree == (H, (0, 1))
+    host.set_workspace_count(1)
+    host.add_workspace(0, "below")                                            # two rows
+    for scope in ("this", "all"):
+        assert host.add_workspace(0, "below", scope) is None                  # would be a third row
+    assert host.workspace_count == 2
+
+
+def test_the_fourth_workspace_completes_the_2x2_and_is_offered_only_where_it_fits(host):
+    host.add_workspace(0, "right")
+    host.add_workspace(0, "below", "all")                                     # (H(0,1) over 2)
+    texts0, _ = _menu_for(host, 0)
+    texts2, menu2 = _menu_for(host, 2)
+    assert texts0 == ["Add more from the other workspaces' menus"]            # nothing fits next to / under the top-left one
+    assert texts2 == ["Add Workspace Right", "Close Workspace"]               # the bottom one can take the 4th beside it
+    _trigger(menu2, "Add Workspace Right")
+    assert host._tree == (V, ((H, (0, 1)), (H, (2, 3)))) and host.workspace_count == 4
+
+
+def test_every_layout_reachable_from_the_menus_stays_within_2x2_and_never_gets_stuck(host):
+    """Exhaustive: from one workspace, apply every offered option, over and over,
+    and check every layout that can ever result."""
+    from workspace_host import MAX_WORKSPACES
+    from workspace_state import fits_grid, tree_extent
+
+    seen = set()
+    frontier = [0]
+    while frontier:
+        tree = frontier.pop()
+        if tree in seen:
+            continue
+        seen.add(tree)
+        columns, rows = tree_extent(tree)
+        assert columns <= 2 and rows <= 2 and len(tree_leaves(tree)) <= MAX_WORKSPACES, tree
+        host._tree = tree
+        any_option = False
+        for index in tree_leaves(tree):
+            for direction, scope in host._add_options(index):
+                any_option = True
+                frontier.append(tree_add(tree, index, direction, scope, host._unused_index()))
+        if len(tree_leaves(tree)) < MAX_WORKSPACES:
+            assert any_option, f"stuck below four workspaces: {tree}"          # always some way to grow until it is full
+    assert len(seen) >= 8                                                     # and it really explored the space
+    host._tree = 0
 
 
 def test_a_full_layout_cannot_grow_and_says_so(host):
@@ -677,16 +736,10 @@ def test_new_workspace_takes_the_lowest_free_number(host):
 def test_new_workspace_shares_the_space_equally_as_laid_out(host, app):
     host.resize(1500, 900)
     host.show()
-    host.add_workspace(0, "right")
-    host.add_workspace(0, "right", "all")                                     # three columns
+    host.add_workspace(0, "right")                                            # two equal columns
     _settle(app)
-    widths = [host.panes[i].width() for i in (0, 1, 2)]
-    assert max(widths) - min(widths) <= 6, widths                             # equal thirds
-    xs = [host.panes[i].mapTo(host, host.panes[i].rect().topLeft()).x() for i in (0, 1, 2)]
-    assert xs == sorted(xs)
+    assert abs(host.panes[0].width() - host.panes[1].width()) <= 6
 
-    host.set_workspace_count(1)
-    host.add_workspace(0, "right")
     host.add_workspace(0, "below", "all")                                     # a row of two over one: halves vertically
     _settle(app)
     top = host.panes[0].mapTo(host, host.panes[0].rect().topLeft()).y()
@@ -695,6 +748,12 @@ def test_new_workspace_shares_the_space_equally_as_laid_out(host, app):
     assert bottom > top and abs(heights[0] - heights[1]) <= 8, heights
     assert host.panes[2].width() >= host._layout_root.width() - 4             # spans both columns above it
     assert abs(host.panes[0].width() - host.panes[1].width()) <= 6            # the two above split equally
+
+    host.add_workspace(2, "right")                                            # the 2x2: four equal quarters
+    _settle(app)
+    sizes = [(host.panes[i].width(), host.panes[i].height()) for i in range(4)]
+    assert max(w for w, _ in sizes) - min(w for w, _ in sizes) <= 8, sizes
+    assert max(h for _, h in sizes) - min(h for _, h in sizes) <= 8, sizes
 
 
 def test_below_this_leaves_the_other_workspace_full_height(host, app):

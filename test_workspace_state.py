@@ -9,7 +9,7 @@ from workspace_host import H, V, tree_for_count
 
 
 def test_layout_tree_round_trips_through_json():
-    for tree in (0, (H, (0, 1)), (V, ((H, (0, 1)), 2)), (H, ((V, (0, 2)), 1, 3)), tree_for_count(4)):
+    for tree in (0, (H, (0, 1)), (V, ((H, (0, 1)), 2)), (H, ((V, (0, 2)), 1)), tree_for_count(4)):
         as_json = json.loads(json.dumps(ws.tree_to_json(tree)))          # through real JSON text
         assert ws.tree_from_json(as_json) == tree
 
@@ -113,3 +113,32 @@ def test_remote_server_radios_are_identified_by_their_server():
     assert ws.identity_key(identity) == "IC-7300@shack.example:8080"
     saved = {"r": {"radio_model": "IC-7300", "connection_type": "remote", "remote_host": "shack.example", "remote_port": 8080}}
     assert ws.find_connection_profile(identity, saved) is saved["r"]
+
+
+def test_extent_counts_columns_and_rows():
+    assert ws.tree_extent(0) == (1, 1)
+    assert ws.tree_extent(("h", (0, 1))) == (2, 1)
+    assert ws.tree_extent(("v", (0, 1))) == (1, 2)
+    assert ws.tree_extent(("v", (("h", (0, 1)), 2))) == (2, 2)
+    assert ws.tree_extent(("h", (("v", (0, 2)), 1))) == (2, 2)
+    assert ws.tree_extent(("v", (("h", (0, 1)), ("h", (2, 3))))) == (2, 2)
+    assert ws.tree_extent(("h", (0, 1, 2))) == (3, 1)
+    assert ws.tree_extent(("v", (0, 1, 2))) == (1, 3)
+    assert ws.tree_extent(("h", (0, ("v", (1, ("h", (2, 3))))))) == (3, 2)      # nesting adds up: 1 + 2 columns
+
+
+def test_only_layouts_within_two_wide_and_two_tall_are_valid():
+    ok = [0, ("h", (0, 1)), ("v", (0, 1)), ("v", (("h", (0, 1)), 2)), ("h", (("v", (0, 2)), 1)),
+          ("v", (("h", (0, 1)), ("h", (2, 3)))), ("h", (("v", (0, 2)), ("v", (1, 3))))]
+    too_wide_or_tall = [("h", (0, 1, 2)), ("v", (0, 1, 2)), ("h", (0, 1, 2, 3)), ("v", (0, 1, 2, 3)),
+                        ("h", (0, ("v", (1, ("h", (2, 3))))))]
+    assert all(ws.fits_grid(tree) for tree in ok)
+    assert not any(ws.fits_grid(tree) for tree in too_wide_or_tall)
+
+
+def test_a_saved_layout_wider_or_taller_than_2x2_is_rejected_on_load():
+    assert ws.tree_from_json(["h", [0, 1, 2]]) is None                       # three columns (an older version allowed these)
+    assert ws.tree_from_json(["v", [0, 1, 2]]) is None
+    assert ws.tree_from_json(["h", [0, 1]]) == ("h", (0, 1))
+    assert ws.clean_state({"layout": ["h", [0, 1, 2]], "workspaces": {}}) is None   # so a whole such state is simply not restored
+

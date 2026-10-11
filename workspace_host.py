@@ -29,7 +29,7 @@ show()/raise_() behaviour when no host exists (tests, headless use).
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter
-from workspace_state import tree_from_json, tree_to_json
+from workspace_state import fits_grid, tree_from_json, tree_to_json
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -471,15 +471,19 @@ class WorkspaceHost(QMainWindow):
         return min(i for i in range(MAX_WORKSPACES) if i not in used)
 
     def can_add_workspace(self, index=0, direction="right", scope="this"):
-        return self.workspace_count < MAX_WORKSPACES and index in tree_leaves(self._tree)
+        """True if a workspace can be added that way without the layout
+        growing past four workspaces, two wide and two tall."""
+        if self.workspace_count >= MAX_WORKSPACES or index not in tree_leaves(self._tree):
+            return False
+        return fits_grid(tree_add(self._tree, index, direction, scope, self._unused_index()))
 
     def add_workspace(self, index, direction, scope="this"):
         """Adds an empty workspace to the 'right' of or 'below' workspace
         `index` alone (scope "this") or the whole layout (scope "all"); it
         splits equally with the workspaces it shares a split with. It takes
         the lowest unused workspace number. Returns its index, or None if
-        there are already four."""
-        if not self.can_add_workspace(index):
+        that would exceed four workspaces or two across / two down."""
+        if not self.can_add_workspace(index, direction, scope):
             return None
         new_index = self._unused_index()
         self._tree = tree_add(self._tree, index, direction, scope, new_index)
@@ -490,15 +494,16 @@ class WorkspaceHost(QMainWindow):
         """The distinct ways workspace `index` can grow a neighbour, as
         [(direction, scope)] -- options that would give the identical layout
         (e.g. right of "this" and right of "all" when this is the last
-        column) are listed once."""
-        if not self.can_add_workspace(index):
+        column) are listed once, and options that would make the layout wider
+        or taller than 2x2 are not offered at all."""
+        if self.workspace_count >= MAX_WORKSPACES or index not in tree_leaves(self._tree):
             return []
         new_index = self._unused_index()
         seen, options = set(), []
         for direction in ("right", "below"):
             for scope in ("this", "all"):
                 result = tree_add(self._tree, index, direction, scope, new_index)
-                if result not in seen:
+                if fits_grid(result) and result not in seen:
                     seen.add(result)
                     options.append((direction, scope))
         return options
@@ -561,7 +566,13 @@ class WorkspaceHost(QMainWindow):
             action.setToolTip("Its tabs move to the other workspaces; nothing is closed.")
             action.triggered.connect(lambda _c=False: self.close_workspace(index))
         elif menu.isEmpty():
-            action = menu.addAction(f"All {MAX_WORKSPACES} workspaces are in use")
+            # Nothing fits next to / under THIS one: either all four exist, or the
+            # remaining room (the 2x2 limit) is beside another workspace.
+            full = self.workspace_count >= MAX_WORKSPACES
+            action = menu.addAction(
+                f"All {MAX_WORKSPACES} workspaces are in use" if full
+                else "Add more from the other workspaces' menus"
+            )
             action.setEnabled(False)
 
     def _build_layout(self):

@@ -163,6 +163,19 @@ class WorldMapWidget(QWidget):
         self.satellite_layer_button.setCheckable(True)
         self.satellite_layer_button.toggled.connect(self._on_satellite_layer_toggled)
 
+        # "Center on my location" -- a way back to where the operator
+        # actually is after zooming/panning around. Disabled until an
+        # operator location is known (set_operator_location). "◎" is a
+        # plain bullseye glyph present in the standard fonts.
+        self.my_location_button = QPushButton("\u25ce", self)
+        self.my_location_button.setFixedSize(self._ZOOM_BUTTON_SIZE, self._ZOOM_BUTTON_SIZE)
+        self.my_location_button.setStyleSheet(
+            button_style + "QPushButton:disabled { color: rgba(255, 255, 255, 80); }"
+        )
+        self.my_location_button.setEnabled(False)
+        self._update_my_location_button()
+        self.my_location_button.clicked.connect(self.center_on_operator)
+
         self._position_zoom_buttons()
 
     def shutdown_tile_fetcher(self):
@@ -188,6 +201,7 @@ class WorldMapWidget(QWidget):
         self.zoom_in_button.move(x, y)
         self.zoom_out_button.move(x, y + self._ZOOM_BUTTON_SIZE + 4)
         self.satellite_layer_button.move(x, y + 2 * (self._ZOOM_BUTTON_SIZE + 4))
+        self.my_location_button.move(x, y + 3 * (self._ZOOM_BUTTON_SIZE + 4))
 
     def _on_satellite_layer_toggled(self, checked):
         self._map_layer = "satellite" if checked else "osm"
@@ -222,7 +236,24 @@ class WorldMapWidget(QWidget):
         self._operator_lat = lat
         self._operator_lon = lon
         self._operator_label = label
+        self._update_my_location_button()
         self.update()
+
+    def _update_my_location_button(self):
+        known = self._operator_lat is not None and self._operator_lon is not None
+        self.my_location_button.setEnabled(known)
+        self.my_location_button.setToolTip(
+            "Center the map on my location" if known
+            else "Center on my location (set your location in Profile first)"
+        )
+
+    def center_on_operator(self):
+        """Recenters on the operator's own location -- at the current zoom
+        if already zoomed in, otherwise at a country-level view (see
+        center_on). No-op until a location is known."""
+        if self._operator_lat is None or self._operator_lon is None:
+            return
+        self.center_on(self._operator_lat, self._operator_lon)
 
     def paintEvent(self, event):
         painter = QPainter(self)

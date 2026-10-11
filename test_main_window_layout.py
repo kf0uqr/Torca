@@ -95,7 +95,7 @@ def test_radio_window_is_short_enough_for_a_maximized_1080p_workspace(app, radio
     # A workspace's scroll area never shrinks its content below the content's
     # minimum size, so the minimum height decides whether a scroll bar appears.
     # A maximized 1080p window leaves ~940px for the radio tab.
-    assert radio_window.minimumSizeHint().height() <= 860
+    assert radio_window.minimumSizeHint().height() <= 910
 
 
 def test_it_also_grows_when_docked_in_a_workspace(app, radio_window):
@@ -151,3 +151,35 @@ def test_no_scroll_bars_when_maximized_at_a_decent_resolution(app, radio_window,
         assert bottom <= page.viewport().height()
     finally:
         _close(host)
+
+
+def test_knobs_sit_under_the_buttons_and_left_of_the_passband(app, radio_window):
+    radio_window.show()
+    radio_window.resize(1100, 1000)
+    _settle(app)
+
+    def top_left(widget):
+        return widget.mapTo(radio_window, widget.rect().topLeft())
+
+    mode_row_bottom = max(widget.mapTo(radio_window, widget.rect().bottomLeft()).y()
+                          for widget in radio_window.findChildren(main_window.QPushButton)
+                          if widget.text() in ("Digital Mode", "NR", "NB", "Split") and widget.parent() is radio_window)
+    rit, vfo, passband = (top_left(radio_window.rit_knob), top_left(radio_window.tuning_knob),
+                          top_left(radio_window.filter_shape_widget))
+    assert rit.x() < vfo.x() < passband.x()                   # RIT knob, VFO knob, then the passband
+    assert vfo.y() >= mode_row_bottom - 4                     # knobs are BELOW the mode/AGC buttons ...
+    assert passband.y() >= mode_row_bottom - 4                # ... and so is the passband
+    assert radio_window.filter_shape_widget.height() <= main_window._MAX_PASSBAND_HEIGHT
+
+
+def test_mode_controls_span_the_full_width_above_the_knobs(app, radio_window):
+    radio_window.show()
+    radio_window.resize(1100, 1000)
+    _settle(app)
+    last_button = max((w for w in radio_window.findChildren(main_window.QPushButton)
+                       if w.isVisible() and w.parent() is radio_window and w.text() == "Split"),
+                      key=lambda w: w.x(), default=None)
+    assert last_button is not None
+    # the Split button (right end of the button row) reaches the right-hand side of the window,
+    # i.e. the row is no longer confined to the left of the knobs
+    assert last_button.geometry().right() > radio_window.width() * 0.8

@@ -90,6 +90,12 @@ _MIN_SPECTRUM_HEIGHT = 90
 _MIN_WATERFALL_HEIGHT = 100
 _MIN_METER_HEIGHT = 60
 
+# The passband graphic sits beside the knobs, whose column sets the row's
+# height; it must not grow into all of that (it is also what the PBT /
+# filter-width sliders under it share the column with once they appear).
+_MIN_PASSBAND_HEIGHT = 140
+_MAX_PASSBAND_HEIGHT = 200
+
 
 class RadioWindow(QWidget):
     closed = Signal(object)  # emitted at the end of closeEvent, carrying self -- HamClockWindow listens
@@ -725,9 +731,8 @@ class RadioWindow(QWidget):
                     # RIT's on/off toggle doesn't live in buttons_row at
                     # all -- it's assembled into rit_column, next to
                     # rit_knob, once tuning_row is built further down
-                    # (rit_column sits BETWEEN left_column and knob_row,
-                    # per explicit instruction), not stacked in the
-                    # buttons row like every other toggle here.
+                    # (rit_column sits left of knob_row), not stacked in
+                    # the buttons row like every other toggle here.
                     self.rit_status_button = widget
                 else:
                     buttons_row.addWidget(widget)
@@ -763,10 +768,8 @@ class RadioWindow(QWidget):
         # dropdowns_row (Mode/AGC/Preamp/Filter) stacked above
         # buttons_row (Digital/NR/NB/VFO/Split) -- per explicit
         # instruction, two separate rows rather than one mixed row.
-        # controls_column and the passband display/PBT sliders (see
-        # left_column below) stack vertically together, to the left of the
-        # tuning knob -- not mixed into knob_row, which is the knob's own
-        # column on the right. WSJT-X/Rigctld/
+        # controls_column spans the full window width; the knobs and the
+        # passband display/PBT sliders sit below it (see tuning_area). WSJT-X/Rigctld/
         # Virtual Cables all moved to the Ham Dashboard, which is the
         # one place that makes sense once multiple radios can be
         # connected at once.
@@ -794,14 +797,6 @@ class RadioWindow(QWidget):
         filter_shape_column.addWidget(self.filter_shape_widget)
         filter_shape_column.addLayout(pbt_row)
 
-        left_column = QVBoxLayout()
-        left_column.addLayout(controls_column)
-        # The passband display and its PBT/filter-width controls sit
-        # directly under the mode/button controls, where the (now
-        # removed) role text used to be -- they used to be their own
-        # column between this one and the RIT knob.
-        left_column.addLayout(filter_shape_column, 1)
-
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
         knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
@@ -809,13 +804,9 @@ class RadioWindow(QWidget):
         knob_row.addWidget(self.tune_button)
         knob_row.addWidget(self.swr_protection_button)
 
-        # RIT knob column -- between left_column (ending in the CW/
-        # SSTV/RTTY tool buttons) and knob_row (VFO tuning knob/PTT),
-        # bottom-anchored via the stretch above it so it sits above the
-        # level sliders, roughly level with the tool buttons/PTT --
-        # per explicit instruction ("between the vfo/ptt and the tool
-        # buttons... above the sliders and below the main/sub and
-        # memories buttons", the latter two living up in buttons_row).
+        # RIT knob column -- left of knob_row (VFO tuning knob/PTT),
+        # bottom-anchored via the stretch above it so it sits just above
+        # the level sliders, level with PTT.
         rit_column = QVBoxLayout()
         rit_column.addStretch()
         rit_column.addWidget(self.rit_xit_mode_button, alignment=Qt.AlignHCenter)
@@ -823,12 +814,24 @@ class RadioWindow(QWidget):
         rit_column.addWidget(self.rit_offset_label, alignment=Qt.AlignHCenter)
         rit_column.addWidget(self.rit_status_button, alignment=Qt.AlignHCenter)
 
+        # Under the full-width mode/AGC/Preamp/Filter dropdowns and their
+        # buttons: the RIT knob, then the VFO knob with PTT/Tune/SWR
+        # protect, then the passband display and its PBT/filter-width
+        # sliders taking whatever width is left (so it is narrower than
+        # when it had the whole left side to itself).
         tuning_row = QHBoxLayout()
-        tuning_row.addLayout(left_column, 1)
-        tuning_row.addSpacing(8)
         tuning_row.addLayout(rit_column)
         tuning_row.addSpacing(16)
         tuning_row.addLayout(knob_row)
+        tuning_row.addSpacing(16)
+        tuning_row.addLayout(filter_shape_column, 1)
+        # Top-align the passband column with the knobs (its widget has a
+        # capped height, so it would otherwise be centered vertically).
+        tuning_row.setAlignment(filter_shape_column, Qt.AlignTop)
+
+        tuning_area = QVBoxLayout()
+        tuning_area.addLayout(controls_column)
+        tuning_area.addLayout(tuning_row)
 
         # Any height beyond what the controls need goes to the scope,
         # waterfall and meters, in these proportions (the controls below
@@ -836,6 +839,8 @@ class RadioWindow(QWidget):
         # -- stay at their natural size, stretch 0). Their minimum heights
         # (set on the widgets themselves) are unchanged, so a small window
         # looks exactly as before.
+        self.filter_shape_widget.setMinimumHeight(_MIN_PASSBAND_HEIGHT)
+        self.filter_shape_widget.setMaximumHeight(_MAX_PASSBAND_HEIGHT)
         self.spectrum_widget.setMinimumHeight(_MIN_SPECTRUM_HEIGHT)
         self.waterfall_widget.setMinimumHeight(_MIN_WATERFALL_HEIGHT)
         for meter in (*self.meter_widgets, self.meter_widget_4, self.meter_widget_5, self.meter_widget_6):
@@ -848,7 +853,7 @@ class RadioWindow(QWidget):
         layout.addLayout(self.meters_row, _STRETCH_METER_ROW)
         layout.addLayout(self.meters_row_2, _STRETCH_METER_ROW)
         layout.addLayout(self.band_buttons_row)
-        layout.addLayout(tuning_row)
+        layout.addLayout(tuning_area)
         layout.addLayout(levels_row)
         layout.addWidget(self.status_label)
         self.setLayout(layout)

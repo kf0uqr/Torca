@@ -1561,9 +1561,6 @@ class HamClockWindow(QWidget):
         # LogBookWindow.closeEvent hides rather than destroys it, so
         # this same instance is always safe to show()/raise_() again.
         self.log_book_window = None
-        self.log_book_button = QPushButton("Log Book...")
-        self.log_book_button.setToolTip("QSO log -- view/sort every contact, log a new one, edit and re-sync with QRZ.com.")
-        self.log_book_button.clicked.connect(self._on_log_book_clicked)
 
         # Opens the same New QSO window LogBookWindow itself uses --
         # lazily builds that window (without showing it) if it doesn't
@@ -1691,7 +1688,6 @@ class HamClockWindow(QWidget):
         top_buttons_row.addWidget(self.wsjtx_button)
         top_buttons_row.addWidget(self.js8call_button)
         top_buttons_row.addWidget(self.wsjtx_autolog_button)
-        top_buttons_row.addWidget(self.log_book_button)
         top_buttons_row.addWidget(self.new_qso_button)
         top_buttons_row.addWidget(self.update_button)
         top_buttons_row.addWidget(self.remote_access_button)
@@ -2494,6 +2490,7 @@ class HamClockWindow(QWidget):
             tabs.removeTab(0)
             pages.append((title, page))
         pages.append(("Satellites", self.satellite_passes_page))
+        self._data_pages = pages
         for _title, page in pages:
             page.setMinimumHeight(0)
             page.setMaximumHeight(16777215)
@@ -2505,6 +2502,13 @@ class HamClockWindow(QWidget):
         self._bottom_row.removeWidget(self.satellite_passes_page)
         self.layout().removeItem(self._bottom_row)
         tabs.hide()
+        # The pages wait, unshown, until the operator opens one from a
+        # workspace's "+" menu (the host re-parents it into a tab then).
+        # Until then they must not stay visible children of this window --
+        # they would draw on top of the map.
+        for _title, page in pages:
+            page.hide()
+            page.setParent(None)
 
         # The park marker used to follow "Parks is the selected tab of
         # band_data_tabs"; with Parks its own host tab, that is simply
@@ -2512,6 +2516,31 @@ class HamClockWindow(QWidget):
         # its workspace is selected, or its workspace is hidden).
         self.parks_tab.installEventFilter(self)
         return pages
+
+    def populate_workspace_menu(self, menu, ctx):
+        """Fills a workspace's "+" menu (see WorkspaceHost.add_menu_
+        provider): the reference-data pages, the Log Book, and a submenu
+        of tools for each connected radio. Everything is built lazily --
+        picking an entry opens it as a tab in that workspace."""
+        for title, page in getattr(self, "_data_pages", []):
+            menu.addAction(ctx.label(title, page)).triggered.connect(
+                lambda _c=False, p=page: ctx.open(p)
+            )
+        if getattr(self, "_data_pages", None):
+            menu.addSeparator()
+        menu.addAction(ctx.label("Log Book", self.log_book_window)).triggered.connect(
+            lambda _c=False: ctx.open(self._ensure_log_book_window())
+        )
+        radios = list(self._connected_radios)
+        if radios:
+            menu.addSeparator()
+            for window in radios:
+                window.populate_tool_menu(menu.addMenu(self._radio_list_base_label(window._details)), ctx)
+
+    def _ensure_log_book_window(self):
+        if self.log_book_window is None:
+            self.log_book_window = LogBookWindow(self)
+        return self.log_book_window
 
     def eventFilter(self, obj, event):
         if obj is getattr(self, "parks_tab", None):
@@ -3207,9 +3236,7 @@ class HamClockWindow(QWidget):
             present_window(window)
 
     def _on_log_book_clicked(self):
-        if self.log_book_window is None:
-            self.log_book_window = LogBookWindow(self)
-        present_window(self.log_book_window)
+        present_window(self._ensure_log_book_window())
 
     def _on_new_qso_clicked(self):
         # Deliberately does NOT show()/raise_() the Log Book window --

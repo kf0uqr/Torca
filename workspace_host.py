@@ -96,10 +96,66 @@ class WorkspacePane(QTabWidget):
         self.setUsesScrollButtons(True)
         self.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
 
+        self._menu_builder = None  # set by the host: fills a QMenu with what can be opened here
+
         self._badge = QLabel()
         self._badge.setContentsMargins(8, 0, 8, 0)
-        self.setCornerWidget(self._badge, Qt.TopRightCorner)
+        self._add_button = QToolButton()
+        self._add_button.setText("+")
+        self._add_button.setToolTip("Add a tab to this workspace")
+        self._add_button.setPopupMode(QToolButton.InstantPopup)
+        self._add_button.setStyleSheet("QToolButton { font-weight: bold; font-size: 16px; padding: 0 8px; }"
+                                       "QToolButton::menu-indicator { image: none; }")
+        self._add_button.setMenu(QMenu(self._add_button))
+        self._add_button.menu().aboutToShow.connect(lambda: self._fill_menu(self._add_button.menu()))
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(0)
+        corner_layout.addWidget(self._add_button)
+        corner_layout.addWidget(self._badge)
+        self.setCornerWidget(corner, Qt.TopRightCorner)
+
+        # An empty workspace shows no tab bar (so no "+" above), so it
+        # gets its own button in the middle of the placeholder text.
+        self._empty_button = QPushButton("+ Add Tab", self)
+        self._empty_button.setMenu(QMenu(self._empty_button))
+        self._empty_button.menu().aboutToShow.connect(lambda: self._fill_menu(self._empty_button.menu()))
         self.set_active(False)
+        self._update_empty_state()
+
+    def set_menu_builder(self, builder):
+        self._menu_builder = builder
+
+    def _fill_menu(self, menu):
+        menu.clear()
+        if self._menu_builder is not None:
+            self._menu_builder(menu)
+        if menu.isEmpty():
+            menu.addAction("(nothing to add)").setEnabled(False)
+
+    def _update_empty_state(self):
+        empty = self.count() == 0
+        self._empty_button.setVisible(empty)
+        if empty:
+            self._position_empty_button()
+
+    def _position_empty_button(self):
+        size = self._empty_button.sizeHint()
+        self._empty_button.move((self.width() - size.width()) // 2, self.height() // 2 + 60)
+
+    def tabInserted(self, index):
+        super().tabInserted(index)
+        self._update_empty_state()
+
+    def tabRemoved(self, index):
+        super().tabRemoved(index)
+        self._update_empty_state()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.count() == 0:
+            self._position_empty_button()
 
     def set_active(self, active):
         self._badge.setText(f"Workspace {self.index + 1}")
@@ -113,9 +169,9 @@ class WorkspacePane(QTabWidget):
             painter = QPainter(self)
             painter.setPen(Qt.gray)
             painter.drawText(
-                self.rect(), Qt.AlignCenter,
+                self.rect().adjusted(0, 0, 0, -40), Qt.AlignCenter,
                 f"Workspace {self.index + 1} — empty\n\nNew radios open here.\n"
-                "Right-click a tab in another workspace to move it here.",
+                "Use + to add a tab, or right-click a tab in another workspace to move it here.",
             )
 
 
@@ -134,12 +190,33 @@ class _HideWatcher(QObject):
         return False
 
 
+class _MenuContext:
+    """Handed to menu providers while the "+" menu of one workspace is
+    being filled: open(widget) docks (or moves) the widget into THAT
+    workspace; label() decorates a title with where the widget is
+    already open, if anywhere."""
+
+    def __init__(self, host, pane):
+        self._host = host
+        self._pane = pane
+
+    def open(self, widget):
+        self._host.open_in(widget, self._pane.index)
+
+    def label(self, title, widget=None):
+        where = self._host.pane_of(widget) if widget is not None else None
+        if where is None:
+            return title
+        return title if where == self._pane.index else f"{title}  (Workspace {where + 1})"
+
+
 class WorkspaceHost(QMainWindow):
     def __init__(self):
         global _HOST
         super().__init__()
         self.setWindowTitle("TORCA")
         self._entries = {}       # widget -> _Entry
+        self._menu_providers = []  # fn(menu, ctx) -> None, see add_menu_provider
         self._floating_menu_items = []
         self._dashboard = None
         self._active_pane = None
@@ -156,6 +233,7 @@ class WorkspaceHost(QMainWindow):
                 lambda pos, p=pane: self._on_tab_context_menu(p, pos)
             )
             pane.tabCloseRequested.connect(lambda i, p=pane: self._on_tab_close_requested(p, i))
+            pane.set_menu_builder(lambda menu, p=pane: self._fill_add_menu(menu, p))
             pane.currentChanged.connect(lambda _i, p=pane: self._set_active_pane(p))
         self._active_pane = self.panes[0]
 
@@ -284,33 +362,79 @@ class WorkspaceHost(QMainWindow):
     # Hosting windows
     # ------------------------------------------------------------------
 
-    def add_window(self, widget, closable=True, pane_index=None):
-        """Registers `widget` and docks it (without stealing focus
-        rules from present()). closable=False (the dashboard) removes
-        the tab's close button and the pop-out menu item."""
+    def register_window(self, widget, closable=True):
+        """Makes `widget` known to the host WITHOUT showing it anywhere
+        yet -- for tabs the operator opens later from a workspace's "+"
+        menu."""
         entry = self._entries.get(widget)
         if entry is None:
             entry = _Entry(widget, closable)
             self._entries[widget] = entry
             widget.installEventFilter(self._hide_watcher)
             widget.windowTitleChanged.connect(lambda _t, w=widget: self._refresh_title(w))
+        return entry
+
+    def add_window(self, widget, closable=True, pane_index=None):
+        """Registers `widget` and docks it (without stealing focus
+        rules from present()). closable=False (the dashboard) removes
+        the tab's close button and the pop-out menu item."""
+        entry = self.register_window(widget, closable)
         pane = self.panes[pane_index] if pane_index is not None else self._choose_pane()
         self._dock(entry, pane)
         return entry
 
+    def open_in(self, widget, pane_index):
+        """Opens `widget` as a tab in a SPECIFIC workspace (what picking
+        something from that workspace's "+" menu does): docks it there
+        if it isn't open, otherwise moves its tab there."""
+        entry = self.register_window(widget)
+        pane = self.panes[pane_index]
+        if entry.floating:
+            self.dock_floating(widget)
+            entry = self._entries[widget]
+        if entry.pane is None:
+            self._dock(entry, pane)
+        elif entry.pane is not pane:
+            self._move_to_pane(entry, pane)
+        pane.setCurrentWidget(entry.page)
+        self._set_active_pane(pane)
+        widget.show()
+
+    def add_menu_provider(self, provider):
+        """provider(menu, ctx) is called each time a workspace's "+" menu
+        opens and adds its own actions/submenus to `menu`; an action
+        opens a widget in that workspace via ctx.open(widget). ctx.label(
+        title, widget) marks entries already open elsewhere. Providers
+        build widgets lazily (inside the action's handler), so listing
+        something here costs nothing until it is picked."""
+        self._menu_providers.append(provider)
+
+    def _fill_add_menu(self, menu, pane):
+        ctx = _MenuContext(self, pane)
+        for provider in self._menu_providers:
+            if not menu.isEmpty():
+                menu.addSeparator()
+            provider(menu, ctx)
+
     def add_dashboard(self, dashboard, pane_index=0):
-        """Docks the dashboard (non-closable) and, if it offers
-        take_data_pages(), its reference-data sections as their own
-        non-closable tabs in the SAME workspace, then leaves the
-        dashboard itself selected. Closing the host runs the dashboard's
-        shutdown (see set_dashboard)."""
+        """Docks the dashboard (non-closable) and wires it into the
+        workspaces' "+" menus: if it offers take_data_pages(), its
+        reference-data sections (Band Conditions, Contests, ...) are
+        registered as closable tabs the operator opens when and where
+        they want -- none are opened automatically -- and if it offers
+        populate_workspace_menu(menu, ctx) that adds its own entries too.
+        Closing the host runs the dashboard's shutdown (see
+        set_dashboard)."""
         self.add_window(dashboard, closable=False, pane_index=pane_index)
         self.set_dashboard(dashboard)
         take = getattr(dashboard, "take_data_pages", None)
         if take is not None:
             for title, page in take():
                 page.setWindowTitle(title)
-                self.add_window(page, closable=False, pane_index=pane_index)
+                self.register_window(page, closable=True)
+        populate = getattr(dashboard, "populate_workspace_menu", None)
+        if populate is not None:
+            self.add_menu_provider(populate)
         self.present(dashboard)
 
     def present(self, widget):

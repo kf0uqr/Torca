@@ -264,31 +264,133 @@ def test_hosted_qthread_survives_layout_changes(host, app):
         thread.wait(5000)
 
 
-def test_add_dashboard_docks_data_pages_beside_it_in_the_same_workspace(host, app):
-    class FakeDashboard(RealClose):
-        def take_data_pages(self):
-            self.pages = [(t, QWidget()) for t in ("Band Conditions", "Contests", "DX Spots", "Parks", "Satellites")]
-            return self.pages
+class FakeDashboard(RealClose):
+    """Stand-in for HamClockWindow's workspace hooks."""
 
-    host.set_workspace_count(3)
-    dash = FakeDashboard("Ham Dashboard")
-    host.add_dashboard(dash, pane_index=1)
-    pane = host.panes[1]
-    assert [pane.tabText(i) for i in range(pane.count())] == [
-        "Ham Dashboard", "Band Conditions", "Contests", "DX Spots", "Parks", "Satellites"]
-    assert all(host.pane_of(page) == 1 for _t, page in dash.pages)
-    assert pane.currentWidget() is host._entries[dash].page      # dashboard itself is left selected
-    assert host.panes[0].count() == 0 and host.panes[2].count() == 0
-    # none of them can be closed or popped out
-    for _t, page in dash.pages:
-        host.pop_out(page)
-        assert host.pane_of(page) == 1
-    # and closing the host still runs the dashboard's shutdown
+    def __init__(self):
+        super().__init__("Ham Dashboard")
+        self.pages = []
+        self.log_book = None
+
+    def take_data_pages(self):
+        self.pages = [(t, QWidget()) for t in ("Band Conditions", "Contests", "DX Spots", "Parks", "Satellites")]
+        return self.pages
+
+    def populate_workspace_menu(self, menu, ctx):
+        for title, page in self.pages:
+            menu.addAction(ctx.label(title, page)).triggered.connect(lambda _c=False, p=page: ctx.open(p))
+        menu.addAction(ctx.label("Log Book", self.log_book)).triggered.connect(lambda _c=False: ctx.open(self._log()))
+
+    def _log(self):
+        if self.log_book is None:
+            self.log_book = HideOnClose("Log Book")
+        return self.log_book
+
+
+def _menu_texts(host, pane_index):
+    from PySide6.QtWidgets import QMenu
+    menu = QMenu()
+    host.panes[pane_index]._fill_menu(menu)   # exactly what opening the "+" menu does
+    return [a.text() for a in menu.actions() if not a.isSeparator()], menu
+
+
+def test_add_dashboard_opens_only_the_dashboard_and_offers_pages_in_plus_menu(host, app):
+    dash = FakeDashboard()
+    host.add_dashboard(dash)
+    assert sum(p.count() for p in host.panes) == 1 and host.pane_of(dash) == 0   # nothing auto-opened
+    texts, _ = _menu_texts(host, 1)
+    assert texts == ["Band Conditions", "Contests", "DX Spots", "Parks", "Satellites", "Log Book"]
+
+
+def test_plus_menu_opens_tab_in_that_workspace_and_marks_where_open_ones_are(host, app):
+    dash = FakeDashboard()
+    host.add_dashboard(dash)
+    _t, menu = _menu_texts(host, 1)
+    next(a for a in menu.actions() if a.text() == "Contests").trigger()
+    contests = dash.pages[1][1]
+    assert host.pane_of(contests) == 1 and host.panes[1].currentWidget() is host._entries[contests].page
+
+    texts, menu0 = _menu_texts(host, 0)                       # from workspace 1: it's open in workspace 2
+    assert "Contests  (Workspace 2)" in texts
+    next(a for a in menu0.actions() if a.text().startswith("Contests")).trigger()
+    assert host.pane_of(contests) == 0                         # picking it moves it here
+    texts, _ = _menu_texts(host, 0)
+    assert "Contests" in texts                                 # open HERE: plain label
+
+
+def test_data_page_tabs_can_be_closed_and_reopened_from_plus(host, app):
+    dash = FakeDashboard()
+    host.add_dashboard(dash)
+    page = dash.pages[3][1]
+    _t, menu = _menu_texts(host, 0)
+    next(a for a in menu.actions() if a.text() == "Parks").trigger()
+    pane = host.panes[0]
+    host._on_tab_close_requested(pane, pane.indexOf(host._entries[page].page))
+    _settle(app)
+    assert host.pane_of(page) is None and pane.count() == 1
+    _t, menu = _menu_texts(host, 0)
+    next(a for a in menu.actions() if a.text() == "Parks").trigger()
+    assert host.pane_of(page) == 0 and page.isVisible()
+
+
+def test_lazily_built_tab_is_only_created_when_picked(host, app):
+    dash = FakeDashboard()
+    host.add_dashboard(dash)
+    assert dash.log_book is None
+    _t, menu = _menu_texts(host, 1)                            # listing the menu must not build it
+    assert dash.log_book is None
+    next(a for a in menu.actions() if a.text() == "Log Book").trigger()
+    assert dash.log_book is not None and host.pane_of(dash.log_book) == 1
+
+
+def test_empty_workspace_shows_add_button_and_hides_it_once_it_has_a_tab(host, app):
+    dash = FakeDashboard()
+    host.add_dashboard(dash)
+    host.show()
+    _settle(app)
+    assert host.panes[1].count() == 0 and not host.panes[1]._empty_button.isHidden()
+    assert host.panes[0].count() == 1 and host.panes[0]._empty_button.isHidden()
+    host.open_in(dash.pages[0][1], 1)
+    assert host.panes[1]._empty_button.isHidden()
+    host.move_window(dash.pages[0][1], 0)
+    assert not host.panes[1]._empty_button.isHidden()          # back to empty -> button returns
+
+
+def test_add_dashboard_works_for_a_dashboard_without_hooks(host):
+    dash = RealClose("Ham Dashboard")
+    host.add_dashboard(dash)
+    assert host.pane_of(dash) == 0 and host.panes[0].count() == 1
+    texts, _ = _menu_texts(host, 0)
+    assert texts == ["(nothing to add)"]
+
+
+def test_closing_host_still_runs_dashboard_shutdown_with_pages_registered(host):
+    dash = FakeDashboard()
+    host.add_dashboard(dash)
     host.close()
     assert dash.closed
 
 
-def test_add_dashboard_works_for_a_dashboard_without_data_pages(host):
-    dash = RealClose("Ham Dashboard")
-    host.add_dashboard(dash)
-    assert host.pane_of(dash) == 0 and host.panes[0].count() == 1
+def test_radio_window_tool_menu_lists_every_tool_and_builds_lazily(app):
+    import types
+    from PySide6.QtWidgets import QMenu
+    from main_window import RadioWindow
+
+    built = []
+    fake = types.SimpleNamespace(
+        cw_window=None, aprs_window=None, sstv_window=None, rtty_window=None,
+        psk31_window=None, recording_window=None, memories_window=None,
+    )
+    for name in ("cw_tool", "aprs_tool", "sstv_tool", "rtty_tool", "psk31_tool", "recording_tool"):
+        setattr(fake, f"ensure_{name}_window", lambda n=name: built.append(n) or n)
+    fake.ensure_memories_window = lambda: built.append("memories") or "memories"
+
+    opened = []
+    ctx = types.SimpleNamespace(open=opened.append, label=lambda title, widget=None: title)
+    menu = QMenu()
+    RadioWindow.populate_tool_menu(fake, menu, ctx)
+    assert [a.text() for a in menu.actions()] == [
+        "CW Tool", "APRS Tool", "SSTV Tool", "RTTY Tool", "PSK31 Tool", "Recording Tool", "Memories"]
+    assert built == []                                   # nothing constructed just by listing
+    menu.actions()[1].trigger()
+    assert built == ["aprs_tool"] and opened == ["aprs_tool"]

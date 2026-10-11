@@ -992,20 +992,29 @@ class RadioWindow(QWidget):
         self.ensure_cw_tool_window()
         present_window(self.cw_window)
 
-    def _on_sstv_tool_clicked(self):
+    def ensure_sstv_tool_window(self):
         if self.sstv_window is None:
             self.sstv_window = SstvToolWindow(self)
-        present_window(self.sstv_window)
+        return self.sstv_window
 
-    def _on_rtty_tool_clicked(self):
+    def _on_sstv_tool_clicked(self):
+        present_window(self.ensure_sstv_tool_window())
+
+    def ensure_rtty_tool_window(self):
         if self.rtty_window is None:
             self.rtty_window = RttyToolWindow(self)
-        present_window(self.rtty_window)
+        return self.rtty_window
 
-    def _on_psk31_tool_clicked(self):
+    def _on_rtty_tool_clicked(self):
+        present_window(self.ensure_rtty_tool_window())
+
+    def ensure_psk31_tool_window(self):
         if self.psk31_window is None:
             self.psk31_window = Psk31ToolWindow(self)
-        present_window(self.psk31_window)
+        return self.psk31_window
+
+    def _on_psk31_tool_clicked(self):
+        present_window(self.ensure_psk31_tool_window())
 
     def ensure_aprs_tool_window(self):
         """Lazily constructs self.aprs_window if it doesn't exist yet
@@ -1021,15 +1030,39 @@ class RadioWindow(QWidget):
         self.ensure_aprs_tool_window()
         present_window(self.aprs_window)
 
-    def _on_memories_button_clicked(self):
+    def ensure_memories_window(self):
         if self.memories_window is None:
             self.memories_window = MemoriesWindow(self)
-        present_window(self.memories_window)
+        return self.memories_window
 
-    def _on_recording_tool_clicked(self):
+    def _on_memories_button_clicked(self):
+        present_window(self.ensure_memories_window())
+
+    def ensure_recording_tool_window(self):
         if self.recording_window is None:
             self.recording_window = RecordingToolWindow(self)
-        present_window(self.recording_window)
+        return self.recording_window
+
+    def _on_recording_tool_clicked(self):
+        present_window(self.ensure_recording_tool_window())
+
+    def populate_tool_menu(self, menu, ctx):
+        """Adds this radio's tools to a workspace "+" menu (a submenu per
+        radio, built by HamClockWindow.populate_workspace_menu). Same
+        lazily-constructed singletons the tool buttons use, so opening
+        one here and from the button is the same window."""
+        for title, ensure, current in (
+            ("CW Tool", self.ensure_cw_tool_window, self.cw_window),
+            ("APRS Tool", self.ensure_aprs_tool_window, self.aprs_window),
+            ("SSTV Tool", self.ensure_sstv_tool_window, self.sstv_window),
+            ("RTTY Tool", self.ensure_rtty_tool_window, self.rtty_window),
+            ("PSK31 Tool", self.ensure_psk31_tool_window, self.psk31_window),
+            ("Recording Tool", self.ensure_recording_tool_window, self.recording_window),
+            ("Memories", self.ensure_memories_window, self.memories_window),
+        ):
+            menu.addAction(ctx.label(title, current)).triggered.connect(
+                lambda _c=False, f=ensure: ctx.open(f())
+            )
 
     @Slot(str)
     def _on_connection_failed(self, message):

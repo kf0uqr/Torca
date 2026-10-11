@@ -154,6 +154,10 @@ Toggle **POTA** to plot currently active Parks on the Air activator spots on the
 
 Toggle **PSKReporter** to plot recent reception reports involving your callsign (who heard you, or who you were heard by, depending on direction) -- configurable lookback window in its settings dialog.
 
+With the direction set to **Stations you are hearing** (or **Both**), the stations your FT8/FT4 tool decodes are plotted straight away, as you hear them (a station appears once a message from it has told TORCA its grid square; the tooltip shows band, mode, signal and time).
+
+**Reporting what you hear.** Right-click the PSKReporter button and tick **Report the stations I hear to PSKReporter** to also send those decodes to pskreporter.info, so you show up as a receiver there and your reports appear on PSKReporter's own map. It is off until you turn it on, and TORCA first tells you what becomes public: your callsign, your location as a 6-character grid square from your profile, and each station heard with its frequency, signal and time. Reports go out about every five minutes (not more often, as PSKReporter asks), a station is reported at most once per ten minutes per band, and anything still queued is sent when you quit. Only the FT8/FT4 tool reports for now, and it needs the radio's frequency (a connected radio), and your callsign and location set in Profile.
+
 ### DX Cluster
 
 A traditional telnet DX cluster feed (default: a public AK1A-format cluster). Enter a host/port if you want a different one, then **Connect** for a continuous, live stream of spots.

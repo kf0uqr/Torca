@@ -80,7 +80,9 @@ from satellite_session import SatelliteSession
 from log_book_window import LogBookWindow
 import adif
 import qso_log
+import ft8_qso
 import pskreporter
+import pskreporter_report
 from aprs_db import shared_database
 from aprs_map_filter_dialog import AprsMapFilterDialog, EMPTY_FILTER, filter_is_active
 import pota
@@ -896,9 +898,18 @@ class PskReporterSettingsDialog(QDialog):
     which direction of reception reports to show -- stations that
     heard you, stations you're hearing, or both."""
 
-    def __init__(self, callsign, since_seconds, direction, parent=None):
+    def __init__(self, callsign, since_seconds, direction, parent=None, report_enabled=False):
         super().__init__(parent)
         self.setWindowTitle("PSKReporter Settings")
+
+        self.report_check = QCheckBox("Report the stations I hear to PSKReporter (FT8 / FT4)")
+        self.report_check.setChecked(report_enabled)
+        self.report_check.setToolTip(
+            "Sends what the FT8/FT4 tool decodes to pskreporter.info, where it is public: your callsign, "
+            "your location (6-character grid square from your profile) and each station heard, with "
+            "frequency, signal and time. Off unless you turn it on. The map shows the stations you hear "
+            "either way (choose 'Stations you are hearing' or 'Both')."
+        )
 
         self.callsign_edit = QLineEdit(callsign)
         self.callsign_edit.setPlaceholderText("e.g. KF0UQR")
@@ -931,6 +942,7 @@ class PskReporterSettingsDialog(QDialog):
         form.addRow("Direction:", self.heard_you_radio)
         form.addRow("", self.hearing_radio)
         form.addRow("", self.both_radio)
+        form.addRow("Reporting:", self.report_check)
 
         layout = QVBoxLayout()
         layout.addLayout(form)
@@ -942,6 +954,9 @@ class PskReporterSettingsDialog(QDialog):
 
     def result_since_seconds(self):
         return self.lookback_combo.currentData()
+
+    def result_report_enabled(self):
+        return self.report_check.isChecked()
 
     def result_direction(self):
         if self.hearing_radio.isChecked():
@@ -1295,6 +1310,16 @@ class HamClockWindow(QWidget):
             "pskreporter_direction", pskreporter.DIRECTION_HEARD_YOU
         )
         self._pskreporter_spots_cache = []  # raw fetched spots (unfiltered by band) -- see _build_pskreporter_markers
+        # What the decoders here have heard themselves (instant, no server round trip), shown as "you heard them".
+        self._pskreporter_local_spots = {}          # (callsign, band) -> spot dict
+        self._pskreporter_locators = {}             # callsign -> last grid heard from them
+        self._pskreporter_report_enabled = settings.value("pskreporter_report_enabled", False, type=bool)
+        self._pskreporter_uploader = None
+        self._pskreporter_refresh_timer = QTimer(self)
+        self._pskreporter_refresh_timer.setSingleShot(True)
+        self._pskreporter_refresh_timer.setInterval(1000)
+        self._pskreporter_refresh_timer.timeout.connect(self._refresh_pskreporter_markers)
+        self._sync_pskreporter_uploader()
         self._pskreporter_worker = None
         self.pskreporter_button = QPushButton("PSKReporter: OFF")
         self.pskreporter_button.setCheckable(True)
@@ -1944,7 +1969,8 @@ class HamClockWindow(QWidget):
 
     def _on_pskreporter_menu_requested(self, _pos):
         dialog = PskReporterSettingsDialog(
-            self._operator_callsign, self._pskreporter_since_seconds, self._pskreporter_direction, self
+            self._operator_callsign, self._pskreporter_since_seconds, self._pskreporter_direction, self,
+            report_enabled=self._pskreporter_report_enabled,
         )
         if dialog.exec() == QDialog.Accepted:
             self._operator_callsign = dialog.result_callsign()
@@ -1954,6 +1980,7 @@ class HamClockWindow(QWidget):
             settings.setValue("operator_callsign", self._operator_callsign)
             settings.setValue("pskreporter_lookback_seconds", self._pskreporter_since_seconds)
             settings.setValue("pskreporter_direction", self._pskreporter_direction)
+            self._apply_pskreporter_reporting_choice(dialog.result_report_enabled(), self._operator_callsign)
             if self.pskreporter_button.isChecked():
                 if self._operator_callsign:
                     self._start_pskreporter_fetch()
@@ -1963,6 +1990,76 @@ class HamClockWindow(QWidget):
                     # which clears the map's markers -- no need to also do
                     # it here.
                     self.pskreporter_button.setChecked(False)
+
+    # ---- reporting what we hear ----
+
+    def _pskreporter_receiver_locator(self):
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        try:
+            return ft8_qso.latlon_to_grid(float(settings.value("operator_lat", 0.0) or 0.0),
+                                          float(settings.value("operator_lon", 0.0) or 0.0), digits=6)
+        except (TypeError, ValueError):
+            return ""
+
+    def _apply_pskreporter_reporting_choice(self, wanted, callsign):
+        """Switches reporting on (after saying plainly what becomes public) or off."""
+        if wanted and not self._pskreporter_report_enabled:
+            box = QMessageBox(self._action_parent())
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Report to PSKReporter")
+            box.setText(
+                f"TORCA will send to pskreporter.info, publicly, every few minutes:\n\n"
+                f"  - your callsign ({callsign or '?'}) and your location as a 6-character grid square "
+                f"({self._pskreporter_receiver_locator() or '?'}), taken from your profile\n"
+                f"  - each station your FT8/FT4 tool decodes, with its frequency, signal strength and time.\n\n"
+                f"Turn reporting on?"
+            )
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.No)
+            wanted = box.exec() == QMessageBox.Yes
+        self._pskreporter_report_enabled = bool(wanted)
+        QSettings("IcomRadioApp", "RadioControl").setValue("pskreporter_report_enabled", self._pskreporter_report_enabled)
+        self._sync_pskreporter_uploader()
+
+    def _sync_pskreporter_uploader(self):
+        want = self._pskreporter_report_enabled and bool(self._operator_callsign) and bool(self._pskreporter_receiver_locator())
+        uploader = self._pskreporter_uploader
+        if uploader is not None and (not want or uploader.callsign != self._operator_callsign.upper()
+                                      or uploader.locator != self._pskreporter_receiver_locator()):
+            uploader.stop()          # sends what is queued, then stops
+            uploader.deleteLater()
+            self._pskreporter_uploader = uploader = None
+        if want and uploader is None:
+            self._pskreporter_uploader = pskreporter_report.PskReporterUploader(
+                self._operator_callsign, self._pskreporter_receiver_locator(), parent=self)
+
+    def _on_stations_heard(self, stations):
+        """Stations a decoder just heard: shown on the PSKReporter map as
+        "you heard them", and queued for reporting if that is switched on."""
+        for station in stations:
+            call = station["callsign"]
+            if station.get("locator"):
+                self._pskreporter_locators[call] = station["locator"]
+            locator = station.get("locator") or self._pskreporter_locators.get(call, "")
+            band = adif.band_for_freq_hz(station["frequency_hz"]) or "?"
+            self._pskreporter_local_spots[(call, band)] = {
+                "callsign": call, "locator": locator, "frequency_hz": station["frequency_hz"], "band": band,
+                "mode": station["mode"], "snr": str(station["snr"]), "flow_start_seconds": station["epoch"],
+                "direction": pskreporter.DIRECTION_HEARING, "raw": {},
+            }
+            if self._pskreporter_uploader is not None:
+                self._pskreporter_uploader.add(pskreporter_report.Spot(
+                    call, station["frequency_hz"], station["snr"], station["mode"], locator, station["epoch"]))
+        cutoff = time.time() - pskreporter.MAX_LOOKBACK_SECONDS
+        for key in [k for k, v in self._pskreporter_local_spots.items() if v["flow_start_seconds"] < cutoff]:
+            del self._pskreporter_local_spots[key]
+        if self.pskreporter_button.isChecked() and self._pskreporter_direction in (pskreporter.DIRECTION_HEARING, "both"):
+            if not self._pskreporter_refresh_timer.isActive():
+                self._pskreporter_refresh_timer.start()
+
+    def _refresh_pskreporter_markers(self):
+        if self.pskreporter_button.isChecked():
+            self.map_widget.set_pskreporter_markers(self._build_pskreporter_markers())
 
     def _start_pskreporter_fetch(self):
         if self._pskreporter_worker is not None and self._pskreporter_worker.isRunning():
@@ -1994,7 +2091,17 @@ class HamClockWindow(QWidget):
         without a parseable locator are skipped (nothing to plot them
         at)."""
         band_filter = self.qso_band_filter_combo.currentData()
-        spots = self._pskreporter_spots_cache
+        spots = list(self._pskreporter_spots_cache)
+        if self._pskreporter_direction in (pskreporter.DIRECTION_HEARING, "both"):
+            # What this station's own decoders heard, within the chosen time frame.
+            cutoff = time.time() - self._pskreporter_since_seconds
+            spots += [s for s in self._pskreporter_local_spots.values() if s["flow_start_seconds"] >= cutoff]
+        newest = {}
+        for spot in spots:       # the server may report the same thing we heard: keep the newest of each
+            key = (spot.get("direction"), spot.get("callsign"), spot.get("band"))
+            if key not in newest or (spot.get("flow_start_seconds") or 0) > (newest[key].get("flow_start_seconds") or 0):
+                newest[key] = spot
+        spots = list(newest.values())
         if band_filter is not None:
             spots = [spot for spot in spots if spot.get("band") == band_filter]
         markers = []
@@ -3160,6 +3267,7 @@ class HamClockWindow(QWidget):
         # whole job is a QSettings side effect -- see its own docstring).
         settings = QSettings("IcomRadioApp", "RadioControl")
         self._operator_callsign = settings.value("operator_callsign", "") or ""
+        self._sync_pskreporter_uploader()   # a changed callsign / location changes who is reporting
         self._load_observer_location()
         self.satellite_session.set_observer_location(
             self._observer_lat, self._observer_lon, self._observer_elevation_m
@@ -3210,6 +3318,7 @@ class HamClockWindow(QWidget):
         window = RadioWindow(details, self.satellite_session)
         window.closed.connect(self._on_radio_window_closed)
         window.aprs_packet_decoded.connect(self._on_aprs_packet_decoded)
+        window.ft8_stations_heard.connect(self._on_stations_heard)
         window.ft8_qso_logged.connect(self._on_wsjtx_qso_logged)   # same path as WSJT-X auto-logging
         # Remote Access identity + state cache -- must be created here,
         # on the GUI thread, NOT lazily from the web server's own
@@ -3908,6 +4017,8 @@ class HamClockWindow(QWidget):
         print(f"[WSJT-X Auto-Log] {message}")
 
     def closeEvent(self, event):
+        if self._pskreporter_uploader is not None:
+            self._pskreporter_uploader.stop()   # report what is queued before quitting
         self._on_remote_access_stop()
         self.satellite_session.stop()
         if self._wsjtx_udp_listener is not None:

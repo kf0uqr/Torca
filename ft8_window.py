@@ -93,6 +93,9 @@ class Ft8ToolWindow(QWidget):
     _build_finished = Signal(bool, str)
     # A contact is complete: the ADIF fields to log (RadioWindow forwards it to the dashboard)
     qso_logged = Signal(dict)
+    # Stations heard in a slot: [{"callsign", "locator", "frequency_hz", "snr", "mode", "epoch"}], for
+    # the PSKReporter map / reports (the dashboard decides what to do with them)
+    stations_heard = Signal(list)
 
     def __init__(self, radio_window, clock=time.time):
         super().__init__()
@@ -373,8 +376,26 @@ class Ft8ToolWindow(QWidget):
         self._last_slot_summary = f"last slot: {count} decode{'s' if count != 1 else ''}"
         if fresh:
             self.table.scrollToBottom()
+        self._publish_heard(fresh)
         for message in fresh:
             self._react_to(message)
+
+    def _publish_heard(self, messages):
+        dial = getattr(self._radio_window, "_current_freq_hz", None) or 0
+        if not dial:
+            return   # without the radio's frequency there is nothing meaningful to report
+        stations = {}
+        for message in messages:
+            heard = ft8_qso.heard_station(message.text)
+            if heard is None:
+                continue
+            callsign, locator = heard
+            stations[callsign] = {
+                "callsign": callsign, "locator": locator, "frequency_hz": int(dial + message.freq),
+                "snr": int(round(message.snr)), "mode": message.mode, "epoch": int(message.slot_start),
+            }
+        if stations:
+            self.stations_heard.emit(list(stations.values()))
 
     def _append_row(self, message, my_callsign):
         row = self.table.rowCount()

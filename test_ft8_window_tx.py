@@ -227,3 +227,21 @@ def test_closing_the_window_never_leaves_it_transmitting(tool):
     window._tx_tick(START + 0.45)
     window.close()
     assert worker.halted == 1 and not window.tx_enable_button.isChecked()
+
+
+def test_decoded_stations_are_published_with_the_radios_frequency(tool):
+    window, worker, clock = tool
+    got = []
+    window.stations_heard.connect(got.append)
+    hear(window, "CQ W1AW FN31", START, snr=-12.4, freq=1200.0)
+    assert got and got[0][0] == {"callsign": "W1AW", "locator": "FN31", "frequency_hz": 14_075_200, "snr": -12,
+                                 "mode": "FT8", "epoch": int(START)}
+
+
+def test_nothing_is_published_without_a_known_radio_frequency(tool):
+    window, worker, clock = tool
+    window._radio_window._current_freq_hz = None
+    got = []
+    window.stations_heard.connect(got.append)
+    hear(window, "CQ W1AW FN31", START)
+    assert got == []

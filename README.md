@@ -251,6 +251,7 @@ Click **Start** in the same dialog -- this brings up the local web server and th
 | `psk31.py` / `psk31_window.py` | BPSK31 decode/send engine + `Psk31ToolWindow` |
 | `sstv.py` / `sstv_window.py` | SSTV image decoder + `SstvToolWindow` |
 | `aprs.py` / `aprs_window.py` | APRS/AX.25 packet decode/send engine + `AprsToolWindow` |
+| `pskreporter_report.py` | Sends reception reports to PSKReporter (IPFIX over UDP), rate-limited, opt-in |
 | `ft8_decoder.py` / `ft8_qso.py` / `ft8_window.py` | FT8/FT4 slot capture, decode and encode (wraps the vendored `ft8_lib`), the QSO sequencing state machine, and `Ft8ToolWindow` |
 | `direwolf_backend.py` | Alternative APRS decode backend using the external `direwolf` TNC |
 

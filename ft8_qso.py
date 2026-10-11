@@ -82,6 +82,17 @@ def parse(text):
     return None
 
 
+def heard_station(text):
+    """(callsign, locator) of the station that SENT a decoded message, as far as
+    the message says -- the locator is only there for a CQ or a first call. None
+    if the message has no usable sender (free text, a hashed callsign...)."""
+    parsed = parse(text)
+    if parsed is None or not parsed.sender or parsed.sender.startswith("<"):
+        return None
+    locator = parsed.value if parsed.kind in (CQ, CALL) else ""
+    return parsed.sender, locator
+
+
 def _base(call):
     return (call or "").upper().split("/")[0]
 

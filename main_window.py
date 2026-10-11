@@ -93,6 +93,13 @@ _MIN_METER_HEIGHT = 60
 # The passband graphic sits beside the knobs, whose column sets the row's
 # height; it must not grow into all of that (it is also what the PBT /
 # filter-width sliders under it share the column with once they appear).
+# The VFO knob's diameter and the PTT/Tune/SWR buttons' width follow the width
+# of the mode buttons (Digital Mode / NR / NB / VFO A / Split) in the row
+# above them, so each column lines up under a button; the knob is kept within
+# these bounds.
+_VFO_KNOB_MIN_DIAMETER = 110
+_VFO_KNOB_MAX_DIAMETER = 220
+
 _MIN_PASSBAND_HEIGHT = 140
 _MAX_PASSBAND_HEIGHT = 200
 
@@ -866,6 +873,7 @@ class RadioWindow(QWidget):
         layout.addLayout(tuning_area)
         layout.addLayout(levels_row)
         layout.addWidget(self.status_label)
+        self._mode_buttons_row = buttons_row  # see _match_control_widths
         self.setLayout(layout)
 
         self.worker = RadioWorker(details)
@@ -2130,6 +2138,42 @@ class RadioWindow(QWidget):
             button.setStyleSheet(
                 "QPushButton { background-color: #2a6; color: white; font-weight: bold; }" if active else ""
             )
+
+    @staticmethod
+    def _layout_widgets(layout):
+        """Every widget in `layout`, in order, descending into nested layouts."""
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            if item.widget() is not None:
+                yield item.widget()
+            elif item.layout() is not None:
+                yield from RadioWindow._layout_widgets(item.layout())
+
+    def _match_control_widths(self):
+        """Makes the VFO knob as wide across as the right-most mode button
+        above it (Split / VFO A / ...), and the PTT, Tune and SWR Protect
+        buttons as wide as the button above THEM. Those mode buttons stretch
+        with the window, so this re-runs on every resize."""
+        buttons = [w for w in self._layout_widgets(self._mode_buttons_row) if w.isVisible() and w.width() > 0]
+        if not buttons:
+            return  # not laid out yet (hidden tab, or before the first show)
+        reference_width = max(buttons, key=lambda w: w.x()).width()
+        diameter = min(max(reference_width, _VFO_KNOB_MIN_DIAMETER), _VFO_KNOB_MAX_DIAMETER)
+        if (self.tuning_knob.width(), self.tuning_knob.height()) != (diameter, diameter):
+            self.tuning_knob.setFixedSize(diameter, diameter)
+        for button in (self.ptt_button, self.tune_button, self.swr_protection_button):
+            target = max(reference_width, button.minimumSizeHint().width())
+            if button.minimumWidth() != target or button.maximumWidth() != target:
+                button.setFixedWidth(target)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._match_control_widths()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Child geometry is only final after the first layout pass.
+        QTimer.singleShot(0, self._match_control_widths)
 
     def closeEvent(self, event):
         if self.cw_window is not None:

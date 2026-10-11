@@ -196,3 +196,54 @@ def test_mode_controls_span_the_full_width_above_the_knobs(app, radio_window):
     # the Split button (right end of the button row) reaches the right-hand side of the window,
     # i.e. the row is no longer confined to the left of the knobs
     assert last_button.geometry().right() > radio_window.width() * 0.8
+
+
+# ---- VFO knob / PTT column widths follow the mode-button row ----
+
+def _rightmost_mode_button_width(window):
+    buttons = [b for b in window._layout_widgets(window._mode_buttons_row) if b.isVisible()]
+    return max(buttons, key=lambda b: b.x()).width()
+
+
+@pytest.mark.parametrize("width", [1000, 1100, 1300])
+def test_vfo_knob_and_tx_buttons_are_as_wide_as_the_mode_buttons_above(app, radio_window, width):
+    radio_window.show()
+    radio_window.resize(width, 1000)
+    _settle(app)
+    reference = _rightmost_mode_button_width(radio_window)
+    # the knob matches the button above it, within its own size limits (the buttons themselves are not capped)
+    expected_knob = min(max(reference, main_window._VFO_KNOB_MIN_DIAMETER), main_window._VFO_KNOB_MAX_DIAMETER)
+    assert radio_window.tuning_knob.width() == radio_window.tuning_knob.height() == expected_knob
+    if width <= 1100:
+        assert expected_knob == reference            # in the normal range, an exact match
+    for button in (radio_window.ptt_button, radio_window.tune_button, radio_window.swr_protection_button):
+        assert button.width() == reference, button.text()
+
+
+def test_knob_follows_the_window_when_it_is_resized(app, radio_window):
+    radio_window.show()
+    radio_window.resize(1000, 1000)
+    _settle(app)
+    narrow = radio_window.tuning_knob.width()
+    radio_window.resize(1400, 1000)
+    _settle(app)
+    wider = radio_window.tuning_knob.width()
+    assert wider > narrow
+    assert wider == min(_rightmost_mode_button_width(radio_window), main_window._VFO_KNOB_MAX_DIAMETER)
+
+
+def test_knob_diameter_is_capped_on_a_very_wide_window(app, radio_window):
+    radio_window.show()
+    radio_window.resize(2600, 1000)
+    _settle(app)
+    assert radio_window.tuning_knob.width() == main_window._VFO_KNOB_MAX_DIAMETER
+    assert radio_window.ptt_button.width() == _rightmost_mode_button_width(radio_window)   # the buttons keep matching
+
+
+def test_wider_controls_still_leave_no_scroll_bars_at_1080p(app, radio_window):
+    host, page = _dock_in_second_workspace(app, radio_window, (1920, 1010))
+    try:
+        assert not page.verticalScrollBar().isVisible() and not page.horizontalScrollBar().isVisible()
+        assert radio_window.minimumSizeHint().height() <= 860
+    finally:
+        _close(host)

@@ -9,3 +9,10 @@ __pycache__/
 
 # empty placeholder dir
 irc/
+
+# FT8/FT4 decoder: sources are vendored, binaries are built locally (see ft8_decoder.py)
+vendor/ft8_lib/.build/
+vendor/ft8_lib/decode_ft8
+vendor/ft8_lib/gen_ft8
+vendor/ft8_lib/test_ft8
+vendor/ft8_lib/libft8.a

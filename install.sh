@@ -198,6 +198,21 @@ do_install() {
     "$INSTALL_DIR/bin/pip" install --upgrade pip
     "$INSTALL_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 
+    # The FT8/FT4 decoder is C source (vendor/ft8_lib, MIT) compiled here. Best effort: a
+    # machine without make / a C compiler still gets a working TORCA, and the FT8 Tool's
+    # "Build Decoder" button (or installing build-essential and re-running this) fixes it later.
+    if command -v make >/dev/null 2>&1 && { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; }; then
+        echo "Building the FT8/FT4 decoder..."
+        if make -C "$INSTALL_DIR/vendor/ft8_lib" decode_ft8 >/dev/null 2>&1; then
+            echo "  FT8/FT4 decoder built."
+        else
+            echo "  Couldn't build the FT8/FT4 decoder; the FT8 Tool will offer to build it later."
+        fi
+    else
+        echo "Note: make and a C compiler weren't found, so the FT8/FT4 decoder wasn't built."
+        echo "      (Debian/Ubuntu: sudo apt install build-essential, then use Build Decoder in the FT8 Tool.)"
+    fi
+
     if [[ "$EUID" -eq 0 ]]; then
         echo "Installing launcher to $LAUNCHER_PATH..."
         cat > "$LAUNCHER_PATH" <<EOF

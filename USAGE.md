@@ -17,6 +17,7 @@ Step-by-step instructions for every feature in TORCA. See [README.md](README.md)
   - [PSK31](#psk31-tool)
   - [SSTV](#sstv-tool)
   - [APRS](#aprs-tool)
+  - [FT8 / FT4](#ft8--ft4-tool)
 - [QSO Log Book](#qso-log-book)
 - [World map & overlays](#world-map--overlays)
 - [Spot networks](#spot-networks)
@@ -63,7 +64,7 @@ Each connected radio's window has:
 - **Tuning knob** -- click-drag to spin; the step size combo next to it sets Hz-per-click.
 - **Band buttons** -- one click recalls the band's last-used frequency (via the radio's own band-stacking register where supported) or tunes to its low edge.
 - **PTT** -- push-to-talk. On a dual-receiver radio, an **Active: MAIN/SUB** toggle picks which receiver the knob/band buttons/PTT currently target.
-- Tool launchers: **CW Tool...**, **RTTY Tool...**, **SSTV Tool...**, **APRS Tool...**, **Memories**.
+- Tool launchers: **CW Tool...**, **RTTY Tool...**, **SSTV Tool...**, **APRS Tool...**, **FT8 Tool...**, **Memories**.
 
 ## Split, RIT, and repeater tone
 
@@ -117,6 +118,15 @@ Decode-only: continuously updates as an image is received, auto-detecting the SS
 ### APRS Tool
 
 Decode-only in one continuously-scrolling table, one row per packet, with full protocol coverage: position reports (plain and compressed), Mic-E, status, object/item, messages/acks, telemetry, weather, and third-party/network-tunneled (IGate-relayed) packets, each translated into plain English alongside the raw bytes. Right-click any row to copy its raw bytes for debugging a packet that isn't decoding correctly. **Send Packet...** builds and transmits a position report. A **Decoder** dropdown lets you switch to an external [direwolf](https://github.com/wb2osz/direwolf) TNC instead of the built-in decoder, if installed.
+
+### FT8 / FT4 Tool
+
+Receive-only decode of FT8 (15 s slots) and FT4 (7.5 s slots) straight from the radio's audio -- no WSJT-X needed. Set the radio to **USB** (or USB-D) on an FT8/FT4 frequency (FT8 is commonly 14.074 MHz on 20 m), pick the mode, and press **Start Decoding**. After each time slot the decoded messages are added to the table: UTC, dB, DT (seconds from the slot's start), audio frequency, and the message. Messages calling **CQ** are green, and anything involving your own callsign (from your operator profile) is amber. Right-click a row to copy the message.
+
+- **Your computer's clock matters.** FT8/FT4 are timed to the UTC clock, so it must be accurate to about a second (use NTP). The first slot after pressing Start is partial and is skipped, so wait for the second one.
+- The **dB** column is the decoder's estimate and is not directly comparable to WSJT-X's SNR.
+- Decoding runs the bundled [ft8_lib](https://github.com/kgoba/ft8_lib) decoder, compiled when TORCA is installed (or updated). If it couldn't be built -- no `make`/C compiler -- the tool says so and offers **Build Decoder** (Debian/Ubuntu: `sudo apt install build-essential`).
+- It does not transmit, and does not show a waterfall; use the main radio window's scope for that, or WSJT-X if you want to work stations.
 
 ## QSO Log Book
 

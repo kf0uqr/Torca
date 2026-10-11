@@ -201,3 +201,37 @@ def test_dashboard_update_flow_opens_progress_dialog_relays_status_and_closes_it
          else fake._update_perform_worker.on_failed("boom"))
         assert not dialog.isVisible() and fake._update_progress_dialog is None   # gone BEFORE the prompt / error box
         assert events == (["prompt"] if outcome == "succeeded" else ["error"])
+
+
+# ---- rebuilding the FT8 decoder on a git-checkout update ----
+
+def test_update_rebuilds_the_ft8_decoder_best_effort(tmp_path, monkeypatch):
+    import updater
+    (tmp_path / "vendor" / "ft8_lib").mkdir(parents=True)
+    (tmp_path / "vendor" / "ft8_lib" / "Makefile").write_text("decode_ft8:\n")
+    monkeypatch.setattr(updater, "APP_DIR", tmp_path)
+    monkeypatch.setattr(updater.shutil, "which", lambda name: "/usr/bin/make")
+    calls, messages = [], []
+    monkeypatch.setattr(updater, "_run", lambda args, cwd=None, timeout=30: calls.append((args, cwd)))
+    updater._rebuild_ft8_decoder(messages.append)
+    assert calls == [(["make", "decode_ft8"], tmp_path / "vendor" / "ft8_lib")]
+    assert messages == ["Building the FT8 decoder..."]
+
+
+def test_ft8_rebuild_is_skipped_without_make_or_the_source_and_never_fails_the_update(tmp_path, monkeypatch):
+    import updater
+    monkeypatch.setattr(updater, "APP_DIR", tmp_path)
+    calls = []
+    monkeypatch.setattr(updater, "_run", lambda *a, **k: calls.append(1))
+    updater._rebuild_ft8_decoder(lambda m: None)                       # no vendor/ft8_lib at all
+    (tmp_path / "vendor" / "ft8_lib").mkdir(parents=True)
+    (tmp_path / "vendor" / "ft8_lib" / "Makefile").write_text("x:\n")
+    monkeypatch.setattr(updater.shutil, "which", lambda name: None)    # and no make
+    updater._rebuild_ft8_decoder(lambda m: None)
+    assert calls == []
+
+    monkeypatch.setattr(updater.shutil, "which", lambda name: "/usr/bin/make")
+    def failing(*args, **kwargs):
+        raise updater.subprocess.CalledProcessError(2, "make")
+    monkeypatch.setattr(updater, "_run", failing)
+    updater._rebuild_ft8_decoder(lambda m: None)                       # a failed build must not raise

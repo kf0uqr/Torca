@@ -383,6 +383,7 @@ def test_tool_windows_are_titled_tool_name_dash_model(app, monkeypatch):
             "SSTV Tool": window.ensure_sstv_tool_window(),
             "RTTY Tool": window.ensure_rtty_tool_window(),
             "PSK31 Tool": window.ensure_psk31_tool_window(),
+            "FT8 Tool": window.ensure_ft8_tool_window(),
             "Recording Tool": window.ensure_recording_tool_window(),
             "Memories": window.ensure_memories_window(),
         }
@@ -445,4 +446,22 @@ def test_the_longest_normal_title_is_not_truncated_in_its_tab(app, monkeypatch):
         assert text == "IC-9700 - Satellite Full Duplex" and "…" not in text
     finally:
         _close(host)
+        window.close()
+
+
+def test_ft8_tool_is_a_normal_tool_tab_that_a_saved_workspace_can_restore(app, monkeypatch):
+    window = _titled_window(monkeypatch)
+    try:
+        tool = window.ensure_tool_window("FT8 Tool")                       # how a restored workspace asks for it
+        assert tool is window.ensure_ft8_tool_window() and tool is window.ft8_window
+        assert tool.windowTitle() == "FT8 Tool - IC-9700"
+        assert tool.workspace_key == window._tool_key("FT8 Tool") and tool.workspace_key.endswith(":FT8 Tool")
+        assert window.ft8_tool_button.isHidden() and not window.ft8_tool_button.isEnabled()      # enabled on connect, like the others
+        from PySide6.QtWidgets import QMenu
+        import types
+        menu = QMenu()
+        ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+        window.populate_tool_menu(menu, ctx)
+        assert "FT8 Tool" in [a.text() for a in menu.actions()]
+    finally:
         window.close()

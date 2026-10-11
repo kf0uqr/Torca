@@ -128,6 +128,21 @@ def check_for_update():
     return UpdateCheckResult(mode, current, latest)
 
 
+def _rebuild_ft8_decoder(status_callback):
+    """Best effort, for a git-checkout update (an installed update runs
+    install.sh, which does this itself): `make` only recompiles what changed, so
+    this is instant when the vendored decoder source is unchanged, and a machine
+    without a compiler just keeps whatever it has (the FT8 Tool offers to build)."""
+    makefile_dir = APP_DIR / "vendor" / "ft8_lib"
+    if not (makefile_dir / "Makefile").is_file() or shutil.which("make") is None:
+        return
+    status_callback("Building the FT8 decoder...")
+    try:
+        _run(["make", "decode_ft8"], cwd=makefile_dir, timeout=300)
+    except Exception:
+        pass
+
+
 def perform_update(status_callback=lambda message: None):
     """Raises on failure -- callers catch and report. status_callback
     is invoked with a short human-readable string at each stage, for a
@@ -143,6 +158,7 @@ def perform_update(status_callback=lambda message: None):
             [sys.executable, "-m", "pip", "install", "-r", str(APP_DIR / "requirements.txt")],
             cwd=APP_DIR, timeout=300,
         )
+        _rebuild_ft8_decoder(status_callback)
         status_callback("Updated.")
         return
 

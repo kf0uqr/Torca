@@ -19,6 +19,7 @@ A PySide6 GUI for controlling amateur radios via [rigplane](https://pypi.org/pro
 - RTTY: AFSK send/decode, macro bank.
 - PSK31: BPSK31 send/decode with an adjustable audio tone, macro bank.
 - SSTV: continuous image decode (multiple modes auto-detected).
+- FT8 / FT4: receive-only decode of both modes from the radio's audio (no WSJT-X needed), with CQ and "calling you" highlighting, built on the bundled ft8_lib decoder.
 - APRS: full packet decode (position/Mic-E/compressed/status/object/item/messages/telemetry/weather/third-party-relayed), symbol translation, packet send, and an optional `direwolf`-backed decoder alongside the built-in one.
 
 **Logging & spotting**
@@ -78,7 +79,8 @@ If you own one of these three radios, connecting it and reporting back (what wor
 - [rigplane](https://pypi.org/project/rigplane/) -- radio control backend
 - [sounddevice](https://pypi.org/project/sounddevice/) -- audio device listing and streaming (PortAudio wrapper)
 - [sgp4](https://pypi.org/project/sgp4/) -- satellite propagation for satellite tracking
-- [numpy](https://pypi.org/project/numpy/) -- DSP for the CW/RTTY/PSK31/SSTV/APRS decoders
+- [numpy](https://pypi.org/project/numpy/) -- DSP for the CW/RTTY/PSK31/SSTV/APRS/FT8 decoders
+- [ft8_lib](https://github.com/kgoba/ft8_lib) (MIT, by Karlis Goba YL3JG) -- the FT8/FT4 decoder, vendored under `vendor/ft8_lib/` (see its `LICENSE`) and compiled locally by the installer / `make -C vendor/ft8_lib decode_ft8`
 - [fastapi](https://pypi.org/project/fastapi/) + [uvicorn](https://pypi.org/project/uvicorn/) -- Remote Access's embedded web server
 - [opuslib](https://pypi.org/project/opuslib/) -- encodes RX audio for Remote Access's audio streaming
 
@@ -249,6 +251,7 @@ Click **Start** in the same dialog -- this brings up the local web server and th
 | `psk31.py` / `psk31_window.py` | BPSK31 decode/send engine + `Psk31ToolWindow` |
 | `sstv.py` / `sstv_window.py` | SSTV image decoder + `SstvToolWindow` |
 | `aprs.py` / `aprs_window.py` | APRS/AX.25 packet decode/send engine + `AprsToolWindow` |
+| `ft8_decoder.py` / `ft8_window.py` | FT8/FT4 slot capture + decode (wraps the vendored `ft8_lib` decoder) + `Ft8ToolWindow` |
 | `direwolf_backend.py` | Alternative APRS decode backend using the external `direwolf` TNC |
 
 **Logging & spot networks**

@@ -61,6 +61,7 @@ from memories_window import MemoriesWindow, all_memory_markers
 from sstv_window import SstvToolWindow
 from rtty_window import RttyToolWindow
 from psk31_window import Psk31ToolWindow
+from ft8_window import Ft8ToolWindow
 from aprs_window import AprsToolWindow
 from workspace_host import present_window, retire_button
 from workspace_state import radio_identity, identity_key
@@ -84,7 +85,7 @@ _LIVE_RADIO_WINDOWS = weakref.WeakSet()
 # (attribute holding the lazily-built tool window, its title prefix)
 _TOOL_TITLES = (
     ("cw_window", "CW Tool"), ("aprs_window", "APRS Tool"), ("sstv_window", "SSTV Tool"),
-    ("rtty_window", "RTTY Tool"), ("psk31_window", "PSK31 Tool"),
+    ("rtty_window", "RTTY Tool"), ("psk31_window", "PSK31 Tool"), ("ft8_window", "FT8 Tool"),
     ("recording_window", "Recording Tool"), ("memories_window", "Memories"),
 )
 
@@ -409,6 +410,14 @@ class RadioWindow(QWidget):
         self.psk31_tool_button.clicked.connect(self._on_psk31_tool_clicked)
         retire_button(self, self.psk31_tool_button)  # reached from a workspace's "+" menu now
         self.psk31_window = None
+
+        # Opens the per-radio FT8/FT4 decode tool (ft8_window.py) -- same singleton/
+        # lazy-construction/enable-on-connect pattern as the PSK31 Tool button above.
+        self.ft8_tool_button = QPushButton("FT8 Tool...")
+        self.ft8_tool_button.setEnabled(False)
+        self.ft8_tool_button.clicked.connect(self._on_ft8_tool_clicked)
+        retire_button(self, self.ft8_tool_button)  # reached from a workspace's "+" menu now
+        self.ft8_window = None
 
         # Opens the per-radio APRS decode tool (aprs_window.py) -- same
         # singleton/lazy-construction/enable-on-connect pattern as the
@@ -979,6 +988,7 @@ class RadioWindow(QWidget):
         self.sstv_tool_button.setEnabled(True)
         self.rtty_tool_button.setEnabled(True)
         self.psk31_tool_button.setEnabled(True)
+        self.ft8_tool_button.setEnabled(True)
         self.aprs_tool_button.setEnabled(True)
         self.recording_tool_button.setEnabled(True)
         self.memories_button.setEnabled(True)
@@ -1088,6 +1098,15 @@ class RadioWindow(QWidget):
     def _on_psk31_tool_clicked(self):
         present_window(self.ensure_psk31_tool_window())
 
+    def ensure_ft8_tool_window(self):
+        if self.ft8_window is None:
+            self.ft8_window = Ft8ToolWindow(self)
+            self.ft8_window.workspace_key = self._tool_key("FT8 Tool")
+        return self.ft8_window
+
+    def _on_ft8_tool_clicked(self):
+        present_window(self.ensure_ft8_tool_window())
+
     def ensure_aprs_tool_window(self):
         """Lazily constructs self.aprs_window if it doesn't exist yet
         (including the packet_decoded passthrough wiring), WITHOUT
@@ -1132,6 +1151,7 @@ class RadioWindow(QWidget):
             ("SSTV Tool", self.ensure_sstv_tool_window, self.sstv_window, self.sstv_tool_button),
             ("RTTY Tool", self.ensure_rtty_tool_window, self.rtty_window, self.rtty_tool_button),
             ("PSK31 Tool", self.ensure_psk31_tool_window, self.psk31_window, self.psk31_tool_button),
+            ("FT8 Tool", self.ensure_ft8_tool_window, self.ft8_window, self.ft8_tool_button),
             ("Recording Tool", self.ensure_recording_tool_window, self.recording_window, self.recording_tool_button),
             ("Memories", self.ensure_memories_window, self.memories_window, self.memories_button),
         ):
@@ -2192,7 +2212,8 @@ class RadioWindow(QWidget):
         builders = {
             "CW Tool": self.ensure_cw_tool_window, "APRS Tool": self.ensure_aprs_tool_window,
             "SSTV Tool": self.ensure_sstv_tool_window, "RTTY Tool": self.ensure_rtty_tool_window,
-            "PSK31 Tool": self.ensure_psk31_tool_window, "Recording Tool": self.ensure_recording_tool_window,
+            "PSK31 Tool": self.ensure_psk31_tool_window, "FT8 Tool": self.ensure_ft8_tool_window,
+            "Recording Tool": self.ensure_recording_tool_window,
             "Memories": self.ensure_memories_window,
         }
         builder = builders.get(tool_name)
@@ -2298,6 +2319,8 @@ class RadioWindow(QWidget):
             self.rtty_window.closing_for_real()
         if self.psk31_window is not None:
             self.psk31_window.closing_for_real()
+        if self.ft8_window is not None:
+            self.ft8_window.closing_for_real()
         if self.aprs_window is not None:
             self.aprs_window.closing_for_real()
         if self.memories_window is not None:

@@ -797,16 +797,24 @@ class RadioWindow(QWidget):
         filter_shape_column.addWidget(self.filter_shape_widget)
         filter_shape_column.addLayout(pbt_row)
 
-        knob_row = QVBoxLayout()
-        knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
-        knob_row.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
-        knob_row.addWidget(self.ptt_button)
-        knob_row.addWidget(self.tune_button)
-        knob_row.addWidget(self.swr_protection_button)
+        # The old single "knob_row" column is now two: the transmit
+        # buttons, and the VFO knob with its tuning-step picker.
+        tx_column = QVBoxLayout()
+        tx_column.addStretch()
+        tx_column.addWidget(self.ptt_button)
+        tx_column.addWidget(self.tune_button)
+        tx_column.addWidget(self.swr_protection_button)
+        tx_column.addStretch()
 
-        # RIT knob column -- left of knob_row (VFO tuning knob/PTT),
+        vfo_column = QVBoxLayout()
+        vfo_column.addStretch()
+        vfo_column.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
+        vfo_column.addWidget(self.step_combo, alignment=Qt.AlignHCenter)
+        vfo_column.addStretch()
+
+        # RIT knob column -- first (leftmost) under the buttons,
         # bottom-anchored via the stretch above it so it sits just above
-        # the level sliders, level with PTT.
+        # the level sliders.
         rit_column = QVBoxLayout()
         rit_column.addStretch()
         rit_column.addWidget(self.rit_xit_mode_button, alignment=Qt.AlignHCenter)
@@ -815,18 +823,20 @@ class RadioWindow(QWidget):
         rit_column.addWidget(self.rit_status_button, alignment=Qt.AlignHCenter)
 
         # Under the full-width mode/AGC/Preamp/Filter dropdowns and their
-        # buttons: the RIT knob, then the VFO knob with PTT/Tune/SWR
-        # protect, then the passband display and its PBT/filter-width
-        # sliders taking whatever width is left (so it is narrower than
-        # when it had the whole left side to itself).
+        # buttons, left to right: the RIT knob and its buttons, the PBT
+        # group (passband display + PBT/filter-width sliders, taking the
+        # width that is left), the PTT/Tune/SWR-protect buttons, and finally
+        # the VFO knob with its tuning-step picker.
         tuning_row = QHBoxLayout()
         tuning_row.addLayout(rit_column)
         tuning_row.addSpacing(16)
-        tuning_row.addLayout(knob_row)
-        tuning_row.addSpacing(16)
         tuning_row.addLayout(filter_shape_column, 1)
-        # Top-align the passband column with the knobs (its widget has a
-        # capped height, so it would otherwise be centered vertically).
+        tuning_row.addSpacing(16)
+        tuning_row.addLayout(tx_column)
+        tuning_row.addSpacing(16)
+        tuning_row.addLayout(vfo_column)
+        # Top-align the passband column (its widget has a capped height,
+        # so it would otherwise be centered vertically).
         tuning_row.setAlignment(filter_shape_column, Qt.AlignTop)
 
         tuning_area = QVBoxLayout()

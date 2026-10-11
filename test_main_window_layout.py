@@ -153,7 +153,7 @@ def test_no_scroll_bars_when_maximized_at_a_decent_resolution(app, radio_window,
         _close(host)
 
 
-def test_knobs_sit_under_the_buttons_and_left_of_the_passband(app, radio_window):
+def test_controls_under_the_buttons_run_rit_then_pbt_then_tx_buttons_then_vfo_knob(app, radio_window):
     radio_window.show()
     radio_window.resize(1100, 1000)
     _settle(app)
@@ -164,11 +164,24 @@ def test_knobs_sit_under_the_buttons_and_left_of_the_passband(app, radio_window)
     mode_row_bottom = max(widget.mapTo(radio_window, widget.rect().bottomLeft()).y()
                           for widget in radio_window.findChildren(main_window.QPushButton)
                           if widget.text() in ("Digital Mode", "NR", "NB", "Split") and widget.parent() is radio_window)
-    rit, vfo, passband = (top_left(radio_window.rit_knob), top_left(radio_window.tuning_knob),
-                          top_left(radio_window.filter_shape_widget))
-    assert rit.x() < vfo.x() < passband.x()                   # RIT knob, VFO knob, then the passband
-    assert vfo.y() >= mode_row_bottom - 4                     # knobs are BELOW the mode/AGC buttons ...
-    assert passband.y() >= mode_row_bottom - 4                # ... and so is the passband
+    rit = top_left(radio_window.rit_knob)
+    pbt = top_left(radio_window.filter_shape_widget)
+    ptt = top_left(radio_window.ptt_button)
+    tune = top_left(radio_window.tune_button)
+    swr = top_left(radio_window.swr_protection_button)
+    vfo = top_left(radio_window.tuning_knob)
+    step = top_left(radio_window.step_combo)
+
+    # left to right: RIT knob | PBT group | PTT/Tune/SWR buttons | VFO knob + tune step
+    assert rit.x() < pbt.x() < ptt.x() < vfo.x()
+    assert abs(ptt.x() - tune.x()) <= 2 and abs(ptt.x() - swr.x()) <= 2        # the three buttons share a column
+    assert ptt.y() < tune.y() < swr.y()                                        # in this order, top to bottom
+    assert abs((vfo.x() + radio_window.tuning_knob.width() // 2)
+               - (step.x() + radio_window.step_combo.width() // 2)) <= 3       # tune step is centred under the knob
+    assert vfo.y() < step.y()
+    # everything is below the mode/AGC buttons, and the passband stays small
+    for point in (rit, pbt, ptt, vfo):
+        assert point.y() >= mode_row_bottom - 4
     assert radio_window.filter_shape_widget.height() <= main_window._MAX_PASSBAND_HEIGHT
 
 

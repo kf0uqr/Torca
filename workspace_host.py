@@ -355,6 +355,7 @@ class WorkspaceHost(QMainWindow):
         self._floating_button.menu().aboutToShow.connect(self._rebuild_floating_menu)
         bar.addWidget(self._floating_button)
         bar.addStretch()
+        self._top_bar = bar  # widgets handed over by the dashboard are added at its right end
 
         self._layout_root = QWidget()
         self._layout_box = QVBoxLayout(self._layout_root)
@@ -590,6 +591,10 @@ class WorkspaceHost(QMainWindow):
             for title, page in take():
                 page.setWindowTitle(title)
                 self.register_window(page, closable=True)
+        take_top_bar = getattr(dashboard, "take_top_bar_widgets", None)
+        if take_top_bar is not None:
+            for widget in take_top_bar():
+                self._top_bar.addWidget(widget)  # after the stretch: right-aligned, same row as "Floating windows"
         populate = getattr(dashboard, "populate_workspace_menu", None)
         if populate is not None:
             self.add_menu_provider(populate)

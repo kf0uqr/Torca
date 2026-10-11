@@ -123,3 +123,39 @@ def test_dashboard_filters_live_in_the_sidebar_and_the_choice_is_remembered(tmp_
     env.pop("PYTHONPATH", None)
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
+
+
+def test_real_dashboard_hands_its_kill_tx_button_to_the_hosts_top_bar(tmp_path):
+    script = textwrap.dedent('''
+        import os, sys
+        sys.path.insert(0, %r)
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+        app = QApplication([])
+        s = QSettings("IcomRadioApp", "RadioControl")
+        s.setValue("operator_callsign", "KF0UQR"); s.setValue("operator_lat", 40.0); s.setValue("operator_lon", -105.0); s.sync()
+        from workspace_host import WorkspaceHost
+        from ham_dashboard import HamClockWindow
+        calls = []
+        HamClockWindow._on_kill_all_remote_tx = lambda self, *a: calls.append("killed")   # before construction: the button connects to it
+        host = WorkspaceHost(); dash = HamClockWindow()
+        host.resize(1500, 800); host.show()
+        host.add_dashboard(dash)
+        for _ in range(10):
+            app.processEvents()
+        kill = dash.kill_remote_tx_button
+        floating = host._floating_button
+        assert kill.window() is host and kill.isVisible(), "button not in the host"
+        assert abs(kill.mapTo(host, kill.rect().center()).y() - floating.mapTo(host, floating.rect().center()).y()) <= 4, "not on the same row"
+        assert kill.mapTo(host, kill.rect().topRight()).x() >= host.width() - 12, "not at the far right"
+        kill.click()                                  # still hooked up to its handler after the move
+        assert calls == ["killed"], calls
+        print("OK")
+        sys.stdout.flush()
+        os._exit(0)
+    ''' % os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "cfg"), XDG_CACHE_HOME=str(tmp_path / "cache"),
+               QT_QPA_PLATFORM="offscreen")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr

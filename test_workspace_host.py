@@ -704,3 +704,42 @@ def test_each_radios_tool_submenu_is_titled_model_tools(app):
         "IC-9700 Tools", "IC-7300 Tools"]
     assert submenu_titles([radio("IC-9700", "192.0.2.1 (LAN)"), radio("IC-9700", "192.0.2.2 (LAN)")]) == [
         "IC-9700 Tools (192.0.2.1 (LAN))", "IC-9700 Tools (192.0.2.2 (LAN))"]               # same model twice: say which
+
+
+# ---- widgets the dashboard hands to the host's top bar (Kill All Remote TX) ----
+
+def test_top_bar_widget_goes_to_the_far_right_of_the_floating_windows_row(host, app):
+    from PySide6.QtWidgets import QPushButton
+
+    class DashboardWithTopBarButton(RealClose):
+        def __init__(self):
+            super().__init__("Ham Dashboard")
+            self.kill = QPushButton("Kill All Remote TX")
+
+        def take_top_bar_widgets(self):
+            return [self.kill]
+
+    host.resize(1400, 700)
+    host.show()
+    dash = DashboardWithTopBarButton()
+    host.add_dashboard(dash)
+    _settle(app)
+    kill, floating = dash.kill, host._floating_button
+    assert kill.isVisible() and kill.window() is host
+    assert abs(kill.mapTo(host, kill.rect().center()).y() - floating.mapTo(host, floating.rect().center()).y()) <= 4   # same row
+    assert kill.mapTo(host, kill.rect().topRight()).x() >= host.width() - 12                                           # far right
+    assert kill.mapTo(host, kill.rect().topLeft()).x() > floating.mapTo(host, floating.rect().topRight()).x()   # to the right of it
+    # reachable from any tab: still visible with another tab selected and in a second workspace
+    other = HideOnClose("Other")
+    host.open_in(other, 0)
+    host.add_workspace(0, "right")
+    host.open_in(other, 1)
+    _settle(app)
+    assert kill.isVisible()
+    assert kill.mapTo(host, kill.rect().topRight()).x() >= host.width() - 12
+
+
+def test_dashboard_without_top_bar_widgets_still_works(host):
+    dash = RealClose("Ham Dashboard")
+    host.add_dashboard(dash)                       # no take_top_bar_widgets: nothing handed over, nothing breaks
+    assert host.pane_of(dash) == 0

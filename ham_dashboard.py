@@ -1693,9 +1693,13 @@ class HamClockWindow(QWidget):
 
         # Per explicit instruction, both WSJT-X buttons moved here
         # (between Radios and Log Book) from their own row.
+        # Kept in the dashboard's own layout only when there is no workspace
+        # host (see take_top_bar_widgets); hosted, it lives in the host's top
+        # bar -- visible from every tab and workspace.
         top_buttons_row = QHBoxLayout()
         top_buttons_row.addWidget(self.kill_remote_tx_button)
         top_buttons_row.addStretch()
+        self._top_buttons_row = top_buttons_row
 
         # Stretches BETWEEN each label (not before the first or after
         # the last) rather than one trailing addStretch() -- per
@@ -2528,6 +2532,17 @@ class HamClockWindow(QWidget):
         # its workspace is selected, or its workspace is hidden).
         self.parks_tab.installEventFilter(self)
         return pages
+
+    def take_top_bar_widgets(self):
+        """Hands the workspace host the widgets that belong in ITS top bar,
+        right-aligned: the red "Kill All Remote TX" button, which is a safety
+        control and so should be reachable from whichever tab or workspace is
+        showing, not only while the dashboard tab is selected. The dashboard's
+        own (now empty) button row is removed. Without a host nothing calls
+        this and the button stays where it was."""
+        self._top_buttons_row.removeWidget(self.kill_remote_tx_button)
+        self.layout().removeItem(self._top_buttons_row)
+        return [self.kill_remote_tx_button]
 
     def populate_workspace_menu(self, menu, ctx):
         """Fills a workspace's "+" menu (see WorkspaceHost.add_menu_

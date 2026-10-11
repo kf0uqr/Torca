@@ -1018,7 +1018,7 @@ class HamClockWindow(QWidget):
         self.satellite_remote_state = SatelliteRemoteState(self)
 
         self._connected_radios = []  # RadioWindow instances, in connection order
-        self._connect_origin = None  # menu context a radio connect was started from (see _remember_connect_origin)
+        self._menu_origin = None  # menu context a radio connect was started from (see _remember_menu_origin)
         self._active_satellite = None  # for populating the transponder combo -- SatelliteSession keeps its own copy for computation
 
         self.map_widget = WorldMapWidget()
@@ -2589,27 +2589,28 @@ class HamClockWindow(QWidget):
         # working; the menu just mirrors their state when it opens.
         menu.addSection("Actions")
         menu.addAction("Connect New Radio...").triggered.connect(
-            lambda _c=False: (self._remember_connect_origin(ctx), self._on_connect_radio_clicked())
+            lambda _c=False: (self._remember_menu_origin(ctx), self._on_connect_radio_clicked())
         )
         # The Radios dialog has its own Connect button, clicked later: remember
         # where it was opened from so that radio lands there too.
-        self._add_action_for_button(menu, self.radios_button, before=lambda: self._remember_connect_origin(ctx))
+        origin = lambda: self._remember_menu_origin(ctx)
+        self._add_action_for_button(menu, self.radios_button, before=origin)
         for button in (self.new_qso_button, self.profile_button):
-            self._add_action_for_button(menu, button)
+            self._add_action_for_button(menu, button, before=origin)
         menu.addSeparator()
         for button in (self.wsjtx_button, self.js8call_button):
-            self._add_action_for_button(menu, button)
+            self._add_action_for_button(menu, button, before=origin)
         autolog = menu.addAction("WSJT-X Auto-Log")
         autolog.setCheckable(True)
         autolog.setChecked(self.wsjtx_autolog_button.isChecked())
         autolog.setToolTip(self.wsjtx_autolog_button.toolTip())
-        autolog.triggered.connect(lambda _c=False: self.wsjtx_autolog_button.toggle())
+        autolog.triggered.connect(lambda _c=False: (origin(), self.wsjtx_autolog_button.toggle()))
         menu.addAction("WSJT-X Auto-Log UDP Port...").triggered.connect(
-            lambda _c=False: self._on_wsjtx_autolog_menu_requested(None)
+            lambda _c=False: (origin(), self._on_wsjtx_autolog_menu_requested(None))
         )
         menu.addSeparator()
         for button in (self.remote_access_button, self.update_button):
-            self._add_action_for_button(menu, button)
+            self._add_action_for_button(menu, button, before=origin)
 
     @staticmethod
     def _add_action_for_button(menu, button, before=None):
@@ -3211,13 +3212,24 @@ class HamClockWindow(QWidget):
     # ---- Connected radios ----
 
     def _on_radios_button_clicked(self):
-        self.radios_dialog.show()
-        self.radios_dialog.raise_()
-        self.radios_dialog.activateWindow()
+        dialog = self.radios_dialog
+        window = self._action_parent().window()
+        # One shared, non-modal dialog. It stays owned by the dashboard -- re-parenting
+        # it to the asking window would have it (and its Connect button and radio list)
+        # destroyed when that window closes -- and is only POSITIONED over that window,
+        # so it appears on that window's monitor.
+        dialog.adjustSize()
+        dialog.move(window.frameGeometry().center() - dialog.rect().center())
+        dialog.show()
+        handle, parent_handle = dialog.windowHandle(), window.windowHandle()
+        if handle is not None and parent_handle is not None:
+            handle.setTransientParent(parent_handle)  # stacks above that window; cleared by Qt if it goes away
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _on_profile_button_clicked(self):
         before = active_profile_name()
-        accepted = OperatorProfileDialog.run(self)
+        accepted = OperatorProfileDialog.run(self._action_parent())
         self._apply_operator_settings()
         after = active_profile_name()
         if accepted and before and after and after != before:
@@ -3230,7 +3242,7 @@ class HamClockWindow(QWidget):
         build from that profile, rather than trying to morph this one. The
         workspace is saved for `before` as the window closes."""
         answer = QMessageBox.question(
-            self, "Switch Profile",
+            self._action_parent(), "Switch Profile",
             f'Switch to the profile "{after}"?\n\n'
             f'TORCA will save this workspace for "{before}", then restart and open "{after}"\'s '
             "last workspace. Connected radios will be disconnected.",
@@ -3268,20 +3280,30 @@ class HamClockWindow(QWidget):
         # Full Duplex radio is connected) -- see
         # connection_dialog.allowed_satellite_roles.
         active_roles = {getattr(window, "_role", "non_sat") for window in self._connected_radios}
-        dialog = ConnectionDialog(self, active_roles=active_roles)
+        dialog = ConnectionDialog(self._action_parent(), active_roles=active_roles)
         if dialog.exec() != QDialog.Accepted:
             return
-        self._open_radio(dialog.details, place=self._connect_origin_placer())
+        self._open_radio(dialog.details, place=self._menu_origin_placer())
 
-    def _remember_connect_origin(self, ctx):
-        """The workspace whose "+" menu the operator started connecting a radio
-        from: the new radio opens THERE (not wherever the general placement rule
-        would put it), also when it is the Radios dialog's own Connect button
-        that finishes the job a moment later."""
-        self._connect_origin = ctx
+    def _remember_menu_origin(self, ctx):
+        """The workspace whose "+" menu the operator last used an Action from.
+        Two things follow from it: a radio being connected opens THERE (not
+        wherever the general placement rule would put it) -- also when it is the
+        Radios dialog's own Connect button that finishes the job a moment later --
+        and dialogs those Actions open appear over THAT window, so on its monitor
+        (see _action_parent)."""
+        self._menu_origin = ctx
 
-    def _connect_origin_placer(self):
-        ctx = self._connect_origin
+    def _action_parent(self):
+        """The window a dialog launched from an Action should appear over: the
+        window whose "+" menu was used, else this dashboard's own window. (The
+        dashboard is just a tab, living in whichever window holds the Map -- so
+        parenting dialogs to it opened them on that window's monitor.)"""
+        ctx = self._menu_origin
+        return ctx.host if ctx is not None and ctx.is_valid() else self
+
+    def _menu_origin_placer(self):
+        ctx = self._menu_origin
         return ctx.open if ctx is not None and ctx.is_valid() else None
 
     def _open_radio(self, details, place=None):
@@ -3412,7 +3434,7 @@ class HamClockWindow(QWidget):
 
         if result.mode == updater.MODE_UNSUPPORTED:
             QMessageBox.information(
-                self, "Check for Updates",
+                self._action_parent(), "Check for Updates",
                 "This installation can't be self-updated: its folder has no git checkout "
                 "and isn't writable by the current user -- likely an install from before "
                 "this feature existed, or one still owned by root.\n\n"
@@ -3422,7 +3444,7 @@ class HamClockWindow(QWidget):
 
         if result.version_unknown:
             proceed = QMessageBox.question(
-                self, "Check for Updates",
+                self._action_parent(), "Check for Updates",
                 "Couldn't determine the currently installed version (no .install_commit "
                 f"marker found). Latest available: {result.latest_commit[:12]}.\n\n"
                 "Update anyway?"
@@ -3431,13 +3453,13 @@ class HamClockWindow(QWidget):
                 return
         elif not result.update_available:
             QMessageBox.information(
-                self, "Check for Updates",
+                self._action_parent(), "Check for Updates",
                 f"You're already running the latest version ({result.current_commit[:12]})."
             )
             return
         else:
             proceed = QMessageBox.question(
-                self, "Check for Updates",
+                self._action_parent(), "Check for Updates",
                 f"Update available: {result.current_commit[:12]} -> {result.latest_commit[:12]}.\n\n"
                 "Update now?"
             )
@@ -3449,12 +3471,12 @@ class HamClockWindow(QWidget):
     def _on_update_check_failed(self, message):
         self.update_button.setEnabled(True)
         self.update_button.setText("Check for Updates...")
-        QMessageBox.warning(self, "Check for Updates", f"Couldn't check for updates:\n{message}")
+        QMessageBox.warning(self._action_parent(), "Check for Updates", f"Couldn't check for updates:\n{message}")
 
     def _start_update(self):
         self.update_button.setEnabled(False)
         self.update_button.setText("Updating...")
-        self._update_progress_dialog = UpdateProgressDialog(self)
+        self._update_progress_dialog = UpdateProgressDialog(self._action_parent())
         self._update_progress_dialog.show()
         worker = UpdatePerformWorker(self)
         worker.status.connect(self._on_update_status)
@@ -3477,7 +3499,7 @@ class HamClockWindow(QWidget):
         self._close_update_progress_dialog()  # before the restart prompt, so the two never stack
         self.update_button.setEnabled(True)
         self.update_button.setText("Check for Updates...")
-        box = QMessageBox(self)
+        box = QMessageBox(self._action_parent())
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("Update Complete")
         box.setText("TORCA has been updated.")
@@ -3502,7 +3524,7 @@ class HamClockWindow(QWidget):
             updater.schedule_relaunch_after_exit()
         except OSError as exc:
             QMessageBox.warning(
-                self, "Restart",
+                self._action_parent(), "Restart",
                 f"Couldn't schedule the restart ({exc}). The update is installed -- "
                 "please restart TORCA yourself."
             )
@@ -3514,7 +3536,7 @@ class HamClockWindow(QWidget):
         self._close_update_progress_dialog()
         self.update_button.setEnabled(True)
         self.update_button.setText("Check for Updates...")
-        QMessageBox.critical(self, "Update Failed", f"Couldn't complete the update:\n{message}")
+        QMessageBox.critical(self._action_parent(), "Update Failed", f"Couldn't complete the update:\n{message}")
 
     def _on_radio_window_closed(self, window):
         """Connected to RadioWindow.closed, emitted from closeEvent
@@ -3791,7 +3813,7 @@ class HamClockWindow(QWidget):
             on_kill_tx=self._on_kill_all_remote_tx,
             on_clear_tx_lock=self._on_clear_all_remote_tx_lock,
             audit=self.remote_audit_log,
-            parent=self,
+            parent=self._action_parent(),
         )
         dialog.exec()
 
@@ -4012,7 +4034,7 @@ class HamClockWindow(QWidget):
 
     def _on_wsjtx_autolog_menu_requested(self, _pos):
         port, ok = QInputDialog.getInt(
-            self, "WSJT-X Auto-Log",
+            self._action_parent(), "WSJT-X Auto-Log",
             "UDP port to listen on (must match WSJT-X's own \"UDP Server "
             "port\" in Settings > Reporting):",
             self._wsjtx_udp_port, 1, 65535,

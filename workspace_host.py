@@ -381,6 +381,11 @@ class _MenuContext:
     def open(self, widget):
         self._host.open_in(widget, self._pane.index)
 
+    @property
+    def host(self):
+        """The window (WorkspaceHost) this menu belongs to."""
+        return self._host
+
     def is_valid(self):
         """True while the window and workspace this menu belongs to still exist
         (a menu's context can be remembered past the window being closed)."""

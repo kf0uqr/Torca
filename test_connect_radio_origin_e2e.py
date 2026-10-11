@@ -24,9 +24,11 @@ SCRIPT = textwrap.dedent('''
     from workspace_host import WorkspaceHost
 
     NEXT = {"n": 0}
+    PARENTS = []                                                          # the window each dialog was parented to
     class FakeConnectionDialog:
         """Stands in for the real dialog: 'user fills it in and presses Connect'."""
-        def __init__(self, parent=None, active_roles=None): pass
+        def __init__(self, parent=None, active_roles=None):
+            PARENTS.append(parent.window() if parent is not None else None)
         def exec(self):
             NEXT["n"] += 1
             self.details = {"radio_model": "IC-9700", "connection_type": "network", "host": f"192.0.2.{NEXT['n']}",
@@ -60,6 +62,7 @@ SCRIPT = textwrap.dedent('''
     # 1. from window 2, workspace 2
     trigger(second, 1, "Connect New Radio...")
     assert where(dash.workspace_radios()[-1]) == (2, 2), where(dash.workspace_radios()[-1])
+    assert PARENTS[-1] is second, "the connection dialog must open over the window it was launched from"
 
     # 2. from window 2, workspace 1 (not the first EMPTY one, and not the active one)
     trigger(second, 0, "Connect New Radio...")
@@ -68,26 +71,53 @@ SCRIPT = textwrap.dedent('''
     # 3. from window 1, workspace 1 (where the map is -- not the empty workspace 2 next to it)
     trigger(host, 0, "Connect New Radio...")
     assert where(dash.workspace_radios()[-1]) == (1, 1), where(dash.workspace_radios()[-1])
+    assert PARENTS[-1] is host                                            # ... and from window 1 it opens over window 1
 
     # 4. via the Radios dialog opened from window 2, workspace 2: its Connect button lands there too
     trigger(second, 1, "Radios")
     dash.connect_radio_button.click(); settle()
     assert where(dash.workspace_radios()[-1]) == (2, 2), where(dash.workspace_radios()[-1])
 
+    assert PARENTS[-1] is second                                         # the dialog opened from the Radios dialog: same window
+
     # 5. a different menu later: the origin follows the most recent one
     trigger(host, 1, "Connect New Radio...")
     assert where(dash.workspace_radios()[-1]) == (1, 2), where(dash.workspace_radios()[-1])
 
-    # 6. the window it was started from is gone: falls back to normal placement, no error
+    # 5b. the other dialogs the Actions open appear over the window whose menu was used
+    from PySide6.QtWidgets import QInputDialog
+    seen = {}
+    ham_dashboard.OperatorProfileDialog.run = staticmethod(lambda parent=None, required=False: seen.__setitem__("profile", parent) or False)
+    QInputDialog.getInt = staticmethod(lambda parent, *a, **k: (seen.__setitem__("autolog", parent), (0, False))[1])
+    for window, label in ((second, "window 2"), (host, "window 1")):
+        trigger(window, 0, "Profile...")
+        assert seen["profile"].window() is window, (label, seen["profile"])
+        trigger(window, 0, "WSJT-X Auto-Log UDP Port...")
+        assert seen["autolog"].window() is window, (label, seen["autolog"])
+    # the shared Radios dialog is moved under, and centred over, the window that asked
+    for window in (second, host, second):
+        trigger(window, 0, "Radios")
+        radios = dash.radios_dialog
+        assert radios.isVisible() and radios.parentWidget() is dash, "the dialog must stay owned by the dashboard"
+        centre = radios.frameGeometry().center()
+        assert window.frameGeometry().contains(centre), (window.frameGeometry(), centre)
+        radios.hide()
+    trigger(second, 1, "Connect New Radio...")                            # leave the origin on window 2 for the next step
+    host.add_workspace(0, "right") if host.workspace_count < 2 else None
+
+    # 6. the window it was started from is gone: falls back to normal placement, no error --
+    #    and the shared Radios dialog (and its Connect button) must survive that window closing
     trigger(second, 0, "Radios")
     second.close(); settle()
+    from shiboken6 import isValid
+    assert isValid(dash.radios_dialog) and isValid(dash.connect_radio_button) and isValid(dash.connected_radios_list)
     count = len(dash.workspace_radios())
     dash.connect_radio_button.click(); settle()
     assert len(dash.workspace_radios()) == count + 1
     assert host.manager.host_of(dash.workspace_radios()[-1]) is host
 
     # 7. nothing remembered at all (e.g. started some other way): the normal rule
-    dash._connect_origin = None
+    dash._menu_origin = None
     dash._on_connect_radio_clicked(); settle()
     assert host.manager.host_of(dash.workspace_radios()[-1]) is host
     print("OK")

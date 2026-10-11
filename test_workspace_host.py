@@ -408,7 +408,7 @@ def _fake_dashboard_for_actions(app):
     fake.wsjtx_autolog_button.setCheckable(True)
     fake.wsjtx_autolog_button.toggled.connect(lambda on: calls.append(f"autolog={on}"))
     fake.origins = []                                                  # menu contexts the dashboard was told to remember
-    fake._remember_connect_origin = lambda ctx: (fake.origins.append(ctx), calls.append("origin"))
+    fake._remember_menu_origin = lambda ctx: (fake.origins.append(ctx), calls.append("origin"))
     fake._on_connect_radio_clicked = lambda: calls.append("connect")
     fake._on_wsjtx_autolog_menu_requested = lambda _pos: calls.append("autolog_port")
     fake._ensure_log_book_window = lambda: None
@@ -435,8 +435,8 @@ def test_dashboard_actions_section_replaces_the_button_row(app):
             a.trigger()
     # connecting from a workspace's menu remembers THAT workspace first (so the radio opens there),
     # for the direct entry and for the Radios dialog's own Connect button
-    assert calls == ["origin", "connect", "origin", "radios", "profile", "autolog_port"]
-    assert fake.origins == [ctx, ctx]
+    assert calls == ["origin", "connect", "origin", "radios", "origin", "profile", "origin", "autolog_port"]
+    assert fake.origins == [ctx] * 4          # EVERY action remembers its menu: that is the window its dialogs open over
 
 
 def test_actions_mirror_button_state_and_toggle_autolog(app):
@@ -457,7 +457,7 @@ def test_actions_mirror_button_state_and_toggle_autolog(app):
     autolog = next(a for a in menu.actions() if a.text() == "WSJT-X Auto-Log")
     assert autolog.isCheckable() and not autolog.isChecked()
     autolog.trigger()
-    assert fake.wsjtx_autolog_button.isChecked() and calls == ["autolog=True"]
+    assert fake.wsjtx_autolog_button.isChecked() and calls == ["origin", "autolog=True"]
     menu2 = QMenu()
     cls.populate_workspace_menu(fake, menu2, ctx)
     assert next(a for a in menu2.actions() if a.text() == "WSJT-X Auto-Log").isChecked()

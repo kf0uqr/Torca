@@ -155,6 +155,7 @@ def _fake_dashboard(monkeypatch, answer):
     events = []
     cls = ham_dashboard.HamClockWindow
     fake = types.SimpleNamespace()
+    fake._action_parent = lambda: fake
     fake._restart_application = lambda: events.append("restart")
     fake._apply_operator_settings = lambda: events.append("reread")
     fake._offer_profile_switch = cls._offer_profile_switch.__get__(fake)
@@ -182,6 +183,7 @@ def _profile_button_harness(monkeypatch, run_result, names):
     events = []
     fake = types.SimpleNamespace(_apply_operator_settings=lambda: events.append("reread"),
                                  _offer_profile_switch=lambda b, a: events.append(f"offer:{b}->{a}"))
+    fake._action_parent = lambda: fake
     queue = list(names)
     monkeypatch.setattr(ham_dashboard, "active_profile_name", lambda: queue.pop(0))
     monkeypatch.setattr(ham_dashboard.OperatorProfileDialog, "run", staticmethod(lambda parent=None, required=False: run_result))

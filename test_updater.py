@@ -94,6 +94,8 @@ def _prompt_harness(monkeypatch, choose_restart, schedule_error=None):
         _update_progress_dialog=None,  # no progress dialog open
     )
     fake._close_update_progress_dialog = cls._close_update_progress_dialog.__get__(fake)
+    fake._action_parent = lambda: fake  # dialogs open over the window an Action was launched from
+    fake._action_parent = lambda: fake      # dialogs open over the window an Action was launched from; here, just this
     fake.window = lambda: fake  # unhosted: the dashboard is its own top-level window
     fake._restart_application = cls._restart_application.__get__(fake)
     return cls._on_update_succeeded.__get__(fake), events, FakeBox
@@ -184,6 +186,7 @@ def test_dashboard_update_flow_opens_progress_dialog_relays_status_and_closes_it
         )
         fake._on_update_status = cls._on_update_status.__get__(fake)
         fake._close_update_progress_dialog = cls._close_update_progress_dialog.__get__(fake)
+        fake._action_parent = lambda: fake
         fake._restart_application = lambda: events.append("restart")
         fake._on_update_succeeded = lambda: (fake._close_update_progress_dialog(), events.append("prompt"))
         fake._on_update_failed = lambda m: (fake._close_update_progress_dialog(), events.append("error"))

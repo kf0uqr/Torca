@@ -46,9 +46,74 @@ from PySide6.QtWidgets import (
 
 MAX_WORKSPACES = 4
 
-# Workspaces sit in a 2x2 grid: slot = (row, column). Workspace 1 is always
-# top-left; others are added to the right of / below an existing one.
-SLOT_ORDER = [(0, 0), (0, 1), (1, 0), (1, 1)]
+# ---------------------------------------------------------------------------
+# Workspace layout = a tree of splits (pure functions, no Qt).
+#
+# A leaf is a workspace index (0-3). A split is (orientation, children):
+# orientation "h" puts children side by side, "v" stacks them. Every child of
+# a split gets an EQUAL share of it, and nested splits of the same orientation
+# are always flattened, so "A | B | C" is three equal columns, never 1/4, 1/4,
+# 1/2. Workspace 1 (index 0) is always present.
+# ---------------------------------------------------------------------------
+
+H, V = "h", "v"
+_ORIENTATION = {"right": H, "below": V}
+
+
+def tree_leaves(tree):
+    """Workspace indices in layout order."""
+    if isinstance(tree, int):
+        return [tree]
+    return [leaf for child in tree[1] for leaf in tree_leaves(child)]
+
+
+def tree_normalize(tree):
+    """Flattens nested same-orientation splits and collapses single-child ones."""
+    if isinstance(tree, int):
+        return tree
+    orientation, children = tree
+    flat = []
+    for child in children:
+        child = tree_normalize(child)
+        if isinstance(child, tuple) and child[0] == orientation:
+            flat.extend(child[1])
+        else:
+            flat.append(child)
+    return flat[0] if len(flat) == 1 else (orientation, tuple(flat))
+
+
+def tree_add(tree, index, direction, scope, new_index):
+    """The layout after adding workspace `new_index` to the 'right' of or
+    'below' either just workspace `index` (scope "this") or the whole
+    layout (scope "all"). The new workspace splits equally with whatever it
+    ends up sharing a split with."""
+    orientation = _ORIENTATION[direction]
+    if scope == "all":
+        return tree_normalize((orientation, (tree, new_index)))
+
+    def grow(node):
+        if isinstance(node, int):
+            return (orientation, (node, new_index)) if node == index else node
+        return (node[0], tuple(grow(child) for child in node[1]))
+
+    return tree_normalize(grow(tree))
+
+
+def tree_remove(tree, index):
+    """The layout after removing workspace `index`, closing the gap."""
+    def drop(node):
+        if isinstance(node, int):
+            return None if node == index else node
+        kept = [child for child in (drop(c) for c in node[1]) if child is not None]
+        return (node[0], tuple(kept)) if kept else None
+
+    return tree_normalize(drop(tree))
+
+
+def tree_for_count(n):
+    """Standard arrangements used by set_workspace_count(): 1 = one, 2 = side
+    by side, 3 = a row of two above one, 4 = two rows of two."""
+    return [0, (H, (0, 1)), (V, ((H, (0, 1)), 2)), (V, ((H, (0, 1)), (H, (2, 3))))][min(max(n, 1), 4) - 1]
 
 PLUS_BUTTON_STYLE = (
     "QToolButton { font-weight: bold; font-size: 16px; padding: 0 8px; }"
@@ -372,7 +437,7 @@ class WorkspaceHost(QMainWindow):
 
         # Start with a single workspace; the operator grows the grid from
         # each workspace's own "Workspace N" menu.
-        self._slots = {0: SLOT_ORDER[0]}  # workspace index -> (row, column)
+        self._tree = 0  # the split tree of workspaces -- see tree_add / tree_remove
         self._build_layout()
 
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
@@ -384,49 +449,55 @@ class WorkspaceHost(QMainWindow):
 
     @property
     def workspace_count(self):
-        return len(self._slots)
+        return len(tree_leaves(self._tree))
 
     def visible_panes(self):
-        return [self.panes[i] for i in sorted(self._slots)]
+        return [self.panes[i] for i in sorted(tree_leaves(self._tree))]
 
-    def can_add_workspace(self, index, direction):
-        """True if workspace `index` can grow a neighbour 'right' or
-        'below' it: the target grid slot must exist and be free. The grid
-        is 2x2, so only the left column can add to the right and only the
-        top row can add below -- which is what makes the result a square."""
-        return self._target_slot(index, direction) is not None
+    def _unused_index(self):
+        used = set(tree_leaves(self._tree))
+        return min(i for i in range(MAX_WORKSPACES) if i not in used)
 
-    def _target_slot(self, index, direction):
-        if index not in self._slots:
-            return None
-        row, col = self._slots[index]
-        if direction == "right" and col == 0:
-            target = (row, 1)
-        elif direction == "below" and row == 0:
-            target = (1, col)
-        else:
-            return None
-        return target if target not in self._slots.values() else None
+    def can_add_workspace(self, index=0, direction="right", scope="this"):
+        return self.workspace_count < MAX_WORKSPACES and index in tree_leaves(self._tree)
 
-    def add_workspace(self, index, direction):
-        """Adds an empty workspace to the right of / below workspace
-        `index` (see can_add_workspace). The new one takes the lowest
-        unused workspace number. Returns its index, or None if not allowed."""
-        target = self._target_slot(index, direction)
-        if target is None:
+    def add_workspace(self, index, direction, scope="this"):
+        """Adds an empty workspace to the 'right' of or 'below' workspace
+        `index` alone (scope "this") or the whole layout (scope "all"); it
+        splits equally with the workspaces it shares a split with. It takes
+        the lowest unused workspace number. Returns its index, or None if
+        there are already four."""
+        if not self.can_add_workspace(index):
             return None
-        new_index = min(i for i in range(MAX_WORKSPACES) if i not in self._slots)
-        self._slots[new_index] = target
+        new_index = self._unused_index()
+        self._tree = tree_add(self._tree, index, direction, scope, new_index)
         self._build_layout()
         return new_index
+
+    def _add_options(self, index):
+        """The distinct ways workspace `index` can grow a neighbour, as
+        [(direction, scope)] -- options that would give the identical layout
+        (e.g. right of "this" and right of "all" when this is the last
+        column) are listed once."""
+        if not self.can_add_workspace(index):
+            return []
+        new_index = self._unused_index()
+        seen, options = set(), []
+        for direction in ("right", "below"):
+            for scope in ("this", "all"):
+                result = tree_add(self._tree, index, direction, scope, new_index)
+                if result not in seen:
+                    seen.add(result)
+                    options.append((direction, scope))
+        return options
 
     def close_workspace(self, index):
         """Removes workspace `index` (never workspace 1). Its tabs are
         MOVED into the remaining workspaces -- the one with the fewest
         tabs each time -- nothing is closed and radios keep running."""
-        if index == 0 or index not in self._slots:
+        if index == 0 or index not in tree_leaves(self._tree):
             return False
-        del self._slots[index]
+        self._tree = tree_remove(self._tree, index)
         remaining = self.visible_panes()
         for entry in [e for e in self._entries.values() if e.pane is self.panes[index]]:
             self._move_to_pane(entry, min(remaining, key=lambda p: (p.count(), p.index)))
@@ -436,31 +507,41 @@ class WorkspaceHost(QMainWindow):
         return True
 
     def set_workspace_count(self, n):
-        """Programmatic arrangement of the first `n` grid slots (top-left,
-        top-right, bottom-left, bottom-right), moving tabs out of any
-        workspace that goes away. The UI itself grows and shrinks the grid
-        one workspace at a time (add_workspace / close_workspace)."""
+        """Programmatic arrangement of `n` workspaces in a standard layout
+        (see tree_for_count), moving tabs out of any workspace that goes
+        away. The UI itself grows and shrinks the layout one workspace at a
+        time (add_workspace / close_workspace)."""
         n = min(max(int(n), 1), MAX_WORKSPACES)
         for index in range(n, MAX_WORKSPACES):
-            if index in self._slots:
-                self._slots.pop(index)
-                remaining = [self.panes[i] for i in sorted(self._slots)] or [self.panes[0]]
+            if index in tree_leaves(self._tree):
+                remaining = [self.panes[i] for i in range(n)]
                 for entry in [e for e in self._entries.values() if e.pane is self.panes[index]]:
                     self._move_to_pane(entry, min(remaining, key=lambda p: (p.count(), p.index)))
-        self._slots = {i: SLOT_ORDER[i] for i in range(n)}
+        self._tree = tree_for_count(n)
         self._build_layout()
-        if self._active_pane.index not in self._slots:
+        if self._active_pane.index not in tree_leaves(self._tree):
             self._set_active_pane(self.panes[0])
 
     def _fill_workspace_menu(self, menu, pane):
         """The menu behind a workspace's "Workspace N" label."""
         index = pane.index
-        if self.can_add_workspace(index, "right"):
-            menu.addAction("Add Workspace Right").triggered.connect(
-                lambda _c=False: self.add_workspace(index, "right"))
-        if self.can_add_workspace(index, "below"):
-            menu.addAction("Add Workspace Below").triggered.connect(
-                lambda _c=False: self.add_workspace(index, "below"))
+        options = self._add_options(index)
+        count = self.workspace_count
+        everyone = "Both" if count == 2 else "All"
+        for direction in ("right", "below"):
+            for_direction = [scope for d, scope in options if d == direction]
+            for scope in for_direction:
+                if len(for_direction) == 1:
+                    text = f"Add Workspace {direction.capitalize()}"
+                elif scope == "this":
+                    text = f"Add Workspace {direction.capitalize()} of This" if direction == "right" else "Add Workspace Below This"
+                else:
+                    text = f"Add Workspace {direction.capitalize()} of {everyone}" if direction == "right" else f"Add Workspace Below {everyone}"
+                action = menu.addAction(text)
+                action.setToolTip(
+                    "Shares space equally with the workspaces it sits among."
+                    if scope == "all" or count > 1 else "Splits this workspace in two.")
+                action.triggered.connect(lambda _c=False, d=direction, sc=scope: self.add_workspace(index, d, sc))
         if index != 0:
             if not menu.isEmpty():
                 menu.addSeparator()
@@ -468,18 +549,12 @@ class WorkspaceHost(QMainWindow):
             action.setToolTip("Its tabs move to the other workspaces; nothing is closed.")
             action.triggered.connect(lambda _c=False: self.close_workspace(index))
         elif menu.isEmpty():
-            full = len(self._slots) >= MAX_WORKSPACES
-            action = menu.addAction(
-                f"All {MAX_WORKSPACES} workspaces are in use" if full
-                else "Add more from the other workspaces' menus"
-            )
+            action = menu.addAction(f"All {MAX_WORKSPACES} workspaces are in use")
             action.setEnabled(False)
 
     def _build_layout(self):
-        """Arranges the visible workspaces in rows by their grid slots: a
-        row with two workspaces is split left/right, and when both rows
-        exist they are stacked top/bottom. A row holding a single
-        workspace gives it the full width."""
+        """Builds the splitter tree for the current layout; every child of a
+        split gets an equal share."""
         for pane in self.panes:
             pane.setParent(self._holder)  # detach from any old splitter before it is discarded
             pane.hide()
@@ -495,18 +570,43 @@ class WorkspaceHost(QMainWindow):
             old_body.setParent(None)
             old_body.deleteLater()
 
-        rows = []
-        for row in (0, 1):
-            in_row = sorted((slot[1], index) for index, slot in self._slots.items() if slot[0] == row)
-            panes = [self.panes[index] for _col, index in in_row]
-            if panes:
-                rows.append(panes[0] if len(panes) == 1 else self._splitter(Qt.Horizontal, *panes))
-        body = rows[0] if len(rows) == 1 else self._splitter(Qt.Vertical, *rows)
+        def build(node):
+            if isinstance(node, int):
+                return self.panes[node]
+            orientation, children = node
+            return self._splitter(Qt.Horizontal if orientation == H else Qt.Vertical, *[build(c) for c in children])
+
+        body = build(self._tree)
         self._body = body
         self._layout_box.addWidget(body)
         for pane in self.visible_panes():
             pane.show()
         body.show()
+        # Equal shares, as real pixel sizes: now (the container already has its
+        # size) and once more after the layout pass for a window not yet shown.
+        self._equalize_splitters()
+        QTimer.singleShot(0, self._equalize_splitters)
+
+    def _equalize_splitters(self):
+        """Gives every child of every split an equal share of it. Sizes are
+        computed top-down from the layout container's real size (a nested
+        splitter has no geometry yet right after it is built), and applied as
+        pixels -- QSplitter.setSizes([1, 1]) is NOT treated as a ratio once
+        the window is showing."""
+        if self._body is None or not isinstance(self._body, QSplitter):
+            return
+        root = self._layout_root
+        self._equalize(self._body, root.width(), root.height())
+
+    def _equalize(self, splitter, width, height):
+        children = [splitter.widget(i) for i in range(splitter.count())]
+        horizontal = splitter.orientation() == Qt.Horizontal
+        total = (width if horizontal else height) - splitter.handleWidth() * (len(children) - 1)
+        share = max(total // len(children), 1)
+        splitter.setSizes([share] * len(children))
+        for child in children:
+            if isinstance(child, QSplitter):
+                self._equalize(child, share if horizontal else width, height if horizontal else share)
 
     @staticmethod
     def _splitter(orientation, *children):
@@ -514,7 +614,6 @@ class WorkspaceHost(QMainWindow):
         splitter.setChildrenCollapsible(False)
         for child in children:
             splitter.addWidget(child)
-        splitter.setSizes([1] * len(children))
         return splitter
 
     # ------------------------------------------------------------------

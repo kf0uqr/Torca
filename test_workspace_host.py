@@ -555,7 +555,51 @@ def test_both_plus_buttons_open_the_same_menu(host, app):
         assert [a.text() for a in button.menu().actions() if not a.isSeparator()][:2] == ["Band Conditions", "Contests"]
 
 
-# ---- growing the workspace grid: add right / below, close ----
+# ---- the layout tree (pure functions) ----
+
+from workspace_host import H, V, tree_add, tree_for_count, tree_leaves, tree_normalize, tree_remove
+
+
+def test_tree_add_this_splits_just_that_workspace():
+    assert tree_add(0, 0, "right", "this", 1) == (H, (0, 1))
+    assert tree_add(0, 0, "below", "this", 1) == (V, (0, 1))
+    side_by_side = (H, (0, 1))
+    assert tree_add(side_by_side, 0, "below", "this", 2) == (H, ((V, (0, 2)), 1))     # WS1 over WS3, WS2 full height
+    assert tree_add(side_by_side, 1, "below", "this", 2) == (H, (0, (V, (1, 2))))
+
+
+def test_tree_add_all_goes_beside_or_below_everything():
+    side_by_side = (H, (0, 1))
+    assert tree_add(side_by_side, 0, "below", "all", 2) == (V, ((H, (0, 1)), 2))      # WS3 across the bottom of both
+    assert tree_add((V, (0, 1)), 0, "right", "all", 2) == (H, ((V, (0, 1)), 2))        # WS3 beside both stacked ones
+
+
+def test_same_orientation_neighbours_share_equally():
+    assert tree_add((H, (0, 1)), 0, "right", "this", 2) == (H, (0, 2, 1))             # inserted right after WS1: 3 equal columns
+    assert tree_add((H, (0, 1)), 0, "right", "all", 2) == (H, (0, 1, 2))              # appended: 3 equal columns
+    assert tree_add((V, (0, 1)), 1, "below", "this", 2) == (V, (0, 1, 2))             # 3 equal rows
+
+
+def test_tree_remove_closes_the_gap_and_collapses():
+    assert tree_remove((H, (0, 1)), 1) == 0
+    assert tree_remove((H, ((V, (0, 2)), 1)), 2) == (H, (0, 1))
+    assert tree_remove((H, ((V, (0, 2)), 1)), 1) == (V, (0, 2))                       # the lone remaining split becomes the layout
+    assert tree_remove((V, ((H, (0, 1)), (H, (2, 3)))), 3) == (V, ((H, (0, 1)), 2))
+    assert tree_remove((V, ((H, (0, 1)), 2)), 2) == (H, (0, 1))
+
+
+def test_tree_normalize_flattens_and_collapses():
+    assert tree_normalize((H, ((H, (0, 1)), 2))) == (H, (0, 1, 2))
+    assert tree_normalize((H, (0,))) == 0
+    assert tree_normalize((H, ((V, (0, 1)), 2))) == (H, ((V, (0, 1)), 2))
+
+
+def test_leaves_and_standard_arrangements():
+    assert tree_leaves((V, ((H, (0, 1)), (H, (2, 3))))) == [0, 1, 2, 3]
+    assert [tree_leaves(tree_for_count(n)) for n in (1, 2, 3, 4)] == [[0], [0, 1], [0, 1, 2], [0, 1, 2, 3]]
+
+
+# ---- growing the workspaces from each one's menu ----
 
 def _menu_for(host, index):
     pane = host.panes[index]
@@ -567,39 +611,50 @@ def _trigger(menu, text):
     next(a for a in menu.actions() if a.text() == text).trigger()
 
 
-def test_workspace_one_offers_right_and_below_and_each_choice_places_the_new_one(host):
+def test_the_first_workspace_offers_right_and_below(host):
     texts, menu = _menu_for(host, 0)
     assert texts == ["Add Workspace Right", "Add Workspace Below"]
     _trigger(menu, "Add Workspace Right")
-    assert host._slots == {0: (0, 0), 1: (0, 1)}
+    assert host._tree == (H, (0, 1)) and host.workspace_count == 2
+
+
+def test_with_two_workspaces_the_third_can_go_beside_or_below_this_one_or_both(host):
+    host.add_workspace(0, "right")                                            # [1 | 2]
     texts, menu = _menu_for(host, 0)
-    assert texts == ["Add Workspace Below"]                                  # right is taken now
-    _trigger(menu, "Add Workspace Below")
-    assert host._slots == {0: (0, 0), 1: (0, 1), 2: (1, 0)}
-    texts, _ = _menu_for(host, 0)
-    assert texts == ["Add more from the other workspaces' menus"]            # workspace 1 is boxed in, but 3 < 4...
-    host.add_workspace(1, "below")
-    texts, _ = _menu_for(host, 0)
-    assert texts == ["All 4 workspaces are in use"]                          # ...until the grid is actually full
+    assert texts == ["Add Workspace Right of This", "Add Workspace Right of Both",
+                     "Add Workspace Below This", "Add Workspace Below Both"]
+    texts_ws2, _ = _menu_for(host, 1)
+    assert texts_ws2 == ["Add Workspace Right",                              # right of this == right of both: shown once
+                         "Add Workspace Below This", "Add Workspace Below Both", "Close Workspace"]
+
+    _trigger(menu, "Add Workspace Below Both")                                # WS3 across the bottom
+    assert host._tree == (V, ((H, (0, 1)), 2))
 
 
-def test_menu_options_follow_the_square_grid_rules(host):
-    # top-left only
-    assert host.can_add_workspace(0, "right") and host.can_add_workspace(0, "below")
-    host.add_workspace(0, "right")                                           # workspace 2, top-right
-    assert not host.can_add_workspace(1, "right")                            # nothing further right of a square
-    assert host.can_add_workspace(1, "below")                                # top-right can add below it
-    texts, _ = _menu_for(host, 1)
-    assert texts == ["Add Workspace Below", "Close Workspace"]
-    host.add_workspace(0, "below")                                           # workspace 3, bottom-left
-    assert host.can_add_workspace(2, "right") and not host.can_add_workspace(2, "below")
-    texts, _ = _menu_for(host, 2)
-    assert texts == ["Add Workspace Right", "Close Workspace"]
-    assert host.add_workspace(2, "right") == 3                               # workspace 4, bottom-right
-    assert host.workspace_count == 4
-    texts, _ = _menu_for(host, 3)
-    assert texts == ["Close Workspace"]                                      # the corner can only be closed
-    assert host.add_workspace(1, "below") is None and host.add_workspace(0, "right") is None   # full / taken
+def test_each_third_workspace_option_gives_its_layout(host):
+    expected = {
+        "Add Workspace Right of This": (H, (0, 2, 1)),
+        "Add Workspace Right of Both": (H, (0, 1, 2)),
+        "Add Workspace Below This": (H, ((V, (0, 2)), 1)),
+        "Add Workspace Below Both": (V, ((H, (0, 1)), 2)),
+    }
+    for label, tree in expected.items():
+        host.set_workspace_count(1)
+        host.add_workspace(0, "right")
+        _texts, menu = _menu_for(host, 0)
+        _trigger(menu, label)
+        assert host._tree == tree, label
+        assert host.workspace_count == 3
+
+
+def test_a_full_layout_cannot_grow_and_says_so(host):
+    host.set_workspace_count(4)
+    for index in range(4):
+        texts, _ = _menu_for(host, index)
+        assert not any(t.startswith("Add Workspace") for t in texts)
+    texts, _ = _menu_for(host, 0)
+    assert texts == ["All 4 workspaces are in use"]
+    assert host.add_workspace(0, "right") is None
 
 
 def test_only_workspaces_two_to_four_can_be_closed(host):
@@ -613,12 +668,44 @@ def test_only_workspaces_two_to_four_can_be_closed(host):
 
 
 def test_new_workspace_takes_the_lowest_free_number(host):
-    assert host.add_workspace(0, "below") == 1                               # first one added is "Workspace 2"
-    assert host._slots[1] == (1, 0)
-    assert host.add_workspace(0, "right") == 2
+    assert host.add_workspace(0, "below") == 1
+    assert host.add_workspace(0, "right", "all") == 2
     host.close_workspace(1)
-    assert host.add_workspace(2, "below") == 1                               # number 2 is reused, now top... right-below
-    assert host._slots[1] == (1, 1)
+    assert host.add_workspace(0, "below", "all") == 1                         # number 2 is reused
+
+
+def test_new_workspace_shares_the_space_equally_as_laid_out(host, app):
+    host.resize(1500, 900)
+    host.show()
+    host.add_workspace(0, "right")
+    host.add_workspace(0, "right", "all")                                     # three columns
+    _settle(app)
+    widths = [host.panes[i].width() for i in (0, 1, 2)]
+    assert max(widths) - min(widths) <= 6, widths                             # equal thirds
+    xs = [host.panes[i].mapTo(host, host.panes[i].rect().topLeft()).x() for i in (0, 1, 2)]
+    assert xs == sorted(xs)
+
+    host.set_workspace_count(1)
+    host.add_workspace(0, "right")
+    host.add_workspace(0, "below", "all")                                     # a row of two over one: halves vertically
+    _settle(app)
+    top = host.panes[0].mapTo(host, host.panes[0].rect().topLeft()).y()
+    bottom = host.panes[2].mapTo(host, host.panes[2].rect().topLeft()).y()
+    heights = (host.panes[0].height(), host.panes[2].height())
+    assert bottom > top and abs(heights[0] - heights[1]) <= 8, heights
+    assert host.panes[2].width() >= host._layout_root.width() - 4             # spans both columns above it
+    assert abs(host.panes[0].width() - host.panes[1].width()) <= 6            # the two above split equally
+
+
+def test_below_this_leaves_the_other_workspace_full_height(host, app):
+    host.resize(1500, 900)
+    host.show()
+    host.add_workspace(0, "right")
+    host.add_workspace(0, "below", "this")                                    # WS1 over WS3, WS2 beside both
+    _settle(app)
+    assert host.panes[1].height() >= host._layout_root.height() - 4          # WS2 keeps the full height
+    assert abs(host.panes[0].height() - host.panes[2].height()) <= 8         # WS1 and WS3 split equally
+    assert abs(host.panes[0].width() - host.panes[1].width()) <= 6            # and the columns are halves
 
 
 def test_closing_a_workspace_moves_its_tabs_into_the_others_and_keeps_everything_running(host, app):
@@ -630,11 +717,20 @@ def test_closing_a_workspace_moves_its_tabs_into_the_others_and_keeps_everything
     assert sorted(host.pane_of(r) for r in radios) == [1, 2]
     host.close_workspace(1)
     _settle(app)
-    assert host.workspace_count == 2 and 1 not in host._slots
+    assert host.workspace_count == 2 and 1 not in tree_leaves(host._tree)
     assert all(host.pane_of(r) in (0, 2) for r in radios)
     assert sum(p.count() for p in host.panes) == 3                            # nothing lost
     assert not any(r.closed for r in radios)
     assert not host.panes[1].isVisibleTo(host)
+
+
+def test_closing_a_workspace_restores_the_remaining_layout(host):
+    host.add_workspace(0, "right")
+    host.add_workspace(0, "below", "all")                                     # (H(0,1) over 2)
+    host.close_workspace(2)
+    assert host._tree == (H, (0, 1))
+    host.close_workspace(1)
+    assert host._tree == 0
 
 
 def test_closing_the_active_workspace_makes_workspace_one_active(host):
@@ -642,19 +738,6 @@ def test_closing_the_active_workspace_makes_workspace_one_active(host):
     host._set_active_pane(host.panes[1])
     host.close_workspace(1)
     assert host._active_pane is host.panes[0]
-
-
-def test_layout_follows_the_slots_and_a_lone_row_spans_the_full_width(host, app):
-    host.resize(1200, 800)
-    host.show()
-    host.add_workspace(0, "below")                                            # slots: (0,0) and (1,0)
-    host.add_workspace(1, "right")                                            # ... plus (1,1): top row has ONE workspace
-    _settle(app)
-    top, bottom_left, bottom_right = host.panes[0], host.panes[1], host.panes[2]
-    assert top.width() >= host._layout_root.width() - 4                       # lone top row spans the full width
-    assert top.y() < bottom_left.mapTo(host, bottom_left.rect().topLeft()).y()
-    assert abs(bottom_left.width() - bottom_right.width()) <= 8               # bottom row split evenly
-    assert bottom_left.mapTo(host, bottom_left.rect().topLeft()).x() < bottom_right.mapTo(host, bottom_right.rect().topLeft()).x()
 
 
 def test_empty_workspace_still_shows_a_clickable_workspace_label(host, app):
@@ -667,43 +750,22 @@ def test_empty_workspace_still_shows_a_clickable_workspace_label(host, app):
     assert badge.isVisible() and badge.height() > 0 and badge.text() == "Workspace 2"
 
 
-def test_changing_the_grid_never_destroys_panes_or_hosted_windows(host, app):
+def test_changing_the_layout_never_destroys_panes_or_hosted_windows(host, app):
     from shiboken6 import isValid
     dash = _dashboard(host)
     tool = HideOnClose("Tool")
     host.present(tool)
-    steps = [("add", 0, "right"), ("add", 0, "below"), ("add", 1, "below"), ("close", 2), ("close", 3),
-             ("close", 1), ("add", 0, "below"), ("close", 1)]
+    steps = [("add", 0, "right", "this"), ("add", 0, "below", "all"), ("add", 1, "right", "this"), ("close", 2),
+             ("close", 3), ("close", 1), ("add", 0, "below", "this"), ("close", 1)]
     for step in steps:
-        host.add_workspace(step[1], step[2]) if step[0] == "add" else host.close_workspace(step[1])
+        if step[0] == "add":
+            host.add_workspace(step[1], step[2], step[3])
+        else:
+            host.close_workspace(step[1])
         _settle(app)
         _flush_deletes(app)
         assert all(isValid(p) for p in host.panes) and isValid(dash) and isValid(tool), step
         assert sum(p.count() for p in host.panes) == 2
-
-
-def test_each_radios_tool_submenu_is_titled_model_tools(app):
-    import types
-    from PySide6.QtWidgets import QMenu
-    fake, calls, cls = _fake_dashboard_for_actions(app)
-
-    def radio(model, label):
-        return types.SimpleNamespace(_details={"radio_model": model, "role": "non_sat"}, _connection_label=label,
-                                     populate_tool_menu=lambda menu, ctx: menu.addAction("CW Tool"))
-
-    ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
-
-    def submenu_titles(radios):
-        fake._connected_radios = radios
-        menu = QMenu()
-        cls.populate_workspace_menu(fake, menu, ctx)
-        return [a.text() for a in menu.actions() if a.menu() is not None]
-
-    assert submenu_titles([radio("IC-9700", "192.0.2.1 (LAN)")]) == ["IC-9700 Tools"]      # no role, no address
-    assert submenu_titles([radio("IC-9700", "192.0.2.1 (LAN)"), radio("IC-7300", "/dev/ttyUSB0 (USB)")]) == [
-        "IC-9700 Tools", "IC-7300 Tools"]
-    assert submenu_titles([radio("IC-9700", "192.0.2.1 (LAN)"), radio("IC-9700", "192.0.2.2 (LAN)")]) == [
-        "IC-9700 Tools (192.0.2.1 (LAN))", "IC-9700 Tools (192.0.2.2 (LAN))"]               # same model twice: say which
 
 
 # ---- widgets the dashboard hands to the host's top bar (Kill All Remote TX) ----

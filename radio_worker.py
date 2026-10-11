@@ -2,7 +2,7 @@
 RadioWorker: a dedicated QThread that owns its own asyncio event loop and
 does all actual rigplane radio I/O -- connecting, polling frequency/
 meters/levels/controls, and handling commands from the GUI thread via
-asyncio.run_coroutine_threadsafe(). Never touches a Qt widget directly;
+_run_threadsafe(). Never touches a Qt widget directly;
 only ever talks to the GUI thread by emitting signals.
 """
 
@@ -245,6 +245,26 @@ async def _try_recall_band_stack(radio, band_code, register=BAND_STACKING_REGIST
     except Exception as exc:
         return None, f"set_frequency({freq_hz}) failed: {exc}"
     return freq_hz, None
+
+
+def _run_threadsafe(coro, loop):
+    """asyncio.run_coroutine_threadsafe, except a no-op (returns None)
+    when the worker's loop is missing or already closed. The GUI keeps
+    calling into a RadioWorker after its thread has finished -- e.g. the
+    satellite session's stop() reaching every radio window while the
+    app shuts down, or a radio whose connection already ended -- and
+    run() leaves self.loop pointing at the CLOSED loop, so the bare call
+    raised "RuntimeError: Event loop is closed" from inside a Qt slot.
+    The never-started coroutine is closed so Python doesn't warn that
+    it was never awaited."""
+    if loop is None or loop.is_closed():
+        coro.close()
+        return None
+    try:
+        return asyncio.run_coroutine_threadsafe(coro, loop)
+    except RuntimeError:  # closed between the check above and the call
+        coro.close()
+        return None
 
 
 def _bcd_decode_2byte(data: bytes) -> int:
@@ -801,7 +821,7 @@ class RadioWorker(QThread):
         preference for whenever it is."""
         if self.loop is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_rx_downmix_channel(channel), self.loop)
+        _run_threadsafe(self._set_rx_downmix_channel(channel), self.loop)
 
     async def _set_rx_downmix_channel(self, channel: str):
         self._rx_downmix_channel = channel
@@ -829,7 +849,7 @@ class RadioWorker(QThread):
         """
         if self.loop is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_virtual_cable_bridge(rx, tx), self.loop)
+        _run_threadsafe(self._set_virtual_cable_bridge(rx, tx), self.loop)
 
     async def _set_virtual_cable_bridge(self, rx: bool, tx: bool):
         # If CW decode is active, detach it BEFORE the bridge instance
@@ -896,7 +916,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             self.error.emit("PTT: not connected yet -- start_ptt() ignored.")
             return
-        asyncio.run_coroutine_threadsafe(self._start_ptt(), self.loop)
+        _run_threadsafe(self._start_ptt(), self.loop)
 
     async def _start_ptt(self):
         # set_ptt() confirmed as a real, separate method via a dir(radio)
@@ -928,7 +948,7 @@ class RadioWorker(QThread):
         """Thread-safe: call from the GUI thread on PTT button release."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_ptt(), self.loop)
+        _run_threadsafe(self._stop_ptt(), self.loop)
 
     async def _stop_ptt(self):
         # Set regardless of what set_ptt(False) below does -- the user
@@ -963,7 +983,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             self.error.emit("Tuner: not connected yet -- start_tuner() ignored.")
             return
-        asyncio.run_coroutine_threadsafe(self._start_tuner(), self.loop)
+        _run_threadsafe(self._start_tuner(), self.loop)
 
     async def _start_tuner(self):
         try:
@@ -1033,7 +1053,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             self.error.emit("Send TX audio: not connected yet.")
             return
-        self._tx_audio_future = asyncio.run_coroutine_threadsafe(self._send_tx_audio_pcm(pcm_bytes), self.loop)
+        self._tx_audio_future = _run_threadsafe(self._send_tx_audio_pcm(pcm_bytes), self.loop)
 
     def stop_tx_audio_send(self):
         """Thread-safe: call from the GUI thread. Aborts an in-progress
@@ -1120,7 +1140,7 @@ class RadioWorker(QThread):
         PTT button is already doing."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._start_tx_audio_stream(), self.loop)
+        _run_threadsafe(self._start_tx_audio_stream(), self.loop)
 
     async def _start_tx_audio_stream(self):
         self._tx_stream_push = self._tx_push_target()
@@ -1146,7 +1166,7 @@ class RadioWorker(QThread):
         support)."""
         if self.loop is None or self.radio is None or self._tx_stream_push is None:
             return
-        asyncio.run_coroutine_threadsafe(self._push_tx_audio_stream_pcm(pcm_bytes), self.loop)
+        _run_threadsafe(self._push_tx_audio_stream_pcm(pcm_bytes), self.loop)
 
     async def _push_tx_audio_stream_pcm(self, pcm_bytes: bytes):
         push = self._tx_stream_push
@@ -1170,7 +1190,7 @@ class RadioWorker(QThread):
         started one)."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_tx_audio_stream(), self.loop)
+        _run_threadsafe(self._stop_tx_audio_stream(), self.loop)
 
     async def _stop_tx_audio_stream(self):
         if not isinstance(self.audio_bridge, PassthroughAudioBridge):
@@ -1193,7 +1213,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             self.error.emit("Send CW: not connected yet -- send_cw_text() ignored.")
             return
-        asyncio.run_coroutine_threadsafe(self._send_cw_text(text), self.loop)
+        _run_threadsafe(self._send_cw_text(text), self.loop)
 
     async def _send_cw_text(self, text: str):
         try:
@@ -1206,7 +1226,7 @@ class RadioWorker(QThread):
         progress CW send (rigplane's stop_cw_text())."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_cw_text(), self.loop)
+        _run_threadsafe(self._stop_cw_text(), self.loop)
 
     async def _stop_cw_text(self):
         try:
@@ -1232,7 +1252,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             raise RuntimeError("start_cw_decode: not connected yet.")
         self._cw_decode_callback = callback
-        asyncio.run_coroutine_threadsafe(self._start_cw_decode(), self.loop)
+        _run_threadsafe(self._start_cw_decode(), self.loop)
 
     async def _start_cw_decode(self):
         await self._attach_cw_decode()
@@ -1285,7 +1305,7 @@ class RadioWorker(QThread):
         """Thread-safe: call from the GUI thread."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_cw_decode(), self.loop)
+        _run_threadsafe(self._stop_cw_decode(), self.loop)
 
     async def _stop_cw_decode(self):
         self._cw_decode_callback = None
@@ -1318,7 +1338,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             raise RuntimeError("start_sstv_decode: not connected yet.")
         self._sstv_decode_callback = callback
-        asyncio.run_coroutine_threadsafe(self._start_sstv_decode(), self.loop)
+        _run_threadsafe(self._start_sstv_decode(), self.loop)
 
     async def _start_sstv_decode(self):
         await self._attach_sstv_decode()
@@ -1361,7 +1381,7 @@ class RadioWorker(QThread):
         """Thread-safe: call from the GUI thread."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_sstv_decode(), self.loop)
+        _run_threadsafe(self._stop_sstv_decode(), self.loop)
 
     async def _stop_sstv_decode(self):
         self._sstv_decode_callback = None
@@ -1392,7 +1412,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             raise RuntimeError("start_rtty_decode: not connected yet.")
         self._rtty_decode_callback = callback
-        asyncio.run_coroutine_threadsafe(self._start_rtty_decode(), self.loop)
+        _run_threadsafe(self._start_rtty_decode(), self.loop)
 
     async def _start_rtty_decode(self):
         await self._attach_rtty_decode()
@@ -1431,7 +1451,7 @@ class RadioWorker(QThread):
         """Thread-safe: call from the GUI thread."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_rtty_decode(), self.loop)
+        _run_threadsafe(self._stop_rtty_decode(), self.loop)
 
     async def _stop_rtty_decode(self):
         self._rtty_decode_callback = None
@@ -1460,7 +1480,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             raise RuntimeError("start_aprs_decode: not connected yet.")
         self._aprs_decode_callback = callback
-        asyncio.run_coroutine_threadsafe(self._start_aprs_decode(), self.loop)
+        _run_threadsafe(self._start_aprs_decode(), self.loop)
 
     async def _start_aprs_decode(self):
         await self._attach_aprs_decode()
@@ -1500,7 +1520,7 @@ class RadioWorker(QThread):
         """Thread-safe: call from the GUI thread."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_aprs_decode(), self.loop)
+        _run_threadsafe(self._stop_aprs_decode(), self.loop)
 
     async def _stop_aprs_decode(self):
         self._aprs_decode_callback = None
@@ -1531,7 +1551,7 @@ class RadioWorker(QThread):
         if self.loop is None or self.radio is None:
             raise RuntimeError("start_psk31_decode: not connected yet.")
         self._psk31_decode_callback = callback
-        asyncio.run_coroutine_threadsafe(self._start_psk31_decode(), self.loop)
+        _run_threadsafe(self._start_psk31_decode(), self.loop)
 
     async def _start_psk31_decode(self):
         await self._attach_psk31_decode()
@@ -1571,7 +1591,7 @@ class RadioWorker(QThread):
         """Thread-safe: call from the GUI thread."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_psk31_decode(), self.loop)
+        _run_threadsafe(self._stop_psk31_decode(), self.loop)
 
     async def _stop_psk31_decode(self):
         self._psk31_decode_callback = None
@@ -1850,7 +1870,7 @@ class RadioWorker(QThread):
         command is delayed/coalesced."""
         if self.loop is None or key not in self._level_methods:
             return
-        asyncio.run_coroutine_threadsafe(self._debounce_level_value(key, value), self.loop)
+        _run_threadsafe(self._debounce_level_value(key, value), self.loop)
 
     async def _debounce_level_value(self, key: str, value: float):
         # Runs on self.loop, same as every task it touches here, so
@@ -1885,7 +1905,7 @@ class RadioWorker(QThread):
         cancel each other's pending task."""
         if self.loop is None or key not in self._pbt_methods:
             return
-        asyncio.run_coroutine_threadsafe(self._debounce_pbt_value(key, value), self.loop)
+        _run_threadsafe(self._debounce_pbt_value(key, value), self.loop)
 
     async def _debounce_pbt_value(self, key: str, value: int):
         existing = self._pbt_debounce_tasks.get(key)
@@ -1919,7 +1939,7 @@ class RadioWorker(QThread):
         failure. Debounced the same way as set_pbt_value/set_level_value."""
         if self.loop is None or not self.is_filter_width_capable:
             return
-        asyncio.run_coroutine_threadsafe(self._debounce_filter_width_value(width_hz), self.loop)
+        _run_threadsafe(self._debounce_filter_width_value(width_hz), self.loop)
 
     async def _debounce_filter_width_value(self, width_hz: int):
         existing = self._filter_width_debounce_task
@@ -1951,7 +1971,7 @@ class RadioWorker(QThread):
         (_on_control_combo_changed), not a dragged control."""
         if self.loop is None or not self._filter_shape_available:
             return
-        asyncio.run_coroutine_threadsafe(self._set_filter_shape_value(value), self.loop)
+        _run_threadsafe(self._set_filter_shape_value(value), self.loop)
 
     async def _set_filter_shape_value(self, value: int):
         try:
@@ -1978,7 +1998,7 @@ class RadioWorker(QThread):
         immediate-dispatch treatment as the Filter Shape combo."""
         if self.loop is None or not self.is_ic705_preamp_att:
             return
-        asyncio.run_coroutine_threadsafe(self._set_preamp_att_value(preamp_level, atten_db), self.loop)
+        _run_threadsafe(self._set_preamp_att_value(preamp_level, atten_db), self.loop)
 
     async def _set_preamp_att_value(self, preamp_level: int, atten_db):
         try:
@@ -2519,7 +2539,7 @@ class RadioWorker(QThread):
                 "(no working getter+setter was found on connect)."
             )
             return
-        asyncio.run_coroutine_threadsafe(self._set_control_value(key, value), self.loop)
+        _run_threadsafe(self._set_control_value(key, value), self.loop)
 
     async def _set_control_value(self, key: str, value):
         _get_name, set_name = self._control_methods[key]
@@ -2577,7 +2597,7 @@ class RadioWorker(QThread):
                 "(no working getter+setter was found on connect)."
             )
             return
-        asyncio.run_coroutine_threadsafe(
+        _run_threadsafe(
             self._set_receiver_control_value(receiver, key, value, restore, vfo_slot), self.loop
         )
 
@@ -3128,7 +3148,7 @@ class RadioWorker(QThread):
     def set_frequency(self, freq_hz: int, check_conflict: bool = True):
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_frequency(freq_hz, check_conflict), self.loop)
+        _run_threadsafe(self._set_frequency(freq_hz, check_conflict), self.loop)
 
     async def _set_frequency(self, freq_hz: int, check_conflict: bool = True):
         # This method has no receiver parameter at all -- both of its
@@ -3205,7 +3225,7 @@ class RadioWorker(QThread):
         instead of a stale value from whichever it stopped matching."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._select_receiver(receiver), self.loop)
+        _run_threadsafe(self._select_receiver(receiver), self.loop)
 
     async def _select_receiver(self, receiver: int):
         try:
@@ -3227,7 +3247,7 @@ class RadioWorker(QThread):
         Sub's downlink (to see your own signal) while Main handles TX."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_scope_receiver(receiver), self.loop)
+        _run_threadsafe(self._set_scope_receiver(receiver), self.loop)
 
     async def _set_scope_receiver(self, receiver: int):
         try:
@@ -3248,7 +3268,7 @@ class RadioWorker(QThread):
         their own receiver= kwarg."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_scope_span(span_index), self.loop)
+        _run_threadsafe(self._set_scope_span(span_index), self.loop)
 
     async def _set_scope_span(self, span_index: int):
         try:
@@ -3263,7 +3283,7 @@ class RadioWorker(QThread):
         set_key_speed() BCD encoding, commands/levels.py)."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_key_speed(wpm), self.loop)
+        _run_threadsafe(self._set_key_speed(wpm), self.loop)
 
     async def _set_key_speed(self, wpm: int):
         try:
@@ -3282,7 +3302,7 @@ class RadioWorker(QThread):
         the receiver's passband."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_cw_pitch(pitch_hz), self.loop)
+        _run_threadsafe(self._set_cw_pitch(pitch_hz), self.loop)
 
     async def _set_cw_pitch(self, pitch_hz: int):
         try:
@@ -3302,7 +3322,7 @@ class RadioWorker(QThread):
         comment in constants.py for the confirmation history."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_scope_ref(ref_db), self.loop)
+        _run_threadsafe(self._set_scope_ref(ref_db), self.loop)
 
     async def _set_scope_ref(self, ref_db: float):
         try:
@@ -3317,7 +3337,7 @@ class RadioWorker(QThread):
         scope_set_speed(): 0=fast, 1=mid, 2=slow."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_scope_speed(speed_index), self.loop)
+        _run_threadsafe(self._set_scope_speed(speed_index), self.loop)
 
     async def _set_scope_speed(self, speed_index: int):
         try:
@@ -3349,7 +3369,7 @@ class RadioWorker(QThread):
         9700's)."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_dual_receiver_linking(on), self.loop)
+        _run_threadsafe(self._set_dual_receiver_linking(on), self.loop)
 
     async def _set_dual_receiver_linking(self, on: bool):
         try:
@@ -3371,7 +3391,7 @@ class RadioWorker(QThread):
         button."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._quick_split(), self.loop)
+        _run_threadsafe(self._quick_split(), self.loop)
 
     async def _quick_split(self):
         try:
@@ -3386,7 +3406,7 @@ class RadioWorker(QThread):
         equalize_main_sub(). Used by split_dialog.py's "M=>S" button."""
         if self.loop is None or self.radio is None or not self.is_dual_receiver:
             return
-        asyncio.run_coroutine_threadsafe(self._equalize_main_sub(), self.loop)
+        _run_threadsafe(self._equalize_main_sub(), self.loop)
 
     async def _equalize_main_sub(self):
         try:
@@ -3401,7 +3421,7 @@ class RadioWorker(QThread):
         swap_main_sub(). Used by split_dialog.py's "Swap M/S" button."""
         if self.loop is None or self.radio is None or not self.is_dual_receiver:
             return
-        asyncio.run_coroutine_threadsafe(self._swap_main_sub(), self.loop)
+        _run_threadsafe(self._swap_main_sub(), self.loop)
 
     async def _swap_main_sub(self):
         try:
@@ -3442,7 +3462,7 @@ class RadioWorker(QThread):
         rather than guessing only one matters."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_repeater_tone_settings(mode, freq_hz), self.loop)
+        _run_threadsafe(self._set_repeater_tone_settings(mode, freq_hz), self.loop)
 
     async def _set_repeater_tone_settings(self, mode: str, freq_hz: float):
         receiver = RECEIVER_MAIN
@@ -3478,7 +3498,7 @@ class RadioWorker(QThread):
         read first."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_rit_frequency(offset_hz), self.loop)
+        _run_threadsafe(self._set_rit_frequency(offset_hz), self.loop)
 
     async def _set_rit_frequency(self, offset_hz: int):
         try:
@@ -3500,7 +3520,7 @@ class RadioWorker(QThread):
         None on failure."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._capture_memory_snapshot(), self.loop)
+        _run_threadsafe(self._capture_memory_snapshot(), self.loop)
 
     async def _capture_memory_snapshot(self):
         if "vfo" not in self._control_methods:
@@ -3593,7 +3613,7 @@ class RadioWorker(QThread):
         is skipped too, if it was left blank."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._recall_memory_snapshot(snapshot), self.loop)
+        _run_threadsafe(self._recall_memory_snapshot(snapshot), self.loop)
 
     async def _recall_memory_snapshot(self, snapshot):
         if "vfo" not in self._control_methods:
@@ -3666,7 +3686,7 @@ class RadioWorker(QThread):
         frequency()."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._set_receiver_frequency(receiver, freq_hz), self.loop)
+        _run_threadsafe(self._set_receiver_frequency(receiver, freq_hz), self.loop)
 
     async def _set_receiver_frequency(self, receiver: int, freq_hz: int):
         async with self._receiver_switch_lock:
@@ -3731,7 +3751,7 @@ class RadioWorker(QThread):
         should leave this at its default (True)."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(
+        _run_threadsafe(
             self._select_receiver_vfo_and_set_frequency(receiver, vfo_slot, freq_hz, check_conflict), self.loop
         )
 
@@ -4016,7 +4036,7 @@ class RadioWorker(QThread):
                 "(no working getter+setter was found on connect) -- frequency not changed."
             )
             return
-        asyncio.run_coroutine_threadsafe(
+        _run_threadsafe(
             self._select_vfo_and_set_frequency(vfo_value, freq_hz, check_conflict), self.loop
         )
 
@@ -4077,7 +4097,7 @@ class RadioWorker(QThread):
         the corruption at all."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(
+        _run_threadsafe(
             self._start_ptt_after_vfo(vfo_value, freq_hz, receiver, check_conflict), self.loop
         )
 
@@ -4119,7 +4139,7 @@ class RadioWorker(QThread):
         "slot" for the uplink."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._start_ptt_with_frequency(freq_hz, receiver), self.loop)
+        _run_threadsafe(self._start_ptt_with_frequency(freq_hz, receiver), self.loop)
 
     async def _start_ptt_with_frequency(self, freq_hz: int, receiver: int = None):
         async with self._receiver_switch_lock:
@@ -4151,7 +4171,7 @@ class RadioWorker(QThread):
         real 9700)."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_ptt_then_vfo(vfo_value, freq_hz), self.loop)
+        _run_threadsafe(self._stop_ptt_then_vfo(vfo_value, freq_hz), self.loop)
 
     async def _stop_ptt_then_vfo(self, vfo_value, freq_hz: int):
         await self._stop_ptt()
@@ -4182,7 +4202,7 @@ class RadioWorker(QThread):
         during RX."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._stop_ptt_and_select_receiver(receiver), self.loop)
+        _run_threadsafe(self._stop_ptt_and_select_receiver(receiver), self.loop)
 
     async def _stop_ptt_and_select_receiver(self, receiver: int):
         await self._stop_ptt()
@@ -4225,7 +4245,7 @@ class RadioWorker(QThread):
         docstring; the tuning knob had the exact same problem)."""
         if self.loop is None or self.radio is None:
             return
-        asyncio.run_coroutine_threadsafe(self._select_band(band_label, low_edge_hz, receiver), self.loop)
+        _run_threadsafe(self._select_band(band_label, low_edge_hz, receiver), self.loop)
 
     async def _select_band(self, band_label: str, low_edge_hz: int, receiver: int = None):
         radio_model = self._details["radio_model"]

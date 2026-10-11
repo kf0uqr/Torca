@@ -473,13 +473,6 @@ class RadioWindow(QWidget):
             scope_controls_row.addWidget(widget)
         scope_controls_row.addStretch()
 
-        # Purely informational -- satellite tracking is now controlled
-        # centrally from the Ham Dashboard (satellite/transponder
-        # selection, Start/Stop Tracking), not per-radio-window, but the
-        # operator still needs to see at a glance what each connected
-        # radio is doing.
-        self.role_label = QLabel(f"Role: {_ROLE_LABELS.get(self._role, self._role)}")
-        self.role_label.setStyleSheet("color: #aaa; font-size: 11px;")
 
         # Dual-receiver (9700/7610) only, "full_duplex" role's periodic
         # tracking tick specifically: whether Sub's own VFO A has
@@ -754,9 +747,10 @@ class RadioWindow(QWidget):
         # dropdowns_row (Mode/AGC/Preamp/Filter) stacked above
         # buttons_row (Digital/NR/NB/VFO/Split) -- per explicit
         # instruction, two separate rows rather than one mixed row.
-        # controls_column and the role label stack vertically together,
-        # to the left of the tuning knob -- not mixed into knob_row,
-        # which is the knob's own column on the right. WSJT-X/Rigctld/
+        # controls_column and the passband display/PBT sliders (see
+        # left_column below) stack vertically together, to the left of the
+        # tuning knob -- not mixed into knob_row, which is the knob's own
+        # column on the right. WSJT-X/Rigctld/
         # Virtual Cables all moved to the Ham Dashboard, which is the
         # one place that makes sense once multiple radios can be
         # connected at once.
@@ -766,10 +760,31 @@ class RadioWindow(QWidget):
         controls_column.addLayout(dropdowns_row)
         controls_column.addLayout(buttons_row)
 
+        # filter_shape_widget's own column: the graphic on top, PBT
+        # Inner/PBT Outer/Filter Width sliders stacked directly under it
+        # (pbt_row, built above) -- fills the empty space below the
+        # graphic that used to just be blank, and keeps the whole
+        # "twin PBT + filter width" control group visually grouped with
+        # the graphic it drives, rather than separated at the very
+        # bottom of the window next to the unrelated AF Gain/Squelch/etc
+        # level sliders (per explicit instruction).
+        filter_shape_column = QVBoxLayout()
+        # No Qt.AlignHCenter here -- that would size the widget to its
+        # hint and center it instead of letting its Expanding size
+        # policy actually stretch it to fill the column. No trailing
+        # addStretch() either -- filter_shape_widget's own Expanding
+        # policy absorbs the vertical space that used to sit empty below
+        # the sliders, instead of leaving it blank.
+        filter_shape_column.addWidget(self.filter_shape_widget)
+        filter_shape_column.addLayout(pbt_row)
+
         left_column = QVBoxLayout()
         left_column.addLayout(controls_column)
-        left_column.addWidget(self.role_label)
-        left_column.addStretch()
+        # The passband display and its PBT/filter-width controls sit
+        # directly under the mode/button controls, where the (now
+        # removed) role text used to be -- they used to be their own
+        # column between this one and the RIT knob.
+        left_column.addLayout(filter_shape_column, 1)
 
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
@@ -792,38 +807,8 @@ class RadioWindow(QWidget):
         rit_column.addWidget(self.rit_offset_label, alignment=Qt.AlignHCenter)
         rit_column.addWidget(self.rit_status_button, alignment=Qt.AlignHCenter)
 
-        # filter_shape_widget's own column: the graphic on top, PBT
-        # Inner/PBT Outer/Filter Width sliders stacked directly under it
-        # (pbt_row, built above) -- fills the empty space below the
-        # graphic that used to just be blank, and keeps the whole
-        # "twin PBT + filter width" control group visually grouped with
-        # the graphic it drives, rather than separated at the very
-        # bottom of the window next to the unrelated AF Gain/Squelch/etc
-        # level sliders (per explicit instruction).
-        filter_shape_column = QVBoxLayout()
-        # No Qt.AlignHCenter here -- that would size the widget to its
-        # hint and center it instead of letting its Expanding size
-        # policy actually stretch it to fill the column. No trailing
-        # addStretch() either -- filter_shape_widget's own Expanding
-        # policy absorbs the vertical space that used to sit empty below
-        # the sliders, instead of leaving it blank.
-        filter_shape_column.addWidget(self.filter_shape_widget)
-        filter_shape_column.addLayout(pbt_row)
-
         tuning_row = QHBoxLayout()
-        tuning_row.addLayout(left_column)
-        # filter_shape_column takes the stretch itself now (both the
-        # widget's own Expanding size policy and this stretch factor),
-        # filling what used to be a bare addStretch() gap to its left,
-        # per explicit instruction -- rit_column still sits snug against
-        # knob_row (fixed spacing, no stretch of its own).
-        tuning_row.addLayout(filter_shape_column, 1)
-        # Top-align, same as dropdowns_row's own columns -- without this,
-        # now that filter_shape_widget's height is capped (see its own
-        # setMaximumHeight comment) rather than growing to consume all
-        # of tuning_row's height, Qt centers the shorter column
-        # vertically instead of anchoring it level with left_column.
-        tuning_row.setAlignment(filter_shape_column, Qt.AlignTop)
+        tuning_row.addLayout(left_column, 1)
         tuning_row.addSpacing(8)
         tuning_row.addLayout(rit_column)
         tuning_row.addSpacing(16)

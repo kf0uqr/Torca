@@ -28,8 +28,10 @@ its own docstring in radio_worker.py), not itself APRS-specific.
 """
 
 import datetime
+import sqlite3
+import time
 
-from PySide6.QtCore import Qt, QSettings, Signal
+from PySide6.QtCore import Qt, QSettings, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QWidget,
@@ -51,9 +53,29 @@ from PySide6.QtWidgets import (
 
 from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
 from aprs import AprsDecoder, build_position_packet_pcm, symbol_description
+from aprs_db import shared_database
 from direwolf_backend import DirewolfBackend, direwolf_available
 
+# The table is a bounded VIEW onto the database (aprs_db.py), not the
+# record of what was decoded: a long unattended decode run used to grow
+# it (one row of widget items + a full packet dict per packet) until the
+# machine ran out of RAM. Rows past the cap are dropped from the view
+# only; they remain in the database.
+_MAX_TABLE_ROWS = 1000
+_INITIAL_TABLE_ROWS = 500  # how much recent history to preload from the database on open
+
 _COLUMNS = ["Time", "Source", "Destination", "Type", "Details"]
+# aprs_db.AprsDatabase.SORT_COLUMNS key for each table column, in order.
+_COLUMN_SORT_KEYS = ["time", "source", "destination", "type", "details"]
+
+# While a filter/sort is active the table shows a database query result
+# instead of the live stream; new packets just schedule a (coalesced)
+# re-query this long after the first one arrives, rather than one query
+# per packet.
+_REQUERY_DELAY_MS = 2000
+_TEXT_FILTER_DEBOUNCE_MS = 300
+
+_TIME_RANGES = [("All time", None), ("Last hour", 3600), ("Last 24 hours", 86400), ("Last 7 days", 7 * 86400)]
 
 _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
@@ -415,6 +437,42 @@ class AprsToolWindow(QWidget):
         self.status_label = QLabel("Not decoding.")
         self.status_label.setStyleSheet("color: #aaa;")
 
+        # ---- Filter bar ----
+        self.callsign_filter = QLineEdit()
+        self.callsign_filter.setPlaceholderText("Callsign")
+        self.callsign_filter.setFixedWidth(110)
+        self.callsign_filter.setToolTip(
+            "Without an SSID (N0CALL) matches every SSID of that callsign; "
+            "with one (N0CALL-9) matches exactly that station."
+        )
+        self.type_filter = QComboBox()
+        self.type_filter.addItem("All types", None)
+        self.text_filter = QLineEdit()
+        self.text_filter.setPlaceholderText("Search source, destination, details")
+        self.time_filter = QComboBox()
+        for label, seconds in _TIME_RANGES:
+            self.time_filter.addItem(label, seconds)
+        reset_filters_button = QPushButton("Reset")
+        reset_filters_button.setToolTip("Clear all filters and return to the live view")
+        reset_filters_button.clicked.connect(self._on_reset_filters_clicked)
+        self.view_label = QLabel("")
+        self.view_label.setStyleSheet("color: #aaa;")
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(self.callsign_filter)
+        filter_row.addWidget(self.type_filter)
+        filter_row.addWidget(self.text_filter, stretch=1)
+        filter_row.addWidget(self.time_filter)
+        filter_row.addWidget(reset_filters_button)
+
+        self._sort = None  # None = default live order (time, newest at the bottom), else (sort_key, descending)
+        self._requery_timer = QTimer(self)
+        self._requery_timer.setSingleShot(True)
+        self._requery_timer.timeout.connect(self._refresh_view)
+        self._text_debounce_timer = QTimer(self)
+        self._text_debounce_timer.setSingleShot(True)
+        self._text_debounce_timer.timeout.connect(self._refresh_view)
+
         self.table = QTableWidget(0, len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(_COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
@@ -422,14 +480,148 @@ class AprsToolWindow(QWidget):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
+        header = self.table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._on_header_clicked)
+        header.setToolTip("Click a column to sort; click again to reverse, once more to return to the live view")
 
         layout = QVBoxLayout()
         layout.addLayout(buttons_row)
+        layout.addLayout(filter_row)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.view_label)
         layout.addWidget(self.table, stretch=1)
         self.setLayout(layout)
 
         self._packets_ready.connect(self._on_packets_ready)
+
+        self._db = shared_database()
+        self._db_error_reported = False
+        self._refresh_type_choices()
+        self._load_recent_packets()
+
+        # Connected last: populating the pickers above must not fire a
+        # refresh.
+        self.callsign_filter.textChanged.connect(self._schedule_text_refresh)
+        self.text_filter.textChanged.connect(self._schedule_text_refresh)
+        self.type_filter.currentIndexChanged.connect(self._refresh_view)
+        self.time_filter.currentIndexChanged.connect(self._refresh_view)
+
+    # ---- Filter / sort view ----
+
+    def _current_filter(self):
+        seconds = self.time_filter.currentData()
+        return {
+            "since": (time.time() - seconds) if seconds else None,
+            "callsign": self.callsign_filter.text().strip(),
+            "ptype": self.type_filter.currentData(),
+            "text": self.text_filter.text().strip(),
+        }
+
+    def _filter_active(self):
+        return bool(
+            self.callsign_filter.text().strip() or self.type_filter.currentData()
+            or self.text_filter.text().strip() or self.time_filter.currentData()
+        )
+
+    def _query_mode(self):
+        """True while the table shows a database query result (any
+        filter or non-default sort) rather than the live stream."""
+        return self._filter_active() or self._sort is not None
+
+    def _schedule_text_refresh(self):
+        self._text_debounce_timer.start(_TEXT_FILTER_DEBOUNCE_MS)
+
+    def _refresh_type_choices(self):
+        """Repopulates the type picker from what's in the database,
+        keeping the current selection (even if it no longer appears)."""
+        try:
+            types = self._db.packet_types()
+        except sqlite3.Error:
+            return
+        selected = self.type_filter.currentData()
+        self.type_filter.blockSignals(True)
+        self.type_filter.clear()
+        self.type_filter.addItem("All types", None)
+        for packet_type in types:
+            self.type_filter.addItem(packet_type, packet_type)
+        if selected and selected not in types:
+            self.type_filter.addItem(selected, selected)
+        index = self.type_filter.findData(selected)
+        self.type_filter.setCurrentIndex(max(index, 0))
+        self.type_filter.blockSignals(False)
+
+    def _refresh_view(self):
+        """Rebuilds the table for the current filter/sort: the live
+        view's recent history when neither is active, otherwise a
+        database query (sorted and limited -- see
+        AprsDatabase.query_packets)."""
+        self._requery_timer.stop()
+        self._text_debounce_timer.stop()
+        self._refresh_type_choices()
+        self.table.setRowCount(0)
+        header = self.table.horizontalHeader()
+        if not self._query_mode():
+            header.setSortIndicatorShown(False)
+            self.view_label.setText("")
+            self._load_recent_packets()
+            return
+        sort_key, descending = self._sort or ("time", False)
+        if self._sort is None:
+            header.setSortIndicatorShown(False)
+        else:
+            header.setSortIndicator(
+                _COLUMN_SORT_KEYS.index(sort_key),
+                Qt.DescendingOrder if descending else Qt.AscendingOrder,
+            )
+            header.setSortIndicatorShown(True)
+        try:
+            packets, total = self._db.query_packets(
+                **self._current_filter(), sort=sort_key, descending=descending, limit=_MAX_TABLE_ROWS
+            )
+        except sqlite3.Error as exc:
+            self.view_label.setText(f"Couldn't query saved packets: {exc}")
+            return
+        for packet in packets:
+            self._append_row(packet, packet["received_at"])
+        if self._sort is None:
+            self.table.scrollToBottom()
+        shown = f"{len(packets)} of {total}" if total > len(packets) else str(total)
+        self.view_label.setText(f"Filtered/sorted view of saved packets: showing {shown} matching.")
+
+    def _on_header_clicked(self, column):
+        self.table.clearSelection()  # a header click would otherwise select the whole column
+        key = _COLUMN_SORT_KEYS[column]
+        # ascending -> descending -> back to the default live order
+        if self._sort is None or self._sort[0] != key:
+            self._sort = (key, False)
+        elif not self._sort[1]:
+            self._sort = (key, True)
+        else:
+            self._sort = None
+        self._refresh_view()
+
+    def _on_reset_filters_clicked(self):
+        for widget in (self.callsign_filter, self.text_filter, self.type_filter, self.time_filter):
+            widget.blockSignals(True)
+        self.callsign_filter.clear()
+        self.text_filter.clear()
+        self.type_filter.setCurrentIndex(0)
+        self.time_filter.setCurrentIndex(0)
+        for widget in (self.callsign_filter, self.text_filter, self.type_filter, self.time_filter):
+            widget.blockSignals(False)
+        self._sort = None
+        self._refresh_view()
+
+    def _load_recent_packets(self):
+        try:
+            history = self._db.recent_packets(_INITIAL_TABLE_ROWS)
+        except sqlite3.Error as exc:
+            self.status_label.setText(f"Couldn't load saved APRS history: {exc}")
+            return
+        for packet in history:
+            self._append_row(packet, packet["received_at"])
+        self.table.scrollToBottom()
 
     # ---- Decode ----
 
@@ -521,34 +713,66 @@ class AprsToolWindow(QWidget):
         self._on_packets_ready([packet])
 
     def _on_packets_ready(self, packets):
-        now = datetime.datetime.now().strftime("%H:%M:%S")
+        received_at = time.time()
         for packet in packets:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            digipeater_suffix = f" via {','.join(packet['digipeaters'])}" if packet["digipeaters"] else ""
             info = packet["info"]
-            values = [
-                now,
-                packet["source"],
-                packet["destination"] + digipeater_suffix,
-                (info["type"] if info else "unknown"),
-                _format_packet_details(info),
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if col == 0:
-                    # The full packet dict (including info_raw, the
-                    # original undecoded info-field bytes) lives on
-                    # column 0's item only -- one copy per row is
-                    # enough, _on_table_context_menu just needs SOME
-                    # item in the clicked row to pull it back out of.
-                    item.setData(Qt.UserRole, packet)
-                self.table.setItem(row, col, item)
+            try:
+                self._db.add_packet(
+                    packet, received_at=received_at, radio=self._radio_window._connection_label,
+                    details=_format_packet_details(info),
+                )
+            except sqlite3.Error as exc:
+                # Storage trouble (disk full, read-only home, ...) must
+                # never stop decoding itself -- the packet still shows
+                # in the table and still reaches the map.
+                if not self._db_error_reported:
+                    self._db_error_reported = True
+                    self.status_label.setText(f"Warning: couldn't save packets to the database: {exc}")
+            if not self._query_mode():
+                self._append_row(packet, received_at)
             if info is not None and info["type"] == "position":
                 self.packet_decoded.emit(packet)
+        if self._query_mode():
+            # The table is a query result, not the live stream: refresh
+            # it shortly (coalesced) instead of per packet.
+            if not self._requery_timer.isActive():
+                self._requery_timer.start(_REQUERY_DELAY_MS)
+            return
+        excess = self.table.rowCount() - _MAX_TABLE_ROWS
+        for _ in range(max(excess, 0)):
+            self.table.removeRow(0)
         self.table.scrollToBottom()
 
+    def _append_row(self, packet, received_at):
+        stamp = datetime.datetime.fromtimestamp(received_at)
+        # Time only for today's packets; history reloaded from an
+        # earlier day needs the date too to be unambiguous.
+        time_text = stamp.strftime("%H:%M:%S" if stamp.date() == datetime.date.today() else "%m-%d %H:%M:%S")
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        digipeater_suffix = f" via {','.join(packet['digipeaters'])}" if packet["digipeaters"] else ""
+        info = packet["info"]
+        values = [
+            time_text,
+            packet["source"],
+            packet["destination"] + digipeater_suffix,
+            (info["type"] if info else "unknown"),
+            _format_packet_details(info),
+        ]
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if col == 0:
+                # The full packet dict (including info_raw, the
+                # original undecoded info-field bytes) lives on
+                # column 0's item only -- one copy per row is
+                # enough, _on_table_context_menu just needs SOME
+                # item in the clicked row to pull it back out of.
+                item.setData(Qt.UserRole, packet)
+            self.table.setItem(row, col, item)
+
     def _on_clear_clicked(self):
+        # Clears the on-screen view only -- history stays in the
+        # database (aprs_db.py) and is re-shown on the next open.
         self.table.setRowCount(0)
 
     def _on_table_context_menu(self, pos):

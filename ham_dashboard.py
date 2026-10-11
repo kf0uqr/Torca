@@ -35,6 +35,8 @@ at all and moved here too, for the same "one central place" reasoning.
 import datetime
 import os
 import platform
+import sqlite3
+import time
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot, QSettings
 from PySide6.QtGui import QColor, QGuiApplication
@@ -76,6 +78,8 @@ from log_book_window import LogBookWindow
 import adif
 import qso_log
 import pskreporter
+from aprs_db import shared_database
+from aprs_map_filter_dialog import AprsMapFilterDialog, EMPTY_FILTER, filter_is_active
 import pota
 import contests
 import dxcluster
@@ -1354,7 +1358,13 @@ class HamClockWindow(QWidget):
         # worker here, just an always-listening accumulator; the
         # toggle only controls whether it's DRAWN, not whether it's
         # collected.
-        self._aprs_stations = {}  # {source_callsign: {"lat", "lon", "tooltip"}}
+        # Always exactly what the map is entitled to show: seeded from
+        # the persistent APRS database (aprs_db.py) at startup, rebuilt
+        # from it whenever the right-click filter changes, and updated
+        # by live packets only if they pass that filter -- so the web
+        # remote (which reads this dict directly) honors the filter too.
+        self._aprs_stations = {}  # {station_callsign: {"lat", "lon", "tooltip"}}
+        self._aprs_filter = dict(EMPTY_FILTER)
         self.aprs_button = QPushButton("APRS: OFF")
         self.aprs_button.setCheckable(True)
         self.aprs_button.setStyleSheet(
@@ -1363,9 +1373,13 @@ class HamClockWindow(QWidget):
         self.aprs_button.setToolTip(
             "Toggle showing APRS station positions (from any connected "
             "radio's APRS Tool decoder) on the map, in red. Hover a "
-            "marker for the packet's details."
+            "marker for the packet's details. Right-click to filter by "
+            "date/time and callsign."
         )
         self.aprs_button.toggled.connect(self._on_aprs_toggled)
+        self.aprs_button.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.aprs_button.customContextMenuRequested.connect(self._on_aprs_menu_requested)
+        self._reload_aprs_stations_from_db()
 
         # Filters which band's QSOs the map overlay shows -- every band
         # this app knows about (same list/order as HF_6M_BANDS +
@@ -2098,8 +2112,57 @@ class HamClockWindow(QWidget):
         lines.append(f"Grid: {spot.get('locator', '?')}")
         return "\n".join(lines)
 
+    def _reload_aprs_stations_from_db(self):
+        """Rebuilds _aprs_stations from the persistent database under
+        the current filter -- at startup (so the map isn't empty after
+        a restart) and whenever the filter changes."""
+        flt = self._aprs_filter
+        try:
+            packets = shared_database().latest_positions(
+                since=flt["since"], until=flt["until"], callsign=flt["callsign"]
+            )
+        except sqlite3.Error:
+            packets = []  # no history is better than a dashboard that won't start
+        self._aprs_stations = {}
+        for packet in packets:
+            self._add_aprs_station(packet, heard_at=packet["received_at"])
+
+    def _add_aprs_station(self, packet, heard_at):
+        info = packet["info"]
+        # Keyed by the real originating station -- see
+        # _on_aprs_packet_decoded's docstring for why not packet["source"].
+        station_key = info.get("third_party_source") or packet["source"]
+        self._aprs_stations[station_key] = {
+            "lat": info["lat"],
+            "lon": info["lon"],
+            "tooltip": self._aprs_tooltip_text(packet, info, heard_at),
+        }
+
+    def _aprs_passes_filter(self, packet):
+        """Live-packet check against the active filter (a live packet is
+        heard "now", so only an `until` in the past can exclude it)."""
+        flt = self._aprs_filter
+        if flt["until"] is not None and time.time() > flt["until"]:
+            return False
+        call = flt["callsign"]
+        if call:
+            info = packet["info"]
+            station = (info.get("third_party_source") or packet["source"]).upper()
+            if station != call and ("-" in call or not station.startswith(call + "-")):
+                return False
+        return True
+
+    def _on_aprs_menu_requested(self, pos):
+        dialog = AprsMapFilterDialog(self._aprs_filter, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._aprs_filter = dialog.filter()
+        self._reload_aprs_stations_from_db()
+        self._on_aprs_toggled(self.aprs_button.isChecked())
+
     def _on_aprs_toggled(self, checked):
-        self.aprs_button.setText("APRS: ON" if checked else "APRS: OFF")
+        label = "APRS: ON" if checked else "APRS: OFF"
+        self.aprs_button.setText(label + (" (filtered)" if filter_is_active(self._aprs_filter) else ""))
         self.map_widget.set_aprs_markers(list(self._aprs_stations.values()) if checked else [])
 
     def _on_aprs_packet_decoded(self, packet):
@@ -2121,18 +2184,14 @@ class HamClockWindow(QWidget):
         overwrote (and appeared to erase) whichever station's marker
         was there before. info["third_party_source"] (present only on
         unwrapped packets) is the real originating callsign instead."""
-        info = packet["info"]
-        station_key = info.get("third_party_source") or packet["source"]
-        self._aprs_stations[station_key] = {
-            "lat": info["lat"],
-            "lon": info["lon"],
-            "tooltip": self._aprs_tooltip_text(packet, info),
-        }
+        if not self._aprs_passes_filter(packet):
+            return
+        self._add_aprs_station(packet, heard_at=time.time())
         if self.aprs_button.isChecked():
             self.map_widget.set_aprs_markers(list(self._aprs_stations.values()))
 
     @staticmethod
-    def _aprs_tooltip_text(packet, info):
+    def _aprs_tooltip_text(packet, info, heard_at=None):
         destination = packet.get("destination", "?")
         digipeaters = packet.get("digipeaters") or []
         if digipeaters:
@@ -2148,6 +2207,8 @@ class HamClockWindow(QWidget):
             lines.append(f"via IGate {packet.get('source', '?')}")
         lines.append(f"To: {destination}")
         lines.append(f"{info['lat']:.5f}, {info['lon']:.5f}")
+        if heard_at is not None:
+            lines.append("Heard: " + datetime.datetime.fromtimestamp(heard_at).strftime("%Y-%m-%d %H:%M:%S"))
         symbol = f"{info.get('symbol_table', '')}{info.get('symbol_code', '')}".strip()
         if symbol:
             lines.append(f"Symbol: {symbol}")

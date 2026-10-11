@@ -30,9 +30,11 @@ update mechanics differ (see detect_mode()):
 
 Either way, the CURRENTLY RUNNING process keeps executing its already-
 loaded old code after a successful update -- there's no in-place hot
-reload here, the caller needs to tell the operator to restart.
+reload here. The caller asks the operator whether to restart now (see
+schedule_relaunch_after_exit) or keep running the old version for now.
 """
 
+import json
 import os
 import pathlib
 import shutil
@@ -141,7 +143,7 @@ def perform_update(status_callback=lambda message: None):
             [sys.executable, "-m", "pip", "install", "-r", str(APP_DIR / "requirements.txt")],
             cwd=APP_DIR, timeout=300,
         )
-        status_callback("Updated -- restart TORCA to use the new version.")
+        status_callback("Updated.")
         return
 
     if mode == MODE_INSTALLED:
@@ -163,7 +165,7 @@ def perform_update(status_callback=lambda message: None):
         # install.sh itself only re-requires root if that's NOT true
         # (see its own docstring).
         _run(["bash", "install.sh"], cwd=UPDATE_CACHE_DIR, timeout=300)
-        status_callback("Updated -- restart TORCA to use the new version.")
+        status_callback("Updated.")
         return
 
     raise RuntimeError(
@@ -171,4 +173,48 @@ def perform_update(status_callback=lambda message: None):
         "writable by the current user (likely an install from before this feature existed, "
         "or one still owned by root). Re-run install.sh by hand instead: "
         "sudo ./install.sh (after a fresh git pull/clone)."
+    )
+
+
+# Run by the relaunch helper process (see schedule_relaunch_after_exit).
+# Blocks reading stdin -- a pipe whose only writer is the TORCA process
+# being replaced -- so read() returns (EOF) exactly when that process
+# has fully exited, however it exits. Only then is the new instance
+# started, so it can never collide with the old one over a serial port,
+# audio device, or the web remote's listening port.
+_RELAUNCH_BOOTSTRAP = (
+    "import json, subprocess, sys\n"
+    "cmd, cwd = json.loads(sys.argv[1]), sys.argv[2]\n"
+    "sys.stdin.buffer.read()\n"
+    "subprocess.Popen(cmd, cwd=cwd)\n"
+)
+
+_relaunch_helper = None  # kept referenced so its stdin pipe stays open until this process exits
+
+
+def relaunch_command():
+    """The command line that starts TORCA again: the same interpreter
+    and arguments as the running process (so it keeps whatever venv/
+    environment this one was launched with), pointed at main.py in the
+    app directory -- which, after an update, now holds the new code."""
+    return [sys.executable, str(APP_DIR / "main.py"), *sys.argv[1:]]
+
+
+def schedule_relaunch_after_exit():
+    """Starts a small detached helper that launches a fresh TORCA once
+    THIS process has exited. Call it, then shut the app down normally
+    (so radios, servers, and worker threads are closed cleanly) -- the
+    helper does nothing until this process is gone. Raises OSError if
+    the helper can't be started; in that case nothing was scheduled
+    and the caller should NOT quit."""
+    global _relaunch_helper
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True  # survives this process (and its terminal) going away
+    _relaunch_helper = subprocess.Popen(
+        [sys.executable, "-c", _RELAUNCH_BOOTSTRAP, json.dumps(relaunch_command()), str(APP_DIR)],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        **kwargs,
     )

@@ -41,6 +41,7 @@ import time
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot, QSettings
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
+    QApplication,
     QWidget,
     QDialog,
     QVBoxLayout,
@@ -3243,10 +3244,38 @@ class HamClockWindow(QWidget):
     def _on_update_succeeded(self):
         self.update_button.setEnabled(True)
         self.update_button.setText("Check for Updates...")
-        QMessageBox.information(
-            self, "Update Complete",
-            "TORCA has been updated. Restart the app to use the new version."
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Update Complete")
+        box.setText("TORCA has been updated.")
+        box.setInformativeText(
+            "Restart now to use the new version? Any connected radios will be "
+            "disconnected and decoding will stop.\n\n"
+            "If you choose Later, TORCA keeps running the old version until you restart it yourself."
         )
+        restart_button = box.addButton("Restart Now", QMessageBox.AcceptRole)
+        box.addButton("Later", QMessageBox.RejectRole)
+        box.setDefaultButton(restart_button)
+        box.exec()
+        if box.clickedButton() is restart_button:
+            self._restart_application()
+
+    def _restart_application(self):
+        """Closes TORCA through the normal shutdown path (closeEvent --
+        radios, servers, worker threads), with a helper process
+        queued to start the new version once this one has fully
+        exited."""
+        try:
+            updater.schedule_relaunch_after_exit()
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Restart",
+                f"Couldn't schedule the restart ({exc}). The update is installed -- "
+                "please restart TORCA yourself."
+            )
+            return
+        self.close()
+        QApplication.quit()
 
     def _on_update_failed(self, message):
         self.update_button.setEnabled(True)

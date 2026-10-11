@@ -70,11 +70,12 @@ from PySide6.QtWidgets import (
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
 from workspace_host import present_window, retire_button
+from workspace_state import find_connection_profile
 from update_progress_dialog import UpdateProgressDialog
 from collapsible_sidebar import CollapsibleSidebar
 from world_map import WorldMapWidget
-from connection_dialog import ConnectionDialog
-from operator_profile import OperatorProfileDialog
+from connection_dialog import ConnectionDialog, details_from_saved_profile, load_connection_profiles
+from operator_profile import OperatorProfileDialog, active_profile_name, apply_profile
 from main_window import RadioWindow
 from satellite_session import SatelliteSession
 from log_book_window import LogBookWindow
@@ -2606,6 +2607,7 @@ class HamClockWindow(QWidget):
     def _ensure_log_book_window(self):
         if self.log_book_window is None:
             self.log_book_window = LogBookWindow(self)
+            self.log_book_window.workspace_key = "logbook"
         return self.log_book_window
 
     def eventFilter(self, obj, event):
@@ -3197,7 +3199,33 @@ class HamClockWindow(QWidget):
         self.radios_dialog.activateWindow()
 
     def _on_profile_button_clicked(self):
-        OperatorProfileDialog.run(self)
+        before = active_profile_name()
+        accepted = OperatorProfileDialog.run(self)
+        self._apply_operator_settings()
+        after = active_profile_name()
+        if accepted and before and after and after != before:
+            self._offer_profile_switch(before, after)
+
+    def _offer_profile_switch(self, before, after):
+        """A different profile was picked (or a new one created). Each profile
+        has its own workspace, so switching restarts TORCA into the new
+        profile's last workspace -- a clean teardown of the radios and a fresh
+        build from that profile, rather than trying to morph this one. The
+        workspace is saved for `before` as the window closes."""
+        answer = QMessageBox.question(
+            self, "Switch Profile",
+            f'Switch to the profile "{after}"?\n\n'
+            f'TORCA will save this workspace for "{before}", then restart and open "{after}"\'s '
+            "last workspace. Connected radios will be disconnected.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            self._restart_application()  # closes through the normal shutdown, which saves the workspace
+            return
+        apply_profile(before)  # declined: stay on the profile we were on
+        self._apply_operator_settings()
+
+    def _apply_operator_settings(self):
         # Cheap either way (accepted or cancelled) -- just re-reads
         # QSettings and re-pushes to whatever already consumes it, same
         # "always just re-read" approach _load_observer_location's own
@@ -3226,8 +3254,13 @@ class HamClockWindow(QWidget):
         dialog = ConnectionDialog(self, active_roles=active_roles)
         if dialog.exec() != QDialog.Accepted:
             return
-        details = dialog.details
+        self._open_radio(dialog.details)
 
+    def _open_radio(self, details):
+        """Everything after the connection details are known: build the radio's
+        window, wire it into the dashboard and Remote Access, and show it (in
+        its workspace). Shared by the Connect dialog and by restoring a saved
+        workspace. Returns the new RadioWindow."""
         window = RadioWindow(details, self.satellite_session)
         window.closed.connect(self._on_radio_window_closed)
         window.aprs_packet_decoded.connect(self._on_aprs_packet_decoded)
@@ -3257,6 +3290,26 @@ class HamClockWindow(QWidget):
 
         self._update_radio_service_buttons_enabled()
         present_window(window)
+        return window
+
+    # ---- saved workspace support (see workspace_persistence.py) ----
+
+    def workspace_radios(self):
+        return list(self._connected_radios)
+
+    def reconnect_radio(self, identity):
+        """Reconnects a radio from a saved workspace: its saved connection
+        profile is found by identity (model + where it connects), turned into
+        details exactly as the Connect dialog would, and opened. Returns the
+        RadioWindow, or None if there is no matching saved connection profile."""
+        profile = find_connection_profile(identity, load_connection_profiles())
+        if profile is None:
+            return None
+        details = details_from_saved_profile(profile, role=identity.get("role"))
+        return self._open_radio(details) if details else None
+
+    def open_log_book(self):
+        present_window(self._ensure_log_book_window())
 
     @staticmethod
     def _radio_list_base_label(details):
@@ -3310,9 +3363,7 @@ class HamClockWindow(QWidget):
         # the (possibly not-yet-created, and left hidden either way)
         # LogBookWindow instance around to own persistence/QRZ upload,
         # same as _on_log_book_clicked's lazy construction.
-        if self.log_book_window is None:
-            self.log_book_window = LogBookWindow(self)
-        self.log_book_window._on_new_qso_clicked()
+        self._ensure_log_book_window()._on_new_qso_clicked()
 
     def _on_update_button_clicked(self):
         if self._update_check_worker is not None and self._update_check_worker.isRunning():
@@ -3958,9 +4009,7 @@ class HamClockWindow(QWidget):
         which already reaches into LogBookWindow the same way. Doesn't
         show/raise the window -- this should never steal focus just
         because a QSO came in in the background."""
-        if self.log_book_window is None:
-            self.log_book_window = LogBookWindow(self)
-        self.log_book_window._on_new_qso_submitted(fields)
+        self._ensure_log_book_window()._on_new_qso_submitted(fields)
 
     def _on_wsjtx_udp_error(self, message):
         print(f"[WSJT-X Auto-Log] {message}")

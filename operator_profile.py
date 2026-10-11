@@ -163,9 +163,10 @@ class OperatorProfileDialog(QDialog):
     location already takes.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, required=False):
         super().__init__(parent)
         self.setWindowTitle("Operator Profile")
+        self._required = required  # first launch: a named profile must be created, and there is no Cancel
         self._profiles = load_operator_profiles()
 
         self.profile_combo = QComboBox()
@@ -232,16 +233,30 @@ class OperatorProfileDialog(QDialog):
         form.addRow("Longitude:", self.lon_input)
         form.addRow("Elevation:", self.elevation_input)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        if self._required:
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+            buttons.addButton("Quit TORCA", QDialogButtonBox.RejectRole)
+        else:
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout()
-        intro = QLabel(
-            "Set up who's operating and from where. Save this as a named "
-            "profile to switch between operators/locations later (Ham "
-            "Dashboard's own \"Profile...\" button)."
-        )
+        if self._required:
+            intro_text = (
+                "<b>Welcome to TORCA.</b> Create your operator profile to get started: who's "
+                "operating and from where. Your workspace (open tabs, connected radios) is saved "
+                "under this profile and reopened automatically next time. Use <b>Save Profile...</b> "
+                "to name it. You can add more profiles and switch between them later from the + menu "
+                "(Actions \u2192 Profile...)."
+            )
+        else:
+            intro_text = (
+                "Set up who's operating and from where. Save this as a named profile to switch "
+                "between operators/locations later -- switching restarts TORCA into that profile's "
+                "last workspace."
+            )
+        intro = QLabel(intro_text)
         intro.setWordWrap(True)
         layout.addWidget(intro)
         layout.addLayout(form)
@@ -386,6 +401,17 @@ class OperatorProfileDialog(QDialog):
         )
 
     def _on_accept(self):
+        if self._required and not self.profile_combo.currentData():
+            # A named profile is what everything is saved under: ask for the
+            # name now rather than making the operator hunt for the button.
+            self._on_save_profile_clicked()
+            if not self.profile_combo.currentData():
+                QMessageBox.information(
+                    self, "Operator Profile",
+                    "Please give your profile a name (Save Profile...) to continue -- your workspace "
+                    "is saved under it.",
+                )
+                return
         settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         callsign = self.callsign_input.text().strip().upper()
         settings.setValue("operator_callsign", callsign)
@@ -406,11 +432,58 @@ class OperatorProfileDialog(QDialog):
         self.accept()
 
     @staticmethod
-    def run(parent=None):
+    def run(parent=None, required=False):
         """Shows the dialog modally. Returns True if the operator
         confirmed (OK), False if they cancelled/closed it -- see the
         class docstring for why callers generally don't need to
         branch on this (everything's already in QSettings on True;
         nothing changed on False)."""
-        dialog = OperatorProfileDialog(parent)
+        dialog = OperatorProfileDialog(parent, required=required)
         return dialog.exec() == QDialog.Accepted
+
+
+# ---- which profile is active ------------------------------------------------
+
+def active_profile_name():
+    """The profile in use (the last one selected and accepted), or None."""
+    return (QSettings(_SETTINGS_ORG, _SETTINGS_APP).value("last_operator_profile", "") or None)
+
+
+def apply_profile(name):
+    """Makes `name` the active profile: copies its values into the shared
+    QSettings keys the rest of the app reads (the same ones the dialog
+    writes on accept) and records it as the last-used profile. Returns False
+    if there is no such saved profile."""
+    profile = load_operator_profiles().get(name)
+    if not isinstance(profile, dict):
+        return False
+    settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    settings.setValue("operator_callsign", str(profile.get("callsign", "")).strip().upper())
+    settings.setValue("operator_name", profile.get("name", ""))
+    settings.setValue("operator_address", profile.get("address", ""))
+    settings.setValue("operator_lat", float(profile.get("lat", 0.0)))
+    settings.setValue("operator_lon", float(profile.get("lon", 0.0)))
+    settings.setValue("operator_elevation_m", float(profile.get("elevation_m", 0.0)))
+    settings.setValue("last_operator_profile", name)
+    return True
+
+
+def ensure_active_profile(parent=None):
+    """Startup: returns the name of the profile to run under, or None if the
+    operator declined to create one (the caller should then quit).
+
+    - Profiles exist: no prompt; the last-used one is loaded (or, if that is
+      missing or was deleted, the first alphabetically).
+    - None exist (first launch): the profile dialog is shown, and a named
+      profile must be created -- there is no Cancel, only Quit."""
+    profiles = load_operator_profiles()
+    if profiles:
+        name = active_profile_name()
+        if name not in profiles:
+            name = sorted(profiles)[0]
+        if apply_profile(name):
+            return name
+    if not OperatorProfileDialog.run(parent, required=True):
+        return None
+    return active_profile_name()
+

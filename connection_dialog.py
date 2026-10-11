@@ -585,3 +585,23 @@ class ConnectionDialog(QDialog):
             return dialog.details
         return None
 
+
+def details_from_saved_profile(profile, role=None):
+    """The details dict ConnectionDialog would produce for this saved
+    connection profile, without showing any dialog -- used to reconnect a
+    radio when a saved workspace is restored. Goes through the dialog's own
+    code (the same field handling and name -> audio-device resolution as a
+    manual connect) rather than duplicating it. `role` overrides the
+    profile's own role (the role last used may differ from what was saved).
+    Returns None if the profile can't be turned into valid details."""
+    dialog = ConnectionDialog(None)
+    try:
+        dialog._apply_profile(profile)
+        if role is not None:
+            index = dialog.role_combo.findData(role)
+            if index != -1:
+                dialog.role_combo.setCurrentIndex(index)
+        dialog._on_accept()
+        return dialog.details
+    finally:
+        dialog.deleteLater()

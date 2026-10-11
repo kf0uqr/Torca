@@ -29,6 +29,7 @@ show()/raise_() behaviour when no host exists (tests, headless use).
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter
+from workspace_state import tree_from_json, tree_to_json
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -383,12 +384,21 @@ class _MenuContext:
 
 
 class WorkspaceHost(QMainWindow):
+    # Something about the arrangement changed (tabs added/removed/moved/
+    # reordered, a different tab selected, workspaces added/closed): the
+    # owner debounces these into a save -- see workspace_persistence.py.
+    layout_changed = Signal()
+    # The window is closing; emitted FIRST, before anything is torn down, so
+    # the owner can save the arrangement while it is still intact.
+    closing = Signal()
+
     def __init__(self):
         global _HOST
         super().__init__()
         self.setWindowTitle("TORCA")
         self._entries = {}       # widget -> _Entry
         self._menu_providers = []  # fn(menu, ctx) -> None, see add_menu_provider
+        self._placement_hints = {}  # tab key -> workspace index, from a saved arrangement (see restore_state)
         self._floating_menu_items = []
         self._dashboard = None
         self._active_pane = None
@@ -408,6 +418,8 @@ class WorkspaceHost(QMainWindow):
             pane.set_menu_builder(lambda menu, p=pane: self._fill_add_menu(menu, p))
             pane.set_workspace_menu_builder(lambda menu, p=pane: self._fill_workspace_menu(menu, p))
             pane.currentChanged.connect(lambda _i, p=pane: self._set_active_pane(p))
+            pane.currentChanged.connect(lambda _i: self.layout_changed.emit())
+            pane.tabBar().tabMoved.connect(lambda _a, _b: self.layout_changed.emit())
         self._active_pane = self.panes[0]
 
         # ---- Top bar: floating-window menu ----
@@ -555,6 +567,7 @@ class WorkspaceHost(QMainWindow):
     def _build_layout(self):
         """Builds the splitter tree for the current layout; every child of a
         split gets an equal share."""
+        self.layout_changed.emit()
         for pane in self.panes:
             pane.setParent(self._holder)  # detach from any old splitter before it is discarded
             pane.hide()
@@ -637,7 +650,7 @@ class WorkspaceHost(QMainWindow):
         rules from present()). closable=False (the dashboard) removes
         the tab's close button and the pop-out menu item."""
         entry = self.register_window(widget, closable)
-        pane = self.panes[pane_index] if pane_index is not None else self._choose_pane()
+        pane = self.panes[pane_index] if pane_index is not None else self._pane_for(widget)
         self._dock(entry, pane)
         return entry
 
@@ -683,12 +696,15 @@ class WorkspaceHost(QMainWindow):
         populate_workspace_menu(menu, ctx) that adds its own entries too.
         Closing the host runs the dashboard's shutdown (see
         set_dashboard)."""
+        if getattr(dashboard, "workspace_key", None) is None:
+            dashboard.workspace_key = "map"
         self.add_window(dashboard, closable=False, pane_index=pane_index)
         self.set_dashboard(dashboard)
         take = getattr(dashboard, "take_data_pages", None)
         if take is not None:
             for title, page in take():
                 page.setWindowTitle(title)
+                page.workspace_key = f"page:{title}"
                 self.register_window(page, closable=True)
         take_top_bar = getattr(dashboard, "take_top_bar_widgets", None)
         if take_top_bar is not None:
@@ -711,10 +727,20 @@ class WorkspaceHost(QMainWindow):
             widget.activateWindow()
             return
         elif entry.pane is None:
-            self._dock(entry, self._choose_pane())
+            self._dock(entry, self._pane_for(widget))
         entry.pane.setCurrentWidget(entry.page)
         self._set_active_pane(entry.pane)
         widget.setFocus()
+
+    def _pane_for(self, widget):
+        """Where a window being docked for the first time goes: the
+        workspace it had in the saved arrangement being restored (see
+        restore_state), else the normal placement rule."""
+        key = getattr(widget, "workspace_key", None)
+        index = self._placement_hints.pop(key, None) if key else None
+        if index is not None and index in tree_leaves(self._tree):
+            return self.panes[index]
+        return self._choose_pane()
 
     def _choose_pane(self):
         for pane in self.visible_panes():
@@ -744,6 +770,7 @@ class WorkspaceHost(QMainWindow):
             pane.tabBar().setTabButton(index, QTabBar.RightSide, None)
         entry.pane = pane
         pane.setCurrentIndex(index)
+        self.layout_changed.emit()
 
     def _move_to_pane(self, entry, target):
         """Moves an already-docked window's tab to another workspace."""
@@ -802,6 +829,7 @@ class WorkspaceHost(QMainWindow):
         entry.widget.setParent(None)
         page.deleteLater()
         entry.pane = entry.page = None
+        self.layout_changed.emit()
 
     # ---- floating ----
 
@@ -820,6 +848,7 @@ class WorkspaceHost(QMainWindow):
         widget.resize(size)
         widget.show()
         widget.raise_()
+        self.layout_changed.emit()
 
     def dock_floating(self, widget):
         entry = self._entries.get(widget)
@@ -880,6 +909,93 @@ class WorkspaceHost(QMainWindow):
             widget = widget.parentWidget()
 
     # ------------------------------------------------------------------
+    # Saved arrangement (see workspace_state.py / workspace_persistence.py)
+    # ------------------------------------------------------------------
+
+    def window_keys(self):
+        """{key: widget} for every hosted window that has a workspace_key."""
+        return {key: entry.widget for entry in self._entries.values()
+                if (key := getattr(entry.widget, "workspace_key", None))}
+
+    def capture_state(self):
+        """The current arrangement as plain data: the layout tree, and per
+        workspace its docked tabs (by key, in order) and selected tab. Only
+        windows with a workspace_key are recorded; floating ones are not."""
+        workspaces = {}
+        for index in tree_leaves(self._tree):
+            pane = self.panes[index]
+            tabs, current = [], None
+            for position in range(pane.count()):
+                entry = next((e for e in self._entries.values() if e.page is pane.widget(position)), None)
+                key = getattr(entry.widget, "workspace_key", None) if entry else None
+                if key:
+                    tabs.append(key)
+                    if position == pane.currentIndex():
+                        current = key
+            workspaces[str(index)] = {"tabs": tabs, "current": current}
+        return {
+            "layout": tree_to_json(self._tree),
+            "workspaces": workspaces,
+            "active": self._active_pane.index if self._active_pane.index in tree_leaves(self._tree) else 0,
+        }
+
+    def restore_state(self, state):
+        """Applies a (cleaned) saved arrangement's LAYOUT and records where
+        each tab should go. Windows that already exist are placed with
+        place_by_hint(); ones created afterwards (radios, tools, the Log Book)
+        dock in their saved workspace the first time they are shown. Call
+        finish_restore() once everything has been created."""
+        tree = tree_from_json(state.get("layout"))
+        if tree is None:
+            return False
+        self._tree = tree
+        self._build_layout()
+        self._placement_hints = {
+            key: int(index) for index, workspace in state.get("workspaces", {}).items() for key in workspace.get("tabs", [])
+        }
+        return True
+
+    def place_by_hint(self, widget):
+        """Puts an already-registered window where the saved arrangement had
+        it -- moving it if docked elsewhere, docking it if it was open then.
+        Returns True if the saved arrangement had it open."""
+        key = getattr(widget, "workspace_key", None)
+        index = self._placement_hints.pop(key, None) if key else None
+        if index is None or index not in tree_leaves(self._tree):
+            return False
+        self.open_in(widget, index)
+        return True
+
+    def finish_restore(self, state):
+        """After everything is created: put each workspace's tabs in their
+        saved order, select the saved tab in each, and the saved active
+        workspace. Forgets any hints that were never used."""
+        self._placement_hints.clear()
+        keys = self.window_keys()
+        for index_text, workspace in state.get("workspaces", {}).items():
+            index = int(index_text)
+            if index not in tree_leaves(self._tree):
+                continue
+            pane = self.panes[index]
+            position = 0
+            for key in workspace.get("tabs", []):
+                widget = keys.get(key)
+                entry = self._entries.get(widget)
+                if entry is None or entry.pane is not pane:
+                    continue
+                current_position = pane.indexOf(entry.page)
+                if current_position != position:
+                    pane.tabBar().moveTab(current_position, position)
+                position += 1
+            widget = keys.get(workspace.get("current"))
+            entry = self._entries.get(widget)
+            if entry is not None and entry.pane is pane:
+                pane.setCurrentWidget(entry.page)
+        active = state.get("active", 0)
+        self._set_active_pane(self.panes[active if active in tree_leaves(self._tree) else 0])
+        self.layout_changed.emit()
+
+    # ------------------------------------------------------------------
     # Application shutdown
     # ------------------------------------------------------------------
 
@@ -890,6 +1006,7 @@ class WorkspaceHost(QMainWindow):
 
     def closeEvent(self, event):
         global _HOST
+        self.closing.emit()  # first: lets the owner save the arrangement while it is still intact
         self._closing = True
         if self._dashboard is not None:
             self._dashboard.close()  # radios, servers, worker threads -- see HamClockWindow.closeEvent

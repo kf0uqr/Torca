@@ -63,6 +63,7 @@ from rtty_window import RttyToolWindow
 from psk31_window import Psk31ToolWindow
 from aprs_window import AprsToolWindow
 from workspace_host import present_window, retire_button
+from workspace_state import radio_identity, identity_key
 from wrapping_button_layout import WrappingButtonLayout
 from recording_window import RecordingToolWindow
 
@@ -134,6 +135,11 @@ class RadioWindow(QWidget):
     def __init__(self, details, satellite_session):
         super().__init__()
         self._details = details
+        # Which radio this is, for the saved workspace (see workspace_state.py):
+        # the identity has no credentials; the key names this tab (and, with a
+        # tool name appended, its tool tabs) across launches.
+        self.identity = radio_identity(details)
+        self.workspace_key = f"radio:{identity_key(self.identity)}"
         self._role = details.get("role", "non_sat")
         self._satellite_session = satellite_session
         if details["connection_type"] == "network":
@@ -1048,6 +1054,7 @@ class RadioWindow(QWidget):
         logic or showing a window the operator never asked to see."""
         if self.cw_window is None:
             self.cw_window = CwToolWindow(self)
+            self.cw_window.workspace_key = self._tool_key("CW Tool")
         return self.cw_window
 
     def _on_cw_tool_clicked(self):
@@ -1057,6 +1064,7 @@ class RadioWindow(QWidget):
     def ensure_sstv_tool_window(self):
         if self.sstv_window is None:
             self.sstv_window = SstvToolWindow(self)
+            self.sstv_window.workspace_key = self._tool_key("SSTV Tool")
         return self.sstv_window
 
     def _on_sstv_tool_clicked(self):
@@ -1065,6 +1073,7 @@ class RadioWindow(QWidget):
     def ensure_rtty_tool_window(self):
         if self.rtty_window is None:
             self.rtty_window = RttyToolWindow(self)
+            self.rtty_window.workspace_key = self._tool_key("RTTY Tool")
         return self.rtty_window
 
     def _on_rtty_tool_clicked(self):
@@ -1073,6 +1082,7 @@ class RadioWindow(QWidget):
     def ensure_psk31_tool_window(self):
         if self.psk31_window is None:
             self.psk31_window = Psk31ToolWindow(self)
+            self.psk31_window.workspace_key = self._tool_key("PSK31 Tool")
         return self.psk31_window
 
     def _on_psk31_tool_clicked(self):
@@ -1085,6 +1095,7 @@ class RadioWindow(QWidget):
         this exists (Remote Access's APRS web page)."""
         if self.aprs_window is None:
             self.aprs_window = AprsToolWindow(self)
+            self.aprs_window.workspace_key = self._tool_key("APRS Tool")
             self.aprs_window.packet_decoded.connect(self.aprs_packet_decoded)
         return self.aprs_window
 
@@ -1095,6 +1106,7 @@ class RadioWindow(QWidget):
     def ensure_memories_window(self):
         if self.memories_window is None:
             self.memories_window = MemoriesWindow(self)
+            self.memories_window.workspace_key = self._tool_key("Memories")
         return self.memories_window
 
     def _on_memories_button_clicked(self):
@@ -1103,6 +1115,7 @@ class RadioWindow(QWidget):
     def ensure_recording_tool_window(self):
         if self.recording_window is None:
             self.recording_window = RecordingToolWindow(self)
+            self.recording_window.workspace_key = self._tool_key("Recording Tool")
         return self.recording_window
 
     def _on_recording_tool_clicked(self):
@@ -2168,6 +2181,22 @@ class RadioWindow(QWidget):
             )
 
     # ---- titles (these are what the workspace tabs show) ----
+
+    def _tool_key(self, tool_name):
+        return f"tool:{identity_key(self.identity)}:{tool_name}"
+
+    def ensure_tool_window(self, tool_name):
+        """Builds (without showing) the tool window with this display name --
+        "CW Tool", "APRS Tool", ... -- or returns None for an unknown name.
+        Used to bring a tool tab back when a saved workspace is restored."""
+        builders = {
+            "CW Tool": self.ensure_cw_tool_window, "APRS Tool": self.ensure_aprs_tool_window,
+            "SSTV Tool": self.ensure_sstv_tool_window, "RTTY Tool": self.ensure_rtty_tool_window,
+            "PSK31 Tool": self.ensure_psk31_tool_window, "Recording Tool": self.ensure_recording_tool_window,
+            "Memories": self.ensure_memories_window,
+        }
+        builder = builders.get(tool_name)
+        return builder() if builder else None
 
     def display_name(self):
         """The radio's model, e.g. "IC-9700" -- plus its connection in

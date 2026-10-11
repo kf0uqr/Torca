@@ -48,12 +48,14 @@ import logging
 import os
 import sys
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from ham_dashboard import HamClockWindow
-from operator_profile import OperatorProfileDialog
+from operator_profile import ensure_active_profile
 from theme import apply_dark_theme
 from workspace_host import WorkspaceHost
+from workspace_persistence import WorkspacePersistence
 
 # Diagnostic only -- TORCA_DEBUG_RIGPLANE=1 python3 main.py. Surfaces
 # rigplane's own internal DEBUG logging (logging.getLogger("rigplane")),
@@ -71,14 +73,13 @@ def main():
     app = QApplication(sys.argv)
     apply_dark_theme(app)
 
-    # First thing on every launch: who's operating, and from where.
-    # Purely a QSettings side effect (operator_callsign/operator_lat/
-    # operator_lon/operator_elevation_m) -- see operator_profile.py's
-    # own docstring. Cancelling just proceeds with whatever was already
-    # saved (or blank, on a genuinely first-ever run) rather than
-    # blocking startup -- same non-blocking precedent as this app's
-    # older single-field callsign prompt.
-    OperatorProfileDialog.run()
+    # Who's operating, and from where -- as a named profile everything is
+    # saved under (see operator_profile.py). The very first launch requires
+    # creating one; after that the last-used profile loads without asking.
+    # New profiles and switching are done from within the app (Profile...).
+    profile = ensure_active_profile()
+    if profile is None:
+        sys.exit(0)  # declined to create a profile on first launch
 
     # One main window with 1-4 workspaces holds the dashboard, every radio
     # and every tool as tabs -- see workspace_host.py. The dashboard is
@@ -88,6 +89,18 @@ def main():
     window = HamClockWindow()
     host.add_dashboard(window)
     host.showMaximized()
+
+    # Reopen the profile's last workspace (tabs, layout, connected radios) once
+    # the window has its real size, then keep saving it as it changes. Kept on
+    # the host so it lives as long as the app.
+    host.persistence = WorkspacePersistence(host, window, profile)
+
+    def restore_workspace():
+        problems = host.persistence.start()
+        if problems:
+            QMessageBox.information(host, "Couldn't reopen everything", "\n\n".join(problems))
+
+    QTimer.singleShot(0, restore_workspace)
     sys.exit(app.exec())
 
 

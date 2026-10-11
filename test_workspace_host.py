@@ -805,3 +805,124 @@ def test_dashboard_without_top_bar_widgets_still_works(host):
     dash = RealClose("Ham Dashboard")
     host.add_dashboard(dash)                       # no take_top_bar_widgets: nothing handed over, nothing breaks
     assert host.pane_of(dash) == 0
+
+
+# ---- saved arrangement: capture / restore ----
+
+def _keyed(cls, key, title=None):
+    widget = cls(title or key)
+    widget.workspace_key = key
+    return widget
+
+
+def test_capture_records_layout_tabs_order_current_and_active_by_key(host, app):
+    host.add_workspace(0, "right")
+    a, b, c = _keyed(RealClose, "map"), _keyed(HideOnClose, "page:Contests"), _keyed(HideOnClose, "logbook")
+    host.add_window(a, closable=False, pane_index=0)
+    host.open_in(b, 0)
+    host.open_in(c, 1)
+    host.panes[0].setCurrentWidget(host._entries[a].page)
+    host._set_active_pane(host.panes[1])
+    unkeyed = HideOnClose("no key")
+    host.open_in(unkeyed, 1)                                   # windows without a key are simply not recorded
+
+    state = host.capture_state()
+    assert state["layout"] == ["h", [0, 1]]
+    assert state["workspaces"]["0"] == {"tabs": ["map", "page:Contests"], "current": "map"}
+    assert state["workspaces"]["1"]["tabs"] == ["logbook"]
+    assert state["active"] == 1
+
+
+def test_restore_puts_existing_and_later_created_windows_in_their_saved_workspaces(host, app):
+    saved = {
+        "layout": ["h", [0, 1]],
+        "workspaces": {
+            "0": {"tabs": ["page:Parks", "map"], "current": "page:Parks"},
+            "1": {"tabs": ["logbook", "radio:r", "tool:r:CW"], "current": "radio:r"},
+        },
+        "active": 1,
+    }
+    dash = _keyed(RealClose, "map")
+    host.add_window(dash, closable=False, pane_index=0)
+    parks, contests = _keyed(HideOnClose, "page:Parks"), _keyed(HideOnClose, "page:Contests")
+    host.register_window(parks)
+    host.register_window(contests)
+
+    assert host.restore_state(saved)
+    assert host.workspace_count == 2
+    assert host.place_by_hint(dash) and host.place_by_hint(parks)       # already registered: placed now
+    assert not host.place_by_hint(contests)                             # was not open when saved: stays closed
+    assert host.pane_of(contests) is None and host.pane_of(parks) == 0
+
+    # windows created later (a radio reconnecting, a tool, the Log Book) dock where they were
+    radio, tool, logbook = _keyed(RealClose, "radio:r"), _keyed(HideOnClose, "tool:r:CW"), _keyed(HideOnClose, "logbook")
+    for widget in (radio, tool, logbook):
+        host.present(widget)
+        assert host.pane_of(widget) == 1, widget.workspace_key
+    host.finish_restore(saved)
+    assert host.capture_state()["workspaces"] == {
+        "0": {"tabs": ["page:Parks", "map"], "current": "page:Parks"},
+        "1": {"tabs": ["logbook", "radio:r", "tool:r:CW"], "current": "radio:r"},
+    }
+    assert host._active_pane is host.panes[1]
+
+
+def test_restore_applies_the_saved_split_layout(host, app):
+    saved = {"layout": ["v", [["h", [0, 2]], 1]], "workspaces": {"0": {"tabs": [], "current": None}}, "active": 0}
+    assert host.restore_state(saved)
+    assert host._tree == (V, ((H, (0, 2)), 1)) and host.workspace_count == 3
+
+
+def test_unknown_or_invalid_saved_data_is_ignored_safely(host, app):
+    assert host.restore_state({"layout": ["h", [1, 2]], "workspaces": {}}) is False
+    assert host.workspace_count == 1
+    stray = _keyed(HideOnClose, "tool:never:CW")
+    host.restore_state({"layout": ["h", [0, 1]], "workspaces": {"3": {"tabs": ["tool:never:CW"], "current": None}}})
+    host.present(stray)                                                   # hint points at a workspace that doesn't exist
+    assert host.pane_of(stray) in (0, 1)
+    host.finish_restore({"layout": ["h", [0, 1]], "workspaces": {"9": {"tabs": ["x"], "current": "x"}}, "active": 7})
+
+
+def test_a_hint_is_used_once_so_a_reopened_window_follows_the_normal_rule(host, app):
+    host.restore_state({"layout": ["h", [0, 1]], "workspaces": {"1": {"tabs": ["logbook"], "current": "logbook"}}, "active": 0})
+    logbook = _keyed(HideOnClose, "logbook")
+    host.present(logbook)
+    assert host.pane_of(logbook) == 1
+    host.panes[1].tabCloseRequested.emit(0)                               # closed by the user ...
+    _settle(app)
+    host.add_window(_keyed(RealClose, "map"), closable=False, pane_index=1)   # ... and workspace 2 is no longer empty
+    host.present(logbook)
+    assert host.pane_of(logbook) == host._active_pane.index               # normal rule, not the stale hint
+
+
+def test_layout_changed_fires_for_structural_changes_and_closing_fires_first(host, app):
+    seen = []
+    host.layout_changed.connect(lambda: seen.append("changed"))
+    host.closing.connect(lambda: seen.append("closing"))
+    host.add_workspace(0, "right")
+    assert "changed" in seen
+    seen.clear()
+    widget = _keyed(HideOnClose, "logbook")
+    host.present(widget)
+    assert "changed" in seen
+    seen.clear()
+    host.move_window(widget, 1)
+    assert "changed" in seen
+    seen.clear()
+    dash = _keyed(RealClose, "map")
+    host.add_window(dash, closable=False, pane_index=0)
+    host.set_dashboard(dash)
+    seen.clear()
+    host.close()
+    assert seen[0] == "closing" and dash.closed
+
+
+def test_add_dashboard_gives_the_dashboard_and_its_pages_keys(host):
+    class Dash(RealClose):
+        def take_data_pages(self):
+            return [("Band Conditions", QWidget()), ("Contests", QWidget())]
+
+    dash = Dash("Map")
+    host.add_dashboard(dash)
+    assert dash.workspace_key == "map"
+    assert set(host.window_keys()) == {"map", "page:Band Conditions", "page:Contests"}

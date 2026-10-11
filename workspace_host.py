@@ -392,6 +392,10 @@ class _MenuContext:
         host = self._host
         return host in host.manager.hosts and self._pane.index in tree_leaves(host._tree)
 
+    def is_open(self, widget):
+        """True if the widget is already a tab somewhere (in any window)."""
+        return widget is not None and self._host.manager.host_of(widget) is not None
+
     def label(self, title, widget=None):
         """`title`, plus where the widget is already open if that is not right
         here: "(Workspace 2)" in this window, "(Window 2, Workspace 1)" in another."""
@@ -421,6 +425,9 @@ class _TopBarContext:
 
     def is_valid(self):
         return self._host in self._host.manager.hosts
+
+    def is_open(self, widget):
+        return widget is not None and self._host.manager.host_of(widget) is not None
 
     def label(self, title, widget=None):
         return title

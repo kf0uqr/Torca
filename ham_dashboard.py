@@ -2490,15 +2490,18 @@ class HamClockWindow(QWidget):
         provider): the reference-data pages, the Log Book, and a submenu
         of tools for each connected radio. Everything is built lazily --
         picking an entry opens it as a tab in that workspace."""
-        for title, page in getattr(self, "_data_pages", []):
+        # Anything already open as a tab is not offered again.
+        pages = [(title, page) for title, page in getattr(self, "_data_pages", []) if not ctx.is_open(page)]
+        for title, page in pages:
             menu.addAction(ctx.label(title, page)).triggered.connect(
                 lambda _c=False, p=page: ctx.open(p)
             )
-        if getattr(self, "_data_pages", None):
+        if pages:
             menu.addSeparator()
-        menu.addAction(ctx.label("Log Book", self.log_book_window)).triggered.connect(
-            lambda _c=False: ctx.open(self._ensure_log_book_window())
-        )
+        if not ctx.is_open(self.log_book_window):
+            menu.addAction(ctx.label("Log Book", self.log_book_window)).triggered.connect(
+                lambda _c=False: ctx.open(self._ensure_log_book_window())
+            )
         radios = list(self._connected_radios)
         if radios:
             menu.addSeparator()
@@ -2509,7 +2512,10 @@ class HamClockWindow(QWidget):
                     # Two radios of the same model: say which one, or the
                     # submenus would be indistinguishable.
                     title += f" ({window._connection_label})"
-                window.populate_tool_menu(menu.addMenu(title), ctx)
+                submenu = menu.addMenu(title)
+                window.populate_tool_menu(submenu, ctx)
+                if submenu.isEmpty():
+                    menu.removeAction(submenu.menuAction())   # every tool of this radio is already open
 
         # ---- what used to be the dashboard's button row ----
         # Each entry drives the (now hidden) button it replaced, so all the

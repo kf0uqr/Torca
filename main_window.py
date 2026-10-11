@@ -1173,6 +1173,8 @@ class RadioWindow(QWidget):
             ("Recording Tool", self.ensure_recording_tool_window, self.recording_window, self.recording_tool_button),
             ("Memories", self.ensure_memories_window, self.memories_window, self.memories_button),
         ):
+            if ctx.is_open(current):
+                continue   # a tool is one tab: once it is open there is nothing to add
             action = menu.addAction(ctx.label(title, current))
             # The (hidden) tool buttons are only enabled once the radio has
             # connected -- the same rule applies to the menu entries.

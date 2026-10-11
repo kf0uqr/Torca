@@ -460,7 +460,7 @@ def test_ft8_tool_is_a_normal_tool_tab_that_a_saved_workspace_can_restore(app, m
         from PySide6.QtWidgets import QMenu
         import types
         menu = QMenu()
-        ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+        ctx = types.SimpleNamespace(open=lambda w: None, is_open=lambda w: False, label=lambda title, widget=None: title)
         window.populate_tool_menu(menu, ctx)
         assert "FT8 Tool" in [a.text() for a in menu.actions()]
     finally:

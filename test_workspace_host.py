@@ -369,7 +369,7 @@ def test_radio_window_tool_menu_lists_every_tool_and_builds_lazily(app):
 
     fake, built = _fake_radio(app, connected=True)
     opened = []
-    ctx = types.SimpleNamespace(open=opened.append, label=lambda title, widget=None: title)
+    ctx = types.SimpleNamespace(open=opened.append, is_open=lambda w: False, label=lambda title, widget=None: title)
     menu = QMenu()
     RadioWindow.populate_tool_menu(fake, menu, ctx)
     assert [a.text() for a in menu.actions()] == [
@@ -386,7 +386,7 @@ def test_radio_tool_menu_entries_are_disabled_until_the_radio_has_connected(app)
     from main_window import RadioWindow
 
     fake, _built = _fake_radio(app, connected=False)
-    ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+    ctx = types.SimpleNamespace(open=lambda w: None, is_open=lambda w: False, label=lambda title, widget=None: title)
     menu = QMenu()
     RadioWindow.populate_tool_menu(fake, menu, ctx)
     assert menu.actions() and not any(a.isEnabled() for a in menu.actions())
@@ -422,7 +422,7 @@ def test_dashboard_menu_keeps_only_connect(app):
     import types
     from PySide6.QtWidgets import QMenu
     fake, calls, cls = _fake_dashboard_for_actions(app)
-    ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+    ctx = types.SimpleNamespace(open=lambda w: None, is_open=lambda w: False, label=lambda title, widget=None: title)
     menu = QMenu()
     cls.populate_workspace_menu(fake, menu, ctx)
     texts = [a.text() for a in menu.actions() if not a.isSeparator()]
@@ -438,7 +438,7 @@ def test_top_bar_buttons_mirror_the_retired_buttons_and_remember_their_window(ap
     import types
     fake, calls, cls = _fake_dashboard_for_actions(app)
     fake.profile_button.setText("Profile...")
-    ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+    ctx = types.SimpleNamespace(open=lambda w: None, is_open=lambda w: False, label=lambda title, widget=None: title)
     fake._remember_menu_origin = lambda c: (fake.origins.append(c), calls.append("origin"))
     buttons = cls.make_top_bar_actions(fake, ctx)
     assert [b.text() for b in buttons] == ["Profile...", "new_qso", "wsjtx", "js8call", "Check for Updates...", "remote_access"]
@@ -1172,3 +1172,25 @@ def test_secondary_windows_are_deleted_when_closed_and_do_not_leak(host, app):
     _flush_deletes(app)
     assert not isValid(second)
     assert host.manager.hosts == [host]
+
+
+def test_menu_hides_tabs_that_are_already_open(host, app):
+    import types
+    from PySide6.QtWidgets import QMenu
+    fake, calls, cls = _fake_dashboard_for_actions(app)
+    page, other = RealClose("Contests"), RealClose("Parks")
+    fake._data_pages = [("Contests", page), ("Parks", other)]
+    host.register_window(page, closable=True)
+    host.register_window(other, closable=True)
+    ctx = host._menu_ctx(0) if hasattr(host, "_menu_ctx") else None
+    from workspace_host import _MenuContext
+    ctx = _MenuContext(host, host.panes[0])
+
+    def texts():
+        menu = QMenu()
+        cls.populate_workspace_menu(fake, menu, ctx)
+        return [a.text() for a in menu.actions() if not a.isSeparator()]
+    assert "Contests" in texts() and "Parks" in texts()
+    host.open_in(page, 0)
+    listed = texts()
+    assert "Contests" not in listed and "Parks" in listed and "Connect New Radio..." in listed

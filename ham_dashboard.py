@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
 from workspace_host import present_window, retire_button
 from update_progress_dialog import UpdateProgressDialog
+from collapsible_sidebar import CollapsibleSidebar
 from world_map import WorldMapWidget
 from connection_dialog import ConnectionDialog
 from operator_profile import OperatorProfileDialog
@@ -1712,14 +1713,24 @@ class HamClockWindow(QWidget):
         clocks_row.addStretch()
         clocks_row.addWidget(self.k_index_label)
 
-        map_buttons_row = QHBoxLayout()
-        map_buttons_row.addWidget(self.satellite_button)
-        map_buttons_row.addWidget(self.qso_map_button)
-        map_buttons_row.addWidget(self.pskreporter_button)
-        map_buttons_row.addWidget(self.pota_button)
-        map_buttons_row.addWidget(self.aprs_button)
-        map_buttons_row.addWidget(self.qso_band_filter_combo)
-        map_buttons_row.addStretch()
+        # The map-layer toggles and the QSO band filter live in an
+        # expandable sidebar beside the map (collapsed, it is just a thin
+        # arrow strip) -- show or hide it from its header; the choice is
+        # remembered. Stacked vertically; the controls are the same widgets
+        # as before, so everything wired to them is unchanged.
+        self.filters_sidebar = CollapsibleSidebar(
+            "Filters",
+            expanded=QSettings("IcomRadioApp", "RadioControl").value("filters_sidebar_expanded", True, type=bool),
+        )
+        for filter_control in (self.satellite_button, self.qso_map_button, self.pskreporter_button,
+                               self.pota_button, self.aprs_button, self.qso_band_filter_combo):
+            self.filters_sidebar.content_layout().addWidget(filter_control)
+        self.filters_sidebar.toggled.connect(
+            lambda expanded: QSettings("IcomRadioApp", "RadioControl").setValue("filters_sidebar_expanded", expanded)
+        )
+        map_row = QHBoxLayout()
+        map_row.addWidget(self.filters_sidebar)
+        map_row.addWidget(self.map_widget, 1)
 
         passes_header_row = QHBoxLayout()
         passes_header_row.addWidget(QLabel("Upcoming Satellite Passes:"))
@@ -1749,16 +1760,15 @@ class HamClockWindow(QWidget):
 
         layout = QVBoxLayout()
         # clocks_row (UTC/local time plus SFI/SSN/K-index, per explicit
-        # instruction) and map_buttons_row (satellite/QSO Map toggles,
-        # in their own row) both above the map. The map takes all spare
-        # height (stretch 1): it is a real tiled map now, so it simply
+        # instruction) above the map, with the filters sidebar (map-layer
+        # toggles and band filter) to the map's left. The map takes all
+        # spare height (stretch 1): it is a real tiled map now, so it simply
         # fills its container instead of needing an aspect-correct box
         # (see world_map.py's docstring). The satellite controls
         # (tracking row, live readout, TLE warning) live on the
         # Satellites page with the passes list, not under the map.
         layout.addLayout(clocks_row)
-        layout.addLayout(map_buttons_row)
-        layout.addWidget(self.map_widget, 1)  # the map takes all spare height (it is a real tiled map: no aspect to preserve)
+        layout.addLayout(map_row, 1)  # the map takes all spare height (it is a real tiled map: no aspect to preserve)
         layout.addLayout(top_buttons_row)
         layout.addLayout(bottom_row)
         self.setLayout(layout)

@@ -381,6 +381,12 @@ class _MenuContext:
     def open(self, widget):
         self._host.open_in(widget, self._pane.index)
 
+    def is_valid(self):
+        """True while the window and workspace this menu belongs to still exist
+        (a menu's context can be remembered past the window being closed)."""
+        host = self._host
+        return host in host.manager.hosts and self._pane.index in tree_leaves(host._tree)
+
     def label(self, title, widget=None):
         """`title`, plus where the widget is already open if that is not right
         here: "(Workspace 2)" in this window, "(Window 2, Workspace 1)" in another."""

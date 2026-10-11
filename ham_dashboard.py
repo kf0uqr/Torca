@@ -1018,6 +1018,7 @@ class HamClockWindow(QWidget):
         self.satellite_remote_state = SatelliteRemoteState(self)
 
         self._connected_radios = []  # RadioWindow instances, in connection order
+        self._connect_origin = None  # menu context a radio connect was started from (see _remember_connect_origin)
         self._active_satellite = None  # for populating the transponder combo -- SatelliteSession keeps its own copy for computation
 
         self.map_widget = WorldMapWidget()
@@ -2587,8 +2588,13 @@ class HamClockWindow(QWidget):
         # enable/progress/toggle logic those buttons already carry keeps
         # working; the menu just mirrors their state when it opens.
         menu.addSection("Actions")
-        menu.addAction("Connect New Radio...").triggered.connect(lambda _c=False: self._on_connect_radio_clicked())
-        for button in (self.radios_button, self.new_qso_button, self.profile_button):
+        menu.addAction("Connect New Radio...").triggered.connect(
+            lambda _c=False: (self._remember_connect_origin(ctx), self._on_connect_radio_clicked())
+        )
+        # The Radios dialog has its own Connect button, clicked later: remember
+        # where it was opened from so that radio lands there too.
+        self._add_action_for_button(menu, self.radios_button, before=lambda: self._remember_connect_origin(ctx))
+        for button in (self.new_qso_button, self.profile_button):
             self._add_action_for_button(menu, button)
         menu.addSeparator()
         for button in (self.wsjtx_button, self.js8call_button):
@@ -2606,14 +2612,14 @@ class HamClockWindow(QWidget):
             self._add_action_for_button(menu, button)
 
     @staticmethod
-    def _add_action_for_button(menu, button):
+    def _add_action_for_button(menu, button, before=None):
         """A menu entry that mirrors a retired button: its current text
         (e.g. "Updating: Pulling the latest changes..." mid-update),
         enabled state and tooltip, and clicking it clicks the button."""
         action = menu.addAction(button.text())
         action.setEnabled(button.isEnabled())
         action.setToolTip(button.toolTip())
-        action.triggered.connect(lambda _c=False, b=button: b.click())
+        action.triggered.connect(lambda _c=False, b=button: (before() if before else None, b.click()))
 
     def _ensure_log_book_window(self):
         if self.log_book_window is None:
@@ -3265,9 +3271,20 @@ class HamClockWindow(QWidget):
         dialog = ConnectionDialog(self, active_roles=active_roles)
         if dialog.exec() != QDialog.Accepted:
             return
-        self._open_radio(dialog.details)
+        self._open_radio(dialog.details, place=self._connect_origin_placer())
 
-    def _open_radio(self, details):
+    def _remember_connect_origin(self, ctx):
+        """The workspace whose "+" menu the operator started connecting a radio
+        from: the new radio opens THERE (not wherever the general placement rule
+        would put it), also when it is the Radios dialog's own Connect button
+        that finishes the job a moment later."""
+        self._connect_origin = ctx
+
+    def _connect_origin_placer(self):
+        ctx = self._connect_origin
+        return ctx.open if ctx is not None and ctx.is_valid() else None
+
+    def _open_radio(self, details, place=None):
         """Everything after the connection details are known: build the radio's
         window, wire it into the dashboard and Remote Access, and show it (in
         its workspace). Shared by the Connect dialog and by restoring a saved
@@ -3300,7 +3317,7 @@ class HamClockWindow(QWidget):
         self.connected_radios_list.addItem(item)
 
         self._update_radio_service_buttons_enabled()
-        present_window(window)
+        (place or present_window)(window)  # `place`: the workspace the connect was started from, if any
         return window
 
     # ---- saved workspace support (see workspace_persistence.py) ----

@@ -407,6 +407,8 @@ def _fake_dashboard_for_actions(app):
     fake.wsjtx_autolog_button = QPushButton("WSJT-X Auto-Log: OFF")
     fake.wsjtx_autolog_button.setCheckable(True)
     fake.wsjtx_autolog_button.toggled.connect(lambda on: calls.append(f"autolog={on}"))
+    fake.origins = []                                                  # menu contexts the dashboard was told to remember
+    fake._remember_connect_origin = lambda ctx: (fake.origins.append(ctx), calls.append("origin"))
     fake._on_connect_radio_clicked = lambda: calls.append("connect")
     fake._on_wsjtx_autolog_menu_requested = lambda _pos: calls.append("autolog_port")
     fake._ensure_log_book_window = lambda: None
@@ -431,7 +433,10 @@ def test_dashboard_actions_section_replaces_the_button_row(app):
     for a in menu.actions():
         if a.text() in ("Connect New Radio...", "radios", "profile", "WSJT-X Auto-Log UDP Port..."):
             a.trigger()
-    assert calls == ["connect", "radios", "profile", "autolog_port"]
+    # connecting from a workspace's menu remembers THAT workspace first (so the radio opens there),
+    # for the direct entry and for the Radios dialog's own Connect button
+    assert calls == ["origin", "connect", "origin", "radios", "profile", "autolog_port"]
+    assert fake.origins == [ctx, ctx]
 
 
 def test_actions_mirror_button_state_and_toggle_autolog(app):

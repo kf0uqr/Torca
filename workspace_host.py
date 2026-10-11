@@ -144,6 +144,17 @@ def present_window(widget):
     widget.activateWindow()
 
 
+def forget_window(widget):
+    """A throwaway tab (e.g. a New QSO form) is finished with: drops it from
+    the registry and deletes it, if it is no longer shown anywhere."""
+    manager = _HOST.manager if _HOST is not None else None
+    entry = manager.entries.get(widget) if manager is not None else None
+    if entry is not None and entry.host is None:
+        del manager.entries[widget]
+    if entry is None or entry.host is None:
+        widget.deleteLater()
+
+
 def retire_button(parent, button):
     """Takes a button out of the visible UI while keeping the object.
     Its entry now lives in a workspace's "+" menu, but the button still

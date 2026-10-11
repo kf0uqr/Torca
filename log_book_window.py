@@ -14,7 +14,7 @@ re-shown without needing a "closed" signal to know when to build a
 fresh one.
 """
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtWidgets import (
     QWidget,
     QDialog,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 import qso_log
 import qrz_logbook
 from new_qso_dialog import NewQsoDialog
+from workspace_host import forget_window, present_window
 
 _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
@@ -348,13 +349,22 @@ class LogBookWindow(QWidget):
         # but a locally-scoped Python variable going out of scope right
         # after .show() returns is still worth avoiding explicitly.
         self._open_dialogs.append(dialog)
-        dialog.finished.connect(lambda _result, d=dialog: self._open_dialogs.remove(d) if d in self._open_dialogs else None)
+        dialog.finished.connect(lambda _result, d=dialog: self._dialog_finished(d))
 
-    def _on_new_qso_clicked(self):
-        dialog = NewQsoDialog(self._dashboard, parent=self)
+    def _dialog_finished(self, dialog):
+        if dialog in self._open_dialogs:
+            self._open_dialogs.remove(dialog)
+        # The form hid itself (its tab is dropped on the next event-loop turn);
+        # once that has happened it is finished with for good.
+        QTimer.singleShot(0, lambda: forget_window(dialog))
+
+    def _on_new_qso_clicked(self, place=None):
+        """Opens a fresh New QSO form as a tab -- in the workspace `place` docks
+        it into, else wherever the usual placement rule puts it."""
+        dialog = NewQsoDialog(self._dashboard)
         dialog.submitted.connect(self._on_new_qso_submitted)
         self._track_dialog(dialog)
-        dialog.show()
+        (place or present_window)(dialog)
 
     def _on_new_qso_submitted(self, fields):
         fields = qso_log.ensure_uuid(fields)
@@ -395,10 +405,10 @@ class LogBookWindow(QWidget):
         self._qsos[index] = original  # persists a freshly-assigned UUID, if this record didn't have one yet
         qso_uuid = original[qso_log.UUID_FIELD]
 
-        dialog = NewQsoDialog(self._dashboard, existing_qso=original, parent=self)
+        dialog = NewQsoDialog(self._dashboard, existing_qso=original)
         dialog.submitted.connect(lambda fields, u=qso_uuid, orig=original: self._on_edit_submitted(u, orig, fields))
         self._track_dialog(dialog)
-        dialog.show()
+        present_window(dialog)
 
     def _on_edit_submitted(self, qso_uuid, original, updated):
         index = self._find_qso_index_by_uuid(qso_uuid)

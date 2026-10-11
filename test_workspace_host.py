@@ -400,7 +400,7 @@ def _fake_dashboard_for_actions(app):
 
     calls = []
     fake = types.SimpleNamespace(_data_pages=[], log_book_window=None, _connected_radios=[])
-    for name in ("new_qso", "profile", "wsjtx", "js8call", "remote_access", "update"):
+    for name in ("profile", "wsjtx", "js8call", "remote_access", "update"):
         button = QPushButton({"update": "Check for Updates..."}.get(name, name))
         button.setToolTip(f"{name} tip")
         button.clicked.connect(lambda _c=False, n=name: calls.append(n))
@@ -411,6 +411,7 @@ def _fake_dashboard_for_actions(app):
     fake.origins = []                                                  # menu contexts the dashboard was told to remember
     fake._remember_menu_origin = lambda ctx: (fake.origins.append(ctx), calls.append("origin"))
     fake._on_connect_radio_clicked = lambda: calls.append("connect")
+    fake._on_new_qso_clicked = lambda place=None: calls.append(("new_qso", place))
     fake._on_wsjtx_autolog_menu_requested = lambda _pos: calls.append("autolog_port")
     fake._ensure_log_book_window = lambda: None
     fake._radio_list_base_label = lambda d: "radio"
@@ -427,12 +428,14 @@ def test_dashboard_menu_keeps_only_connect(app):
     menu = QMenu()
     cls.populate_workspace_menu(fake, menu, ctx)
     texts = [a.text() for a in menu.actions() if not a.isSeparator()]
-    assert texts == ["Log Book", "Connect New Radio..."]
+    assert texts == ["Log Book", "New QSO", "Connect New Radio..."]
     assert not any(a.isSeparator() and a.text() for a in menu.actions())   # no "Actions" heading any more
     for a in menu.actions():
         if a.text() == "Connect New Radio...":
             a.trigger()
-    assert calls == ["origin", "connect"] and fake.origins == [ctx]        # connecting remembers THAT workspace first
+    assert calls == ["origin", "connect"] and fake.origins == [ctx]
+    next(a for a in menu.actions() if a.text() == "New QSO").trigger()      # opens as a tab in THIS workspace
+    assert calls[-1] == ("new_qso", ctx.open)        # connecting remembers THAT workspace first
 
 
 def test_top_bar_buttons_mirror_the_retired_buttons_and_remember_their_window(app):
@@ -442,10 +445,10 @@ def test_top_bar_buttons_mirror_the_retired_buttons_and_remember_their_window(ap
     ctx = types.SimpleNamespace(open=lambda w: None, is_open=lambda w: False, label=lambda title, widget=None: title)
     fake._remember_menu_origin = lambda c: (fake.origins.append(c), calls.append("origin"))
     buttons = cls.make_top_bar_actions(fake, ctx)
-    assert [b.text() for b in buttons] == ["Profile...", "new_qso", "wsjtx", "js8call", "Check for Updates...", "remote_access"]
+    assert [b.text() for b in buttons] == ["Profile...", "wsjtx", "js8call", "Check for Updates...", "remote_access"]
     fake.update_button.setText("Updating: Pulling the latest changes...")
     fake.update_button.setEnabled(False)
-    update = buttons[4]
+    update = buttons[3]
     update._sync()
     assert update.text().startswith("Updating") and not update.isEnabled() and update.toolTip() == "update tip"
     buttons[0].click()

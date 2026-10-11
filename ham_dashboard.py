@@ -1486,14 +1486,6 @@ class HamClockWindow(QWidget):
         # this same instance is always safe to show()/raise_() again.
         self.log_book_window = None
 
-        # Opens the same New QSO window LogBookWindow itself uses --
-        # lazily builds that window (without showing it) if it doesn't
-        # exist yet, so a QSO can be logged quickly without opening the
-        # full log table first. See _on_new_qso_clicked.
-        self.new_qso_button = QPushButton("New QSO...")
-        self.new_qso_button.setToolTip("Log a new QSO -- auto-fills from a connected radio's live state if one is picked.")
-        self.new_qso_button.clicked.connect(self._on_new_qso_clicked)
-        retire_button(self, self.new_qso_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # See updater.py's own docstring for the two ways this can
         # actually update things (a dev git checkout vs. an install.sh
@@ -2464,14 +2456,14 @@ class HamClockWindow(QWidget):
         return [self.kill_remote_tx_button]
 
     def make_top_bar_actions(self, ctx):
-        """The Profile / New QSO / WSJT-X / JS8Call / Updates / Remote Access buttons for
+        """The Profile / WSJT-X / JS8Call / Updates / Remote Access buttons for
         ONE window's top bar (right after its Windows menu). Each is a mirror of
         the retired button that carries the real state: it shows that button's
         text (e.g. update progress), enabled state and tooltip, and clicking it
         clicks that button -- after remembering this window, so the dialogs it
         opens appear over it."""
         return [_MirroredButton(source, lambda: self._remember_menu_origin(ctx))
-                for source in (self.profile_button, self.new_qso_button, self.wsjtx_button, self.js8call_button,
+                for source in (self.profile_button, self.wsjtx_button, self.js8call_button,
                                self.update_button, self.remote_access_button)]
 
     def make_top_bar_widgets(self):
@@ -2522,6 +2514,9 @@ class HamClockWindow(QWidget):
         # enable/progress/toggle logic those buttons already carry keeps
         # working; the menu just mirrors their state when it opens.
         menu.addSeparator()
+        menu.addAction("New QSO").triggered.connect(
+            lambda _c=False: (self._remember_menu_origin(ctx), self._on_new_qso_clicked(place=ctx.open))
+        )
         menu.addAction("Connect New Radio...").triggered.connect(
             lambda _c=False: (self._remember_menu_origin(ctx), self._on_connect_radio_clicked())
         )
@@ -3281,13 +3276,12 @@ class HamClockWindow(QWidget):
     def _on_log_book_clicked(self):
         present_window(self._ensure_log_book_window())
 
-    def _on_new_qso_clicked(self):
-        # Deliberately does NOT show()/raise_() the Log Book window --
-        # logging a QSO shouldn't force that table open too, just needs
-        # the (possibly not-yet-created, and left hidden either way)
-        # LogBookWindow instance around to own persistence/QRZ upload,
-        # same as _on_log_book_clicked's lazy construction.
-        self._ensure_log_book_window()._on_new_qso_clicked()
+    def _on_new_qso_clicked(self, place=None):
+        # Opens the New QSO form as a tab (in the workspace `place` puts it,
+        # else by the usual placement rule). Deliberately does NOT show the Log
+        # Book -- it only needs the (possibly not-yet-created, and left hidden)
+        # LogBookWindow instance to own persistence/QRZ upload.
+        self._ensure_log_book_window()._on_new_qso_clicked(place)
 
     def _on_update_button_clicked(self):
         if self._update_check_worker is not None and self._update_check_worker.isRunning():

@@ -45,3 +45,27 @@ def test_log_book_drives_the_dashboards_wsjtx_autolog(monkeypatch, tmp_path):
     assert not window.autolog_button.isChecked()
     window.autolog_port_button.click()
     assert ports == [None]
+
+
+def test_new_qso_is_a_tab_that_goes_away_when_logged(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import types
+    import log_book_window
+    import workspace_host
+    from workspace_host import WorkspaceHost
+    monkeypatch.setattr(log_book_window.qso_log, "load_qso_log", lambda: [])
+    monkeypatch.setattr(log_book_window.qso_log, "save_qso_log", lambda q: None)
+    host = WorkspaceHost(); host.show()
+    dash = types.SimpleNamespace(_connected_radios=[])
+    book = log_book_window.LogBookWindow(dash)
+    book._on_new_qso_clicked(place=lambda w: host.open_in(w, 0))
+    dialog = book._open_dialogs[0]
+    assert host.pane_of(dialog) == 0 and host.panes[0].tabText(0) == "New QSO"
+    dialog.call_input.setText("W1AW")
+    dialog._on_accept()
+    for _ in range(5):
+        _app.processEvents()
+    assert host.panes[0].count() == 0 and dialog not in host.manager.entries and not book._open_dialogs
+    assert [q.get("CALL") for q in book._qsos] == ["W1AW"]
+    workspace_host._HOST = None
+    host._closing = True; host.close()

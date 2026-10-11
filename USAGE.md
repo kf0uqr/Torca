@@ -132,7 +132,7 @@ Receive-only decode of FT8 (15 s slots) and FT4 (7.5 s slots) straight from the 
 
 Opened from the Ham Dashboard's **Log Book...** button. Lists every QSO from a local ADIF file (works fully with no QRZ account). Click a column header to sort; **Manage Columns...** picks which fields show.
 
-- **New QSO...** -- opens a form auto-filled from a connected radio's live frequency/mode (and the active satellite/transponder, if tracking) -- everything stays editable.
+- **New QSO** (in a workspace's **+** menu) -- opens a form, as a tab, auto-filled from a connected radio's live frequency/mode (and the active satellite/transponder, if tracking) -- everything stays editable.
 - **Sync with QRZ** -- optional, two-way reconciliation with your QRZ.com Logbook (needs a QRZ Logbook API key, entered via **QRZ Settings...**).
 - **Edit Selected** / **Delete Selected** -- edit or remove one or more selected rows (deleting also removes them from QRZ if synced).
 - **WSJT-X Auto-Log** (button at the top of the Log Book): once toggled on, every QSO WSJT-X logs (its own "Log QSO" dialog, OK) is logged here automatically over WSJT-X's UDP protocol -- no manual entry, works with any running WSJT-X instance whose UDP Server port matches (use **UDP Port...** next to it to change TORCA's own listening port).

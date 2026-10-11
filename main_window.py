@@ -80,6 +80,16 @@ _STRETCH_SPECTRUM = 3
 _STRETCH_WATERFALL = 4
 _STRETCH_METER_ROW = 1
 
+# The displays only NEED these heights; the stretch factors above hand them
+# everything else the window has. Kept small on purpose: the window's
+# minimum height is what a workspace's scroll area refuses to shrink
+# below, so with the old minimums (120/200/70+70) the radio tab scrolled
+# even in a maximized 1080p window. Now the whole radio window needs
+# roughly 815px instead of 975px.
+_MIN_SPECTRUM_HEIGHT = 90
+_MIN_WATERFALL_HEIGHT = 100
+_MIN_METER_HEIGHT = 60
+
 
 class RadioWindow(QWidget):
     closed = Signal(object)  # emitted at the end of closeEvent, carrying self -- HamClockWindow listens
@@ -826,6 +836,10 @@ class RadioWindow(QWidget):
         # -- stay at their natural size, stretch 0). Their minimum heights
         # (set on the widgets themselves) are unchanged, so a small window
         # looks exactly as before.
+        self.spectrum_widget.setMinimumHeight(_MIN_SPECTRUM_HEIGHT)
+        self.waterfall_widget.setMinimumHeight(_MIN_WATERFALL_HEIGHT)
+        for meter in (*self.meter_widgets, self.meter_widget_4, self.meter_widget_5, self.meter_widget_6):
+            meter.setMinimumHeight(_MIN_METER_HEIGHT)
         layout = QVBoxLayout()
         layout.addLayout(scope_controls_row)
         layout.addWidget(self.spectrum_widget, _STRETCH_SPECTRUM)

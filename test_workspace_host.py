@@ -9,6 +9,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QWidget
 
 import workspace_host
@@ -1194,3 +1195,128 @@ def test_menu_hides_tabs_that_are_already_open(host, app):
     host.open_in(page, 0)
     listed = texts()
     assert "Contests" not in listed and "Parks" in listed and "Connect New Radio..." in listed
+
+
+# ---- dragging tabs between workspaces and windows ----
+
+def test_tree_add_left_and_above_put_the_new_workspace_first():
+    assert tree_add(0, 0, "left", "this", 1) == (H, (1, 0))
+    assert tree_add(0, 0, "above", "this", 1) == (V, (1, 0))
+    assert tree_add((H, (0, 1)), 0, "left", "all", 2) == (H, (2, 0, 1))
+
+
+def _tabs(host, index):
+    pane = host.panes[index]
+    return [pane.tabText(i) for i in range(pane.count())]
+
+
+def test_dropping_a_tab_in_another_workspace_moves_it_there(host, app):
+    a, b = RealClose("A"), RealClose("B")
+    host.add_window(a); host.add_window(b)
+    host.add_workspace(0, "right")
+    assert host.manager.drop_tab(b, host, 1)
+    assert host.pane_of(b) == 1 and _tabs(host, 0) == ["A"]
+    assert not host.manager.drop_tab(b, host, 1)               # already there: nothing to do
+
+
+def test_dropping_on_an_edge_adds_a_workspace_with_the_tab(host, app):
+    a, b = RealClose("A"), RealClose("B")
+    host.add_window(a); host.add_window(b)
+    assert host.manager.drop_tab(b, host, 0, "right")
+    assert host.workspace_count == 2 and host.pane_of(b) == 1 and host.pane_of(a) == 0
+    assert not host.manager.drop_tab(a, host, 0, "left")       # already two wide: no room, and it is where it was
+    assert host.manager.drop_tab(a, host, 0, "above")          # but a row above fits
+    assert host.workspace_count == 3 and host.pane_of(a) == 2
+
+
+def test_dragging_the_last_tab_out_closes_its_workspace(host, app):
+    a, b = RealClose("A"), RealClose("B")
+    host.add_window(a); host.add_window(b)
+    host.add_workspace(0, "right")
+    host.move_window(b, 1)
+    host.manager.drop_tab(b, host, 0)                           # workspace 2's only tab leaves
+    assert host.workspace_count == 1 and host.pane_of(b) == 0
+    # workspace 1 is never closed, even when emptied
+    host.add_workspace(0, "right")
+    host.manager.drop_tab(a, host, 1); host.manager.drop_tab(b, host, 1)
+    assert host.workspace_count == 2 and host.panes[0].count() == 0
+
+
+def test_dragging_a_tab_to_another_window(host, app):
+    a, b = RealClose("A"), RealClose("B")
+    host.add_window(a); host.add_window(b)
+    second = _new_window(host)
+    assert host.manager.drop_tab(b, second, 0)
+    assert host.manager.host_of(b) is second and _tabs(host, 0) == ["A"]
+    assert host.manager.drop_tab(b, host, 0, "below")           # and back, as a new workspace
+    assert host.manager.host_of(b) is host and host.workspace_count == 2
+    second._closing = True; second.close()
+
+
+def test_edge_zones_only_where_a_workspace_can_be_added(host, app):
+    from PySide6.QtCore import QPoint
+    a, b = RealClose("A"), RealClose("B")
+    host.add_window(a); host.add_window(b)
+    host.resize(1000, 700); _settle(app)
+    state = workspace_host._DragState(b, host, host.panes[0])
+    overlay = workspace_host._DropOverlay(host, host.panes[0], state)
+    w, h = overlay.width(), overlay.height()
+    assert overlay.zone_at(QPoint(w // 2, h // 2)) == "center"
+    assert overlay.zone_at(QPoint(w - 5, h // 2)) == "right"
+    assert overlay.zone_at(QPoint(5, h // 2)) == "left"
+    assert overlay.zone_at(QPoint(w // 2, h - 5)) == "below"
+    assert overlay.zone_at(QPoint(w // 2, 5)) == "center"
+    host.set_workspace_count(4)                                  # full 2x2: nothing can be added
+    assert overlay.zone_at(QPoint(w - 5, h // 2)) == "center"
+    overlay.deleteLater()
+
+
+def test_a_workspaces_only_tab_cannot_be_split_into_a_new_workspace_of_its_own(host, app):
+    from PySide6.QtCore import QPoint
+    a = RealClose("A")
+    host.add_window(a); host.resize(1000, 700); _settle(app)
+    state = workspace_host._DragState(a, host, host.panes[0])
+    overlay = workspace_host._DropOverlay(host, host.panes[0], state)
+    assert overlay.zone_at(QPoint(overlay.width() - 5, overlay.height() // 2)) == "center"
+    overlay.deleteLater()
+
+
+def test_tab_bar_hands_a_far_drag_to_the_manager_and_applies_the_drop(host, app, monkeypatch):
+    a, b = RealClose("A"), RealClose("B")
+    host.add_window(a); host.add_window(b)
+    host.add_workspace(0, "right")
+    pane = host.panes[0]
+    seen = []
+
+    class FakeDrag:
+        def __init__(self, source): pass
+        def setMimeData(self, mime): seen.append(mime.hasFormat(workspace_host.TAB_MIME))
+        def setPixmap(self, p): pass
+        def setHotSpot(self, p): pass
+        def exec(self, action):
+            overlays = host.panes[1].findChildren(workspace_host._DropOverlay)
+            assert len(overlays) == 1                                   # a drop target over each workspace
+            host.manager._dragging.drop = (host, 1, "center")           # as if dropped on workspace 2
+    monkeypatch.setattr(workspace_host, "QDrag", FakeDrag)
+    host.manager.start_tab_drag(host, pane, host._entries[b].page)
+    for _ in range(3):
+        app.processEvents()
+    assert seen == [True] and host.pane_of(b) == 1 and host.manager._dragging is None
+
+
+def test_pulling_a_held_tab_out_of_the_bar_starts_a_drag_but_reordering_does_not(host, app, monkeypatch):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtTest import QTest
+    a, b = RealClose("A"), RealClose("B")
+    host.add_window(a); host.add_window(b)
+    host.resize(900, 600); _settle(app)
+    bar = host.panes[0].tabBar()
+    started = []
+    host.manager.start_tab_drag = lambda h, p, page: started.append(page)
+    first = bar.tabRect(0).center()
+    QTest.mousePress(bar, Qt.LeftButton, Qt.NoModifier, first)
+    QTest.mouseMove(bar, bar.tabRect(1).center())               # sideways within the bar: Qt's own reorder
+    assert not started
+    QTest.mouseMove(bar, QPoint(first.x(), 200))                 # well below the bar: a drag
+    QTest.mouseRelease(bar, Qt.LeftButton, Qt.NoModifier, QPoint(first.x(), 200))
+    assert len(started) == 1

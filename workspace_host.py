@@ -30,9 +30,8 @@ this through present_window() below, which falls back to the old
 show()/raise_() behaviour when no window exists (tests, headless use).
 """
 
-from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtGui import QPainter
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QDrag, QGuiApplication, QMouseEvent, QPainter, QPen
 from workspace_state import fits_grid, tree_from_json, tree_to_json
 from PySide6.QtWidgets import (
     QApplication,
@@ -62,7 +61,8 @@ MAX_WORKSPACES = 4
 # ---------------------------------------------------------------------------
 
 H, V = "h", "v"
-_ORIENTATION = {"right": H, "below": V}
+_ORIENTATION = {"right": H, "left": H, "below": V, "above": V}
+_BEFORE = ("left", "above")   # the new workspace goes first in its split
 
 
 def tree_leaves(tree):
@@ -89,16 +89,17 @@ def tree_normalize(tree):
 
 def tree_add(tree, index, direction, scope, new_index):
     """The layout after adding workspace `new_index` to the 'right' of or
-    'below' either just workspace `index` (scope "this") or the whole
+    'below' (or 'left' / 'above') either just workspace `index` (scope "this") or the whole
     layout (scope "all"). The new workspace splits equally with whatever it
     ends up sharing a split with."""
     orientation = _ORIENTATION[direction]
+    pair = (lambda node: (new_index, node)) if direction in _BEFORE else (lambda node: (node, new_index))
     if scope == "all":
-        return tree_normalize((orientation, (tree, new_index)))
+        return tree_normalize((orientation, pair(tree)))
 
     def grow(node):
         if isinstance(node, int):
-            return (orientation, (node, new_index)) if node == index else node
+            return (orientation, pair(node)) if node == index else node
         return (node[0], tuple(grow(child) for child in node[1]))
 
     return tree_normalize(grow(tree))
@@ -182,16 +183,49 @@ class _AddTabBar(QTabBar):
     tells the pane to show its corner "+" instead."""
 
     overflowChanged = Signal(bool)
+    drag_out = Signal(object)   # the page being dragged out of the bar (to another workspace / window)
+
+    # How far (px) the pointer must leave the bar, while a tab is held, before
+    # it stops being a reorder and becomes a drag to somewhere else.
+    DRAG_OUT_MARGIN = 14
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._overflowing = False
+        self._pressed_page = None
         self.add_button = QToolButton(self)
         self.add_button.setText("+")
         self.add_button.setToolTip("Add a tab to this workspace")
         self.add_button.setAutoRaise(True)
         self.add_button.setPopupMode(QToolButton.InstantPopup)
         self.add_button.setStyleSheet(PLUS_BUTTON_STYLE)
+
+    def mousePressEvent(self, event):
+        self._pressed_page = None
+        if event.button() == Qt.LeftButton:
+            index = self.tabAt(event.position().toPoint())
+            pane = self.parentWidget()
+            if index >= 0 and isinstance(pane, QTabWidget):
+                self._pressed_page = pane.widget(index)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        page = self._pressed_page
+        if page is not None and event.buttons() & Qt.LeftButton:
+            margin = self.DRAG_OUT_MARGIN
+            if not self.rect().adjusted(-margin, -margin, margin, margin).contains(event.position().toPoint()):
+                self._pressed_page = None
+                # End Qt's own reorder-in-place first, then hand over to a real drag.
+                super().mouseReleaseEvent(QMouseEvent(
+                    QEvent.MouseButtonRelease, event.position(), event.globalPosition(),
+                    Qt.LeftButton, Qt.NoButton, event.modifiers()))
+                self.drag_out.emit(page)
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._pressed_page = None
+        super().mouseReleaseEvent(event)
 
     def reposition_add_button(self):
         button = self.add_button
@@ -245,6 +279,7 @@ class WorkspacePane(QTabWidget):
         self.setElideMode(Qt.ElideRight)
         self.setUsesScrollButtons(True)
         self.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.drag_out = self.tabBar().drag_out   # (page) a tab was dragged out of this workspace's bar
 
         self._menu_builder = None  # set by the host: fills a QMenu with what can be opened here
 
@@ -353,6 +388,94 @@ class WorkspacePane(QTabWidget):
             )
 
 
+TAB_MIME = "application/x-torca-tab"
+
+
+class _DropOverlay(QWidget):
+    """Covers one workspace while a tab is being dragged, so the drop lands on
+    TORCA's own widget whatever (web view, text box...) is underneath. Dropping
+    in the middle moves the tab into that workspace; dropping near an edge, where
+    the window can still grow a workspace that way, adds one there with the tab.
+    Highlights what would happen."""
+
+    EDGE_MIN = 60   # px: the edge bands are at least this wide
+
+    def __init__(self, host, pane, state):
+        super().__init__(pane)
+        self.host = host
+        self.pane = pane
+        self._state = state
+        self._zone = None
+        self.setAcceptDrops(True)
+        self.setGeometry(pane.rect())
+        self.raise_()
+        self.show()
+
+    def zone_at(self, pos):
+        """"center", or the direction ("left", "right", "above", "below") a new
+        workspace would be added in -- only where the layout allows one."""
+        w, h = self.width(), self.height()
+        bar = self.pane.tabBar().height()
+        bx, by = max(self.EDGE_MIN, int(w * 0.18)), max(self.EDGE_MIN, int((h - bar) * 0.18))
+        distances = {"left": pos.x(), "right": w - pos.x(), "above": pos.y() - bar, "below": h - pos.y()}
+        bands = {"left": bx, "right": bx, "above": by, "below": by}
+        for direction, distance in sorted(distances.items(), key=lambda item: item[1]):
+            if 0 <= distance < bands[direction] and self._can_add(direction):
+                return direction
+        return "center"
+
+    def _can_add(self, direction):
+        if self.pane is self._state.source_pane and self.pane.count() <= 1:
+            return False   # splitting a workspace's only tab off into a new one achieves nothing
+        return self.host.can_add_workspace(self.pane.index, direction, "this")
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(TAB_MIME):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        zone = self.zone_at(event.position().toPoint())
+        if zone != self._zone:
+            self._zone = zone
+            self.update()
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._zone = None
+        self.update()
+
+    def dropEvent(self, event):
+        self._state.drop = (self.host, self.pane.index, self.zone_at(event.position().toPoint()))
+        event.acceptProposedAction()
+
+    def paintEvent(self, event):
+        if self._zone is None:
+            return
+        painter = QPainter(self)
+        accent = QColor(232, 163, 61)
+        fill = QColor(accent.red(), accent.green(), accent.blue(), 55)
+        rect = self.rect()
+        label = "Move tab here"
+        if self._zone != "center":
+            half_w, half_h = rect.width() // 2, rect.height() // 2
+            rect = {"left": QRect(0, 0, half_w, rect.height()), "right": QRect(half_w, 0, rect.width() - half_w, rect.height()),
+                    "above": QRect(0, 0, rect.width(), half_h), "below": QRect(0, half_h, rect.width(), rect.height() - half_h)}[self._zone]
+            label = "Add workspace here"
+        painter.fillRect(rect, fill)
+        painter.setPen(QPen(accent, 2))
+        painter.drawRect(rect.adjusted(1, 1, -1, -1))
+        painter.setPen(Qt.white)
+        painter.drawText(rect, Qt.AlignCenter, label)
+
+
+class _DragState:
+    def __init__(self, widget, source_host, source_pane):
+        self.widget = widget
+        self.source_host = source_host
+        self.source_pane = source_pane
+        self.drop = None   # (host, pane index, zone) once dropped
+
+
 class _HideWatcher(QObject):
     """Event filter on a hosted widget: an explicit hide() of the widget
     itself (what a window's closeEvent does, or a completed close) means
@@ -456,6 +579,7 @@ class WindowManager(QObject):
         self.top_bar_action_factory = None  # (ctx) -> buttons placed right after the Windows menu in a NEW window
         self.top_bar_factory = None  # () -> new widgets for a NEW window's top bar (e.g. a Kill TX button)
         self.shutting_down = False
+        self._dragging = None        # _DragState while a tab is being dragged
         self._hide_watcher = _HideWatcher(self)
 
     # ---- windows ----
@@ -602,6 +726,67 @@ class WindowManager(QObject):
         index = pane_index if pane_index is not None else target._choose_pane().index
         target.open_in(widget, index)
 
+    # ---- dragging tabs between workspaces and windows ----
+
+    def start_tab_drag(self, host, pane, page):
+        """The pointer left a workspace's tab bar with a tab held: drag it. Every
+        workspace of every window shows a drop target for the duration; the move
+        itself happens once the drag has fully ended."""
+        entry = next((e for e in self.entries.values() if e.page is page), None)
+        if entry is None or self._dragging is not None:
+            return
+        state = self._dragging = _DragState(entry.widget, host, pane)
+        overlays = [_DropOverlay(h, p, state) for h in self.hosts for p in h.visible_panes()]
+        drag = QDrag(pane.tabBar())
+        mime = QMimeData()
+        mime.setData(TAB_MIME, b"1")
+        drag.setMimeData(mime)
+        bar = pane.tabBar()
+        index = pane.indexOf(page)
+        if index >= 0:
+            pixmap = bar.grab(bar.tabRect(index))
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+        try:
+            drag.exec(Qt.MoveAction)
+        finally:
+            for overlay in overlays:
+                overlay.hide()
+                overlay.deleteLater()
+            self._dragging = None
+        if state.drop is not None:
+            target, pane_index, zone = state.drop
+            QTimer.singleShot(0, lambda: self.drop_tab(state.widget, target, pane_index, zone))
+
+    def drop_tab(self, widget, target, pane_index, zone="center"):
+        """Puts `widget` in workspace `pane_index` of window `target`; for a
+        direction zone ("left"/"right"/"above"/"below") that workspace is added
+        next to it first. If that was the last tab of its old workspace, the
+        workspace closes (workspace 1 of a window stays, empty). Returns False if
+        nothing was done."""
+        entry = self.entries.get(widget)
+        if entry is None or entry.host is None or target not in self.hosts:
+            return False
+        source_host, source_pane = entry.host, entry.pane
+        if zone != "center":
+            added = target.add_workspace(pane_index, zone)
+            if added is None:
+                zone = "center"
+            else:
+                pane_index = added
+        if source_host is target and source_pane.index == pane_index:
+            return False
+        if source_host is target:
+            target.move_window(widget, pane_index)
+        else:
+            self.move_widget(widget, target, pane_index)
+        if source_pane.count() == 0 and source_pane.index != 0 and source_host in self.hosts:
+            source_host.close_workspace(source_pane.index)
+        target._set_active_pane(target.panes[pane_index])
+        if target is not source_host:
+            self.activate(target)
+        return True
+
     # ---- the saved arrangement of all windows ----
 
     @staticmethod
@@ -716,6 +901,7 @@ class WorkspaceHost(QMainWindow):
                 lambda pos, p=pane: self._on_tab_context_menu(p, pos)
             )
             pane.tabCloseRequested.connect(lambda i, p=pane: self._on_tab_close_requested(p, i))
+            pane.drag_out.connect(lambda page, p=pane: self.manager.start_tab_drag(self, p, page))
             pane.set_menu_builder(lambda menu, p=pane: self._fill_add_menu(menu, p))
             pane.set_workspace_menu_builder(lambda menu, p=pane: self._fill_workspace_menu(menu, p))
             pane.currentChanged.connect(lambda _i, p=pane: self._set_active_pane(p))

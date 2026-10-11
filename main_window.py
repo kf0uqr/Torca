@@ -100,6 +100,10 @@ _MIN_METER_HEIGHT = 60
 _VFO_KNOB_MIN_DIAMETER = 110
 _VFO_KNOB_MAX_DIAMETER = 220
 
+# Fallback proportions of the four groups under the mode buttons (RIT, PBT,
+# PTT/Tune/SWR, VFO knob) before the real button positions are known.
+_DEFAULT_TUNING_COLUMN_STRETCH = (1, 2, 1, 1)
+
 _MIN_PASSBAND_HEIGHT = 140
 _MAX_PASSBAND_HEIGHT = 200
 
@@ -831,20 +835,26 @@ class RadioWindow(QWidget):
 
         # Under the full-width mode/AGC/Preamp/Filter dropdowns and their
         # buttons, left to right: the RIT knob and its buttons, the PBT
-        # group (passband display + PBT/filter-width sliders, taking the
-        # width that is left), the PTT/Tune/SWR-protect buttons, and finally
-        # the VFO knob with its tuning-step picker.
+        # group (passband display + PBT/filter-width sliders), the PTT/Tune/
+        # SWR-protect buttons, and finally the VFO knob with its tuning-step
+        # picker. Each group is a container sized to line up under the mode
+        # buttons above (RIT under the first, PBT spanning the next two,
+        # PTT under the one before last, the VFO knob under the last) --
+        # see _match_control_widths.
+        def column_widget(column_layout):
+            column_layout.setContentsMargins(0, 0, 0, 0)
+            container = QWidget()
+            container.setLayout(column_layout)
+            return container
+
+        self._tuning_columns = [
+            column_widget(rit_column), column_widget(filter_shape_column),
+            column_widget(tx_column), column_widget(vfo_column),
+        ]
         tuning_row = QHBoxLayout()
-        tuning_row.addLayout(rit_column)
-        tuning_row.addSpacing(16)
-        tuning_row.addLayout(filter_shape_column, 1)
-        tuning_row.addSpacing(16)
-        tuning_row.addLayout(tx_column)
-        tuning_row.addSpacing(16)
-        tuning_row.addLayout(vfo_column)
-        # Top-align the passband column (its widget has a capped height,
-        # so it would otherwise be centered vertically).
-        tuning_row.setAlignment(filter_shape_column, Qt.AlignTop)
+        for container, stretch in zip(self._tuning_columns, _DEFAULT_TUNING_COLUMN_STRETCH):
+            tuning_row.addWidget(container, stretch)
+        self._tuning_row = tuning_row
 
         tuning_area = QVBoxLayout()
         tuning_area.addLayout(controls_column)
@@ -2150,21 +2160,43 @@ class RadioWindow(QWidget):
                 yield from RadioWindow._layout_widgets(item.layout())
 
     def _match_control_widths(self):
-        """Makes the VFO knob as wide across as the right-most mode button
-        above it (Split / VFO A / ...), and the PTT, Tune and SWR Protect
-        buttons as wide as the button above THEM. Those mode buttons stretch
-        with the window, so this re-runs on every resize."""
-        buttons = [w for w in self._layout_widgets(self._mode_buttons_row) if w.isVisible() and w.width() > 0]
+        """Lines the controls under the mode-button row up with the buttons
+        above them: the RIT column under the first button (Digital Mode),
+        the PBT group across the buttons after it up to the last two (NR +
+        NB), the PTT/Tune/SWR column under the second-to-last (VFO A), and
+        the VFO knob under the last (Split) -- with the knob as wide across
+        as that button. The buttons stretch with the window, so this re-runs
+        on every resize. Widths are applied as layout STRETCH proportions
+        (not fixed sizes) so the window can still be made narrower."""
+        buttons = sorted(
+            (w for w in self._layout_widgets(self._mode_buttons_row) if w.isVisible() and w.width() > 0),
+            key=lambda w: w.x(),
+        )
         if not buttons:
             return  # not laid out yet (hidden tab, or before the first show)
-        reference_width = max(buttons, key=lambda w: w.x()).width()
+        reference_width = buttons[-1].width()
         diameter = min(max(reference_width, _VFO_KNOB_MIN_DIAMETER), _VFO_KNOB_MAX_DIAMETER)
         if (self.tuning_knob.width(), self.tuning_knob.height()) != (diameter, diameter):
             self.tuning_knob.setFixedSize(diameter, diameter)
-        for button in (self.ptt_button, self.tune_button, self.swr_protection_button):
-            target = max(reference_width, button.minimumSizeHint().width())
-            if button.minimumWidth() != target or button.maximumWidth() != target:
-                button.setFixedWidth(target)
+
+        if len(buttons) < 4:
+            # Too few buttons to map the four groups onto: default proportions.
+            for index, stretch in enumerate(_DEFAULT_TUNING_COLUMN_STRETCH):
+                self._tuning_row.setStretch(index, stretch)
+            return
+        gap = max(buttons[1].x() - (buttons[0].x() + buttons[0].width()), 0)
+        middle = buttons[1:-2]
+        widths = [
+            buttons[0].width(),
+            (middle[-1].x() + middle[-1].width()) - middle[0].x(),
+            buttons[-2].width(),
+            buttons[-1].width(),
+        ]
+        if self._tuning_row.spacing() != gap:
+            self._tuning_row.setSpacing(gap)
+        for index, width in enumerate(widths):
+            if self._tuning_row.stretch(index) != width:
+                self._tuning_row.setStretch(index, width)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

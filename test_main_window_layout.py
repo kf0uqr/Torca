@@ -247,3 +247,55 @@ def test_wider_controls_still_leave_no_scroll_bars_at_1080p(app, radio_window):
         assert radio_window.minimumSizeHint().height() <= 860
     finally:
         _close(host)
+
+
+# ---- column alignment under the mode buttons ----
+
+def _span(window, widget):
+    left = widget.mapTo(window, widget.rect().topLeft()).x()
+    return left, left + widget.width()
+
+
+def _mode_buttons(window):
+    return sorted((b for b in window._layout_widgets(window._mode_buttons_row) if b.isVisible()), key=lambda b: b.x())
+
+
+@pytest.mark.parametrize("width", [1000, 1100, 1400])
+def test_control_groups_line_up_under_the_mode_buttons(app, radio_window, width):
+    radio_window.show()
+    radio_window.resize(width, 1000)
+    _settle(app)
+    digital, nr, nb, vfo_a, split = _mode_buttons(radio_window)[:5]
+    rit, pbt, tx, vfo = (_span(radio_window, c) for c in radio_window._tuning_columns)
+    tolerance = 2
+    assert abs(rit[0] - _span(radio_window, digital)[0]) <= tolerance and abs(rit[1] - _span(radio_window, digital)[1]) <= tolerance
+    assert abs(pbt[0] - _span(radio_window, nr)[0]) <= tolerance and abs(pbt[1] - _span(radio_window, nb)[1]) <= tolerance   # PBT = NR + NB
+    assert abs(tx[0] - _span(radio_window, vfo_a)[0]) <= tolerance and abs(tx[1] - _span(radio_window, vfo_a)[1]) <= tolerance
+    assert abs(vfo[0] - _span(radio_window, split)[0]) <= tolerance and abs(vfo[1] - _span(radio_window, split)[1]) <= tolerance
+
+
+def test_ptt_buttons_fill_their_column_and_the_passband_fills_its_span(app, radio_window):
+    radio_window.show()
+    radio_window.resize(1100, 1000)
+    _settle(app)
+    _digital, nr, nb, vfo_a, split = _mode_buttons(radio_window)[:5]
+    for button in (radio_window.ptt_button, radio_window.tune_button, radio_window.swr_protection_button):
+        assert abs(_span(radio_window, button)[0] - _span(radio_window, vfo_a)[0]) <= 2, button.text()
+        assert abs(button.width() - vfo_a.width()) <= 2, button.text()
+    passband = _span(radio_window, radio_window.filter_shape_widget)
+    assert abs(passband[0] - _span(radio_window, nr)[0]) <= 2 and abs(passband[1] - _span(radio_window, nb)[1]) <= 2
+    knob = _span(radio_window, radio_window.tuning_knob)
+    assert abs(knob[0] - _span(radio_window, split)[0]) <= 2
+
+
+def test_window_can_still_be_made_narrower_after_being_wide(app, radio_window):
+    # widths are applied as stretch proportions, not fixed sizes, so the layout
+    # must not pin the window at the widest size it has been
+    radio_window.show()
+    radio_window.resize(1600, 1000)
+    _settle(app)
+    wide_min = radio_window.minimumSizeHint().width()
+    radio_window.resize(radio_window.minimumSizeHint().width(), 1000)
+    _settle(app)
+    assert radio_window.width() <= wide_min + 2
+    assert radio_window.minimumSizeHint().width() <= 1000

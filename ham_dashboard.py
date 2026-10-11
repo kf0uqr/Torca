@@ -3295,7 +3295,6 @@ class HamClockWindow(QWidget):
         if self._update_perform_worker is not None and self._update_perform_worker.isRunning():
             return
         self.update_button.setEnabled(False)
-        self.update_button.setText("Checking...")
         worker = UpdateCheckWorker(self)
         worker.result_ready.connect(self._on_update_check_ready)
         worker.failed.connect(self._on_update_check_failed)
@@ -3304,7 +3303,6 @@ class HamClockWindow(QWidget):
 
     def _on_update_check_ready(self, result):
         self.update_button.setEnabled(True)
-        self.update_button.setText("Check for Updates...")
 
         if result.mode == updater.MODE_UNSUPPORTED:
             QMessageBox.information(
@@ -3344,12 +3342,10 @@ class HamClockWindow(QWidget):
 
     def _on_update_check_failed(self, message):
         self.update_button.setEnabled(True)
-        self.update_button.setText("Check for Updates...")
         QMessageBox.warning(self._action_parent(), "Check for Updates", f"Couldn't check for updates:\n{message}")
 
     def _start_update(self):
         self.update_button.setEnabled(False)
-        self.update_button.setText("Updating...")
         self._update_progress_dialog = UpdateProgressDialog(self._action_parent())
         self._update_progress_dialog.show()
         worker = UpdatePerformWorker(self)
@@ -3360,7 +3356,6 @@ class HamClockWindow(QWidget):
         worker.start()
 
     def _on_update_status(self, message):
-        self.update_button.setText(f"Updating: {message}")
         if self._update_progress_dialog is not None:
             self._update_progress_dialog.set_status(message)
 
@@ -3372,7 +3367,6 @@ class HamClockWindow(QWidget):
     def _on_update_succeeded(self):
         self._close_update_progress_dialog()  # before the restart prompt, so the two never stack
         self.update_button.setEnabled(True)
-        self.update_button.setText("Check for Updates...")
         box = QMessageBox(self._action_parent())
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("Update Complete")
@@ -3409,7 +3403,6 @@ class HamClockWindow(QWidget):
     def _on_update_failed(self, message):
         self._close_update_progress_dialog()
         self.update_button.setEnabled(True)
-        self.update_button.setText("Check for Updates...")
         QMessageBox.critical(self._action_parent(), "Update Failed", f"Couldn't complete the update:\n{message}")
 
     def _on_radio_window_closed(self, window):

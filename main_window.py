@@ -74,6 +74,12 @@ _MEMORY_MARKER_REFRESH_MS = 5000
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 
+# Share of any spare window height each display gets -- see the layout
+# built at the end of RadioWindow.__init__.
+_STRETCH_SPECTRUM = 3
+_STRETCH_WATERFALL = 4
+_STRETCH_METER_ROW = 1
+
 
 class RadioWindow(QWidget):
     closed = Signal(object)  # emitted at the end of closeEvent, carrying self -- HamClockWindow listens
@@ -814,13 +820,19 @@ class RadioWindow(QWidget):
         tuning_row.addSpacing(16)
         tuning_row.addLayout(knob_row)
 
+        # Any height beyond what the controls need goes to the scope,
+        # waterfall and meters, in these proportions (the controls below
+        # them -- band buttons, mode/passband/knobs, level sliders, status
+        # -- stay at their natural size, stretch 0). Their minimum heights
+        # (set on the widgets themselves) are unchanged, so a small window
+        # looks exactly as before.
         layout = QVBoxLayout()
         layout.addLayout(scope_controls_row)
-        layout.addWidget(self.spectrum_widget)
-        layout.addWidget(self.waterfall_widget)
+        layout.addWidget(self.spectrum_widget, _STRETCH_SPECTRUM)
+        layout.addWidget(self.waterfall_widget, _STRETCH_WATERFALL)
         layout.addWidget(self.band_plan_widget)
-        layout.addLayout(self.meters_row)
-        layout.addLayout(self.meters_row_2)
+        layout.addLayout(self.meters_row, _STRETCH_METER_ROW)
+        layout.addLayout(self.meters_row_2, _STRETCH_METER_ROW)
         layout.addLayout(self.band_buttons_row)
         layout.addLayout(tuning_row)
         layout.addLayout(levels_row)

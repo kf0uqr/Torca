@@ -69,7 +69,7 @@ from PySide6.QtWidgets import (
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
-from theme import position_on_screen_half
+from workspace_host import present_window
 from world_map import WorldMapWidget
 from connection_dialog import ConnectionDialog
 from operator_profile import OperatorProfileDialog
@@ -989,7 +989,6 @@ class HamClockWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Ham Dashboard")
-        position_on_screen_half(self, "right")
 
         # main.py's OperatorProfileDialog already ran before this window
         # was even constructed, so operator_callsign/operator_lat/
@@ -3106,7 +3105,7 @@ class HamClockWindow(QWidget):
         self.connected_radios_list.addItem(item)
 
         self._update_radio_service_buttons_enabled()
-        window.show()
+        present_window(window)
 
     @staticmethod
     def _radio_list_base_label(details):
@@ -3149,16 +3148,12 @@ class HamClockWindow(QWidget):
     def _on_connected_radio_item_double_clicked(self, item):
         window = item.data(Qt.UserRole)
         if window is not None:
-            window.show()
-            window.raise_()
-            window.activateWindow()
+            present_window(window)
 
     def _on_log_book_clicked(self):
         if self.log_book_window is None:
             self.log_book_window = LogBookWindow(self)
-        self.log_book_window.show()
-        self.log_book_window.raise_()
-        self.log_book_window.activateWindow()
+        present_window(self.log_book_window)
 
     def _on_new_qso_clicked(self):
         # Deliberately does NOT show()/raise_() the Log Book window --
@@ -3274,7 +3269,7 @@ class HamClockWindow(QWidget):
                 "please restart TORCA yourself."
             )
             return
-        self.close()
+        self.window().close()  # the workspace host (full shutdown via this window's closeEvent), or this window if unhosted
         QApplication.quit()
 
     def _on_update_failed(self, message):

@@ -92,6 +92,7 @@ def _prompt_harness(monkeypatch, choose_restart, schedule_error=None):
         update_button=types.SimpleNamespace(setEnabled=lambda *_: None, setText=lambda *_: None),
         close=lambda: events.append("close"),
     )
+    fake.window = lambda: fake  # unhosted: the dashboard is its own top-level window
     fake._restart_application = cls._restart_application.__get__(fake)
     return cls._on_update_succeeded.__get__(fake), events, FakeBox
 

@@ -61,6 +61,7 @@ from sstv_window import SstvToolWindow
 from rtty_window import RttyToolWindow
 from psk31_window import Psk31ToolWindow
 from aprs_window import AprsToolWindow
+from workspace_host import present_window
 from recording_window import RecordingToolWindow
 
 # How often the band-plan overlay's memory-channel tick marks are
@@ -989,30 +990,22 @@ class RadioWindow(QWidget):
 
     def _on_cw_tool_clicked(self):
         self.ensure_cw_tool_window()
-        self.cw_window.show()
-        self.cw_window.raise_()
-        self.cw_window.activateWindow()
+        present_window(self.cw_window)
 
     def _on_sstv_tool_clicked(self):
         if self.sstv_window is None:
             self.sstv_window = SstvToolWindow(self)
-        self.sstv_window.show()
-        self.sstv_window.raise_()
-        self.sstv_window.activateWindow()
+        present_window(self.sstv_window)
 
     def _on_rtty_tool_clicked(self):
         if self.rtty_window is None:
             self.rtty_window = RttyToolWindow(self)
-        self.rtty_window.show()
-        self.rtty_window.raise_()
-        self.rtty_window.activateWindow()
+        present_window(self.rtty_window)
 
     def _on_psk31_tool_clicked(self):
         if self.psk31_window is None:
             self.psk31_window = Psk31ToolWindow(self)
-        self.psk31_window.show()
-        self.psk31_window.raise_()
-        self.psk31_window.activateWindow()
+        present_window(self.psk31_window)
 
     def ensure_aprs_tool_window(self):
         """Lazily constructs self.aprs_window if it doesn't exist yet
@@ -1026,23 +1019,17 @@ class RadioWindow(QWidget):
 
     def _on_aprs_tool_clicked(self):
         self.ensure_aprs_tool_window()
-        self.aprs_window.show()
-        self.aprs_window.raise_()
-        self.aprs_window.activateWindow()
+        present_window(self.aprs_window)
 
     def _on_memories_button_clicked(self):
         if self.memories_window is None:
             self.memories_window = MemoriesWindow(self)
-        self.memories_window.show()
-        self.memories_window.raise_()
-        self.memories_window.activateWindow()
+        present_window(self.memories_window)
 
     def _on_recording_tool_clicked(self):
         if self.recording_window is None:
             self.recording_window = RecordingToolWindow(self)
-        self.recording_window.show()
-        self.recording_window.raise_()
-        self.recording_window.activateWindow()
+        present_window(self.recording_window)
 
     @Slot(str)
     def _on_connection_failed(self, message):

@@ -53,6 +53,7 @@ from PySide6.QtWidgets import QApplication
 from ham_dashboard import HamClockWindow
 from operator_profile import OperatorProfileDialog
 from theme import apply_dark_theme
+from workspace_host import WorkspaceHost
 
 # Diagnostic only -- TORCA_DEBUG_RIGPLANE=1 python3 main.py. Surfaces
 # rigplane's own internal DEBUG logging (logging.getLogger("rigplane")),
@@ -79,8 +80,15 @@ def main():
     # older single-field callsign prompt.
     OperatorProfileDialog.run()
 
+    # One main window with 1-4 workspaces holds the dashboard, every radio
+    # and every tool as tabs -- see workspace_host.py. The dashboard is
+    # created first so it lands in workspace 1; closing the host runs its
+    # full shutdown.
+    host = WorkspaceHost()
     window = HamClockWindow()
-    window.show()
+    host.add_window(window, closable=False, pane_index=0)
+    host.set_dashboard(window)
+    host.showMaximized()
     sys.exit(app.exec())
 
 

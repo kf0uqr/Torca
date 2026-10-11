@@ -299,3 +299,55 @@ def test_window_can_still_be_made_narrower_after_being_wide(app, radio_window):
     _settle(app)
     assert radio_window.width() <= wide_min + 2
     assert radio_window.minimumSizeHint().width() <= 1000
+
+
+
+# ---- band buttons wrap instead of forcing a horizontal scroll bar ----
+
+def _window_for(model, monkeypatch):
+    monkeypatch.setattr(radio_worker.RadioWorker, "start", lambda self, *a, **k: None)
+    return main_window.RadioWindow(dict(DETAILS, radio_model=model), SatelliteSession())
+
+
+@pytest.mark.parametrize("model, band_count", [("IC-9700", 3), ("IC-7300", 11), ("IC-705", 13)])
+def test_every_radio_fits_a_half_screen_workspace_without_a_horizontal_scroll_bar(app, monkeypatch, model, band_count):
+    window = _window_for(model, monkeypatch)
+    try:
+        assert len(window.band_buttons) == band_count
+        host, page = _dock_in_second_workspace(app, window, (1920, 1010))
+        try:
+            assert not page.horizontalScrollBar().isVisible(), f"{model}: horizontal scroll bar"
+            assert not page.verticalScrollBar().isVisible(), f"{model}: vertical scroll bar"
+            assert window.minimumSizeHint().width() <= 940, window.minimumSizeHint().width()
+        finally:
+            _close(host)
+    finally:
+        window.close()
+
+
+def test_ic705_band_buttons_wrap_in_balanced_rows_when_narrow_and_use_one_row_when_wide(app, monkeypatch):
+    window = _window_for("IC-705", monkeypatch)
+    try:
+        window.show()
+        window.resize(940, 1000)
+        _settle(app)
+        assert window.band_buttons_row.grid_for_width(window.band_buttons_row.geometry().width()) == (7, 2)
+        assert all(b.isVisible() for b in window.band_buttons)
+        window.resize(1700, 1000)
+        _settle(app)
+        assert window.band_buttons_row.grid_for_width(window.band_buttons_row.geometry().width()) == (13, 1)
+    finally:
+        window.close()
+
+
+def test_band_buttons_still_select_their_band_after_wrapping(app, monkeypatch):
+    window = _window_for("IC-705", monkeypatch)
+    try:
+        picked = []
+        window._on_band_selected = lambda label, freq: picked.append(label)
+        for button in window.band_buttons:
+            button.setEnabled(True)
+        window.band_buttons[5].click()
+        assert picked == [window.band_buttons[5].text()]
+    finally:
+        window.close()

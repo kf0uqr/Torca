@@ -62,6 +62,7 @@ from rtty_window import RttyToolWindow
 from psk31_window import Psk31ToolWindow
 from aprs_window import AprsToolWindow
 from workspace_host import present_window, retire_button
+from wrapping_button_layout import WrappingButtonLayout
 from recording_window import RecordingToolWindow
 
 # How often the band-plan overlay's memory-channel tick marks are
@@ -222,7 +223,9 @@ class RadioWindow(QWidget):
         # connects. Buttons stay disabled until _on_connected() enables them.
         self.band_buttons = []
         self.band_button_ranges = []  # parallel list: (button, low_hz, high_hz), for highlighting the active band
-        self.band_buttons_row = QHBoxLayout()
+        # Wraps onto a second row when the window is too narrow (an IC-705 has 13
+        # bands) instead of forcing a horizontal scroll bar -- see wrapping_button_layout.
+        self.band_buttons_row = WrappingButtonLayout()
         for label, low_hz, high_hz in RADIO_BANDS.get(details["radio_model"], []):
             button = QPushButton(label)
             button.setEnabled(False)

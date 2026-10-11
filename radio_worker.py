@@ -790,11 +790,11 @@ class RadioWorker(QThread):
         Output's roles are swapped from the AudioBridge case)."""
         input_device = self._details.get("audio_input_device")
         output_device = self._details.get("audio_output_device")
-        if not input_device and not output_device:
-            return  # user left both as "None" -- nothing to set up
 
         profile = RADIO_PROFILES.get(self._details.get("radio_model"), {})
         if profile.get("audio_mode") == "passthrough":
+            if not input_device and not output_device:
+                return  # a cable radio with no sound card chosen has no audio at all
             self.audio_bridge = PassthroughAudioBridge(
                 self.loop, input_device, output_device,
                 status_callback=self.audio_status.emit,
@@ -814,6 +814,30 @@ class RadioWorker(QThread):
             status_callback=self.audio_status.emit,
         )
         await self.audio_bridge.start()
+
+    # ---- the Audio tab's controls ----
+
+    def audio_hub_status(self):
+        """A snapshot of this radio's audio hub for the Audio tab (None if it
+        has none -- not connected yet, or a cable radio with no sound card)."""
+        bridge = self.audio_bridge
+        return bridge.rx_status() if bridge is not None else None
+
+    def audio_level(self):
+        bridge = self.audio_bridge
+        return bridge.read_level() if bridge is not None else 0.0
+
+    def set_monitor(self, volume=None, muted=None):
+        if self.audio_bridge is not None:
+            self.audio_bridge.set_monitor(volume=volume, muted=muted)
+
+    def set_monitor_output(self, device):
+        """Plays this radio's audio on another output device (an index,
+        AUDIO_DEVICE_SYSTEM_DEFAULT, or None for no monitor). Returns True if
+        it is now playing there."""
+        if self.audio_bridge is None:
+            return False
+        return self.audio_bridge.set_output_device(device)
 
     def set_rx_downmix_channel(self, channel: str):
         """Thread-safe: call from the GUI thread. channel is "mix"/
@@ -902,7 +926,12 @@ class RadioWorker(QThread):
                 )
                 await self.audio_bridge.start()
             else:
-                self.audio_bridge = None
+                # No devices chosen: still the radio's audio hub (decoders and
+                # the like share its one RX stream), just with no monitor.
+                self.audio_bridge = AudioBridge(
+                    self.radio, self.loop, None, None, status_callback=self.audio_status.emit,
+                )
+                await self.audio_bridge.start()
             self._virtual_cable_active = False
 
         if cw_decode_was_active:

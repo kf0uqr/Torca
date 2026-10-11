@@ -17,6 +17,8 @@ import threading
 import time
 from array import array
 
+import numpy as np
+
 try:
     # pip install sounddevice (wraps PortAudio). Used both to list real
     # input/output devices in the connection dialog AND to actually open
@@ -261,7 +263,23 @@ class AudioBridge:
     asyncio loop (the RadioWorker's loop, passed in as `loop`). Data
     crosses those boundaries only via thread-safe queues, never by
     calling asyncio or Qt APIs directly from a PortAudio callback.
+
+    Every connected radio has exactly one bridge, whatever devices were
+    chosen (even none): it is the radio's audio HUB. It alone holds
+    rigplane's single start_rx() registration and fans the audio out to
+    every consumer (each decoder tool, the recorder, a browser stream) and,
+    separately, to the "monitor" -- the stream played on a real output
+    device. The monitor is optional and can be re-pointed, turned down or
+    muted at any time without affecting any decoder (see the Audio tab):
+    decoders never depend on where, or whether, the audio is played.
     """
+
+    # Meter state, defaulted on the class so a bare instance (tests) works too.
+    _level_peak = 0.0
+    _last_audio_monotonic = None
+    _rx_bytes_total = 0
+    _monitor_gain = 1.0
+    _monitor_muted = False
 
     def __init__(self, radio, loop, input_device, output_device, status_callback, rx_downmix_channel="mix"):
         self.radio = radio
@@ -383,6 +401,12 @@ class AudioBridge:
             self.sample_rate * (AUDIO_JITTER_BUFFER_MS / 1000.0) * AUDIO_SAMPLE_WIDTH * AUDIO_CHANNELS
         )
         self._rx_underrun_count = 0
+        # The monitor (what is played on the output device) and the meters.
+        self._monitor_gain = 1.0
+        self._monitor_muted = False
+        self._level_peak = 0.0          # loudest sample since read_level() last looked, 0..1
+        self._last_audio_monotonic = None
+        self._rx_bytes_total = 0
 
     @staticmethod
     def _codec_label(value):
@@ -443,13 +467,14 @@ class AudioBridge:
         return "2CH" in self._codec_label(codec).upper()
 
     async def start(self):
-        if not SOUNDDEVICE_AVAILABLE:
-            self._status("sounddevice isn't installed -- run `pip install sounddevice` for audio.")
-            return
         if not self._pcm_ok:
             return
-        if self._output_device is not None:
-            await self._start_rx()
+        # Always claim the radio's RX stream (the hub: see the class docstring),
+        # whether or not anything is played -- only the playing needs sounddevice.
+        await self._start_rx()
+        if not SOUNDDEVICE_AVAILABLE:
+            self._status("sounddevice isn't installed -- run `pip install sounddevice` for audio playback.")
+            return
         if self._input_device is not None:
             self._open_input_stream()
             if self._in_stream:
@@ -497,10 +522,20 @@ class AudioBridge:
 
     # ---- RX: radio audio -> speaker ----
 
-    async def _start_rx(self):
+    def _open_output_stream(self):
+        """(Re)opens the monitor on self._output_device (None = no monitor).
+        Returns True if it is playing."""
+        if self._out_stream is not None:
+            try:
+                self._out_stream.close()
+            except Exception:
+                pass
+            self._out_stream = None
         self._rx_playback_buf.clear()
         self._rx_primed = False
         self._rx_underrun_count = 0
+        if self._output_device is None or not SOUNDDEVICE_AVAILABLE:
+            return False
         blocksize = max(1, int(self.sample_rate * (AUDIO_OUTPUT_BLOCK_MS / 1000.0)))
         try:
             self._out_stream = sd.RawOutputStream(
@@ -512,10 +547,50 @@ class AudioBridge:
                 callback=self._on_output_needed,
             )
             self._out_stream.start()
+            return True
         except Exception as exc:
             self._status(f"Couldn't open output device {self._device_label(self._output_device)}: {exc}")
             self._out_stream = None
-            return
+            return False
+
+    def set_output_device(self, device):
+        """Re-points the monitor at another output device while running --
+        AUDIO_DEVICE_SYSTEM_DEFAULT, a device index, or None for no
+        monitor (silent; decoders are unaffected). Returns True if the
+        requested device is now playing (always True for None)."""
+        self._output_device = device
+        if device is None:
+            self._open_output_stream()
+            return True
+        return self._open_output_stream()
+
+    def set_monitor(self, volume=None, muted=None):
+        """Monitor volume (0.0-1.0) and mute. Applies to what is PLAYED only;
+        decoders always get the full-level audio."""
+        if volume is not None:
+            self._monitor_gain = max(0.0, min(1.0, float(volume)))
+        if muted is not None:
+            self._monitor_muted = bool(muted)
+
+    def read_level(self):
+        """Loudest sample of the radio's RX audio (0..1) since the last call
+        -- what the decoders are being fed, regardless of the monitor."""
+        level, self._level_peak = self._level_peak, 0.0
+        return level
+
+    def rx_status(self):
+        """A snapshot for the Audio tab."""
+        age = None if self._last_audio_monotonic is None else time.monotonic() - self._last_audio_monotonic
+        return {
+            "receiving": self._rx_active, "audio_age": age, "chunks": self._rx_chunk_count,
+            "sample_rate": self.sample_rate, "consumers": len(self._extra_rx_callbacks),
+            "monitor_device": self._output_device, "monitor_open": self._out_stream is not None,
+            "muted": self._monitor_muted, "volume": self._monitor_gain, "underruns": self._rx_underrun_count,
+            "monitor_supported": True,
+        }
+
+    async def _start_rx(self):
+        self._open_output_stream()
 
         try:
             # Confirmed by reading rigplane's own source
@@ -664,9 +739,17 @@ class AudioBridge:
                 )
             self._status(f"RX audio: first chunk received ({len(data)} bytes{detail}).")
         self._rx_chunk_count += 1
+        self._rx_bytes_total += len(data)
+        self._last_audio_monotonic = time.monotonic()
+        self._note_level(data)
         self._report_rx_rate(len(data))
-        for extra_callback in self._extra_rx_callbacks:
-            extra_callback(data)
+        for extra_callback in list(self._extra_rx_callbacks):
+            try:
+                extra_callback(data)
+            except Exception as exc:   # one consumer failing must never starve the others (or the monitor)
+                self._status(f"RX audio: a consumer raised {exc!r}; carrying on.")
+        if self._out_stream is None:
+            return   # no monitor: nothing to queue for playback
         try:
             self._rx_queue.put_nowait(data)
         except queue.Full:
@@ -681,6 +764,13 @@ class AudioBridge:
                 self._rx_queue.put_nowait(data)
             except queue.Full:
                 pass
+
+    def _note_level(self, pcm):
+        usable = len(pcm) - (len(pcm) % 2)
+        if usable:
+            peak = float(np.abs(np.frombuffer(pcm[:usable], dtype="<i2").astype(np.int32)).max()) / 32768.0
+            if peak > self._level_peak:
+                self._level_peak = peak
 
     def _report_rx_rate(self, chunk_bytes: int) -> None:
         """Diagnostic for the direct-USB warble investigation -- see the
@@ -760,7 +850,7 @@ class AudioBridge:
                 return
 
         if len(buf) >= needed:
-            outdata[:needed] = bytes(buf[:needed])
+            outdata[:needed] = self._apply_monitor_gain(bytes(buf[:needed]))
             del buf[:needed]
         else:
             # Ran dry: play what little is left, pad the rest with
@@ -781,6 +871,14 @@ class AudioBridge:
                     "underruns are normal; if this repeats constantly, try "
                     "raising AUDIO_JITTER_BUFFER_MS for more cushion."
                 )
+
+    def _apply_monitor_gain(self, pcm):
+        if self._monitor_muted:
+            return b"\x00" * len(pcm)
+        if self._monitor_gain >= 0.999:
+            return pcm
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) * self._monitor_gain
+        return samples.astype("<i2").tobytes()
 
     # ---- TX: mic -> radio, gated by PTT ----
 
@@ -1059,6 +1157,9 @@ class PassthroughAudioBridge:
     so access to it is protected by a plain threading.Lock.
     """
 
+    _level_peak = 0.0
+    _last_audio_monotonic = None
+
     def __init__(self, loop, input_device, output_device, status_callback):
         self.loop = loop
         self._input_device = input_device
@@ -1138,10 +1239,39 @@ class PassthroughAudioBridge:
         if self._rx_chunk_count == 0:
             self._status(f"Passthrough RX: first chunk captured ({len(data)} bytes).")
         self._rx_chunk_count += 1
-        for extra_callback in self._extra_rx_callbacks:
-            extra_callback(data)
-        for extra_raw_callback in self._extra_rx_raw_callbacks:
-            extra_raw_callback(data)
+        self._last_audio_monotonic = time.monotonic()
+        AudioBridge._note_level(self, data)
+        for extra_callback in list(self._extra_rx_callbacks):
+            try:
+                extra_callback(data)
+            except Exception as exc:
+                self._status(f"Passthrough RX: a consumer raised {exc!r}; carrying on.")
+        for extra_raw_callback in list(self._extra_rx_raw_callbacks):
+            try:
+                extra_raw_callback(data)
+            except Exception as exc:
+                self._status(f"Passthrough RX: a consumer raised {exc!r}; carrying on.")
+
+    # ---- the Audio tab's view of this bridge (there is no software monitor here) ----
+
+    def read_level(self):
+        level, self._level_peak = self._level_peak, 0.0
+        return level
+
+    def rx_status(self):
+        age = None if self._last_audio_monotonic is None else time.monotonic() - self._last_audio_monotonic
+        return {
+            "receiving": self._rx_active, "audio_age": age, "chunks": self._rx_chunk_count,
+            "sample_rate": self.sample_rate, "consumers": len(self._extra_rx_callbacks),
+            "monitor_device": None, "monitor_open": False, "muted": False, "volume": 1.0,
+            "underruns": 0, "monitor_supported": False,
+        }
+
+    def set_monitor(self, volume=None, muted=None):
+        pass
+
+    def set_output_device(self, device):
+        return False
 
     # ---- TX: torca's own generated tones -> a real sound card wired to the radio's mic-in ----
 

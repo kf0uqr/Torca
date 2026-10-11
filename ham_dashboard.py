@@ -67,6 +67,7 @@ from PySide6.QtWidgets import (
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
+from audio_tab import AudioTab
 from workspace_host import present_window, retire_button
 from workspace_state import find_connection_profile
 from update_progress_dialog import UpdateProgressDialog
@@ -2417,6 +2418,8 @@ class HamClockWindow(QWidget):
             tabs.removeTab(0)
             pages.append((title, page))
         pages.append(("Satellites", self.satellite_passes_page))
+        self.audio_tab = AudioTab(self)
+        pages.append(("Audio", self.audio_tab))
         self._data_pages = pages
         for _title, page in pages:
             page.setMinimumHeight(0)

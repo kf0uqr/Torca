@@ -34,6 +34,7 @@ def make_bare_bridge():
     bridge._rx_rate_bytes = 0
     bridge._rx_rate_next_report_at = None
     bridge._rx_queue = queue.Queue(maxsize=50)
+    bridge._out_stream = object()   # a monitor is playing: chunks are queued for it
     bridge._status = lambda msg: None
     return bridge
 

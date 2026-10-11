@@ -26,6 +26,7 @@ Step-by-step instructions for every feature in TORCA. See [README.md](README.md)
   - [DX Cluster](#dx-cluster)
   - [Contest Calendar](#contest-calendar)
 - [WSJT-X and JS8Call integration](#wsjt-x-and-js8call-integration)
+- [Audio](#audio)
 - [Virtual Cables](#virtual-cables)
 - [rigctld](#rigctld)
 - [Updating](#updating)
@@ -164,6 +165,12 @@ A read-only table of upcoming contests (WA7BNM's own published calendar) -- doub
 ## WSJT-X and JS8Call integration
 
 **Launch WSJT-X** starts it in its own isolated profile (`--rig-name`), separate from your regular WSJT-X settings, so it won't collide with an existing setup. **Launch JS8Call** starts JS8Call directly (no isolated-profile flag -- it uses its own regular settings). Use **Rigctld...** (below) to let either one control a specific connected radio (point its own Radio settings at `127.0.0.1:<port>`, rig "Hamlib NET rigctl"). Both remember whichever executable path you locate the first time, and re-prompt (a file browser) if that path ever stops existing.
+
+## Audio
+
+Every connected radio's audio goes to one place first -- its own audio hub -- which feeds every decoder tool (CW, RTTY, PSK31, SSTV, APRS, FT8), the recorder and the web remote at full level, all at once, whether or not you hear anything and whichever audio device you chose when connecting. (Before, a radio connected with no audio device chosen could feed only one decoder at a time.)
+
+What you HEAR is separate. Open the **Audio** tab from a workspace's **+** menu: each radio has a level meter (the audio its decoders are being fed, so you can see at a glance whether a radio is delivering audio, and "no audio for N s" if it stops), the number of tools using it, and its own **Play on** device (the system default, any sound card or virtual cable, or **Silent** -- nothing played, decoders unaffected), **Volume** and **Mute**. Choices are remembered per radio. A radio whose audio comes from a sound card (cable-connected, e.g. truSDX) is metered but not played by TORCA.
 
 ## Virtual Cables
 

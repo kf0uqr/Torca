@@ -109,7 +109,7 @@ def test_transmission_goes_out_once_in_the_right_slot_and_is_valid_ft8(tool):
     assert worker.sent == []
     window._tx_tick(START + 15.1)                                 # too early in the odd slot (audio starts at 0.5 s)
     assert worker.sent == []
-    window._tx_tick(START + 15.3)
+    window._tx_tick(START + 15.45)
     assert len(worker.sent) == 1
     assert len(worker.sent[0]) == int(12.64 * 48000) * 2 or abs(len(worker.sent[0]) - 12.64 * 48000 * 2) < 200
     window._tx_tick(START + 15.4)                                 # not again in the same slot
@@ -125,7 +125,7 @@ def test_too_late_into_the_slot_waits_for_the_next_one(tool):
     double_click(window, "CQ W1AW FN31")
     window._tx_tick(START + 17.0)                                 # 2 s in: the start would be lost
     assert worker.sent == []
-    window._tx_tick(START + 45.3)                                 # the next odd slot
+    window._tx_tick(START + 45.45)                                 # the next odd slot
     assert len(worker.sent) == 1
 
 
@@ -133,19 +133,19 @@ def test_a_whole_contact_is_sequenced_and_logged(tool):
     window, worker, clock = tool
     hear(window, "CQ W1AW FN31", START, snr=-7)
     double_click(window, "CQ W1AW FN31")
-    window._tx_tick(START + 15.3)
+    window._tx_tick(START + 15.45)
     window._on_tx_finished("W1AW KF0UQR EM18")
     assert window.logged == []
 
     hear(window, "KF0UQR W1AW -12", START + 30, snr=-9)          # they report
     assert window.tx_message_edit.text() == "W1AW KF0UQR R-09"
-    window._tx_tick(START + 45.3)
+    window._tx_tick(START + 45.45)
     assert decode_back(worker.sent[-1]) == ["W1AW KF0UQR R-09"]
     window._on_tx_finished("W1AW KF0UQR R-09")
 
     hear(window, "KF0UQR W1AW RR73", START + 60, snr=-9)
     assert window.tx_message_edit.text() == "W1AW KF0UQR 73"
-    window._tx_tick(START + 75.3)
+    window._tx_tick(START + 75.45)
     window._on_tx_finished("W1AW KF0UQR 73")
 
     assert len(window.logged) == 1
@@ -162,14 +162,14 @@ def test_calling_cq_repeats_and_resumes_after_a_contact(tool):
     window.tx_parity_combo.setCurrentIndex(0)
     window._on_cq_clicked()
     assert window.tx_message_edit.text() == "CQ KF0UQR EM18"
-    window._tx_tick(START + 0.3)
+    window._tx_tick(START + 0.45)
     assert decode_back(worker.sent[0]) == ["CQ KF0UQR EM18"]
     window._on_tx_finished("CQ KF0UQR EM18")
     hear(window, "KF0UQR N0XYZ EM28", START + 15, snr=-3)         # someone answers
     assert window.dx_call_edit.text() == "N0XYZ" and window.tx_message_edit.text() == "N0XYZ KF0UQR -03"
-    window._tx_tick(START + 30.3); window._on_tx_finished("N0XYZ KF0UQR -03")
+    window._tx_tick(START + 30.45); window._on_tx_finished("N0XYZ KF0UQR -03")
     hear(window, "KF0UQR N0XYZ R-10", START + 45, snr=-3)
-    window._tx_tick(START + 60.3); window._on_tx_finished("N0XYZ KF0UQR RR73")
+    window._tx_tick(START + 60.45); window._on_tx_finished("N0XYZ KF0UQR RR73")
     assert [q["CALL"] for q in window.logged] == ["N0XYZ"]
     assert window.tx_message_edit.text() == "CQ KF0UQR EM18" and window.tx_enable_button.isChecked()   # back to CQ
 
@@ -177,7 +177,7 @@ def test_calling_cq_repeats_and_resumes_after_a_contact(tool):
 def test_halt_stops_the_audio_and_the_timer(tool):
     window, worker, clock = tool
     window._on_cq_clicked()
-    window._tx_tick(START + 0.3)
+    window._tx_tick(START + 0.45)
     assert window._sending
     window.halt_tx()
     assert worker.halted == 1 and not window._sending and not window.tx_enable_button.isChecked()
@@ -199,7 +199,7 @@ def test_giving_up_after_no_answer(tool):
     hear(window, "CQ W1AW FN31", START)
     double_click(window, "CQ W1AW FN31")
     for n in range(5):
-        window._tx_tick(START + 15.3 + 30 * n)                   # each odd slot sends it again
+        window._tx_tick(START + 15.45 + 30 * n)                   # each odd slot sends it again
         assert len(worker.sent) == n + 1
         window._on_tx_finished("W1AW KF0UQR EM18")
     assert not window.tx_enable_button.isChecked() and "gave up" in window.tx_status_label.text()
@@ -209,7 +209,7 @@ def test_unsendable_message_halts_with_a_reason(tool):
     window, worker, clock = tool
     window._on_cq_clicked()
     window.tx_message_edit.setText("THIS IS NOT A VALID FT8 MESSAGE AT ALL")
-    window._tx_tick(START + 0.3)
+    window._tx_tick(START + 0.45)
     assert worker.sent == [] and not window.tx_enable_button.isChecked()
     assert "not a message" in window.tx_status_label.text()
 
@@ -224,6 +224,6 @@ def test_without_a_callsign_it_refuses_to_transmit(tool):
 def test_closing_the_window_never_leaves_it_transmitting(tool):
     window, worker, clock = tool
     window._on_cq_clicked()
-    window._tx_tick(START + 0.3)
+    window._tx_tick(START + 0.45)
     window.close()
     assert worker.halted == 1 and not window.tx_enable_button.isChecked()

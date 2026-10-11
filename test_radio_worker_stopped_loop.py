@@ -56,3 +56,33 @@ def test_stop_on_a_worker_whose_connection_already_failed_does_not_raise():
     worker._main_task = type("T", (), {"cancel": lambda self: None})()
     worker.stop()
     assert worker._stop_requested
+
+
+def test_generated_tx_audio_is_paced_and_the_ptt_stays_on_until_it_has_played():
+    """The radio queues what it is given in a small buffer, so a whole FT8 transmission
+    handed over at once would key the radio for an instant. It must go out in real time."""
+    import time
+    import radio_worker
+    from constants import AUDIO_TX_PCM_FRAME_BYTES, AUDIO_TX_PCM_FRAME_MS
+
+    events = []
+    start = time.monotonic()
+
+    class Radio:
+        async def set_ptt(self, on): events.append(("ptt", on, time.monotonic() - start))
+        async def start_audio_tx_pcm(self): events.append(("start", None, time.monotonic() - start))
+        async def stop_audio_tx_pcm(self): events.append(("stop", None, time.monotonic() - start))
+
+    async def push(frame): events.append(("push", None, time.monotonic() - start))
+
+    worker = RadioWorker({"radio_model": "IC-9700"})
+    worker.radio = Radio()
+    worker._tx_push_target = lambda: push
+    frames = 40                                                     # 0.8 s of audio
+    asyncio.run(worker._send_tx_audio_pcm(b"\x00" * AUDIO_TX_PCM_FRAME_BYTES * frames))
+    seconds = frames * AUDIO_TX_PCM_FRAME_MS / 1000.0
+    pushes = [t for kind, _, t in events if kind == "push"]
+    assert len(pushes) == frames
+    assert pushes[-1] >= seconds - radio_worker._TX_PUSH_LEAD_SECONDS - 0.05        # not dumped all at once
+    unkey = next(t for kind, on, t in events if kind == "ptt" and on is False)
+    assert unkey >= seconds - 0.05                                                    # keyed for the whole transmission

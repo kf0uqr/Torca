@@ -79,7 +79,7 @@ WATCHDOG_SECONDS = 6 * 60
 # A transmission starts this long after its slot starts (see ft8_decoder), with
 # the PTT keyed a little before the audio. Too late into the slot, it waits for
 # the next slot of the right parity instead.
-_TX_KEY_LEAD = 0.25
+_TX_KEY_LEAD = 0.1
 _TX_TOO_LATE = 1.5
 
 _COLOR_CQ = QColor("#5fd068")

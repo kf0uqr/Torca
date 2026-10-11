@@ -168,6 +168,7 @@ except Exception as _yaesu_rigs_dir_patch_exc:
     )
 
 from constants import (
+    AUDIO_TX_PCM_FRAME_MS,
     RADIO_PROFILES,
     RADIO_BANDS,
     BAND_STACKING_CODES,
@@ -245,6 +246,13 @@ async def _try_recall_band_stack(radio, band_code, register=BAND_STACKING_REGIST
     except Exception as exc:
         return None, f"set_frequency({freq_hz}) failed: {exc}"
     return freq_hz, None
+
+
+# Transmitting generated audio (send_tx_audio_pcm): frames are handed to the radio
+# this far ahead of real time, and after the last one the PTT stays on this long
+# for the radio-side buffer to play out.
+_TX_PUSH_LEAD_SECONDS = 0.3
+_TX_DRAIN_SECONDS = 0.35
 
 
 def _run_threadsafe(coro, loop):
@@ -1140,8 +1148,22 @@ class RadioWorker(QThread):
             remainder = len(padded) % AUDIO_TX_PCM_FRAME_BYTES
             if remainder:
                 padded += b"\x00" * (AUDIO_TX_PCM_FRAME_BYTES - remainder)
-            for i in range(0, len(padded), AUDIO_TX_PCM_FRAME_BYTES):
+            # Hand the audio over in REAL TIME, not all at once. The radio side
+            # only queues what it is given (a small bounded buffer that drops the
+            # oldest audio when full), so pushing a whole transmission instantly
+            # would play a fraction of it, then unkey the radio a moment later --
+            # the PTT must stay on for as long as the audio takes to play.
+            frame_seconds = AUDIO_TX_PCM_FRAME_MS / 1000.0
+            started = time.monotonic()
+            for n, i in enumerate(range(0, len(padded), AUDIO_TX_PCM_FRAME_BYTES)):
+                wait = started + n * frame_seconds - _TX_PUSH_LEAD_SECONDS - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
                 await push(padded[i:i + AUDIO_TX_PCM_FRAME_BYTES])
+            # Let what is still queued play out before unkeying.
+            finish = started + (len(padded) / AUDIO_TX_PCM_FRAME_BYTES) * frame_seconds + _TX_DRAIN_SECONDS
+            if finish > time.monotonic():
+                await asyncio.sleep(finish - time.monotonic())
             if stop_name:
                 await getattr(self.radio, stop_name)()
             self.audio_status.emit(f"Send TX audio: sent {len(pcm_bytes)} bytes.")

@@ -297,3 +297,37 @@ def test_window_filter_sort_and_live_requery(tmp_path, monkeypatch):
 
     window._on_reset_filters_clicked()
     assert not window._query_mode() and len(names()) == 4
+
+
+# ---- no-audio watchdog ----
+
+def test_audio_watchdog_warns_when_stream_stalls_and_clears_on_resume(tmp_path, monkeypatch):
+    aprs_window, window, db = _make_window(tmp_path, monkeypatch)
+    now = 1000.0
+    window._last_audio_monotonic = now
+
+    window._check_audio_flow(now=now + 2)                       # within the grace/normal gap
+    assert window.audio_warning_label.isHidden()
+    window._check_audio_flow(now=now + aprs_window._AUDIO_STALL_SECONDS + 3)
+    assert not window.audio_warning_label.isHidden()
+    assert "No audio received" in window.audio_warning_label.text() and "8 s" in window.audio_warning_label.text()
+
+    window._last_audio_monotonic = now + 20                     # audio came back
+    window._check_audio_flow(now=now + 21)
+    assert window.audio_warning_label.isHidden()
+
+
+def test_audio_watchdog_idle_when_not_decoding(tmp_path, monkeypatch):
+    aprs_window, window, db = _make_window(tmp_path, monkeypatch)
+    window._check_audio_flow(now=10_000.0)                      # never started: no timestamp, no warning
+    assert window.audio_warning_label.isHidden() and not window._audio_watchdog.isActive()
+
+
+def test_both_audio_callbacks_stamp_the_watchdog(tmp_path, monkeypatch):
+    aprs_window, window, db = _make_window(tmp_path, monkeypatch)
+    window._on_decode_audio_frame(b"\x00\x00")                  # no decoder yet -- still counts as audio arriving
+    first = window._last_audio_monotonic
+    assert first is not None
+    window._last_audio_monotonic = None
+    window._on_direwolf_audio_frame(b"\x00\x00")
+    assert window._last_audio_monotonic is not None

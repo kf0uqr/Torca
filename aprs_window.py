@@ -75,6 +75,13 @@ _COLUMN_SORT_KEYS = ["time", "source", "destination", "type", "details"]
 _REQUERY_DELAY_MS = 2000
 _TEXT_FILTER_DEBOUNCE_MS = 300
 
+# Audio chunks arrive many times a second whenever the radio's RX stream
+# is up -- even on a silent channel -- so a gap this long means the
+# stream itself has stalled (network audio dropped, radio disconnected,
+# stream never started), not that nobody is transmitting.
+_AUDIO_STALL_SECONDS = 5.0
+_AUDIO_WATCHDOG_INTERVAL_MS = 1000
+
 _TIME_RANGES = [("All time", None), ("Last hour", 3600), ("Last 24 hours", 86400), ("Last 7 days", 7 * 86400)]
 
 _SETTINGS_ORG = "IcomRadioApp"
@@ -437,6 +444,18 @@ class AprsToolWindow(QWidget):
         self.status_label = QLabel("Not decoding.")
         self.status_label.setStyleSheet("color: #aaa;")
 
+        # Separate from status_label (which the decoder backends and
+        # database errors also write to) so a stalled-audio warning can't
+        # be overwritten by, or overwrite, those messages.
+        self.audio_warning_label = QLabel("")
+        self.audio_warning_label.setWordWrap(True)
+        self.audio_warning_label.setStyleSheet("color: #e8a33d; font-weight: bold;")
+        self.audio_warning_label.setVisible(False)
+        self._last_audio_monotonic = None  # set from the worker thread's audio callbacks
+        self._audio_watchdog = QTimer(self)
+        self._audio_watchdog.setInterval(_AUDIO_WATCHDOG_INTERVAL_MS)
+        self._audio_watchdog.timeout.connect(self._check_audio_flow)
+
         # ---- Filter bar ----
         self.callsign_filter = QLineEdit()
         self.callsign_filter.setPlaceholderText("Callsign")
@@ -489,6 +508,7 @@ class AprsToolWindow(QWidget):
         layout.addLayout(buttons_row)
         layout.addLayout(filter_row)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.audio_warning_label)
         layout.addWidget(self.view_label)
         layout.addWidget(self.table, stretch=1)
         self.setLayout(layout)
@@ -625,6 +645,26 @@ class AprsToolWindow(QWidget):
 
     # ---- Decode ----
 
+    def _check_audio_flow(self, now=None):
+        """Watchdog (GUI thread, once a second while decoding): warns
+        when no audio has reached the decoder for _AUDIO_STALL_SECONDS,
+        and clears the warning as soon as audio resumes. A quiet channel
+        still delivers audio, so this means the stream itself stalled --
+        which otherwise looks identical to "nobody is transmitting"."""
+        last = self._last_audio_monotonic
+        if last is None:
+            return
+        silent_for = (time.monotonic() if now is None else now) - last
+        if silent_for >= _AUDIO_STALL_SECONDS:
+            self.audio_warning_label.setText(
+                f"No audio received from the radio for {int(silent_for)} s -- the audio stream "
+                "may have stalled, so nothing can be decoded. Try Stop/Start Decoding, "
+                "or reconnect the radio."
+            )
+            self.audio_warning_label.setVisible(True)
+        else:
+            self.audio_warning_label.setVisible(False)
+
     def _on_decode_toggled(self, checked):
         worker = self._radio_window.worker
         use_direwolf = self.backend_combo.currentIndex() == 1
@@ -668,12 +708,16 @@ class AprsToolWindow(QWidget):
                 self.decode_toggle_button.setChecked(False)
                 self.decode_toggle_button.blockSignals(False)
                 return
+            self._last_audio_monotonic = time.monotonic()  # grace period: the stream gets _AUDIO_STALL_SECONDS to start
+            self._audio_watchdog.start()
             self.backend_combo.setEnabled(False)
             self.decode_toggle_button.setText("Stop Decoding")
             if not use_direwolf:
                 self.status_label.setText("Decoding -- listening for AX.25 packets...")
         else:
             worker.stop_aprs_decode()
+            self._audio_watchdog.stop()
+            self.audio_warning_label.setVisible(False)
             self._decoder = None
             if self._direwolf_backend is not None:
                 self._direwolf_backend.stop()
@@ -690,6 +734,7 @@ class AprsToolWindow(QWidget):
         # which only replace/clear self._decoder while decoding is NOT
         # active -- so there's never genuine concurrent access to the
         # same AprsDecoder instance.
+        self._last_audio_monotonic = time.monotonic()
         if self._decoder is None:
             return
         packets = self._decoder.feed(pcm_bytes)
@@ -701,6 +746,7 @@ class AprsToolWindow(QWidget):
         # feed_audio() is a plain synchronous UDP send with no Qt
         # event-loop or widget touch, so this crosses no thread
         # boundary that needs marshaling (see its own docstring).
+        self._last_audio_monotonic = time.monotonic()
         if self._direwolf_backend is None:
             return
         self._direwolf_backend.feed_audio(pcm_bytes)

@@ -123,7 +123,7 @@ class Psk31ToolWindow(QWidget):
     def __init__(self, radio_window):
         super().__init__()
         self._radio_window = radio_window
-        self.setWindowTitle(f"PSK31 Tool -- {radio_window._connection_label}")
+        self.setWindowTitle(radio_window.tool_title("PSK31 Tool"))
         self.resize(560, 500)
 
         self._decoder = None  # psk31.Psk31Decoder, constructed fresh each time decoding starts

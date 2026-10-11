@@ -143,6 +143,7 @@ def test_real_dashboard_hands_its_kill_tx_button_to_the_hosts_top_bar(tmp_path):
         host.add_dashboard(dash)
         for _ in range(10):
             app.processEvents()
+        assert dash.windowTitle() == "Map" and host.panes[0].tabText(0) == "Map", host.panes[0].tabText(0)
         kill = dash.kill_remote_tx_button
         floating = host._floating_button
         assert kill.window() is host and kill.isVisible(), "button not in the host"

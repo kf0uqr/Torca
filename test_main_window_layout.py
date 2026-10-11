@@ -351,3 +351,98 @@ def test_band_buttons_still_select_their_band_after_wrapping(app, monkeypatch):
         assert picked == [window.band_buttons[5].text()]
     finally:
         window.close()
+
+
+# ---- tab titles ----
+
+def _titled_window(monkeypatch, model="IC-9700", role="non_sat", host="192.0.2.1"):
+    monkeypatch.setattr(radio_worker.RadioWorker, "start", lambda self, *a, **k: None)
+    return main_window.RadioWindow(dict(DETAILS, radio_model=model, role=role, host=host), SatelliteSession())
+
+
+def test_radio_window_title_is_model_dash_role(app, monkeypatch):
+    window = _titled_window(monkeypatch)
+    try:
+        assert window.windowTitle() == "IC-9700 - Non-Sat"
+    finally:
+        window.close()
+    for role, label in (("full_duplex", "Satellite Full Duplex"), ("downlink", "Satellite Downlink"), ("uplink", "Satellite Uplink")):
+        window = _titled_window(monkeypatch, role=role)
+        try:
+            assert window.windowTitle() == f"IC-9700 - {label}"
+        finally:
+            window.close()
+
+
+def test_tool_windows_are_titled_tool_name_dash_model(app, monkeypatch):
+    window = _titled_window(monkeypatch, model="IC-7300")
+    try:
+        built = {
+            "CW Tool": window.ensure_cw_tool_window(),
+            "APRS Tool": window.ensure_aprs_tool_window(),
+            "SSTV Tool": window.ensure_sstv_tool_window(),
+            "RTTY Tool": window.ensure_rtty_tool_window(),
+            "PSK31 Tool": window.ensure_psk31_tool_window(),
+            "Recording Tool": window.ensure_recording_tool_window(),
+            "Memories": window.ensure_memories_window(),
+        }
+        for name, tool in built.items():
+            assert tool.windowTitle() == f"{name} - IC-7300", name       # model, not the IP address
+            assert "192.0.2.1" not in tool.windowTitle()
+    finally:
+        window.close()
+
+
+def test_two_radios_of_the_same_model_are_told_apart_and_it_reverts_when_one_closes(app, monkeypatch):
+    first = _titled_window(monkeypatch, host="192.0.2.1")
+    first_cw = first.ensure_cw_tool_window()                              # built BEFORE the second radio exists
+    assert first.windowTitle() == "IC-9700 - Non-Sat" and first_cw.windowTitle() == "CW Tool - IC-9700"
+    second = _titled_window(monkeypatch, host="192.0.2.2")
+    try:
+        assert first.windowTitle() == "IC-9700 (192.0.2.1 (LAN)) - Non-Sat"          # existing windows re-titled too
+        assert first_cw.windowTitle() == "CW Tool - IC-9700 (192.0.2.1 (LAN))"
+        assert second.windowTitle() == "IC-9700 (192.0.2.2 (LAN)) - Non-Sat"
+        assert second.ensure_aprs_tool_window().windowTitle() == "APRS Tool - IC-9700 (192.0.2.2 (LAN))"
+        second.close()
+        assert first.windowTitle() == "IC-9700 - Non-Sat"                            # back to the short form
+        assert first_cw.windowTitle() == "CW Tool - IC-9700"
+    finally:
+        first.close()
+
+
+def test_different_models_never_get_a_connection_suffix(app, monkeypatch):
+    nine = _titled_window(monkeypatch, model="IC-9700")
+    seven = _titled_window(monkeypatch, model="IC-7300", host="192.0.2.9")
+    try:
+        assert nine.windowTitle() == "IC-9700 - Non-Sat" and seven.windowTitle() == "IC-7300 - Non-Sat"
+    finally:
+        nine.close()
+        seven.close()
+
+
+def test_tab_text_follows_the_new_titles_in_the_workspace(app, monkeypatch):
+    window = _titled_window(monkeypatch)
+    host = WorkspaceHost()
+    try:
+        host.present(window)
+        pane = host.panes[host.pane_of(window)]
+        assert pane.tabText(pane.indexOf(host._entries[window].page)) == "IC-9700 - Non-Sat"
+        tool = window.ensure_cw_tool_window()
+        host.present(tool)
+        assert "CW Tool - IC-9700" in [pane.tabText(i) for i in range(pane.count())]
+    finally:
+        _close(host)
+        window.close()
+
+
+def test_the_longest_normal_title_is_not_truncated_in_its_tab(app, monkeypatch):
+    window = _titled_window(monkeypatch, role="full_duplex")
+    host = WorkspaceHost()
+    try:
+        host.present(window)
+        pane = host.panes[host.pane_of(window)]
+        text = pane.tabText(pane.indexOf(host._entries[window].page))
+        assert text == "IC-9700 - Satellite Full Duplex" and "…" not in text
+    finally:
+        _close(host)
+        window.close()

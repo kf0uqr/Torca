@@ -98,6 +98,9 @@ def _make_window(tmp_path, monkeypatch):
     class StubRadioWindow:
         _connection_label = "test-radio"
 
+        def tool_title(self, name):
+            return f"{name} - test"
+
     return aprs_window, aprs_window.AprsToolWindow(StubRadioWindow()), db
 
 
@@ -123,6 +126,9 @@ def test_window_reloads_history_on_open_and_clear_keeps_it(tmp_path, monkeypatch
 
     class StubRadioWindow:
         _connection_label = "test-radio"
+
+        def tool_title(self, name):
+            return f"{name} - test"
 
     reopened = aprs_window.AprsToolWindow(StubRadioWindow())
     assert [reopened.table.item(r, 1).text() for r in range(reopened.table.rowCount())] == ["K0A-1", "K0A-2"]

@@ -990,7 +990,7 @@ class HamClockWindow(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Ham Dashboard")
+        self.setWindowTitle("Map")
 
         # main.py's OperatorProfileDialog already ran before this window
         # was even constructed, so operator_callsign/operator_lat/

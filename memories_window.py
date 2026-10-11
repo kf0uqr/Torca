@@ -383,7 +383,7 @@ class MemoriesWindow(QWidget):
     def __init__(self, radio_window):
         super().__init__()
         self._radio_window = radio_window
-        self.setWindowTitle(f"Memories -- {radio_window._connection_label}")
+        self.setWindowTitle(radio_window.tool_title("Memories"))
         self.resize(640, 420)
         self._closing_for_real = False
         self._data = _load_memories()

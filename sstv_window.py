@@ -77,7 +77,7 @@ class SstvToolWindow(QWidget):
     def __init__(self, radio_window):
         super().__init__()
         self._radio_window = radio_window
-        self.setWindowTitle(f"SSTV Tool -- {radio_window._connection_label}")
+        self.setWindowTitle(radio_window.tool_title("SSTV Tool"))
         self.resize(420, 760)
 
         self._decoder = None  # sstv.SstvDecoder, constructed fresh each time decoding starts

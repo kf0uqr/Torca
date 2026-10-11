@@ -181,7 +181,7 @@ class RecordingToolWindow(QWidget):
     def __init__(self, radio_window):
         super().__init__()
         self._radio_window = radio_window
-        self.setWindowTitle(f"Recording Tool -- {radio_window._connection_label}")
+        self.setWindowTitle(radio_window.tool_title("Recording Tool"))
         self.resize(640, 520)
         self._closing_for_real = False
 

@@ -168,7 +168,7 @@ class CwToolWindow(QWidget):
     def __init__(self, radio_window):
         super().__init__()
         self._radio_window = radio_window
-        self.setWindowTitle(f"CW Tool -- {radio_window._connection_label}")
+        self.setWindowTitle(radio_window.tool_title("CW Tool"))
         self.resize(560, 480)
 
         self._decoder = None  # cw.CwDecoder, constructed fresh each time decoding starts

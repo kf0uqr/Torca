@@ -120,7 +120,7 @@ PLUS_BUTTON_STYLE = (
     "QToolButton::menu-indicator { image: none; }"
 )
 
-_TAB_TITLE_MAX = 28
+_TAB_TITLE_MAX = 34
 
 _HOST = None  # the live WorkspaceHost, if any -- see present_window()
 

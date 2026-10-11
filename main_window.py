@@ -14,6 +14,7 @@ radio does with the shared Doppler state depending on its role.
 """
 
 import sys
+import weakref
 
 from PySide6.QtCore import Qt, Slot, Signal, QTimer
 from PySide6.QtWidgets import (
@@ -75,6 +76,17 @@ _MEMORY_MARKER_REFRESH_MS = 5000
 
 _ROLE_LABELS = {value: label for label, value in RADIO_ROLES}  # "full_duplex" -> "Satellite Full Duplex", etc.
 
+# Every live RadioWindow, so two connected radios of the SAME model can be told
+# apart in their tab titles (see RadioWindow.display_name).
+_LIVE_RADIO_WINDOWS = weakref.WeakSet()
+
+# (attribute holding the lazily-built tool window, its title prefix)
+_TOOL_TITLES = (
+    ("cw_window", "CW Tool"), ("aprs_window", "APRS Tool"), ("sstv_window", "SSTV Tool"),
+    ("rtty_window", "RTTY Tool"), ("psk31_window", "PSK31 Tool"),
+    ("recording_window", "Recording Tool"), ("memories_window", "Memories"),
+)
+
 # Share of any spare window height each display gets -- see the layout
 # built at the end of RadioWindow.__init__.
 _STRETCH_SPECTRUM = 3
@@ -130,7 +142,10 @@ class RadioWindow(QWidget):
             self._connection_label = f"{details['remote_host']}:{details['remote_port']} (Remote Server)"
         else:
             self._connection_label = f"{details['serial_port']} (USB)"
-        self.setWindowTitle(f"TORCA -- {details['radio_model']}")
+        # Tab title: "<model> - <role>" (see refresh_titles); registered first so a
+        # second radio of the same model gets told apart from this one.
+        _LIVE_RADIO_WINDOWS.add(self)
+        self._refresh_same_model_titles()
 
         # QLineEdit, not QLabel -- editable so an operator can type a
         # frequency directly instead of only tuning via the knob/band
@@ -2152,6 +2167,37 @@ class RadioWindow(QWidget):
                 "QPushButton { background-color: #2a6; color: white; font-weight: bold; }" if active else ""
             )
 
+    # ---- titles (these are what the workspace tabs show) ----
+
+    def display_name(self):
+        """The radio's model, e.g. "IC-9700" -- plus its connection in
+        brackets only while another connected radio is the same model, so
+        their tabs stay distinguishable."""
+        model = self._details["radio_model"]
+        if any(other is not self and other._details["radio_model"] == model for other in _LIVE_RADIO_WINDOWS):
+            return f"{model} ({self._connection_label})"
+        return model
+
+    def tool_title(self, tool_name):
+        """Title for one of this radio's tool windows: "CW Tool - IC-9700"."""
+        return f"{tool_name} - {self.display_name()}"
+
+    def refresh_titles(self):
+        self.setWindowTitle(f"{self.display_name()} - {_ROLE_LABELS.get(self._role, self._role)}")
+        for attribute, tool_name in _TOOL_TITLES:
+            tool_window = getattr(self, attribute, None)
+            if tool_window is not None:
+                tool_window.setWindowTitle(self.tool_title(tool_name))
+
+    def _refresh_same_model_titles(self):
+        """Re-titles this radio and every other live radio of its model --
+        called when one connects or closes, since that is what decides
+        whether the connection needs to be shown."""
+        model = self._details["radio_model"]
+        for window in list(_LIVE_RADIO_WINDOWS):
+            if window._details["radio_model"] == model:
+                window.refresh_titles()
+
     @staticmethod
     def _layout_widgets(layout):
         """Every widget in `layout`, in order, descending into nested layouts."""
@@ -2230,6 +2276,8 @@ class RadioWindow(QWidget):
         if self.recording_window is not None:
             self.recording_window.closing_for_real()
         self._satellite_session.unregister(self)
+        _LIVE_RADIO_WINDOWS.discard(self)
+        self._refresh_same_model_titles()  # a remaining radio of this model no longer needs its connection shown
         # Emitted BEFORE worker.stop() -- HamClockWindow's handler may
         # still need to call something on this worker (e.g.
         # set_virtual_cable_bridge(False, False), if this radio was a

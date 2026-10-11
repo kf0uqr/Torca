@@ -77,16 +77,13 @@ SCRIPT = textwrap.dedent('''
     trigger(host, 1, "Connect New Radio...")
     assert where(dash.workspace_radios()[-1]) == (1, 2), where(dash.workspace_radios()[-1])
 
-    # 5b. the other dialogs the Actions open appear over the window whose menu was used
-    from PySide6.QtWidgets import QInputDialog
+    # 5b. the Profile button in a window's top bar opens its dialog over THAT window
+    from PySide6.QtWidgets import QPushButton
     seen = {}
     ham_dashboard.OperatorProfileDialog.run = staticmethod(lambda parent=None, required=False: seen.__setitem__("profile", parent) or False)
-    QInputDialog.getInt = staticmethod(lambda parent, *a, **k: (seen.__setitem__("autolog", parent), (0, False))[1])
     for window, label in ((second, "window 2"), (host, "window 1")):
-        trigger(window, 0, "Profile...")
+        next(b for b in window.findChildren(QPushButton) if b.text() == "Profile..." and b.isVisible()).click()
         assert seen["profile"].window() is window, (label, seen["profile"])
-        trigger(window, 0, "WSJT-X Auto-Log UDP Port...")
-        assert seen["autolog"].window() is window, (label, seen["autolog"])
     trigger(second, 1, "Connect New Radio...")                            # leave the origin on window 2 for the next step
     host.add_workspace(0, "right") if host.workspace_count < 2 else None
 

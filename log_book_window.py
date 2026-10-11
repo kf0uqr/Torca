@@ -191,6 +191,22 @@ class LogBookWindow(QWidget):
         self.qrz_settings_button = QPushButton("QRZ Settings...")
         self.qrz_settings_button.clicked.connect(self._on_qrz_settings_clicked)
 
+        # WSJT-X auto-logging: the real on/off state and listener live on the
+        # dashboard (its retired wsjtx_autolog_button); these mirror and drive it.
+        self.autolog_button = QPushButton("WSJT-X Auto-Log: OFF")
+        self.autolog_button.setCheckable(True)
+        self.autolog_button.clicked.connect(self._on_autolog_clicked)
+        self.autolog_port_button = QPushButton("UDP Port...")
+        self.autolog_port_button.setToolTip("The UDP port to listen on -- must match WSJT-X's \"UDP Server port\" in Settings > Reporting.")
+        self.autolog_port_button.clicked.connect(self._on_autolog_port_clicked)
+        source = getattr(dashboard, "wsjtx_autolog_button", None)
+        if source is not None:
+            self.autolog_button.setToolTip(source.toolTip())
+            source.toggled.connect(lambda _on: self._sync_autolog_button())
+        else:
+            self.autolog_button.setEnabled(False)
+            self.autolog_port_button.setEnabled(False)
+
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #aaa; font-size: 11px;")
 
@@ -199,6 +215,9 @@ class LogBookWindow(QWidget):
         toolbar.addWidget(self.delete_button)
         toolbar.addWidget(self.columns_button)
         toolbar.addStretch()
+        toolbar.addWidget(self.autolog_button)
+        toolbar.addWidget(self.autolog_port_button)
+        toolbar.addSpacing(12)
         toolbar.addWidget(self.sync_button)
         toolbar.addWidget(self.qrz_settings_button)
 
@@ -210,6 +229,25 @@ class LogBookWindow(QWidget):
 
         self._update_sync_button_state()
         self._rebuild_table()
+        self._sync_autolog_button()
+
+    # ---- WSJT-X auto-log (state lives on the dashboard) ----
+
+    def _sync_autolog_button(self):
+        source = getattr(self._dashboard, "wsjtx_autolog_button", None)
+        if source is None:
+            return
+        self.autolog_button.setChecked(source.isChecked())
+        self.autolog_button.setText(source.text())
+
+    def _on_autolog_clicked(self):
+        source = self._dashboard.wsjtx_autolog_button
+        source.setChecked(self.autolog_button.isChecked())   # may refuse (port busy) and revert itself
+        self._sync_autolog_button()
+
+    def _on_autolog_port_clicked(self):
+        self._dashboard._on_wsjtx_autolog_menu_requested(None)
+        self._sync_autolog_button()
 
     # ---- persistence helpers ----
 

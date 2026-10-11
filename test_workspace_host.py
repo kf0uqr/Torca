@@ -418,7 +418,7 @@ def _fake_dashboard_for_actions(app):
     return fake, calls, cls
 
 
-def test_dashboard_actions_section_replaces_the_button_row(app):
+def test_dashboard_menu_keeps_only_connect(app):
     import types
     from PySide6.QtWidgets import QMenu
     fake, calls, cls = _fake_dashboard_for_actions(app)
@@ -426,40 +426,29 @@ def test_dashboard_actions_section_replaces_the_button_row(app):
     menu = QMenu()
     cls.populate_workspace_menu(fake, menu, ctx)
     texts = [a.text() for a in menu.actions() if not a.isSeparator()]
-    assert texts == [
-        "Log Book", "Connect New Radio...", "new_qso", "profile", "wsjtx", "js8call",
-        "WSJT-X Auto-Log", "WSJT-X Auto-Log UDP Port...", "remote_access", "Check for Updates..."]
-    assert any(a.isSeparator() and a.text() == "Actions" for a in menu.actions())  # a Qt "section" is a labeled separator
+    assert texts == ["Log Book", "Connect New Radio..."]
+    assert not any(a.isSeparator() and a.text() for a in menu.actions())   # no "Actions" heading any more
     for a in menu.actions():
-        if a.text() in ("Connect New Radio...", "profile", "WSJT-X Auto-Log UDP Port..."):
+        if a.text() == "Connect New Radio...":
             a.trigger()
-    # connecting from a workspace's menu remembers THAT workspace first (so the radio opens there),
-    assert calls == ["origin", "connect", "origin", "profile", "origin", "autolog_port"]
-    assert fake.origins == [ctx] * 3          # EVERY action remembers its menu: that is the window its dialogs open over
+    assert calls == ["origin", "connect"] and fake.origins == [ctx]        # connecting remembers THAT workspace first
 
 
-def test_actions_mirror_button_state_and_toggle_autolog(app):
+def test_top_bar_buttons_mirror_the_retired_buttons_and_remember_their_window(app):
     import types
-    from PySide6.QtWidgets import QMenu
     fake, calls, cls = _fake_dashboard_for_actions(app)
+    fake.profile_button.setText("Profile...")
     ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
-
-    # mid-update: the button's progress text and disabled state show in the menu
+    fake._remember_menu_origin = lambda c: (fake.origins.append(c), calls.append("origin"))
+    buttons = cls.make_top_bar_actions(fake, ctx)
+    assert [b.text() for b in buttons] == ["Profile...", "new_qso", "wsjtx", "js8call", "Check for Updates...", "remote_access"]
     fake.update_button.setText("Updating: Pulling the latest changes...")
     fake.update_button.setEnabled(False)
-    menu = QMenu()
-    cls.populate_workspace_menu(fake, menu, ctx)
-    update = next(a for a in menu.actions() if a.text().startswith("Updating"))
-    assert not update.isEnabled() and update.toolTip() == "update tip"
-
-    # auto-log is a checkable entry bound to the toggle button
-    autolog = next(a for a in menu.actions() if a.text() == "WSJT-X Auto-Log")
-    assert autolog.isCheckable() and not autolog.isChecked()
-    autolog.trigger()
-    assert fake.wsjtx_autolog_button.isChecked() and calls == ["origin", "autolog=True"]
-    menu2 = QMenu()
-    cls.populate_workspace_menu(fake, menu2, ctx)
-    assert next(a for a in menu2.actions() if a.text() == "WSJT-X Auto-Log").isChecked()
+    update = buttons[4]
+    update._sync()
+    assert update.text().startswith("Updating") and not update.isEnabled() and update.toolTip() == "update tip"
+    buttons[0].click()
+    assert calls == ["origin", "profile"] and fake.origins == [ctx]
 
 
 def test_retired_buttons_stay_alive_but_hidden(app):

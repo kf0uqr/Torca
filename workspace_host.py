@@ -405,6 +405,27 @@ class _MenuContext:
         return title if where is None or where == self._pane.index else f"{title}  (Workspace {where + 1})"
 
 
+class _TopBarContext:
+    """Like _MenuContext, for the buttons in a window's top bar: the workspace
+    is whichever one is active in that window when the button is used."""
+
+    def __init__(self, host):
+        self._host = host
+
+    def open(self, widget):
+        self._host.open_in(widget, self._host._active_pane.index)
+
+    @property
+    def host(self):
+        return self._host
+
+    def is_valid(self):
+        return self._host in self._host.manager.hosts
+
+    def label(self, title, widget=None):
+        return title
+
+
 class WindowManager(QObject):
     """Everything shared by TORCA's windows. Each window is a WorkspaceHost
     (up to four workspaces, two wide and two tall); a tab lives in exactly one
@@ -425,6 +446,7 @@ class WindowManager(QObject):
         self.hosts = []              # main window first
         self.entries = {}            # widget -> _Entry, for every registered tab
         self.menu_providers = []     # fn(menu, ctx), see add_menu_provider
+        self.top_bar_action_factory = None  # (ctx) -> buttons placed right after the Windows menu in a NEW window
         self.top_bar_factory = None  # () -> new widgets for a NEW window's top bar (e.g. a Kill TX button)
         self.shutting_down = False
         self._hide_watcher = _HideWatcher(self)
@@ -462,6 +484,8 @@ class WindowManager(QObject):
         cover the others. `place=False` leaves the geometry to the caller."""
         host = WorkspaceHost(self)
         host.setAttribute(Qt.WA_DeleteOnClose, True)
+        if self.top_bar_action_factory is not None:
+            host.add_top_bar_actions(self.top_bar_action_factory(_TopBarContext(host)))
         if self.top_bar_factory is not None:
             for widget in self.top_bar_factory():
                 host._top_bar.addWidget(widget)
@@ -970,6 +994,11 @@ class WorkspaceHost(QMainWindow):
                 menu.addSeparator()
             provider(menu, ctx)
 
+    def add_top_bar_actions(self, widgets):
+        """Buttons placed in the top bar right after the Windows menu."""
+        for offset, widget in enumerate(widgets, start=1):
+            self._top_bar.insertWidget(offset, widget)
+
     def add_dashboard(self, dashboard, pane_index=0):
         """Docks the dashboard (non-closable) and wires it into the
         workspaces' "+" menus: if it offers take_data_pages(), its
@@ -989,6 +1018,10 @@ class WorkspaceHost(QMainWindow):
                 page.setWindowTitle(title)
                 page.workspace_key = f"page:{title}"
                 self.register_window(page, closable=True)
+        make_actions = getattr(dashboard, "make_top_bar_actions", None)
+        if make_actions is not None:
+            self.add_top_bar_actions(make_actions(_TopBarContext(self)))
+            self.manager.top_bar_action_factory = make_actions
         take_top_bar = getattr(dashboard, "take_top_bar_widgets", None)
         if take_top_bar is not None:
             for widget in take_top_bar():

@@ -148,6 +148,35 @@ from satellite_tracking import (
     SGP4_AVAILABLE,
 )
 
+class _MirroredButton(QPushButton):
+    """A button in a window's top bar standing in for a retired dashboard button
+    (which keeps the real enabled/text/progress state). Re-reads that state a
+    couple of times a second -- the source has no signal for a text change."""
+
+    def __init__(self, source, before):
+        super().__init__()
+        self._source = source
+        self._before = before
+        self.clicked.connect(self._forward)
+        self._timer = QTimer(self)
+        self._timer.setInterval(400)
+        self._timer.timeout.connect(self._sync)
+        self._timer.start()
+        self._sync()
+
+    def _sync(self):
+        source = self._source
+        if self.text() != source.text():
+            self.setText(source.text())
+        self.setEnabled(source.isEnabled())
+        if self.toolTip() != source.toolTip():
+            self.setToolTip(source.toolTip())
+
+    def _forward(self):
+        self._before()
+        self._source.click()
+
+
 class VirtualCableDialog(QDialog):
     """Configures virtual cables for ONE radio -- selected beforehand
     from that radio's own window, per explicit instruction
@@ -2434,6 +2463,17 @@ class HamClockWindow(QWidget):
         self.layout().removeItem(self._top_buttons_row)
         return [self.kill_remote_tx_button]
 
+    def make_top_bar_actions(self, ctx):
+        """The Profile / New QSO / WSJT-X / JS8Call / Updates / Remote Access buttons for
+        ONE window's top bar (right after its Windows menu). Each is a mirror of
+        the retired button that carries the real state: it shows that button's
+        text (e.g. update progress), enabled state and tooltip, and clicking it
+        clicks that button -- after remembering this window, so the dialogs it
+        opens appear over it."""
+        return [_MirroredButton(source, lambda: self._remember_menu_origin(ctx))
+                for source in (self.profile_button, self.new_qso_button, self.wsjtx_button, self.js8call_button,
+                               self.update_button, self.remote_access_button)]
+
     def make_top_bar_widgets(self):
         """A NEW "Kill All Remote TX" button for another window's top bar (a
         widget can be in only one window, and this safety control should be
@@ -2471,31 +2511,14 @@ class HamClockWindow(QWidget):
                     title += f" ({window._connection_label})"
                 window.populate_tool_menu(menu.addMenu(title), ctx)
 
-        # ---- Actions: what used to be the dashboard's button row ----
+        # ---- what used to be the dashboard's button row ----
         # Each entry drives the (now hidden) button it replaced, so all the
         # enable/progress/toggle logic those buttons already carry keeps
         # working; the menu just mirrors their state when it opens.
-        menu.addSection("Actions")
+        menu.addSeparator()
         menu.addAction("Connect New Radio...").triggered.connect(
             lambda _c=False: (self._remember_menu_origin(ctx), self._on_connect_radio_clicked())
         )
-        origin = lambda: self._remember_menu_origin(ctx)
-        for button in (self.new_qso_button, self.profile_button):
-            self._add_action_for_button(menu, button, before=origin)
-        menu.addSeparator()
-        for button in (self.wsjtx_button, self.js8call_button):
-            self._add_action_for_button(menu, button, before=origin)
-        autolog = menu.addAction("WSJT-X Auto-Log")
-        autolog.setCheckable(True)
-        autolog.setChecked(self.wsjtx_autolog_button.isChecked())
-        autolog.setToolTip(self.wsjtx_autolog_button.toolTip())
-        autolog.triggered.connect(lambda _c=False: (origin(), self.wsjtx_autolog_button.toggle()))
-        menu.addAction("WSJT-X Auto-Log UDP Port...").triggered.connect(
-            lambda _c=False: (origin(), self._on_wsjtx_autolog_menu_requested(None))
-        )
-        menu.addSeparator()
-        for button in (self.remote_access_button, self.update_button):
-            self._add_action_for_button(menu, button, before=origin)
 
     @staticmethod
     def _add_action_for_button(menu, button, before=None):

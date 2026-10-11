@@ -135,7 +135,7 @@ Opened from the Ham Dashboard's **Log Book...** button. Lists every QSO from a l
 - **New QSO...** -- opens a form auto-filled from a connected radio's live frequency/mode (and the active satellite/transponder, if tracking) -- everything stays editable.
 - **Sync with QRZ** -- optional, two-way reconciliation with your QRZ.com Logbook (needs a QRZ Logbook API key, entered via **QRZ Settings...**).
 - **Edit Selected** / **Delete Selected** -- edit or remove one or more selected rows (deleting also removes them from QRZ if synced).
-- **WSJT-X Auto-Log** (Ham Dashboard button): once toggled on, every QSO WSJT-X logs (its own "Log QSO" dialog, OK) is logged here automatically over WSJT-X's UDP protocol -- no manual entry, works with any running WSJT-X instance whose UDP Server port matches (right-click the button to change TORCA's own listening port).
+- **WSJT-X Auto-Log** (button at the top of the Log Book): once toggled on, every QSO WSJT-X logs (its own "Log QSO" dialog, OK) is logged here automatically over WSJT-X's UDP protocol -- no manual entry, works with any running WSJT-X instance whose UDP Server port matches (use **UDP Port...** next to it to change TORCA's own listening port).
 
 ## World map & overlays
 

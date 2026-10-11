@@ -680,3 +680,27 @@ def test_changing_the_grid_never_destroys_panes_or_hosted_windows(host, app):
         _flush_deletes(app)
         assert all(isValid(p) for p in host.panes) and isValid(dash) and isValid(tool), step
         assert sum(p.count() for p in host.panes) == 2
+
+
+def test_each_radios_tool_submenu_is_titled_model_tools(app):
+    import types
+    from PySide6.QtWidgets import QMenu
+    fake, calls, cls = _fake_dashboard_for_actions(app)
+
+    def radio(model, label):
+        return types.SimpleNamespace(_details={"radio_model": model, "role": "non_sat"}, _connection_label=label,
+                                     populate_tool_menu=lambda menu, ctx: menu.addAction("CW Tool"))
+
+    ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+
+    def submenu_titles(radios):
+        fake._connected_radios = radios
+        menu = QMenu()
+        cls.populate_workspace_menu(fake, menu, ctx)
+        return [a.text() for a in menu.actions() if a.menu() is not None]
+
+    assert submenu_titles([radio("IC-9700", "192.0.2.1 (LAN)")]) == ["IC-9700 Tools"]      # no role, no address
+    assert submenu_titles([radio("IC-9700", "192.0.2.1 (LAN)"), radio("IC-7300", "/dev/ttyUSB0 (USB)")]) == [
+        "IC-9700 Tools", "IC-7300 Tools"]
+    assert submenu_titles([radio("IC-9700", "192.0.2.1 (LAN)"), radio("IC-9700", "192.0.2.2 (LAN)")]) == [
+        "IC-9700 Tools (192.0.2.1 (LAN))", "IC-9700 Tools (192.0.2.2 (LAN))"]               # same model twice: say which

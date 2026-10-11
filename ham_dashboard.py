@@ -2536,8 +2536,14 @@ class HamClockWindow(QWidget):
         radios = list(self._connected_radios)
         if radios:
             menu.addSeparator()
-            for window in radios:
-                window.populate_tool_menu(menu.addMenu(self._radio_list_base_label(window._details)), ctx)
+            models = [window._details["radio_model"] for window in radios]
+            for window, model in zip(radios, models):
+                title = f"{model} Tools"
+                if models.count(model) > 1:
+                    # Two radios of the same model: say which one, or the
+                    # submenus would be indistinguishable.
+                    title += f" ({window._connection_label})"
+                window.populate_tool_menu(menu.addMenu(title), ctx)
 
         # ---- Actions: what used to be the dashboard's button row ----
         # Each entry drives the (now hidden) button it replaced, so all the

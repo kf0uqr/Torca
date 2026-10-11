@@ -61,7 +61,7 @@ from sstv_window import SstvToolWindow
 from rtty_window import RttyToolWindow
 from psk31_window import Psk31ToolWindow
 from aprs_window import AprsToolWindow
-from workspace_host import present_window
+from workspace_host import present_window, retire_button
 from recording_window import RecordingToolWindow
 
 # How often the band-plan overlay's memory-channel tick marks are
@@ -323,6 +323,7 @@ class RadioWindow(QWidget):
         self.cw_tool_button = QPushButton("CW Tool...")
         self.cw_tool_button.setEnabled(False)
         self.cw_tool_button.clicked.connect(self._on_cw_tool_clicked)
+        retire_button(self, self.cw_tool_button)  # reached from a workspace's "+" menu now
         self.cw_window = None
 
         # Opens the per-radio SSTV image decode tool (sstv_window.py)
@@ -331,6 +332,7 @@ class RadioWindow(QWidget):
         self.sstv_tool_button = QPushButton("SSTV Tool...")
         self.sstv_tool_button.setEnabled(False)
         self.sstv_tool_button.clicked.connect(self._on_sstv_tool_clicked)
+        retire_button(self, self.sstv_tool_button)  # reached from a workspace's "+" menu now
         self.sstv_window = None
 
         # Opens the per-radio RTTY decode tool (rtty_window.py) -- same
@@ -339,6 +341,7 @@ class RadioWindow(QWidget):
         self.rtty_tool_button = QPushButton("RTTY Tool...")
         self.rtty_tool_button.setEnabled(False)
         self.rtty_tool_button.clicked.connect(self._on_rtty_tool_clicked)
+        retire_button(self, self.rtty_tool_button)  # reached from a workspace's "+" menu now
         self.rtty_window = None
 
         # Opens the per-radio PSK31 send/decode tool (psk31_window.py)
@@ -347,6 +350,7 @@ class RadioWindow(QWidget):
         self.psk31_tool_button = QPushButton("PSK31 Tool...")
         self.psk31_tool_button.setEnabled(False)
         self.psk31_tool_button.clicked.connect(self._on_psk31_tool_clicked)
+        retire_button(self, self.psk31_tool_button)  # reached from a workspace's "+" menu now
         self.psk31_window = None
 
         # Opens the per-radio APRS decode tool (aprs_window.py) -- same
@@ -355,6 +359,7 @@ class RadioWindow(QWidget):
         self.aprs_tool_button = QPushButton("APRS Tool...")
         self.aprs_tool_button.setEnabled(False)
         self.aprs_tool_button.clicked.connect(self._on_aprs_tool_clicked)
+        retire_button(self, self.aprs_tool_button)  # reached from a workspace's "+" menu now
         self.aprs_window = None
 
         # Opens the per-radio audio recording tool (recording_window.py)
@@ -363,6 +368,7 @@ class RadioWindow(QWidget):
         self.recording_tool_button = QPushButton("Recording Tool...")
         self.recording_tool_button.setEnabled(False)
         self.recording_tool_button.clicked.connect(self._on_recording_tool_clicked)
+        retire_button(self, self.recording_tool_button)  # reached from a workspace's "+" menu now
         self.recording_window = None
 
         # Opens the per-radio memory-channel window (memories_window.py)
@@ -373,6 +379,7 @@ class RadioWindow(QWidget):
         self.memories_button = QPushButton("Memories")
         self.memories_button.setEnabled(False)
         self.memories_button.clicked.connect(self._on_memories_button_clicked)
+        retire_button(self, self.memories_button)  # reached from a workspace's "+" menu now
         self.memories_window = None
 
         # RIT (Receiver Incremental Tuning) adjustment -- a relative
@@ -697,7 +704,6 @@ class RadioWindow(QWidget):
                     # directly under it, per explicit instruction.
                     split_column = QVBoxLayout()
                     split_column.addWidget(widget)
-                    split_column.addWidget(self.memories_button)
                     buttons_row.addLayout(split_column)
                     buttons_row.setAlignment(split_column, Qt.AlignTop)
                     # Right-click opens the full split-configuration
@@ -764,12 +770,6 @@ class RadioWindow(QWidget):
         left_column.addLayout(controls_column)
         left_column.addWidget(self.role_label)
         left_column.addStretch()
-        left_column.addWidget(self.cw_tool_button)
-        left_column.addWidget(self.sstv_tool_button)
-        left_column.addWidget(self.rtty_tool_button)
-        left_column.addWidget(self.psk31_tool_button)
-        left_column.addWidget(self.aprs_tool_button)
-        left_column.addWidget(self.recording_tool_button)
 
         knob_row = QVBoxLayout()
         knob_row.addWidget(self.tuning_knob, alignment=Qt.AlignHCenter)
@@ -1051,18 +1051,20 @@ class RadioWindow(QWidget):
         radio, built by HamClockWindow.populate_workspace_menu). Same
         lazily-constructed singletons the tool buttons use, so opening
         one here and from the button is the same window."""
-        for title, ensure, current in (
-            ("CW Tool", self.ensure_cw_tool_window, self.cw_window),
-            ("APRS Tool", self.ensure_aprs_tool_window, self.aprs_window),
-            ("SSTV Tool", self.ensure_sstv_tool_window, self.sstv_window),
-            ("RTTY Tool", self.ensure_rtty_tool_window, self.rtty_window),
-            ("PSK31 Tool", self.ensure_psk31_tool_window, self.psk31_window),
-            ("Recording Tool", self.ensure_recording_tool_window, self.recording_window),
-            ("Memories", self.ensure_memories_window, self.memories_window),
+        for title, ensure, current, button in (
+            ("CW Tool", self.ensure_cw_tool_window, self.cw_window, self.cw_tool_button),
+            ("APRS Tool", self.ensure_aprs_tool_window, self.aprs_window, self.aprs_tool_button),
+            ("SSTV Tool", self.ensure_sstv_tool_window, self.sstv_window, self.sstv_tool_button),
+            ("RTTY Tool", self.ensure_rtty_tool_window, self.rtty_window, self.rtty_tool_button),
+            ("PSK31 Tool", self.ensure_psk31_tool_window, self.psk31_window, self.psk31_tool_button),
+            ("Recording Tool", self.ensure_recording_tool_window, self.recording_window, self.recording_tool_button),
+            ("Memories", self.ensure_memories_window, self.memories_window, self.memories_button),
         ):
-            menu.addAction(ctx.label(title, current)).triggered.connect(
-                lambda _c=False, f=ensure: ctx.open(f())
-            )
+            action = menu.addAction(ctx.label(title, current))
+            # The (hidden) tool buttons are only enabled once the radio has
+            # connected -- the same rule applies to the menu entries.
+            action.setEnabled(button.isEnabled())
+            action.triggered.connect(lambda _c=False, f=ensure: ctx.open(f()))
 
     @Slot(str)
     def _on_connection_failed(self, message):

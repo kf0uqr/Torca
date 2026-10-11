@@ -69,7 +69,7 @@ from PySide6.QtWidgets import (
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
-from workspace_host import present_window
+from workspace_host import present_window, retire_button
 from world_map import WorldMapWidget
 from connection_dialog import ConnectionDialog
 from operator_profile import OperatorProfileDialog
@@ -1510,6 +1510,7 @@ class HamClockWindow(QWidget):
             "internet via a Cloudflare Tunnel to your own domain."
         )
         self.remote_access_button.clicked.connect(self._on_remote_access_button_clicked)
+        retire_button(self, self.remote_access_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # Link-independent kill switch (47 CFR 97.213): stops every
         # connected radio's remote TX immediately from right here in
@@ -1549,12 +1550,14 @@ class HamClockWindow(QWidget):
         self.profile_button = QPushButton("Profile...")
         self.profile_button.setToolTip("Set your callsign and location, or switch to a saved profile.")
         self.profile_button.clicked.connect(self._on_profile_button_clicked)
+        retire_button(self, self.profile_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # Singleton, non-modal -- see RadiosDialog's own docstring.
         self.radios_dialog = RadiosDialog(self)
         self.radios_button = QPushButton("Radios")
         self.radios_button.setToolTip("Connect a new radio, or bring an already-connected one's window to the front.")
         self.radios_button.clicked.connect(self._on_radios_button_clicked)
+        retire_button(self, self.radios_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # Singleton, non-modal, tracked as self.log_book_window rather
         # than a list (unlike RadioWindow, only one is ever open) --
@@ -1569,6 +1572,7 @@ class HamClockWindow(QWidget):
         self.new_qso_button = QPushButton("New QSO...")
         self.new_qso_button.setToolTip("Log a new QSO -- auto-fills from a connected radio's live state if one is picked.")
         self.new_qso_button.clicked.connect(self._on_new_qso_clicked)
+        retire_button(self, self.new_qso_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # See updater.py's own docstring for the two ways this can
         # actually update things (a dev git checkout vs. an install.sh
@@ -1578,6 +1582,7 @@ class HamClockWindow(QWidget):
         self.update_button = QPushButton("Check for Updates...")
         self.update_button.setToolTip("Checks GitHub for a newer version of TORCA, and can update in place.")
         self.update_button.clicked.connect(self._on_update_button_clicked)
+        retire_button(self, self.update_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # ---- Satellite tracking controls (moved from RadioWindow --
         # now the single shared control point for however many radios
@@ -1642,6 +1647,7 @@ class HamClockWindow(QWidget):
             "let it control a radio."
         )
         self.wsjtx_button.clicked.connect(self._on_wsjtx_button_clicked)
+        retire_button(self, self.wsjtx_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # ---- JS8Call launch -- same find/remember/browse-fallback
         # pattern as "Launch WSJT-X" above, own separate QSettings key
@@ -1653,6 +1659,7 @@ class HamClockWindow(QWidget):
             "(JS8Call's own Settings > Radio, rig \"Hamlib NET rigctl\", 127.0.0.1:<port>)."
         )
         self.js8call_button.clicked.connect(self._on_js8call_button_clicked)
+        retire_button(self, self.js8call_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # ---- WSJT-X UDP auto-log ----
         # Listens for WSJT-X's own "Logged ADIF" UDP broadcast (sent
@@ -1679,18 +1686,11 @@ class HamClockWindow(QWidget):
         self.wsjtx_autolog_button.toggled.connect(self._on_wsjtx_autolog_toggled)
         self.wsjtx_autolog_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.wsjtx_autolog_button.customContextMenuRequested.connect(self._on_wsjtx_autolog_menu_requested)
+        retire_button(self, self.wsjtx_autolog_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # Per explicit instruction, both WSJT-X buttons moved here
         # (between Radios and Log Book) from their own row.
         top_buttons_row = QHBoxLayout()
-        top_buttons_row.addWidget(self.profile_button)
-        top_buttons_row.addWidget(self.radios_button)
-        top_buttons_row.addWidget(self.wsjtx_button)
-        top_buttons_row.addWidget(self.js8call_button)
-        top_buttons_row.addWidget(self.wsjtx_autolog_button)
-        top_buttons_row.addWidget(self.new_qso_button)
-        top_buttons_row.addWidget(self.update_button)
-        top_buttons_row.addWidget(self.remote_access_button)
         top_buttons_row.addWidget(self.kill_remote_tx_button)
         top_buttons_row.addStretch()
 
@@ -2536,6 +2536,39 @@ class HamClockWindow(QWidget):
             menu.addSeparator()
             for window in radios:
                 window.populate_tool_menu(menu.addMenu(self._radio_list_base_label(window._details)), ctx)
+
+        # ---- Actions: what used to be the dashboard's button row ----
+        # Each entry drives the (now hidden) button it replaced, so all the
+        # enable/progress/toggle logic those buttons already carry keeps
+        # working; the menu just mirrors their state when it opens.
+        menu.addSection("Actions")
+        menu.addAction("Connect New Radio...").triggered.connect(lambda _c=False: self._on_connect_radio_clicked())
+        for button in (self.radios_button, self.new_qso_button, self.profile_button):
+            self._add_action_for_button(menu, button)
+        menu.addSeparator()
+        for button in (self.wsjtx_button, self.js8call_button):
+            self._add_action_for_button(menu, button)
+        autolog = menu.addAction("WSJT-X Auto-Log")
+        autolog.setCheckable(True)
+        autolog.setChecked(self.wsjtx_autolog_button.isChecked())
+        autolog.setToolTip(self.wsjtx_autolog_button.toolTip())
+        autolog.triggered.connect(lambda _c=False: self.wsjtx_autolog_button.toggle())
+        menu.addAction("WSJT-X Auto-Log UDP Port...").triggered.connect(
+            lambda _c=False: self._on_wsjtx_autolog_menu_requested(None)
+        )
+        menu.addSeparator()
+        for button in (self.remote_access_button, self.update_button):
+            self._add_action_for_button(menu, button)
+
+    @staticmethod
+    def _add_action_for_button(menu, button):
+        """A menu entry that mirrors a retired button: its current text
+        (e.g. "Updating: Pulling the latest changes..." mid-update),
+        enabled state and tooltip, and clicking it clicks the button."""
+        action = menu.addAction(button.text())
+        action.setEnabled(button.isEnabled())
+        action.setToolTip(button.toolTip())
+        action.triggered.connect(lambda _c=False, b=button: b.click())
 
     def _ensure_log_book_window(self):
         if self.log_book_window is None:

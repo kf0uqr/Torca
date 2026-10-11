@@ -371,26 +371,130 @@ def test_closing_host_still_runs_dashboard_shutdown_with_pages_registered(host):
     assert dash.closed
 
 
-def test_radio_window_tool_menu_lists_every_tool_and_builds_lazily(app):
+def _fake_radio(app, connected):
     import types
-    from PySide6.QtWidgets import QMenu
-    from main_window import RadioWindow
-
+    from PySide6.QtWidgets import QPushButton
     built = []
     fake = types.SimpleNamespace(
         cw_window=None, aprs_window=None, sstv_window=None, rtty_window=None,
         psk31_window=None, recording_window=None, memories_window=None,
     )
+    for name in ("cw_tool", "aprs_tool", "sstv_tool", "rtty_tool", "psk31_tool", "recording_tool", "memories"):
+        button = QPushButton()
+        button.setEnabled(connected)  # the real buttons are enabled by RadioWindow._on_connected
+        setattr(fake, f"{name}_button", button)
     for name in ("cw_tool", "aprs_tool", "sstv_tool", "rtty_tool", "psk31_tool", "recording_tool"):
         setattr(fake, f"ensure_{name}_window", lambda n=name: built.append(n) or n)
     fake.ensure_memories_window = lambda: built.append("memories") or "memories"
+    return fake, built
 
+
+def test_radio_window_tool_menu_lists_every_tool_and_builds_lazily(app):
+    import types
+    from PySide6.QtWidgets import QMenu
+    from main_window import RadioWindow
+
+    fake, built = _fake_radio(app, connected=True)
     opened = []
     ctx = types.SimpleNamespace(open=opened.append, label=lambda title, widget=None: title)
     menu = QMenu()
     RadioWindow.populate_tool_menu(fake, menu, ctx)
     assert [a.text() for a in menu.actions()] == [
         "CW Tool", "APRS Tool", "SSTV Tool", "RTTY Tool", "PSK31 Tool", "Recording Tool", "Memories"]
+    assert all(a.isEnabled() for a in menu.actions())
     assert built == []                                   # nothing constructed just by listing
     menu.actions()[1].trigger()
     assert built == ["aprs_tool"] and opened == ["aprs_tool"]
+
+
+def test_radio_tool_menu_entries_are_disabled_until_the_radio_has_connected(app):
+    import types
+    from PySide6.QtWidgets import QMenu
+    from main_window import RadioWindow
+
+    fake, _built = _fake_radio(app, connected=False)
+    ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+    menu = QMenu()
+    RadioWindow.populate_tool_menu(fake, menu, ctx)
+    assert menu.actions() and not any(a.isEnabled() for a in menu.actions())
+
+
+def _fake_dashboard_for_actions(app):
+    import types
+    from PySide6.QtWidgets import QPushButton
+    import ham_dashboard
+
+    calls = []
+    fake = types.SimpleNamespace(_data_pages=[], log_book_window=None, _connected_radios=[])
+    for name in ("radios", "new_qso", "profile", "wsjtx", "js8call", "remote_access", "update"):
+        button = QPushButton({"update": "Check for Updates..."}.get(name, name))
+        button.setToolTip(f"{name} tip")
+        button.clicked.connect(lambda _c=False, n=name: calls.append(n))
+        setattr(fake, f"{name}_button", button)
+    fake.wsjtx_autolog_button = QPushButton("WSJT-X Auto-Log: OFF")
+    fake.wsjtx_autolog_button.setCheckable(True)
+    fake.wsjtx_autolog_button.toggled.connect(lambda on: calls.append(f"autolog={on}"))
+    fake._on_connect_radio_clicked = lambda: calls.append("connect")
+    fake._on_wsjtx_autolog_menu_requested = lambda _pos: calls.append("autolog_port")
+    fake._ensure_log_book_window = lambda: None
+    fake._radio_list_base_label = lambda d: "radio"
+    cls = ham_dashboard.HamClockWindow
+    fake._add_action_for_button = cls._add_action_for_button
+    return fake, calls, cls
+
+
+def test_dashboard_actions_section_replaces_the_button_row(app):
+    import types
+    from PySide6.QtWidgets import QMenu
+    fake, calls, cls = _fake_dashboard_for_actions(app)
+    ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+    menu = QMenu()
+    cls.populate_workspace_menu(fake, menu, ctx)
+    texts = [a.text() for a in menu.actions() if not a.isSeparator()]
+    assert texts == [
+        "Log Book", "Connect New Radio...", "radios", "new_qso", "profile", "wsjtx", "js8call",
+        "WSJT-X Auto-Log", "WSJT-X Auto-Log UDP Port...", "remote_access", "Check for Updates..."]
+    assert any(a.isSeparator() and a.text() == "Actions" for a in menu.actions())  # a Qt "section" is a labeled separator
+    for a in menu.actions():
+        if a.text() in ("Connect New Radio...", "radios", "profile", "WSJT-X Auto-Log UDP Port..."):
+            a.trigger()
+    assert calls == ["connect", "radios", "profile", "autolog_port"]
+
+
+def test_actions_mirror_button_state_and_toggle_autolog(app):
+    import types
+    from PySide6.QtWidgets import QMenu
+    fake, calls, cls = _fake_dashboard_for_actions(app)
+    ctx = types.SimpleNamespace(open=lambda w: None, label=lambda title, widget=None: title)
+
+    # mid-update: the button's progress text and disabled state show in the menu
+    fake.update_button.setText("Updating: Pulling the latest changes...")
+    fake.update_button.setEnabled(False)
+    menu = QMenu()
+    cls.populate_workspace_menu(fake, menu, ctx)
+    update = next(a for a in menu.actions() if a.text().startswith("Updating"))
+    assert not update.isEnabled() and update.toolTip() == "update tip"
+
+    # auto-log is a checkable entry bound to the toggle button
+    autolog = next(a for a in menu.actions() if a.text() == "WSJT-X Auto-Log")
+    assert autolog.isCheckable() and not autolog.isChecked()
+    autolog.trigger()
+    assert fake.wsjtx_autolog_button.isChecked() and calls == ["autolog=True"]
+    menu2 = QMenu()
+    cls.populate_workspace_menu(fake, menu2, ctx)
+    assert next(a for a in menu2.actions() if a.text() == "WSJT-X Auto-Log").isChecked()
+
+
+def test_retired_buttons_stay_alive_but_hidden(app):
+    from PySide6.QtWidgets import QPushButton, QWidget
+    from workspace_host import retire_button
+    parent = QWidget()
+    parent.show()
+    button = QPushButton("x", parent)
+    button.show()
+    retire_button(parent, button)
+    assert button.isHidden() and button.parent() is parent
+    clicks = []
+    button.clicked.connect(lambda: clicks.append(1))
+    button.click()                                   # still works as a state/signal holder
+    assert clicks == [1]

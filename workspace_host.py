@@ -70,6 +70,17 @@ def present_window(widget):
     widget.activateWindow()
 
 
+def retire_button(parent, button):
+    """Takes a button out of the visible UI while keeping the object.
+    Its entry now lives in a workspace's "+" menu, but the button still
+    carries the state the rest of the code reads and writes (enabled,
+    checked, progress text, clicked/toggled signals) -- so the menu
+    mirrors it and calls click() rather than every one of those code
+    paths being rewritten."""
+    button.setParent(parent)
+    button.hide()
+
+
 def _short_title(title):
     return title if len(title) <= _TAB_TITLE_MAX else title[: _TAB_TITLE_MAX - 1] + "…"
 
@@ -129,6 +140,7 @@ class WorkspacePane(QTabWidget):
 
     def _fill_menu(self, menu):
         menu.clear()
+        menu.setToolTipsVisible(True)
         if self._menu_builder is not None:
             self._menu_builder(menu)
         if menu.isEmpty():

@@ -293,8 +293,9 @@ def qso_rows(window):
 
 def test_your_messages_pane_holds_what_is_sent_to_you_and_what_you_send(tool):
     window, worker, clock = tool
-    hear(window, "CQ W1AW FN31", START)                                  # not for us: band activity only
-    hear(window, "K1ABC W2DEF -05", START)                               # someone else's contact
+    window.waterfall.set_markers(rx_hz=1000.0)
+    hear(window, "CQ W1AW FN31", START, freq=1700.0)                     # not for us, not on our frequency: band activity only
+    hear(window, "K1ABC W2DEF -05", START, freq=1700.0)                  # someone else's contact
     hear(window, "KF0UQR W9XYZ -07", START, snr=-7)                      # to us
     assert qso_rows(window) == [("-7", "KF0UQR W9XYZ -07")]
     assert window.table.rowCount() == 3
@@ -320,3 +321,18 @@ def test_clear_empties_both_lists_and_the_panes_are_side_by_side(tool):
     window._on_clear_clicked()
     assert window.qso_table.rowCount() == 0 and window.table.rowCount() == 0
     assert window.lists.count() == 2 and window.lists.indexOf(window.qso_table.parentWidget()) == 1 and window.lists.indexOf(window.table.parentWidget()) == 0
+
+
+def test_decodes_on_the_receive_frequency_join_your_messages(tool):
+    window, worker, clock = tool
+    window.waterfall.set_markers(rx_hz=1500.0)
+    hear(window, "CQ W1AW FN31", START, freq=1505.0)                     # on the marker: listed, CQ green
+    hear(window, "K1ABC W2DEF -05", START, freq=1498.0)                  # someone else's QSO on our frequency
+    hear(window, "CQ N0XYZ EM28", START, freq=1800.0)                    # elsewhere: band activity only
+    assert [t for _, t in qso_rows(window)] == ["CQ W1AW FN31", "K1ABC W2DEF -05"]
+    assert window.table.rowCount() == 3
+    green = window.qso_table.item(0, 4).foreground().color()
+    assert green == ft8_window._COLOR_CQ
+    window.waterfall.set_markers(rx_hz=1800.0)                           # move the marker: now that station is followed
+    hear(window, "CQ N0XYZ EM28", START + 15, freq=1801.0)
+    assert qso_rows(window)[-1][1] == "CQ N0XYZ EM28"

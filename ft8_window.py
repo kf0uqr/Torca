@@ -424,8 +424,8 @@ class Ft8ToolWindow(QWidget):
             del self._seen[old]
         for message in fresh:
             self._append_row(message, mine)
-            if self._is_to_me(message, mine):
-                self._append_qso_row(message)
+            if self._is_to_me(message, mine) or self._on_rx_frequency(message):
+                self._append_qso_row(message, my_callsign=mine)
         count = len(seen)
         self._last_slot_summary = f"last slot: {count} decode{'s' if count != 1 else ''}"
         if fresh:
@@ -457,15 +457,20 @@ class Ft8ToolWindow(QWidget):
         words = message.text.upper().split()
         return bool(my_callsign) and len(words) >= 2 and ft8_qso._base(words[0]) == ft8_qso._base(my_callsign)
 
-    def _append_qso_row(self, message=None, sent_text=None, sent_at=None, hz=None):
-        """One line in "Your messages": a message addressed to you (`message`), or one you
-        transmitted (`sent_text`, shown in red with Tx in the dB column)."""
+    def _on_rx_frequency(self, message):
+        """True if the decode sits at the green Rx marker (within a signal's width of it)."""
+        width = ft8_waterfall.SIGNAL_WIDTH_HZ.get(self._mode, 50.0)
+        return abs(message.freq - self.waterfall.rx_hz) <= max(20.0, width * 0.4)
+
+    def _append_qso_row(self, message=None, sent_text=None, sent_at=None, hz=None, my_callsign=""):
+        """One line in "Your messages": a message addressed to you or heard on your receive
+        frequency (`message`), or one you transmitted (`sent_text`, red, Tx in the dB column)."""
         table = self.qso_table
         row = table.rowCount()
         table.insertRow(row)
         if message is not None:
             values = [message.utc, f"{message.snr:+.0f}", f"{message.dt:+.1f}", f"{message.freq:.0f}", message.text]
-            color = _COLOR_MINE
+            color = _COLOR_MINE if message.involves(my_callsign) else (_COLOR_CQ if message.is_cq else None)
         else:
             values = [time.strftime("%H:%M:%S", time.gmtime(sent_at)), "Tx", "", f"{hz:.0f}", sent_text]
             color = _COLOR_TX
@@ -473,7 +478,8 @@ class Ft8ToolWindow(QWidget):
             item = QTableWidgetItem(value)
             if column in (1, 2, 3):
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            item.setForeground(color)
+            if color is not None:
+                item.setForeground(color)
             if column == 0 and message is not None:
                 item.setData(Qt.UserRole, message)
             table.setItem(row, column, item)

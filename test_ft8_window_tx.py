@@ -245,3 +245,43 @@ def test_nothing_is_published_without_a_known_radio_frequency(tool):
     window.stations_heard.connect(got.append)
     hear(window, "CQ W1AW FN31", START)
     assert got == []
+
+
+def test_waterfall_clicks_drive_the_markers_and_the_tx_box(tool):
+    window, worker, clock = tool
+    window.waterfall.resize(600, 200)
+    window.waterfall.rx_requested.emit(900.0)
+    assert window.waterfall.rx_hz == 900.0 and window.tx_freq_spin.value() == 1500
+    window.waterfall.tx_requested.emit(2100.0)
+    assert window.tx_freq_spin.value() == 2100 and window.waterfall.tx_hz == 2100.0
+    window.waterfall.both_requested.emit(1000.0)
+    assert window.waterfall.rx_hz == 1000.0 and window.tx_freq_spin.value() == 1000 and window.waterfall.tx_hz == 1000.0
+    window.tx_freq_spin.setValue(1700)                                         # typing in the box moves the red marker too
+    assert window.waterfall.tx_hz == 1700.0
+
+
+def test_answering_a_station_listens_on_its_frequency_and_calls_there_unless_held(tool):
+    window, worker, clock = tool
+    hear(window, "CQ W1AW FN31", START, freq=1840.0)
+    double_click(window, "CQ W1AW FN31")
+    assert window.waterfall.rx_hz == 1840.0 and window.tx_freq_spin.value() == 1840
+    window.halt_tx()
+    window.hold_tx_check.setChecked(True)
+    window.tx_freq_spin.setValue(1200)
+    hear(window, "CQ K1ABC FN42", START + 15, freq=2300.0)
+    double_click(window, "CQ K1ABC FN42")
+    assert window.waterfall.rx_hz == 2300.0 and window.tx_freq_spin.value() == 1200   # the held transmit frequency stays
+
+
+def test_audio_fills_the_waterfall(tool, app):
+    window, worker, clock = tool
+    import numpy as np
+    window._spectrum = __import__("ft8_waterfall").SpectrumRows(8000)
+    tone = (np.sin(2 * np.pi * 1500 * np.arange(8000) / 8000) * 9000).astype("<i2").tobytes()
+    window._capture = ft8.Ft8SlotCapture("FT8", 8000, clock=clock)
+    window._on_decode_audio_frame(tone)
+    for _ in range(5):
+        app.processEvents()
+    column = int(1500 / 3000 * 750)
+    image = window.waterfall._image
+    assert image.pixelColor(column, 0).red() + image.pixelColor(column, 0).green() > image.pixelColor(100, 0).red() + image.pixelColor(100, 0).green()

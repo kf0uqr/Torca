@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
 import adif
 import ft8_decoder as ft8
 import ft8_qso
+import ft8_waterfall
 from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
 
 _SETTINGS_ORG = "IcomRadioApp"
@@ -96,6 +97,8 @@ class Ft8ToolWindow(QWidget):
     # Stations heard in a slot: [{"callsign", "locator", "frequency_hz", "snr", "mode", "epoch"}], for
     # the PSKReporter map / reports (the dashboard decides what to do with them)
     stations_heard = Signal(list)
+    # Audio thread -> GUI thread: new waterfall rows
+    _waterfall_rows = Signal(list)
 
     def __init__(self, radio_window, clock=time.time):
         super().__init__()
@@ -217,6 +220,16 @@ class Ft8ToolWindow(QWidget):
         tx_box.addWidget(self.tx_message_edit)
         tx_box.addWidget(self.tx_status_label)
 
+        self.hold_tx_check = QCheckBox("Hold Tx freq")
+        self.hold_tx_check.setToolTip("Keep your transmit frequency where it is when you double-click a station to answer it.")
+        tx_row.addWidget(self.hold_tx_check)
+
+        self.waterfall = ft8_waterfall.WaterfallWidget()
+        self.waterfall.set_markers(
+            rx_hz=float(settings.value("ft8_rx_hz", self.tx_freq_spin.value()) or self.tx_freq_spin.value()),
+            tx_hz=self.tx_freq_spin.value())
+        self._spectrum = None   # ft8_waterfall.SpectrumRows, built when decoding starts (it needs the sample rate)
+
         self.table = QTableWidget(0, len(_COLUMNS))
         self.table.setHorizontalHeaderLabels(_COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
@@ -234,7 +247,15 @@ class Ft8ToolWindow(QWidget):
         layout.addWidget(self.audio_warning_label)
         layout.addWidget(self.tx_group)
         layout.addWidget(self.table, stretch=1)
+        layout.addWidget(self.waterfall)
         self.setLayout(layout)
+
+        self.waterfall.rx_requested.connect(self.set_rx_frequency)
+        self.waterfall.tx_requested.connect(self.set_tx_frequency)
+        self.waterfall.both_requested.connect(lambda hz: (self.set_rx_frequency(hz), self.set_tx_frequency(hz)))
+        self.tx_freq_spin.valueChanged.connect(lambda hz: self.waterfall.set_markers(tx_hz=hz))
+        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
+        self._waterfall_rows.connect(self.waterfall.add_rows)
 
         self._decoded.connect(self._on_decoded)
         self._build_finished.connect(self._on_build_finished)
@@ -300,6 +321,7 @@ class Ft8ToolWindow(QWidget):
             self._mode = self.mode_combo.currentText()
             self._sample_rate = getattr(worker.radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
             self._capture = ft8.Ft8SlotCapture(self._mode, self._sample_rate, clock=self._clock)
+            self._spectrum = ft8_waterfall.SpectrumRows(self._sample_rate)
             try:
                 worker.start_ft8_decode(self._on_decode_audio_frame)
             except RuntimeError as exc:
@@ -335,6 +357,11 @@ class Ft8ToolWindow(QWidget):
         capture = self._capture
         if capture is None:
             return
+        spectrum = self._spectrum
+        if spectrum is not None:
+            rows = spectrum.feed(pcm_bytes)
+            if rows:
+                self._waterfall_rows.emit(rows)
         for slot in capture.feed(pcm_bytes):
             self._submit_decode(slot, capture.sample_rate, capture.mode)
         for slot in capture.take_early():   # ready early enough to reply in the very next slot
@@ -408,6 +435,8 @@ class Ft8ToolWindow(QWidget):
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             if color is not None:
                 item.setForeground(color)
+            if abs(message.freq - self.waterfall.rx_hz) <= ft8_waterfall.SIGNAL_WIDTH_HZ.get(self._mode, 50.0) / 2 + 10:
+                font = item.font(); font.setBold(True); item.setFont(font)   # on the receive frequency
             if column == 0:
                 item.setData(Qt.UserRole, message)
             self.table.setItem(row, column, item)
@@ -437,6 +466,20 @@ class Ft8ToolWindow(QWidget):
     def _slot_parity(self, slot_start):
         return int(slot_start // ft8.SLOT_SECONDS[self.mode_combo.currentText()]) % 2
 
+    def set_rx_frequency(self, hz):
+        """The audio frequency of the station being listened to (the green marker)."""
+        hz = max(200.0, min(3000.0, float(hz)))
+        self.waterfall.set_markers(rx_hz=hz)
+        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue("ft8_rx_hz", hz)
+
+    def set_tx_frequency(self, hz):
+        """Your transmit audio frequency (the red marker, and the Tx box)."""
+        self.tx_freq_spin.setValue(int(round(max(200.0, min(3000.0, float(hz))))))
+
+    def _on_mode_changed(self, mode):
+        self.waterfall.mode = mode
+        self.waterfall.update()
+
     def _on_row_double_clicked(self, row, _column):
         item = self.table.item(row, 0)
         message = item.data(Qt.UserRole) if item is not None else None
@@ -449,6 +492,9 @@ class Ft8ToolWindow(QWidget):
         if ft8_qso._base(parsed.sender) == ft8_qso._base(qso.my_call):
             return
         qso.work(parsed, message.snr, self._slot_parity(message.slot_start), message.freq)
+        self.set_rx_frequency(message.freq)                   # listen where they are,
+        if not self.hold_tx_check.isChecked():
+            self.set_tx_frequency(message.freq)               # and (unless held) call on their frequency, as WSJT-X does
         self._qso_started = self._clock()
         self._after_qso_change()
         self.tx_enable_button.setChecked(True)

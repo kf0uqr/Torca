@@ -769,6 +769,30 @@ class WindowManager(QObject):
             target, pane_index, zone = state.drop
             QTimer.singleShot(0, lambda: self.drop_tab(state.widget, target, pane_index, zone))
 
+    def move_workspace_to_window(self, source, index, target=None):
+        """Sends every tab of workspace `index` of window `source` to another window
+        (a new one if `target` is None), keeping their order and which tab was showing;
+        in a new window they all land in its workspace 1. The emptied workspace then
+        closes (workspace 1 of a window stays, empty). Returns the window they went to,
+        or None if there was nothing to move."""
+        pane = source.panes[index]
+        entries = [e for e in (next((x for x in self.entries.values() if x.page is pane.widget(i)), None)
+                               for i in range(pane.count())) if e is not None]
+        if not entries or target is source:
+            return None
+        current = next((e.widget for e in entries if e.page is pane.currentWidget()), None)
+        if target is None:
+            target = self.new_window()
+        into = target._active_pane.index if target.workspace_count > 1 else 0
+        for entry in entries:
+            self.move_widget(entry.widget, target, into)
+        if current is not None:
+            target.panes[into].setCurrentWidget(self.entries[current].page)
+        if pane.count() == 0 and index != 0 and source in self.hosts and index in tree_leaves(source._tree):
+            source.close_workspace(index)
+        self.activate(target)
+        return target
+
     def drop_tab(self, widget, target, pane_index, zone="center"):
         """Puts `widget` in workspace `pane_index` of window `target`; for a
         direction zone ("left"/"right"/"above"/"below") that workspace is added
@@ -1075,6 +1099,20 @@ class WorkspaceHost(QMainWindow):
                 else "Add more from the other workspaces' menus"
             )
             action.setEnabled(False)
+
+        # Send the whole workspace (all its tabs) to another window.
+        if pane.count() > 0 and (count > 1 or len(self.manager.hosts) > 1):
+            menu.addSeparator()
+            menu.addAction("Move Workspace to New Window").triggered.connect(
+                lambda _c=False: self.manager.move_workspace_to_window(self, index)
+            )
+            others = [(n, h) for n, h in enumerate(self.manager.hosts, start=1) if h is not self]
+            if others:
+                sub = menu.addMenu("Move Workspace to Window")
+                for number, host in others:
+                    sub.addAction(f"Window {number}").triggered.connect(
+                        lambda _c=False, h=host: self.manager.move_workspace_to_window(self, index, h)
+                    )
 
     def _build_layout(self):
         """Builds the splitter tree for the current layout; every child of a

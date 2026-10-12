@@ -1323,3 +1323,53 @@ def test_pulling_a_held_tab_out_of_the_bar_starts_a_drag_but_reordering_does_not
     QTest.mouseMove(bar, QPoint(first.x(), 200))                 # well below the bar: a drag
     QTest.mouseRelease(bar, Qt.LeftButton, Qt.NoModifier, QPoint(first.x(), 200))
     assert len(started) == 1
+
+
+# ---- moving a whole workspace to another window ----
+
+def test_move_workspace_to_a_new_window_keeps_order_and_selection_and_closes_it(host, app):
+    a, b, c, d = (RealClose(n) for n in "ABCD")
+    for w in (a, b, c, d):
+        host.add_window(w)
+    host.add_workspace(0, "right")
+    for w in (b, c, d):
+        host.move_window(w, 1)
+    host.panes[1].setCurrentWidget(host._entries[c].page)
+    new = host.manager.move_workspace_to_window(host, 1)
+    assert new is not None and new is not host and host.manager.hosts == [host, new]
+    assert [new.panes[0].tabText(i) for i in range(new.panes[0].count())] == ["B", "C", "D"]
+    assert new.panes[0].currentWidget() is host._entries[c].page
+    assert host.workspace_count == 1 and _tabs(host, 0) == ["A"]            # the emptied workspace closed
+    assert not any(w.closed for w in (a, b, c, d))
+    new._closing = True; new.close()
+
+
+def test_move_workspace_one_leaves_it_empty_and_can_go_to_an_existing_window(host, app):
+    a, b = RealClose("A"), RealClose("B")
+    host.add_window(a); host.add_window(b)
+    host.add_workspace(0, "right")
+    host.move_window(b, 1)
+    second = _new_window(host)
+    assert host.manager.move_workspace_to_window(host, 0, second) is second
+    assert host.panes[0].count() == 0 and host.workspace_count == 2          # workspace 1 stays, empty
+    assert [second.panes[0].tabText(i) for i in range(second.panes[0].count())] == ["A"]
+    assert host.manager.move_workspace_to_window(host, 0) is None             # nothing to move
+    assert host.manager.move_workspace_to_window(second, 0, second) is None
+    second._closing = True; second.close()
+
+
+def test_workspace_menu_offers_moving_a_workspace_only_when_it_makes_sense(host, app):
+    from PySide6.QtWidgets import QMenu
+    a = RealClose("A")
+    host.add_window(a)
+
+    def texts(index=0):
+        menu = QMenu(); host._fill_workspace_menu(menu, host.panes[index])
+        return [x.text() for x in menu.actions()]
+    assert "Move Workspace to New Window" not in texts()                      # its window's only workspace: nothing to split off
+    host.add_workspace(0, "right")
+    assert "Move Workspace to New Window" in texts(0) and "Move Workspace to New Window" not in texts(1)   # an empty one has nothing to move
+    assert "Move Workspace to Window" not in texts(0)
+    second = _new_window(host)
+    assert "Move Workspace to Window" in texts(0)
+    second._closing = True; second.close()

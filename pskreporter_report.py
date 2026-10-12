@@ -8,11 +8,13 @@ datagram carries a header, the descriptions ("templates") of the two record
 kinds, one RECEIVER record (who is listening: callsign, locator, software) and
 a batch of SENDER records (who was heard: callsign, frequency, SNR, mode,
 locator, time). Their rules, which this follows:
-- datagrams go out no more often than once every five minutes, unless one is
-  full, and not in lock-step with the clock (hence a random interval);
-- a callsign is reported at most once per five minutes (once an hour when
-  nothing about it changed would be kinder still, so a repeat of the same
-  callsign on the same band inside REPEAT_SECONDS is dropped);
+- each record carries the time the signal was heard, and the server treats a record
+  more than a minute away from the datagram's own time as coming from a wrong clock.
+  So reports must go out promptly, in small frequent batches (as WSJT-X does, every
+  15-60 s): batching for minutes makes every spot "too old" and it is not shown.
+  (An earlier version of this module batched for five minutes and its spots never
+  appeared on PSKReporter.)  The interval is also randomised, not in lock-step with the clock;
+- a repeat of the same callsign on the same band inside REPEAT_SECONDS is dropped;
 - the receiver's identity is public: it is only ever sent when the operator
   has switched reporting on.
 
@@ -24,6 +26,7 @@ import random
 import socket
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, QTimer
@@ -32,8 +35,8 @@ HOST = "report.pskreporter.info"
 PORT = 4739
 
 ENTERPRISE = 30351                       # 0x768F, registered to PSKReporter
-SEND_INTERVAL_SECONDS = 300              # "no more than one every five minutes"
-SEND_JITTER_SECONDS = 30                 # not synchronised to the clock
+SEND_INTERVAL_SECONDS = 30               # short enough that every record is well under a minute old when sent
+SEND_JITTER_SECONDS = 5                  # not synchronised to the clock
 REPEAT_SECONDS = 600                     # the same station on the same band: report it once per this long
 MAX_DATAGRAM_BYTES = 1200                # a full packet is sent at once
 
@@ -130,6 +133,7 @@ class PskReporterUploader(QObject):
         self._last_reported = {}         # (callsign, band-ish) -> time reported
         self.sent_count = 0
         self.last_error = ""
+        self._executor = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_timer)
@@ -177,9 +181,23 @@ class PskReporterUploader(QObject):
     def stop(self):
         self._timer.stop()
         self.flush()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=False)   # let the last datagram leave
+            self._executor = None
 
-    @staticmethod
-    def _send_udp(datagram):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(5)
-            sock.sendto(datagram, (HOST, PORT))
+    def _send_udp(self, datagram):
+        """Sends on a background thread: resolving the server's name can take seconds, and
+        this runs on the GUI thread."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pskreporter")
+        self._executor.submit(self._send_blocking, datagram)
+
+    def _send_blocking(self, datagram):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(5)
+                sock.sendto(datagram, (HOST, PORT))
+            print(f"[PSKReporter] sent a report datagram ({len(datagram)} bytes).")
+        except OSError as exc:
+            self.last_error = str(exc)
+            print(f"[PSKReporter] couldn't send a report datagram: {exc}")

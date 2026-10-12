@@ -86,11 +86,24 @@ def test_a_network_failure_loses_only_that_batch(app):
     uploader.stop()
 
 
-def test_the_interval_is_at_least_four_and_a_half_minutes_and_not_fixed(app):
+def test_reports_go_out_while_still_fresh_and_the_interval_is_not_fixed(app):
+    """PSKReporter treats a record more than a minute from its datagram as coming from a wrong
+    clock, so the batching interval plus the longest decode delay must stay well under that."""
     uploader = pr.PskReporterUploader("KF0UQR", "EM18ge", send=lambda d: None)
-    assert pr.SEND_INTERVAL_SECONDS - pr.SEND_JITTER_SECONDS >= 270 and pr.SEND_JITTER_SECONDS > 0
-    assert 270_000 <= uploader._timer.interval() <= 330_000
+    longest_delay_before_queued = 15 + 5            # an FT8 slot, plus decoding it
+    assert pr.SEND_INTERVAL_SECONDS + pr.SEND_JITTER_SECONDS + longest_delay_before_queued < 60 and pr.SEND_JITTER_SECONDS > 0
+    assert (pr.SEND_INTERVAL_SECONDS - pr.SEND_JITTER_SECONDS) * 1000 <= uploader._timer.interval() <= (pr.SEND_INTERVAL_SECONDS + pr.SEND_JITTER_SECONDS) * 1000
     uploader.stop()
+
+
+def test_the_default_sender_works_off_the_gui_thread(app, monkeypatch):
+    import threading
+    where = []
+    uploader = pr.PskReporterUploader("KF0UQR", "EM18ge")
+    monkeypatch.setattr(uploader, "_send_blocking", lambda datagram: where.append(threading.current_thread().name))
+    uploader.add(spot())
+    uploader.stop()                                  # flushes, then waits for the sender thread
+    assert where and where[0] != threading.main_thread().name
 
 
 def test_heard_station_extracts_the_sender_and_any_locator():

@@ -62,7 +62,8 @@ from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
 _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
 
-_COLUMNS = ["UTC", "dB", "DT", "Freq (Hz)", "Message"]
+_COLUMNS = ["dB", "Message", "Freq", "DT"]
+_MESSAGE_COLUMN = 1
 _MAX_ROWS = 1000
 
 # Same idea as the APRS tool: audio chunks arrive many times a second whenever
@@ -232,12 +233,7 @@ class Ft8ToolWindow(QWidget):
             tx_hz=self.tx_freq_spin.value())
         self._spectrum = None   # ft8_waterfall.SpectrumRows, built when decoding starts (it needs the sample rate)
 
-        self.table = QTableWidget(0, len(_COLUMNS))
-        self.table.setHorizontalHeaderLabels(_COLUMNS)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
+        self.table = self._new_table()
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
@@ -250,12 +246,7 @@ class Ft8ToolWindow(QWidget):
         layout.addWidget(self.tx_group)
         # Two lists side by side, laid out as in WSJT-X: everything heard on the band on the left,
         # what is addressed to you or sent by you (the contact in progress) on the right.
-        self.qso_table = QTableWidget(0, len(_COLUMNS))
-        self.qso_table.setHorizontalHeaderLabels(_COLUMNS)
-        self.qso_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self.qso_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.qso_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.qso_table.verticalHeader().setVisible(False)
+        self.qso_table = self._new_table()
         self.qso_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.qso_table.customContextMenuRequested.connect(lambda pos: self._copy_menu(self.qso_table, pos))
         self.qso_table.cellDoubleClicked.connect(self._on_row_double_clicked_qso)
@@ -462,53 +453,94 @@ class Ft8ToolWindow(QWidget):
         width = ft8_waterfall.SIGNAL_WIDTH_HZ.get(self._mode, 50.0)
         return abs(message.freq - self.waterfall.rx_hz) <= max(20.0, width * 0.4)
 
+    @staticmethod
+    def _new_table():
+        """A decode list: dB, Message, Freq, DT -- sized to fit what they hold (the message
+        takes whatever room is left), with a line above each time slot's decodes."""
+        table = QTableWidget(0, len(_COLUMNS))
+        table.setHorizontalHeaderLabels(_COLUMNS)
+        header = table.horizontalHeader()
+        for column in range(len(_COLUMNS)):
+            header.setSectionResizeMode(column, QHeaderView.Stretch if column == _MESSAGE_COLUMN else QHeaderView.ResizeToContents)
+        header.setMinimumSectionSize(30)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(False)
+        table.verticalHeader().setDefaultSectionSize(22)
+        table.setProperty("last_slot", None)
+        table.setProperty("data_rows", 0)
+        return table
+
+    def _add_row(self, table, slot_start, values, color=None, bold=False, message=None):
+        """Appends one decode (or sent message) to `table`, first adding a time line
+        ("14:32:15") if it belongs to a newer time slot than the last one listed."""
+        last = table.property("last_slot")
+        if last is None or slot_start > last:
+            row = table.rowCount()
+            table.insertRow(row)
+            stamp = QTableWidgetItem(time.strftime("%H:%M:%S", time.gmtime(slot_start)))
+            stamp.setFlags(Qt.ItemIsEnabled)             # not selectable, not a message
+            stamp.setTextAlignment(Qt.AlignCenter)
+            stamp.setForeground(QColor("#9aa4ad"))
+            stamp.setBackground(QColor("#262c33"))
+            font = stamp.font(); font.setBold(True); stamp.setFont(font)
+            table.setItem(row, 0, stamp)
+            table.setSpan(row, 0, 1, len(_COLUMNS))
+            table.setProperty("last_slot", slot_start)
+        row = table.rowCount()
+        table.insertRow(row)
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if column != _MESSAGE_COLUMN:
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if color is not None:
+                item.setForeground(color)
+            if bold:
+                font = item.font(); font.setBold(True); item.setFont(font)
+            if column == _MESSAGE_COLUMN and message is not None:
+                item.setData(Qt.UserRole, message)
+            table.setItem(row, column, item)
+        table.setProperty("data_rows", table.property("data_rows") + 1)
+        self._trim(table)
+
+    @staticmethod
+    def _trim(table):
+        """Keeps at most _MAX_ROWS decodes (oldest go first), and never leaves a time
+        line with nothing under it at the top."""
+        data = table.property("data_rows")
+        while data > _MAX_ROWS and table.rowCount():
+            if table.item(0, _MESSAGE_COLUMN) is not None:
+                data -= 1
+            table.removeRow(0)
+        while table.rowCount() and table.item(0, _MESSAGE_COLUMN) is None and (
+                table.rowCount() == 1 or table.item(1, _MESSAGE_COLUMN) is None):
+            table.removeRow(0)
+        table.setProperty("data_rows", data)
+
     def _append_qso_row(self, message=None, sent_text=None, sent_at=None, hz=None, my_callsign=""):
         """One line in "Your messages": a message addressed to you or heard on your receive
         frequency (`message`), or one you transmitted (`sent_text`, red, Tx in the dB column)."""
-        table = self.qso_table
-        row = table.rowCount()
-        table.insertRow(row)
         if message is not None:
-            values = [message.utc, f"{message.snr:+.0f}", f"{message.dt:+.1f}", f"{message.freq:.0f}", message.text]
             color = _COLOR_MINE if message.involves(my_callsign) else (_COLOR_CQ if message.is_cq else None)
+            self._add_row(self.qso_table, message.slot_start,
+                          [f"{message.snr:+.0f}", message.text, f"{message.freq:.0f}", f"{message.dt:+.1f}"],
+                          color=color, message=message)
         else:
-            values = [time.strftime("%H:%M:%S", time.gmtime(sent_at)), "Tx", "", f"{hz:.0f}", sent_text]
-            color = _COLOR_TX
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            if column in (1, 2, 3):
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            if color is not None:
-                item.setForeground(color)
-            if column == 0 and message is not None:
-                item.setData(Qt.UserRole, message)
-            table.setItem(row, column, item)
-        for _ in range(max(table.rowCount() - _MAX_ROWS, 0)):
-            table.removeRow(0)
-        table.scrollToBottom()
+            slot = ft8.SLOT_SECONDS[self.mode_combo.currentText()]
+            self._add_row(self.qso_table, math.floor(sent_at / slot) * slot,
+                          ["Tx", sent_text, f"{hz:.0f}", ""], color=_COLOR_TX)
+        self.qso_table.scrollToBottom()
 
     def _on_row_double_clicked_qso(self, row, _column):
-        self._answer_item(self.qso_table.item(row, 0))
+        self._answer_item(self.qso_table.item(row, _MESSAGE_COLUMN))
 
     def _append_row(self, message, my_callsign):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        values = [message.utc, f"{message.snr:+.0f}", f"{message.dt:+.1f}", f"{message.freq:.0f}", message.text]
         color = _COLOR_MINE if message.involves(my_callsign) else (_COLOR_CQ if message.is_cq else None)
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            if column in (1, 2, 3):
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            if color is not None:
-                item.setForeground(color)
-            if abs(message.freq - self.waterfall.rx_hz) <= ft8_waterfall.SIGNAL_WIDTH_HZ.get(self._mode, 50.0) / 2 + 10:
-                font = item.font(); font.setBold(True); item.setFont(font)   # on the receive frequency
-            if column == 0:
-                item.setData(Qt.UserRole, message)
-            self.table.setItem(row, column, item)
-        excess = self.table.rowCount() - _MAX_ROWS
-        for _ in range(max(excess, 0)):
-            self.table.removeRow(0)
+        on_rx = abs(message.freq - self.waterfall.rx_hz) <= ft8_waterfall.SIGNAL_WIDTH_HZ.get(self._mode, 50.0) / 2 + 10
+        self._add_row(self.table, message.slot_start,
+                      [f"{message.snr:+.0f}", message.text, f"{message.freq:.0f}", f"{message.dt:+.1f}"],
+                      color=color, bold=on_rx, message=message)
 
     # ---- making contacts ----
 
@@ -547,7 +579,7 @@ class Ft8ToolWindow(QWidget):
         self.waterfall.update()
 
     def _on_row_double_clicked(self, row, _column):
-        self._answer_item(self.table.item(row, 0))
+        self._answer_item(self.table.item(row, _MESSAGE_COLUMN))
 
     def _answer_item(self, item):
         message = item.data(Qt.UserRole) if item is not None else None
@@ -787,15 +819,18 @@ class Ft8ToolWindow(QWidget):
     # ---- table ----
 
     def _on_clear_clicked(self):
-        self.table.setRowCount(0)
-        self.qso_table.setRowCount(0)
+        for table in (self.table, self.qso_table):
+            table.clearSpans()
+            table.setRowCount(0)
+            table.setProperty("last_slot", None)
+            table.setProperty("data_rows", 0)
 
     def _on_table_context_menu(self, pos):
         self._copy_menu(self.table, pos)
 
     def _copy_menu(self, table, pos):
         row = table.rowAt(pos.y())
-        item = table.item(row, 4) if row >= 0 else None
+        item = table.item(row, _MESSAGE_COLUMN) if row >= 0 else None
         if item is None:
             return
         menu = QMenu(self)

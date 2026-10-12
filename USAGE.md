@@ -122,7 +122,7 @@ Decode-only in one continuously-scrolling table, one row per packet, with full p
 
 ### FT8 / FT4 Tool
 
-Decode **and make contacts** in FT8 (15 s slots) and FT4 (7.5 s slots) straight from the radio's audio -- no WSJT-X needed. Set the radio to **USB** (or USB-D) on an FT8/FT4 frequency (FT8 is commonly 14.074 MHz on 20 m), pick the mode, and press **Start Decoding**. After each time slot the decoded messages are added to the table: UTC, dB, DT (seconds from the slot's start), audio frequency, and the message. Messages calling **CQ** are green, and anything involving your own callsign (from your operator profile) is amber. Right-click a row to copy the message.
+Decode **and make contacts** in FT8 (15 s slots) and FT4 (7.5 s slots) straight from the radio's audio -- no WSJT-X needed. Set the radio to **USB** (or USB-D) on an FT8/FT4 frequency (FT8 is commonly 14.074 MHz on 20 m), pick the mode, and press **Start Decoding**. After each time slot the decoded messages are added to the table: dB, the message, its audio frequency and DT (seconds from the slot's start), under a time line (such as 14:32:15) that marks the start of that slot. Messages calling **CQ** are green, and anything involving your own callsign (from your operator profile) is amber. Right-click a row to copy the message.
 
 **Two lists, side by side** (drag the divider to resize): **Band activity** on the left holds everything decoded; **Your messages** on the right (as in WSJT-X) holds the messages addressed to you (amber), everything decoded on your receive frequency (the green marker on the waterfall), and the ones you transmit (red, marked Tx), so a contact in progress reads like a conversation. Double-click a message in either to answer it.
 

@@ -77,7 +77,7 @@ def _wait(app, condition, seconds=15.0):
 
 
 def _texts(window):
-    return [window.table.item(r, 4).text() for r in range(window.table.rowCount())]
+    return [window.table.item(r, 1).text() for r in range(window.table.rowCount()) if window.table.item(r, 1) is not None]
 
 
 def _close(window):
@@ -136,7 +136,7 @@ def test_closing_stops_decoding_and_hides_but_keeps_the_decodes(app, built):
     window._append_row(ft8.Ft8Message(1_800_000_000.0, "FT8", -5, 0.1, 1500, "CQ KF0UQR EM18"), "")
     window.close()                                               # the user closing the tab: hide, don't destroy
     assert worker.stopped == 1 and not window.decode_toggle_button.isChecked() and not window.isVisible()
-    assert window.table.rowCount() == 1
+    assert len(_texts(window)) == 1
     _close(window)
 
 
@@ -222,16 +222,18 @@ def test_real_ft8_audio_is_decoded_into_the_table_with_highlights(app, built, tm
     window.show()
     window.decode_toggle_button.setChecked(True)
     _feed_a_slot(app, window, worker, audio, start)
-    assert _wait(app, lambda: window.table.rowCount() >= 3), _texts(window)
+    assert _wait(app, lambda: len(_texts(window)) >= 3), _texts(window)
     assert sorted(_texts(window)) == sorted(["CQ DX W1AW FN31", "KF0UQR W9XYZ -07", "K1ABC W2DEF RR73"])
 
-    rows = {window.table.item(r, 4).text(): r for r in range(window.table.rowCount())}
-    assert window.table.item(rows["CQ DX W1AW FN31"], 0).text() == time.strftime("%H:%M:%S", time.gmtime(start))
-    freq = float(window.table.item(rows["CQ DX W1AW FN31"], 3).text())
+    rows = {window.table.item(r, 1).text(): r for r in range(window.table.rowCount()) if window.table.item(r, 1) is not None}
+    stamp = window.table.item(0, 0)                                  # one time line above the slot's decodes
+    assert stamp.text() == time.strftime("%H:%M:%S", time.gmtime(start)) and window.table.item(0, 1) is None and window.table.columnSpan(0, 0) == 4
+    assert min(rows.values()) == 1
+    freq = float(window.table.item(rows["CQ DX W1AW FN31"], 2).text())
     assert abs(freq - 1400) <= 10
-    assert window.table.item(rows["CQ DX W1AW FN31"], 4).foreground().color() == ft8_window._COLOR_CQ        # a CQ: green
-    assert window.table.item(rows["KF0UQR W9XYZ -07"], 4).foreground().color() == ft8_window._COLOR_MINE     # to me: amber
-    assert window.table.item(rows["K1ABC W2DEF RR73"], 4).foreground().color() != ft8_window._COLOR_MINE      # someone else's QSO: plain
+    assert window.table.item(rows["CQ DX W1AW FN31"], 1).foreground().color() == ft8_window._COLOR_CQ        # a CQ: green
+    assert window.table.item(rows["KF0UQR W9XYZ -07"], 1).foreground().color() == ft8_window._COLOR_MINE     # to me: amber
+    assert window.table.item(rows["K1ABC W2DEF RR73"], 1).foreground().color() != ft8_window._COLOR_MINE      # someone else's QSO: plain
     assert "3 decodes" in (window._last_slot_summary or "")
     window.decode_toggle_button.setChecked(False)
     _close(window)
@@ -292,7 +294,8 @@ def test_rows_are_capped_and_clear_empties_the_table(app, built, monkeypatch):
     window, _ = _window()
     for i in range(9):
         window._append_row(ft8.Ft8Message(1_800_000_000.0 + i, "FT8", -5, 0.1, 1000 + i, f"CQ TEST{i}"), "")
-    assert window.table.rowCount() == 5 and _texts(window)[0] == "CQ TEST4" and _texts(window)[-1] == "CQ TEST8"
+    assert len(_texts(window)) == 5 and _texts(window)[0] == "CQ TEST4" and _texts(window)[-1] == "CQ TEST8"
+    assert window.table.item(0, 1) is None and window.table.item(1, 1).text() == "CQ TEST4"   # the oldest decode still has its time line
     window._on_clear_clicked()
     assert window.table.rowCount() == 0
     _close(window)
@@ -320,7 +323,7 @@ def test_the_callsign_in_settings_decides_what_is_highlighted(app, built):
     window._append_row(message, "kf0uqr")
     window._append_row(message, "")
     window._append_row(message, "N0CALL")
-    colors = [window.table.item(r, 4).foreground().color() for r in range(3)]
+    colors = [window.table.item(r, 1).foreground().color() for r in range(1, 4)]   # row 0 is the time line
     assert colors[0] == ft8_window._COLOR_MINE
     assert colors[1] != ft8_window._COLOR_MINE and colors[2] != ft8_window._COLOR_MINE
     _close(window)

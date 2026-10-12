@@ -18,6 +18,7 @@ Step-by-step instructions for every feature in TORCA. See [README.md](README.md)
   - [SSTV](#sstv-tool)
   - [APRS](#aprs-tool)
   - [FT8 / FT4](#ft8--ft4-tool)
+  - [WSPR](#wspr-tool)
 - [QSO Log Book](#qso-log-book)
 - [World map & overlays](#world-map--overlays)
 - [Spot networks](#spot-networks)
@@ -134,6 +135,12 @@ Decode **and make contacts** in FT8 (15 s slots) and FT4 (7.5 s slots) straight 
 - The **dB** column is the decoder's estimate and is not directly comparable to WSJT-X's SNR.
 - Decoding runs the bundled [ft8_lib](https://github.com/kgoba/ft8_lib) decoder, compiled when TORCA is installed (or updated). If it couldn't be built -- no `make`/C compiler -- the tool says so and offers **Build Decoder** (Debian/Ubuntu: `sudo apt install build-essential`).
 - It does not transmit, and does not show a waterfall; use the main radio window's scope for that, or WSJT-X if you want to work stations.
+
+### WSPR Tool
+
+Listens for WSPR beacons (two-minute slots starting on even minutes) and lists each station heard: UTC, signal (dB), DT, frequency, drift, callsign, grid, power (dBm and watts) and its distance from you. Choose a **Band** and press **Tune Radio** to put the radio on that band's standard WSPR dial frequency in USB (14.0956 MHz on 20 m, and so on), then **Start Decoding**. Results arrive about two minutes after each slot starts, so the first take a few minutes; your computer's clock must be accurate to about a second. Stations that sent a grid are plotted on the map (PSKReporter overlay, **Stations you are hearing**) -- they are not sent to PSKReporter; WSPR has its own network (WSPRnet), and **this tool is receive-only for now: no transmitting and no upload to WSPRnet**.
+
+Decoding uses `wsprd`, the decoder that comes with WSJT-X, run as a separate program (nothing of WSJT-X is copied into TORCA). Install WSJT-X (Debian/Ubuntu: `sudo apt install wsjtx`); without it the tool says so and Start Decoding stays disabled.
 
 ## QSO Log Book
 

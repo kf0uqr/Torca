@@ -1667,6 +1667,20 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"stop_psk31_decode: radio.stop_rx() failed ({exc}).")
 
+    def add_audio_tap(self, callback):
+        """Thread-safe. Hands `callback` (called with raw mono 16-bit PCM bytes, on the
+        radio's asyncio thread -- no widget access) every chunk of this radio's received
+        audio, through its audio hub alongside every other consumer. Raises RuntimeError if
+        the radio isn't connected yet or has no audio channel."""
+        bridge = self.audio_bridge
+        if bridge is None or not bridge.has_rx_stream():
+            raise RuntimeError("This radio's audio isn't available (not connected yet, or it has no audio channel).")
+        bridge.add_extra_rx_callback(callback)
+
+    def remove_audio_tap(self, callback):
+        if self.audio_bridge is not None:
+            self.audio_bridge.remove_extra_rx_callback(callback)
+
     def start_ft8_decode(self, callback):
         """Thread-safe: call from the GUI thread. Structural clone of
         start_cw_decode/start_sstv_decode/start_rtty_decode/start_aprs_

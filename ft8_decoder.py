@@ -46,7 +46,7 @@ APP_DIR = pathlib.Path(__file__).resolve().parent
 VENDOR_DIR = APP_DIR / "vendor" / "ft8_lib"
 
 MODES = ("FT8", "FT4")
-SLOT_SECONDS = {"FT8": 15.0, "FT4": 7.5}
+SLOT_SECONDS = {"FT8": 15.0, "FT4": 7.5, "WSPR": 120.0}   # WSPR: wspr.py reuses this capture
 DECODER_RATE = 12000  # the only rate decode_ft8 reads correctly
 
 # A slot captured less than this fraction cannot contain a decodable
@@ -56,7 +56,7 @@ MIN_DECODABLE_FRACTION = 0.8
 # A transmission is over this long after its slot starts (it begins 0.5 s in and
 # lasts 12.64 s for FT8, 5.04 s for FT4), so the slot can be decoded this early
 # -- the answer is then ready in time to reply in the very next slot.
-EARLY_DECODE_SECONDS = {"FT8": 13.8, "FT4": 5.8}
+EARLY_DECODE_SECONDS = {"FT8": 13.8, "FT4": 5.8, "WSPR": 114.0}
 TX_START_OFFSET = 0.5          # seconds into its slot that a transmission begins
 SYMBOL_PERIOD = {"FT8": 0.16, "FT4": 0.048}
 SYMBOLS = {"FT8": 79, "FT4": 105}

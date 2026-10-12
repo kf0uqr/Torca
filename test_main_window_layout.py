@@ -384,6 +384,7 @@ def test_tool_windows_are_titled_tool_name_dash_model(app, monkeypatch):
             "RTTY Tool": window.ensure_rtty_tool_window(),
             "PSK31 Tool": window.ensure_psk31_tool_window(),
             "FT8 Tool": window.ensure_ft8_tool_window(),
+            "WSPR Tool": window.ensure_wspr_tool_window(),
             "Recording Tool": window.ensure_recording_tool_window(),
             "Memories": window.ensure_memories_window(),
         }

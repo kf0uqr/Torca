@@ -351,13 +351,13 @@ def _fake_radio(app, connected):
     built = []
     fake = types.SimpleNamespace(
         cw_window=None, aprs_window=None, sstv_window=None, rtty_window=None,
-        psk31_window=None, ft8_window=None, recording_window=None, memories_window=None,
+        psk31_window=None, ft8_window=None, wspr_window=None, recording_window=None, memories_window=None,
     )
-    for name in ("cw_tool", "aprs_tool", "sstv_tool", "rtty_tool", "psk31_tool", "ft8_tool", "recording_tool", "memories"):
+    for name in ("cw_tool", "aprs_tool", "sstv_tool", "rtty_tool", "psk31_tool", "ft8_tool", "wspr_tool", "recording_tool", "memories"):
         button = QPushButton()
         button.setEnabled(connected)  # the real buttons are enabled by RadioWindow._on_connected
         setattr(fake, f"{name}_button", button)
-    for name in ("cw_tool", "aprs_tool", "sstv_tool", "rtty_tool", "psk31_tool", "ft8_tool", "recording_tool"):
+    for name in ("cw_tool", "aprs_tool", "sstv_tool", "rtty_tool", "psk31_tool", "ft8_tool", "wspr_tool", "recording_tool"):
         setattr(fake, f"ensure_{name}_window", lambda n=name: built.append(n) or n)
     fake.ensure_memories_window = lambda: built.append("memories") or "memories"
     return fake, built
@@ -374,7 +374,7 @@ def test_radio_window_tool_menu_lists_every_tool_and_builds_lazily(app):
     menu = QMenu()
     RadioWindow.populate_tool_menu(fake, menu, ctx)
     assert [a.text() for a in menu.actions()] == [
-        "CW Tool", "APRS Tool", "SSTV Tool", "RTTY Tool", "PSK31 Tool", "FT8 Tool", "Recording Tool", "Memories"]
+        "CW Tool", "APRS Tool", "SSTV Tool", "RTTY Tool", "PSK31 Tool", "FT8 Tool", "WSPR Tool", "Recording Tool", "Memories"]
     assert all(a.isEnabled() for a in menu.actions())
     assert built == []                                   # nothing constructed just by listing
     menu.actions()[1].trigger()

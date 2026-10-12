@@ -2047,7 +2047,7 @@ class HamClockWindow(QWidget):
                 "mode": station["mode"], "snr": str(station["snr"]), "flow_start_seconds": station["epoch"],
                 "direction": pskreporter.DIRECTION_HEARING, "raw": {},
             }
-            if self._pskreporter_uploader is not None:
+            if self._pskreporter_uploader is not None and station.get("report", True):   # WSPR spots are for the map only
                 self._pskreporter_uploader.add(pskreporter_report.Spot(
                     call, station["frequency_hz"], station["snr"], station["mode"], locator, station["epoch"]))
         cutoff = time.time() - pskreporter.MAX_LOOKBACK_SECONDS
@@ -3319,6 +3319,7 @@ class HamClockWindow(QWidget):
         window.closed.connect(self._on_radio_window_closed)
         window.aprs_packet_decoded.connect(self._on_aprs_packet_decoded)
         window.ft8_stations_heard.connect(self._on_stations_heard)
+        window.wspr_stations_heard.connect(self._on_stations_heard)
         window.ft8_qso_logged.connect(self._on_wsjtx_qso_logged)   # same path as WSJT-X auto-logging
         # Remote Access identity + state cache -- must be created here,
         # on the GUI thread, NOT lazily from the web server's own

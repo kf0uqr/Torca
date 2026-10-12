@@ -68,3 +68,52 @@ def test_heard_stations_reach_the_map_and_the_uploader(tmp_path):
     env.pop("PYTHONPATH", None)
     result = subprocess.run([sys.executable, "-c", SCRIPT], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
+
+
+FILTER_SCRIPT = textwrap.dedent('''
+    import os, sys, time
+    sys.path.insert(0, %r)
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+    app = QApplication([])
+    s = QSettings("IcomRadioApp", "RadioControl")
+    s.setValue("operator_callsign", "KF0UQR"); s.setValue("operator_lat", 38.2); s.setValue("operator_lon", -97.5); s.sync()
+    import ham_dashboard, pskreporter
+    from workspace_host import WorkspaceHost
+    host = WorkspaceHost(); dash = ham_dashboard.HamClockWindow()
+    host.add_dashboard(dash); host.show()
+    assert sorted(dash._pskreporter_modes) == ["FT4", "FT8", "OTHER", "WSPR"]          # everything by default
+    dash._pskreporter_direction = "both"
+    now = int(time.time())
+    dash._on_stations_heard([
+        {"callsign": "W1AW", "locator": "FN31", "frequency_hz": 14075200, "snr": -12, "mode": "FT8", "epoch": now},
+        {"callsign": "K1ABC", "locator": "FN42", "frequency_hz": 14097100, "snr": -20, "mode": "WSPR", "epoch": now, "report": False},
+        {"callsign": "N0XYZ", "locator": "EM28", "frequency_hz": 7040000, "snr": -5, "mode": "FT4", "epoch": now},
+    ])
+    dash._pskreporter_spots_cache = [{"callsign": "G3ABC", "locator": "IO91", "frequency_hz": 14070000, "band": "20m", "mode": "PSK31",
+                                      "snr": "3", "flow_start_seconds": now, "direction": pskreporter.DIRECTION_HEARING, "raw": {}}]
+    def shown():
+        return sorted(m["tooltip"].splitlines()[0] for m in dash._build_pskreporter_markers())
+    assert shown() == ["G3ABC", "K1ABC", "N0XYZ", "W1AW"]
+    dash._pskreporter_modes = ["WSPR"]
+    assert shown() == ["K1ABC"]
+    dash._pskreporter_modes = ["FT8", "FT4"]
+    assert shown() == ["N0XYZ", "W1AW"]
+    dash._pskreporter_modes = ["OTHER"]                                                  # PSK31 and anything not named
+    assert shown() == ["G3ABC"]
+    dash._pskreporter_modes = []
+    assert shown() == []
+
+    # the dialog round-trips the choice
+    dialog = ham_dashboard.PskReporterSettingsDialog("KF0UQR", 1800, "both", modes=["FT8", "WSPR"])
+    assert [k for k, c in dialog.mode_checks.items() if c.isChecked()] == ["FT8", "WSPR"] and dialog.result_modes() == ["FT8", "WSPR"]
+    print("OK"); sys.stdout.flush(); os._exit(0)
+''' % os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_map_mode_filter(tmp_path):
+    env = dict(os.environ, HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "cfg"),
+               XDG_CACHE_HOME=str(tmp_path / "cache"), QT_QPA_PLATFORM="offscreen")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", FILTER_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr

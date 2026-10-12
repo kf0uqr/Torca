@@ -226,3 +226,98 @@ def test_dashboard_keeps_wspr_spots_off_the_pskreporter_upload():
     import inspect, ham_dashboard
     source = inspect.getsource(ham_dashboard.HamClockWindow._on_stations_heard)
     assert 'station.get("report", True)' in source
+
+
+# ---- WSPRnet upload -------------------------------------------------------------------------------
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs
+
+import wsprnet
+
+SPOT = wspr.WsprSpot(SLOT + 120, -23, -0.34, 14.097103, 1, "K1ABC", "FN42", 37, "raw")
+
+
+class _Server:
+    """A stand-in WSPRnet that records what is posted and answers like the real one."""
+    def __init__(self, reply=b"1 spot(s) added"):
+        outer = self
+        outer.posts, outer.reply = [], reply
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                outer.posts.append((self.path, self.headers["Content-Type"], {k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()}))
+                self.send_response(200); self.end_headers(); self.wfile.write(outer.reply)
+            def log_message(self, *a): pass
+        self.httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}/post/"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+
+
+def test_form_fields_match_wsjtxs_wsprnet_interface():
+    form = wsprnet.build_form(SPOT, "kf0uqr", "EM18ge", 14.0956)
+    assert form == {
+        "function": "wspr", "rcall": "KF0UQR", "rgrid": "EM18ge", "rqrg": "14.095600",
+        "date": time.strftime("%y%m%d", time.gmtime(SLOT + 120)), "time": time.strftime("%H%M", time.gmtime(SLOT + 120)),
+        "sig": "-23", "dt": "-0.3", "drift": "1", "tqrg": "14.097103", "tcall": "K1ABC", "tgrid": "FN42",
+        "dbm": "37", "version": wsprnet.VERSION, "mode": "2"}
+
+
+def test_upload_posts_each_spot_and_counts_the_accepted_ones():
+    server = _Server()
+    try:
+        other = wspr.WsprSpot(SLOT + 120, -9, 0.1, 14.0972, 0, "W9XYZ", "EN52", 30, "raw")
+        hashed = wspr.WsprSpot(SLOT + 120, -9, 0.1, 14.0972, 0, "PJ4/K1ABC", "", None, "raw")     # no grid / power: WSPRnet cannot take it
+        accepted, problems = wsprnet.upload([SPOT, other, hashed], "KF0UQR", "EM18ge", 14.0956, url=server.url)
+    finally:
+        server.close()
+    assert (accepted, problems) == (2, [])
+    assert [p[0] for p in server.posts] == ["/post/", "/post/"] and server.posts[0][1] == "application/x-www-form-urlencoded"
+    assert [p[2]["tcall"] for p in server.posts] == ["K1ABC", "W9XYZ"] and server.posts[0][2]["rcall"] == "KF0UQR"
+
+
+def test_a_refusal_and_a_dead_network_are_reported():
+    server = _Server(reply=b"error")
+    try:
+        accepted, problems = wsprnet.upload([SPOT], "KF0UQR", "EM18ge", 14.0956, url=server.url)
+    finally:
+        server.close()
+    assert accepted == 0 and "not accepted" in problems[0]
+    accepted, problems = wsprnet.upload([SPOT, SPOT], "KF0UQR", "EM18ge", 14.0956, url="http://127.0.0.1:1/post/", timeout=2)
+    assert accepted == 0 and len(problems) == 1                                              # gave up after the first failure
+
+
+def test_window_uploads_only_after_the_operator_agrees(app, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    settings = QSettings(wspr_window._SETTINGS_ORG, wspr_window._SETTINGS_APP)
+    settings.setValue("operator_callsign", "KF0UQR"); settings.setValue("operator_lat", 38.2); settings.setValue("operator_lon", -97.5)
+    sent = []
+    monkeypatch.setattr(wsprnet, "upload", lambda spots, call, grid, dial, **kw: (sent.append((call, grid, dial, [s.callsign for s in spots])) or (len(spots), [])))
+    window, worker = make_window()
+    window._dial_mhz = 14.0956
+    window._on_decoded(SLOT, [SPOT], True)
+    assert sent == []                                                                         # off by default: nothing leaves the machine
+
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.No)
+    window.upload_check.click()                                                               # asked, and said no
+    assert not window.upload_check.isChecked()
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.Yes)
+    window.upload_check.click()
+    assert window.upload_check.isChecked() and settings.value("wspr_upload", False, type=bool)
+    window._on_decoded(SLOT, [SPOT], True)
+    assert wait(app, lambda: sent) and sent == [("KF0UQR", "EM18ge", 14.0956, ["K1ABC"])]
+    assert wait(app, lambda: "uploaded to WSPRnet" in window._upload_status)
+    window.closing_for_real()
+
+
+def test_window_wont_offer_upload_without_a_callsign(app):
+    window, _ = make_window()
+    QSettings(wspr_window._SETTINGS_ORG, wspr_window._SETTINGS_APP).setValue("operator_callsign", "")
+    window.upload_check.click()
+    assert not window.upload_check.isChecked() and "callsign" in window.status_label.text()
+    window.closing_for_real()

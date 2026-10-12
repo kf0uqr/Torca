@@ -890,6 +890,15 @@ class UpdatePerformWorker(QThread):
         self.succeeded.emit()
 
 
+# The map's mode filter: key -> label. Modes not listed here count as "OTHER".
+PSKREPORTER_MODE_FILTERS = {"FT8": "FT8", "FT4": "FT4", "WSPR": "WSPR", "OTHER": "Other"}
+
+
+def pskreporter_mode_key(mode):
+    mode = (mode or "").upper()
+    return mode if mode in PSKREPORTER_MODE_FILTERS and mode != "OTHER" else "OTHER"
+
+
 class PskReporterSettingsDialog(QDialog):
     """Right-click the PSKReporter button to open this: your callsign
     (every PSKReporter query is scoped to just this one -- editable
@@ -898,9 +907,21 @@ class PskReporterSettingsDialog(QDialog):
     which direction of reception reports to show -- stations that
     heard you, stations you're hearing, or both."""
 
-    def __init__(self, callsign, since_seconds, direction, parent=None, report_enabled=False):
+    def __init__(self, callsign, since_seconds, direction, parent=None, report_enabled=False, modes=None):
         super().__init__(parent)
         self.setWindowTitle("PSKReporter Settings")
+
+        # Which modes are plotted: FT8, FT4 and WSPR from your own decoders and the server, and
+        # everything else (PSK31, CW, JT65...) as one group.
+        self.mode_checks = {}
+        shown = set(PSKREPORTER_MODE_FILTERS) if modes is None else set(modes)
+        modes_row = QHBoxLayout()
+        for key, label in PSKREPORTER_MODE_FILTERS.items():
+            check = QCheckBox(label)
+            check.setChecked(key in shown)
+            self.mode_checks[key] = check
+            modes_row.addWidget(check)
+        modes_row.addStretch()
 
         self.report_check = QCheckBox("Report the stations I hear to PSKReporter (FT8 / FT4)")
         self.report_check.setChecked(report_enabled)
@@ -942,6 +963,7 @@ class PskReporterSettingsDialog(QDialog):
         form.addRow("Direction:", self.heard_you_radio)
         form.addRow("", self.hearing_radio)
         form.addRow("", self.both_radio)
+        form.addRow("Modes shown:", modes_row)
         form.addRow("Reporting:", self.report_check)
 
         layout = QVBoxLayout()
@@ -954,6 +976,9 @@ class PskReporterSettingsDialog(QDialog):
 
     def result_since_seconds(self):
         return self.lookback_combo.currentData()
+
+    def result_modes(self):
+        return [key for key, check in self.mode_checks.items() if check.isChecked()]
 
     def result_report_enabled(self):
         return self.report_check.isChecked()
@@ -1309,6 +1334,10 @@ class HamClockWindow(QWidget):
         self._pskreporter_direction = settings.value(
             "pskreporter_direction", pskreporter.DIRECTION_HEARD_YOU
         )
+        stored_modes = settings.value("pskreporter_modes", "")
+        self._pskreporter_modes = (
+            [m for m in str(stored_modes).split(",") if m in PSKREPORTER_MODE_FILTERS] if stored_modes != ""
+            else list(PSKREPORTER_MODE_FILTERS))
         self._pskreporter_spots_cache = []  # raw fetched spots (unfiltered by band) -- see _build_pskreporter_markers
         # What the decoders here have heard themselves (instant, no server round trip), shown as "you heard them".
         self._pskreporter_local_spots = {}          # (callsign, band) -> spot dict
@@ -1970,17 +1999,20 @@ class HamClockWindow(QWidget):
     def _on_pskreporter_menu_requested(self, _pos):
         dialog = PskReporterSettingsDialog(
             self._operator_callsign, self._pskreporter_since_seconds, self._pskreporter_direction, self,
-            report_enabled=self._pskreporter_report_enabled,
+            report_enabled=self._pskreporter_report_enabled, modes=self._pskreporter_modes,
         )
         if dialog.exec() == QDialog.Accepted:
             self._operator_callsign = dialog.result_callsign()
             self._pskreporter_since_seconds = dialog.result_since_seconds()
             self._pskreporter_direction = dialog.result_direction()
+            self._pskreporter_modes = dialog.result_modes()
             settings = QSettings("IcomRadioApp", "RadioControl")
+            settings.setValue("pskreporter_modes", ",".join(self._pskreporter_modes) if self._pskreporter_modes else "-")
             settings.setValue("operator_callsign", self._operator_callsign)
             settings.setValue("pskreporter_lookback_seconds", self._pskreporter_since_seconds)
             settings.setValue("pskreporter_direction", self._pskreporter_direction)
             self._apply_pskreporter_reporting_choice(dialog.result_report_enabled(), self._operator_callsign)
+            self._refresh_pskreporter_markers()   # the mode filter applies at once
             if self.pskreporter_button.isChecked():
                 if self._operator_callsign:
                     self._start_pskreporter_fetch()
@@ -2101,7 +2133,7 @@ class HamClockWindow(QWidget):
             key = (spot.get("direction"), spot.get("callsign"), spot.get("band"))
             if key not in newest or (spot.get("flow_start_seconds") or 0) > (newest[key].get("flow_start_seconds") or 0):
                 newest[key] = spot
-        spots = list(newest.values())
+        spots = [s for s in newest.values() if pskreporter_mode_key(s.get("mode")) in self._pskreporter_modes]
         if band_filter is not None:
             spots = [spot for spot in spots if spot.get("band") == band_filter]
         markers = []

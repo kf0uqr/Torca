@@ -112,3 +112,41 @@ def test_heard_station_extracts_the_sender_and_any_locator():
     assert ft8_qso.heard_station("KF0UQR W9XYZ -07") == ("W9XYZ", "")
     assert ft8_qso.heard_station("K1ABC W2DEF RR73") == ("W2DEF", "")
     assert ft8_qso.heard_station("TNX 73 GL") is None and ft8_qso.heard_station("<...> W2DEF -05") is None
+
+
+# ---- the query side: what a refusing server looks like ----
+
+def test_query_failures_are_turned_into_plain_unavailable_errors(monkeypatch):
+    import io
+    import urllib.error
+    import pskreporter
+
+    def fail_with(exc):
+        def opener(request, timeout=0):
+            raise exc
+        return opener
+
+    http429 = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(b""))
+    monkeypatch.setattr(pskreporter.urllib.request, "urlopen", fail_with(http429))
+    with pytest.raises(pskreporter.PskReporterUnavailable) as caught:
+        pskreporter.fetch_pskreporter_spots("KF0UQR", "hearing", 3600)
+    assert caught.value.rate_limited and "too many requests" in str(caught.value)
+
+    monkeypatch.setattr(pskreporter.urllib.request, "urlopen", fail_with(urllib.error.URLError("no route")))
+    with pytest.raises(pskreporter.PskReporterUnavailable) as caught:
+        pskreporter.fetch_pskreporter_spots("KF0UQR", "hearing", 3600)
+    assert not caught.value.rate_limited and "could not be reached" in str(caught.value)
+
+    class Page:
+        def __init__(self, body): self.body = body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self.body
+    monkeypatch.setattr(pskreporter.urllib.request, "urlopen", lambda r, timeout=0: Page(b"Too many requests, slow down"))
+    with pytest.raises(pskreporter.PskReporterUnavailable) as caught:        # a 200 with a text body, not XML
+        pskreporter.fetch_pskreporter_spots("KF0UQR", "hearing", 3600)
+    assert caught.value.rate_limited
+    monkeypatch.setattr(pskreporter.urllib.request, "urlopen", lambda r, timeout=0: Page(b"<html>oops"))
+    with pytest.raises(pskreporter.PskReporterUnavailable) as caught:
+        pskreporter.fetch_pskreporter_spots("KF0UQR", "hearing", 3600)
+    assert not caught.value.rate_limited and "could not read" in str(caught.value)

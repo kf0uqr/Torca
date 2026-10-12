@@ -580,7 +580,7 @@ class PskReporterWorker(QThread):
     frequently."""
 
     spots_ready = Signal(list)
-    failed = Signal(str)
+    failed = Signal(str, bool)      # (what went wrong, whether the server said it was being asked too often)
 
     def __init__(self, callsign, direction, since_seconds, parent=None):
         super().__init__(parent)
@@ -591,8 +591,11 @@ class PskReporterWorker(QThread):
     def run(self):
         try:
             spots = pskreporter.fetch_pskreporter_spots(self._callsign, self._direction, self._since_seconds)
+        except pskreporter.PskReporterUnavailable as exc:
+            self.failed.emit(str(exc), exc.rate_limited)
+            return
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(str(exc), False)
             return
         self.spots_ready.emit(spots)
 
@@ -1350,6 +1353,9 @@ class HamClockWindow(QWidget):
         self._pskreporter_refresh_timer.timeout.connect(self._refresh_pskreporter_markers)
         self._sync_pskreporter_uploader()
         self._pskreporter_worker = None
+        self._pskreporter_problem = ""        # why the server's spots are missing, if they are
+        self._pskreporter_retry_after = 0.0   # earliest time to ask again after "too many requests"
+        self._pskreporter_notice = None
         self.pskreporter_button = QPushButton("PSKReporter: OFF")
         self.pskreporter_button.setCheckable(True)
         self.pskreporter_button.setStyleSheet(
@@ -1360,6 +1366,7 @@ class HamClockWindow(QWidget):
             "your own callsign). Right-click to choose the time frame "
             "and direction."
         )
+        self._pskreporter_base_tooltip = self.pskreporter_button.toolTip()
         self.pskreporter_button.toggled.connect(self._on_pskreporter_toggled)
         self.pskreporter_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.pskreporter_button.customContextMenuRequested.connect(self._on_pskreporter_menu_requested)
@@ -1990,7 +1997,9 @@ class HamClockWindow(QWidget):
             if not self._operator_callsign:
                 self.pskreporter_button.setChecked(False)
                 return
+        self._pskreporter_problem = ""     # a fresh start: any "server unavailable" notice is re-evaluated
         self.pskreporter_button.setText("PSKReporter: ON" if checked else "PSKReporter: OFF")
+        self.pskreporter_button.setToolTip(self._pskreporter_base_tooltip)
         if checked:
             self._start_pskreporter_fetch()
         else:
@@ -2094,6 +2103,11 @@ class HamClockWindow(QWidget):
             self.map_widget.set_pskreporter_markers(self._build_pskreporter_markers())
 
     def _start_pskreporter_fetch(self):
+        if time.time() < self._pskreporter_retry_after:
+            wait = int(self._pskreporter_retry_after - time.time()) // 60 + 1
+            self._set_pskreporter_problem(f"PSKReporter said it is being asked too often; not asking again for about {wait} minute(s).")
+            self._refresh_pskreporter_markers()
+            return
         if self._pskreporter_worker is not None and self._pskreporter_worker.isRunning():
             return  # a fetch is already in flight -- let it finish rather than piling up requests
         worker = PskReporterWorker(
@@ -2105,13 +2119,45 @@ class HamClockWindow(QWidget):
         worker.start()
 
     def _on_pskreporter_spots_ready(self, spots):
+        self._set_pskreporter_problem("")
         self._pskreporter_spots_cache = spots
         if self.pskreporter_button.isChecked():
             self.map_widget.set_pskreporter_markers(self._build_pskreporter_markers())
 
-    def _on_pskreporter_fetch_failed(self, message):
-        QMessageBox.warning(self, "PSKReporter", f"Couldn't fetch PSKReporter spots:\n{message}")
-        self.pskreporter_button.setChecked(False)
+    PSKREPORTER_COOLDOWN_SECONDS = 300    # after "too many requests", leave the server alone this long
+
+    def _on_pskreporter_fetch_failed(self, message, rate_limited=False):
+        """The server could not be asked (or said no). The map stays on and keeps showing what it
+        has -- the stations this station has heard itself -- and says clearly that the server's
+        spots are missing, rather than switching the feature off."""
+        if rate_limited:
+            self._pskreporter_retry_after = time.time() + self.PSKREPORTER_COOLDOWN_SECONDS
+        self._set_pskreporter_problem(message)
+        self._refresh_pskreporter_markers()
+
+    def _set_pskreporter_problem(self, message):
+        """Shows (or clears) the "PSKReporter is unavailable" notice: on the button, and once as a
+        non-blocking message each time it becomes unavailable."""
+        was = self._pskreporter_problem
+        self._pskreporter_problem = message
+        on = self.pskreporter_button.isChecked()
+        if message:
+            self.pskreporter_button.setText("PSKReporter: ON (server unavailable)" if on else "PSKReporter: OFF")
+            self.pskreporter_button.setToolTip(
+                f"{message}\nOnly the stations you have heard yourself are shown; the server's spots are missing."
+                if on else self._pskreporter_base_tooltip)
+            if on and not was:
+                box = QMessageBox(QMessageBox.Information, "PSKReporter",
+                                  f"{message}\n\nThe map is showing only the stations you have heard yourself; "
+                                  "the spots from the PSKReporter server are missing. Turn the layer off and on to try again "
+                                  "(wait a few minutes if it said too many requests).", QMessageBox.Ok, self._action_parent())
+                box.setWindowModality(Qt.NonModal)
+                box.setAttribute(Qt.WA_DeleteOnClose)
+                box.show()
+                self._pskreporter_notice = box
+        else:
+            self.pskreporter_button.setText("PSKReporter: ON" if on else "PSKReporter: OFF")
+            self.pskreporter_button.setToolTip(self._pskreporter_base_tooltip)
 
     def _build_pskreporter_markers(self):
         """Filters self._pskreporter_spots_cache (the last fetch's raw

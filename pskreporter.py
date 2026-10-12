@@ -50,6 +50,20 @@ MAX_LOOKBACK_SECONDS = 86400
 # ceiling against an unexpectedly huge response.
 _RESULT_LIMIT = 5000
 
+class PskReporterUnavailable(RuntimeError):
+    """The server could not give spots right now. `rate_limited` is True when it said it was
+    being asked too often (so the caller should leave it alone for a while)."""
+
+    def __init__(self, message, rate_limited=False):
+        super().__init__(message)
+        self.rate_limited = rate_limited
+
+
+def _looks_rate_limited(text):
+    text = (text or "").lower()
+    return "too many" in text or "rate limit" in text or "slow down" in text
+
+
 DIRECTION_HEARD_YOU = "heard_you"   # other stations reported hearing your callsign
 DIRECTION_HEARING = "hearing"       # your callsign reported hearing other stations
 
@@ -79,9 +93,22 @@ def _fetch_reports(callsign: str, direction: str, since_seconds: int) -> list:
         raise ValueError(f"unknown direction: {direction!r}")
     url = f"{PSKREPORTER_QUERY_URL}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = response.read()
-    root = ET.fromstring(data)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429 or _looks_rate_limited(exc.reason):
+            raise PskReporterUnavailable("PSKReporter says it is being asked too often (too many requests).", rate_limited=True) from exc
+        raise PskReporterUnavailable(f"PSKReporter returned an error (HTTP {exc.code}).") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise PskReporterUnavailable(f"PSKReporter could not be reached ({getattr(exc, 'reason', exc)}).") from exc
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        text = data[:300].decode("utf-8", "replace")
+        if _looks_rate_limited(text):
+            raise PskReporterUnavailable("PSKReporter says it is being asked too often (too many requests).", rate_limited=True) from exc
+        raise PskReporterUnavailable("PSKReporter sent a reply TORCA could not read.") from exc
 
     reports = []
     for element in root.iter("receptionReport"):

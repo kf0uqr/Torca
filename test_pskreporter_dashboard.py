@@ -117,3 +117,63 @@ def test_map_mode_filter(tmp_path):
     env.pop("PYTHONPATH", None)
     result = subprocess.run([sys.executable, "-c", FILTER_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
+
+
+OUTAGE_SCRIPT = textwrap.dedent('''
+    import os, sys, time
+    sys.path.insert(0, %r)
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    app = QApplication([])
+    s = QSettings("IcomRadioApp", "RadioControl")
+    s.setValue("operator_callsign", "KF0UQR"); s.setValue("operator_lat", 38.2); s.setValue("operator_lon", -97.5); s.sync()
+    import ham_dashboard, pskreporter
+    from workspace_host import WorkspaceHost
+    host = WorkspaceHost(); dash = ham_dashboard.HamClockWindow()
+    host.add_dashboard(dash); host.show()
+    markers = []
+    dash.map_widget.set_pskreporter_markers = markers.append
+    shown = []
+    QMessageBox.show = lambda self: shown.append(self.text())          # the notice is non-blocking: record it
+    dash._pskreporter_direction = pskreporter.DIRECTION_HEARING
+    now = int(time.time())
+    dash._on_stations_heard([{"callsign": "K1ABC", "locator": "FN42", "frequency_hz": 14097100, "snr": -20, "mode": "WSPR", "epoch": now, "report": False}])
+
+    calls = []
+    def server_down(callsign, direction, since):
+        calls.append(1)
+        raise pskreporter.PskReporterUnavailable("PSKReporter says it is being asked too often (too many requests).", rate_limited=True)
+    pskreporter.fetch_pskreporter_spots = server_down
+    dash.pskreporter_button.setChecked(True)
+    for _ in range(60):
+        app.processEvents(); time.sleep(0.05)
+    assert dash.pskreporter_button.isChecked(), "the layer must stay on"
+    assert dash.pskreporter_button.text() == "PSKReporter: ON (server unavailable)"
+    assert "too many requests" in dash.pskreporter_button.toolTip() and "missing" in dash.pskreporter_button.toolTip()
+    assert markers and [m["tooltip"].splitlines()[0] for m in markers[-1]] == ["K1ABC"]       # what we have heard ourselves is still plotted
+    assert len(shown) == 1 and "too many requests" in shown[0] and "only the stations you have heard yourself" in shown[0]
+
+    # asking again straight away is held off (the server asked to be left alone) -- no new request
+    dash.pskreporter_button.setChecked(False); dash.pskreporter_button.setChecked(True)
+    for _ in range(20):
+        app.processEvents(); time.sleep(0.05)
+    assert len(calls) == 1 and "not asking again" in dash.pskreporter_button.toolTip()
+
+    # once the cool-down is over and the server is back, the notice clears and its spots join in
+    dash._pskreporter_retry_after = 0
+    pskreporter.fetch_pskreporter_spots = lambda c, d, s: [{"callsign": "G3ABC", "locator": "IO91", "frequency_hz": 14070000, "band": "20m",
+        "mode": "PSK31", "snr": "3", "flow_start_seconds": now, "direction": d, "raw": {}}]
+    dash.pskreporter_button.setChecked(False); dash.pskreporter_button.setChecked(True)
+    for _ in range(60):
+        app.processEvents(); time.sleep(0.05)
+    assert dash.pskreporter_button.text() == "PSKReporter: ON" and sorted(m["tooltip"].splitlines()[0] for m in markers[-1]) == ["G3ABC", "K1ABC"]
+    print("OK"); sys.stdout.flush(); os._exit(0)
+''' % os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_server_outage_keeps_the_layer_on_with_a_notice(tmp_path):
+    env = dict(os.environ, HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "cfg"),
+               XDG_CACHE_HOME=str(tmp_path / "cache"), QT_QPA_PLATFORM="offscreen")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", OUTAGE_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr

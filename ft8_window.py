@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -83,6 +84,7 @@ WATCHDOG_SECONDS = 6 * 60
 _TX_KEY_LEAD = 0.1
 _TX_TOO_LATE = 1.5
 
+_COLOR_TX = QColor("#ff6b6b")
 _COLOR_CQ = QColor("#5fd068")
 _COLOR_MINE = QColor("#ffb347")
 
@@ -246,7 +248,30 @@ class Ft8ToolWindow(QWidget):
         layout.addWidget(self.status_label)
         layout.addWidget(self.audio_warning_label)
         layout.addWidget(self.tx_group)
-        layout.addWidget(self.table, stretch=1)
+        # Two lists side by side, as in WSJT-X: what is addressed to you or sent by you (the contact
+        # in progress) on the left, everything heard on the band on the right.
+        self.qso_table = QTableWidget(0, len(_COLUMNS))
+        self.qso_table.setHorizontalHeaderLabels(_COLUMNS)
+        self.qso_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.qso_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.qso_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.qso_table.verticalHeader().setVisible(False)
+        self.qso_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.qso_table.customContextMenuRequested.connect(lambda pos: self._copy_menu(self.qso_table, pos))
+        self.qso_table.cellDoubleClicked.connect(self._on_row_double_clicked_qso)
+        self.qso_table.setToolTip("Messages sent to you and messages you transmit. Double-click one from another station to answer it.")
+        self.lists = QSplitter(Qt.Horizontal)
+        for title, table in (("Your messages", self.qso_table), ("Band activity", self.table)):
+            pane = QWidget()
+            box = QVBoxLayout(pane)
+            box.setContentsMargins(0, 0, 0, 0)
+            heading = QLabel(f"<b>{title}</b>")
+            box.addWidget(heading)
+            box.addWidget(table)
+            self.lists.addWidget(pane)
+        self.lists.setStretchFactor(0, 1)
+        self.lists.setStretchFactor(1, 1)
+        layout.addWidget(self.lists, stretch=1)
         layout.addWidget(self.waterfall)
         self.setLayout(layout)
 
@@ -399,6 +424,8 @@ class Ft8ToolWindow(QWidget):
             del self._seen[old]
         for message in fresh:
             self._append_row(message, mine)
+            if self._is_to_me(message, mine):
+                self._append_qso_row(message)
         count = len(seen)
         self._last_slot_summary = f"last slot: {count} decode{'s' if count != 1 else ''}"
         if fresh:
@@ -423,6 +450,39 @@ class Ft8ToolWindow(QWidget):
             }
         if stations:
             self.stations_heard.emit(list(stations.values()))
+
+    @staticmethod
+    def _is_to_me(message, my_callsign):
+        """A standard message addressed to the operator (their callsign is the first word)."""
+        words = message.text.upper().split()
+        return bool(my_callsign) and len(words) >= 2 and ft8_qso._base(words[0]) == ft8_qso._base(my_callsign)
+
+    def _append_qso_row(self, message=None, sent_text=None, sent_at=None, hz=None):
+        """One line in "Your messages": a message addressed to you (`message`), or one you
+        transmitted (`sent_text`, shown in red with Tx in the dB column)."""
+        table = self.qso_table
+        row = table.rowCount()
+        table.insertRow(row)
+        if message is not None:
+            values = [message.utc, f"{message.snr:+.0f}", f"{message.dt:+.1f}", f"{message.freq:.0f}", message.text]
+            color = _COLOR_MINE
+        else:
+            values = [time.strftime("%H:%M:%S", time.gmtime(sent_at)), "Tx", "", f"{hz:.0f}", sent_text]
+            color = _COLOR_TX
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if column in (1, 2, 3):
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            item.setForeground(color)
+            if column == 0 and message is not None:
+                item.setData(Qt.UserRole, message)
+            table.setItem(row, column, item)
+        for _ in range(max(table.rowCount() - _MAX_ROWS, 0)):
+            table.removeRow(0)
+        table.scrollToBottom()
+
+    def _on_row_double_clicked_qso(self, row, _column):
+        self._answer_item(self.qso_table.item(row, 0))
 
     def _append_row(self, message, my_callsign):
         row = self.table.rowCount()
@@ -481,7 +541,9 @@ class Ft8ToolWindow(QWidget):
         self.waterfall.update()
 
     def _on_row_double_clicked(self, row, _column):
-        item = self.table.item(row, 0)
+        self._answer_item(self.table.item(row, 0))
+
+    def _answer_item(self, item):
         message = item.data(Qt.UserRole) if item is not None else None
         parsed = ft8_qso.parse(message.text) if message is not None else None
         qso = self._ensure_qso()
@@ -620,6 +682,7 @@ class Ft8ToolWindow(QWidget):
         QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue("ft8_tx_hz", self.tx_freq_spin.value())
         QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue("ft8_tx_level", self.tx_level_spin.value())
         worker.send_tx_audio_pcm(pcm)
+        self._append_qso_row(sent_text=text, sent_at=self._clock(), hz=self.tx_freq_spin.value())
         duration = len(pcm) / (AUDIO_TX_PCM_SAMPLE_RATE * 2)
         self.tx_status_label.setText(f"TRANSMITTING: {text}")
         QTimer.singleShot(int((duration + 0.3) * 1000), lambda t=text: self._on_tx_finished(t))
@@ -719,15 +782,19 @@ class Ft8ToolWindow(QWidget):
 
     def _on_clear_clicked(self):
         self.table.setRowCount(0)
+        self.qso_table.setRowCount(0)
 
     def _on_table_context_menu(self, pos):
-        row = self.table.rowAt(pos.y())
-        item = self.table.item(row, 4) if row >= 0 else None
+        self._copy_menu(self.table, pos)
+
+    def _copy_menu(self, table, pos):
+        row = table.rowAt(pos.y())
+        item = table.item(row, 4) if row >= 0 else None
         if item is None:
             return
         menu = QMenu(self)
         menu.addAction("Copy Message").triggered.connect(lambda: QGuiApplication.clipboard().setText(item.text()))
-        menu.exec(self.table.viewport().mapToGlobal(pos))
+        menu.exec(table.viewport().mapToGlobal(pos))
 
     # ---- lifecycle ----
 

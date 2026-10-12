@@ -285,3 +285,38 @@ def test_audio_fills_the_waterfall(tool, app):
     column = int(1500 / 3000 * 750)
     image = window.waterfall._image
     assert image.pixelColor(column, 0).red() + image.pixelColor(column, 0).green() > image.pixelColor(100, 0).red() + image.pixelColor(100, 0).green()
+
+
+def qso_rows(window):
+    return [(window.qso_table.item(r, 1).text(), window.qso_table.item(r, 4).text()) for r in range(window.qso_table.rowCount())]
+
+
+def test_your_messages_pane_holds_what_is_sent_to_you_and_what_you_send(tool):
+    window, worker, clock = tool
+    hear(window, "CQ W1AW FN31", START)                                  # not for us: band activity only
+    hear(window, "K1ABC W2DEF -05", START)                               # someone else's contact
+    hear(window, "KF0UQR W9XYZ -07", START, snr=-7)                      # to us
+    assert qso_rows(window) == [("-7", "KF0UQR W9XYZ -07")]
+    assert window.table.rowCount() == 3
+    double_click(window, "CQ W1AW FN31")
+    window._tx_tick(START + 15.45)
+    assert qso_rows(window)[-1] == ("Tx", "W1AW KF0UQR EM18")
+    item = window.qso_table.item(window.qso_table.rowCount() - 1, 4)
+    assert item.foreground().color() == ft8_window._COLOR_TX
+
+
+def test_answering_from_your_messages_pane_works_like_the_band_pane(tool):
+    window, worker, clock = tool
+    hear(window, "KF0UQR W9XYZ EM28", START, snr=-4, freq=1900.0)
+    window._on_row_double_clicked_qso(0, 4)
+    assert window.dx_call_edit.text() == "W9XYZ" and window.tx_message_edit.text() == "W9XYZ KF0UQR -04"
+    assert window.waterfall.rx_hz == 1900.0
+
+
+def test_clear_empties_both_lists_and_the_panes_are_side_by_side(tool):
+    window, worker, clock = tool
+    hear(window, "KF0UQR W9XYZ -07", START)
+    assert window.qso_table.rowCount() == 1
+    window._on_clear_clicked()
+    assert window.qso_table.rowCount() == 0 and window.table.rowCount() == 0
+    assert window.lists.count() == 2 and window.lists.indexOf(window.qso_table.parentWidget()) == 0

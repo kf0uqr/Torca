@@ -288,12 +288,13 @@ def test_audio_fills_the_waterfall(tool, app):
 
 
 def texts_of(table):
-    return [table.item(r, 1).text() for r in range(table.rowCount()) if table.item(r, 1) is not None]
+    column = table.property("message_column")
+    return [table.item(r, column).text() for r in range(table.rowCount()) if table.item(r, column) is not None]
 
 
 def qso_rows(window):
-    return [(window.qso_table.item(r, 0).text(), window.qso_table.item(r, 1).text())
-            for r in range(window.qso_table.rowCount()) if window.qso_table.item(r, 1) is not None]
+    return [(window.qso_table.item(r, 1).text(), window.qso_table.item(r, 2).text())
+            for r in range(window.qso_table.rowCount())]
 
 
 def test_your_messages_pane_holds_what_is_sent_to_you_and_what_you_send(tool):
@@ -307,14 +308,14 @@ def test_your_messages_pane_holds_what_is_sent_to_you_and_what_you_send(tool):
     double_click(window, "CQ W1AW FN31")
     window._tx_tick(START + 15.45)
     assert qso_rows(window)[-1] == ("Tx", "W1AW KF0UQR EM18")
-    item = window.qso_table.item(window.qso_table.rowCount() - 1, 1)
+    item = window.qso_table.item(window.qso_table.rowCount() - 1, 2)
     assert item.foreground().color() == ft8_window._COLOR_TX
 
 
 def test_answering_from_your_messages_pane_works_like_the_band_pane(tool):
     window, worker, clock = tool
     hear(window, "KF0UQR W9XYZ EM28", START, snr=-4, freq=1900.0)
-    window._on_row_double_clicked_qso(1, 1)                              # row 0 is the time line
+    window._on_row_double_clicked_qso(0, 2)
     assert window.dx_call_edit.text() == "W9XYZ" and window.tx_message_edit.text() == "W9XYZ KF0UQR -04"
     assert window.waterfall.rx_hz == 1900.0
 
@@ -338,7 +339,7 @@ def test_decodes_on_the_receive_frequency_join_your_messages(tool):
     hear(window, "CQ N0XYZ EM28", START, freq=1800.0)                    # elsewhere: band activity only
     assert [t for _, t in qso_rows(window)] == ["CQ W1AW FN31", "K1ABC W2DEF -05"]
     assert len(texts_of(window.table)) == 3
-    green = window.qso_table.item(1, 1).foreground().color()
+    green = window.qso_table.item(0, 2).foreground().color()
     assert green == ft8_window._COLOR_CQ
     window.waterfall.set_markers(rx_hz=1800.0)                           # move the marker: now that station is followed
     hear(window, "CQ N0XYZ EM28", START + 15, freq=1801.0)
@@ -368,3 +369,19 @@ def test_columns_are_db_message_freq_dt_and_each_slot_gets_one_time_line(tool):
     window.waterfall.set_markers(rx_hz=800.0)
     hear(window, "CQ N0XYZ EM28", START + 30, freq=800.0)
     assert [window.qso_table.item(r, 0).text() for r in range(window.qso_table.rowCount())][0] == stamp(START + 30)
+
+
+def test_your_messages_keeps_a_time_column_and_no_time_lines(tool):
+    window, worker, clock = tool
+    table = window.qso_table
+    assert [table.horizontalHeaderItem(i).text() for i in range(5)] == ["UTC", "dB", "Message", "Freq", "DT"]
+    window._on_decoded(START, [ft8.Ft8Message(START, "FT8", -9.0, 0.3, 1500.0, "CQ W1AW FN31")], True)   # on the Rx frequency
+    window._on_decoded(START + 15, [ft8.Ft8Message(START + 15, "FT8", -4.0, 0.1, 1500.0, "KF0UQR W1AW -07")], True)
+    cells = [[table.item(r, c).text() for c in range(5)] for r in range(table.rowCount())]
+    stamp = lambda s: time.strftime("%H:%M:%S", time.gmtime(s))
+    assert cells == [[stamp(START), "-9", "CQ W1AW FN31", "1500", "+0.3"], [stamp(START + 15), "-4", "KF0UQR W1AW -07", "1500", "+0.1"]]
+    assert all(table.columnSpan(r, 0) == 1 for r in range(table.rowCount()))
+    window._on_cq_clicked()
+    window._tx_tick(START + 30.45)
+    sent = [table.item(table.rowCount() - 1, c).text() for c in range(5)]
+    assert sent[1:4] == ["Tx", "CQ KF0UQR EM18", "1500"] and len(sent[0]) == 8 and sent[0][2] == ":"

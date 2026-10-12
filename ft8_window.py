@@ -64,6 +64,8 @@ _SETTINGS_APP = "RadioControl"
 
 _COLUMNS = ["dB", "Message", "Freq", "DT"]
 _MESSAGE_COLUMN = 1
+# "Your messages" is a conversation, so each line keeps its own time instead of time lines.
+_QSO_COLUMNS = ["UTC", "dB", "Message", "Freq", "DT"]
 _MAX_ROWS = 1000
 
 # Same idea as the APRS tool: audio chunks arrive many times a second whenever
@@ -246,7 +248,7 @@ class Ft8ToolWindow(QWidget):
         layout.addWidget(self.tx_group)
         # Two lists side by side, laid out as in WSJT-X: everything heard on the band on the left,
         # what is addressed to you or sent by you (the contact in progress) on the right.
-        self.qso_table = self._new_table()
+        self.qso_table = self._new_table(with_time_column=True)
         self.qso_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.qso_table.customContextMenuRequested.connect(lambda pos: self._copy_menu(self.qso_table, pos))
         self.qso_table.cellDoubleClicked.connect(self._on_row_double_clicked_qso)
@@ -454,14 +456,19 @@ class Ft8ToolWindow(QWidget):
         return abs(message.freq - self.waterfall.rx_hz) <= max(20.0, width * 0.4)
 
     @staticmethod
-    def _new_table():
-        """A decode list: dB, Message, Freq, DT -- sized to fit what they hold (the message
-        takes whatever room is left), with a line above each time slot's decodes."""
-        table = QTableWidget(0, len(_COLUMNS))
-        table.setHorizontalHeaderLabels(_COLUMNS)
+    def _new_table(with_time_column=False):
+        """A decode list, sized to fit what it holds (the message takes whatever room is
+        left). Band activity is dB, Message, Freq, DT under a time line above each slot's
+        decodes; with_time_column gives "Your messages" a UTC column instead."""
+        columns = _QSO_COLUMNS if with_time_column else _COLUMNS
+        table = QTableWidget(0, len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        message_column = columns.index("Message")
+        table.setProperty("message_column", message_column)
+        table.setProperty("time_lines", not with_time_column)
         header = table.horizontalHeader()
-        for column in range(len(_COLUMNS)):
-            header.setSectionResizeMode(column, QHeaderView.Stretch if column == _MESSAGE_COLUMN else QHeaderView.ResizeToContents)
+        for column in range(len(columns)):
+            header.setSectionResizeMode(column, QHeaderView.Stretch if column == message_column else QHeaderView.ResizeToContents)
         header.setMinimumSectionSize(30)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -475,8 +482,9 @@ class Ft8ToolWindow(QWidget):
     def _add_row(self, table, slot_start, values, color=None, bold=False, message=None):
         """Appends one decode (or sent message) to `table`, first adding a time line
         ("14:32:15") if it belongs to a newer time slot than the last one listed."""
+        message_column = table.property("message_column")
         last = table.property("last_slot")
-        if last is None or slot_start > last:
+        if table.property("time_lines") and (last is None or slot_start > last):
             row = table.rowCount()
             table.insertRow(row)
             stamp = QTableWidgetItem(time.strftime("%H:%M:%S", time.gmtime(slot_start)))
@@ -486,19 +494,19 @@ class Ft8ToolWindow(QWidget):
             stamp.setBackground(QColor("#262c33"))
             font = stamp.font(); font.setBold(True); stamp.setFont(font)
             table.setItem(row, 0, stamp)
-            table.setSpan(row, 0, 1, len(_COLUMNS))
+            table.setSpan(row, 0, 1, table.columnCount())
             table.setProperty("last_slot", slot_start)
         row = table.rowCount()
         table.insertRow(row)
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
-            if column != _MESSAGE_COLUMN:
+            if column != message_column and not (column == 0 and not table.property("time_lines")):
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             if color is not None:
                 item.setForeground(color)
             if bold:
                 font = item.font(); font.setBold(True); item.setFont(font)
-            if column == _MESSAGE_COLUMN and message is not None:
+            if column == message_column and message is not None:
                 item.setData(Qt.UserRole, message)
             table.setItem(row, column, item)
         table.setProperty("data_rows", table.property("data_rows") + 1)
@@ -508,13 +516,14 @@ class Ft8ToolWindow(QWidget):
     def _trim(table):
         """Keeps at most _MAX_ROWS decodes (oldest go first), and never leaves a time
         line with nothing under it at the top."""
+        column = table.property("message_column")
         data = table.property("data_rows")
         while data > _MAX_ROWS and table.rowCount():
-            if table.item(0, _MESSAGE_COLUMN) is not None:
+            if table.item(0, column) is not None:
                 data -= 1
             table.removeRow(0)
-        while table.rowCount() and table.item(0, _MESSAGE_COLUMN) is None and (
-                table.rowCount() == 1 or table.item(1, _MESSAGE_COLUMN) is None):
+        while table.rowCount() and table.item(0, column) is None and (
+                table.rowCount() == 1 or table.item(1, column) is None):
             table.removeRow(0)
         table.setProperty("data_rows", data)
 
@@ -524,16 +533,16 @@ class Ft8ToolWindow(QWidget):
         if message is not None:
             color = _COLOR_MINE if message.involves(my_callsign) else (_COLOR_CQ if message.is_cq else None)
             self._add_row(self.qso_table, message.slot_start,
-                          [f"{message.snr:+.0f}", message.text, f"{message.freq:.0f}", f"{message.dt:+.1f}"],
+                          [message.utc, f"{message.snr:+.0f}", message.text, f"{message.freq:.0f}", f"{message.dt:+.1f}"],
                           color=color, message=message)
         else:
             slot = ft8.SLOT_SECONDS[self.mode_combo.currentText()]
             self._add_row(self.qso_table, math.floor(sent_at / slot) * slot,
-                          ["Tx", sent_text, f"{hz:.0f}", ""], color=_COLOR_TX)
+                          [time.strftime("%H:%M:%S", time.gmtime(sent_at)), "Tx", sent_text, f"{hz:.0f}", ""], color=_COLOR_TX)
         self.qso_table.scrollToBottom()
 
     def _on_row_double_clicked_qso(self, row, _column):
-        self._answer_item(self.qso_table.item(row, _MESSAGE_COLUMN))
+        self._answer_item(self.qso_table.item(row, self.qso_table.property("message_column")))
 
     def _append_row(self, message, my_callsign):
         color = _COLOR_MINE if message.involves(my_callsign) else (_COLOR_CQ if message.is_cq else None)
@@ -830,7 +839,7 @@ class Ft8ToolWindow(QWidget):
 
     def _copy_menu(self, table, pos):
         row = table.rowAt(pos.y())
-        item = table.item(row, _MESSAGE_COLUMN) if row >= 0 else None
+        item = table.item(row, table.property("message_column")) if row >= 0 else None
         if item is None:
             return
         menu = QMenu(self)

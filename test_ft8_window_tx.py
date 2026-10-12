@@ -319,4 +319,4 @@ def test_clear_empties_both_lists_and_the_panes_are_side_by_side(tool):
     assert window.qso_table.rowCount() == 1
     window._on_clear_clicked()
     assert window.qso_table.rowCount() == 0 and window.table.rowCount() == 0
-    assert window.lists.count() == 2 and window.lists.indexOf(window.qso_table.parentWidget()) == 0
+    assert window.lists.count() == 2 and window.lists.indexOf(window.qso_table.parentWidget()) == 1 and window.lists.indexOf(window.table.parentWidget()) == 0

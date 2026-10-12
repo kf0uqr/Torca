@@ -248,8 +248,8 @@ class Ft8ToolWindow(QWidget):
         layout.addWidget(self.status_label)
         layout.addWidget(self.audio_warning_label)
         layout.addWidget(self.tx_group)
-        # Two lists side by side, as in WSJT-X: what is addressed to you or sent by you (the contact
-        # in progress) on the left, everything heard on the band on the right.
+        # Two lists side by side, laid out as in WSJT-X: everything heard on the band on the left,
+        # what is addressed to you or sent by you (the contact in progress) on the right.
         self.qso_table = QTableWidget(0, len(_COLUMNS))
         self.qso_table.setHorizontalHeaderLabels(_COLUMNS)
         self.qso_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
@@ -261,7 +261,7 @@ class Ft8ToolWindow(QWidget):
         self.qso_table.cellDoubleClicked.connect(self._on_row_double_clicked_qso)
         self.qso_table.setToolTip("Messages sent to you and messages you transmit. Double-click one from another station to answer it.")
         self.lists = QSplitter(Qt.Horizontal)
-        for title, table in (("Your messages", self.qso_table), ("Band activity", self.table)):
+        for title, table in (("Band activity", self.table), ("Your messages", self.qso_table)):
             pane = QWidget()
             box = QVBoxLayout(pane)
             box.setContentsMargins(0, 0, 0, 0)

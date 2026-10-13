@@ -479,7 +479,7 @@ class SatelliteRemoteState(QObject):
     the desktop to sync against, since the combo was never populated
     for a satellite selected via the web at all). request_start/
     request_transponder instead go through HamClockWindow's own
-    dashboard._select_satellite_for_tracking/select_transponder_
+    dashboard.start_tracking_satellite/select_transponder_
     remote, which do the full job (including calling into
     SatelliteSession themselves) -- the exact same path a real
     double-click or combo selection takes."""
@@ -507,7 +507,7 @@ class SatelliteRemoteState(QObject):
         satellite_session.state_updated.connect(self._on_state_updated)
         satellite_session.tracking_changed.connect(self._on_tracking_changed)
 
-        self._do_start.connect(dashboard._select_satellite_for_tracking)
+        self._do_start.connect(dashboard.start_tracking_satellite)
         self._do_stop.connect(satellite_session.stop)
         self._do_set_transponder.connect(dashboard.select_transponder_remote)
         self._do_adjust_offset.connect(satellite_session.adjust_offset)

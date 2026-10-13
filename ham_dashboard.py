@@ -1676,9 +1676,9 @@ class HamClockWindow(QWidget):
             "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
         )
         self.tracking_button.setToolTip(
-            "Pause/resume Doppler re-tuning on every connected satellite-role "
-            "radio. The satellite stays selected either way -- double-click a "
-            "different one on the map (or an upcoming-pass row) to switch."
+            "Start Doppler re-tuning on the radios taking part in the pass (set up in the Satellite "
+            "Tool), for the satellite and transponder chosen here -- nothing is retuned until you "
+            "press it. Stop pauses it; the choice stays."
         )
         self.tracking_button.toggled.connect(self._on_tracking_toggled)
 
@@ -3418,18 +3418,20 @@ class HamClockWindow(QWidget):
             self.transponder_combo.setEnabled(False)
         self.transponder_combo.blockSignals(False)
 
-        # Tracking always (re)starts on selection -- if it's already
-        # checked (switching straight from one satellite to another),
-        # setChecked(True) won't re-emit toggled, so start explicitly
-        # rather than relying on it.
+        # Choosing a satellite does NOT start tracking: nothing retunes a radio until the operator has picked
+        # the satellite and transponder they want and presses Start Tracking themselves. (If a pass was being
+        # tracked, it stops -- it was for the previous satellite.)
+        if self.satellite_session.is_tracking():
+            self.satellite_session.stop()           # also unchecks the button, via _on_session_tracking_changed
         self.tracking_button.setEnabled(True)
-        self.tracking_button.blockSignals(True)
-        self.tracking_button.setChecked(True)
-        self.tracking_button.blockSignals(False)
-        self.tracking_button.setText("Stop Tracking")
+        return True
 
-        self.satellite_session.start(satellite)
-        self.satellite_session.set_transponder(self.transponder_combo.currentData())
+    def start_tracking_satellite(self, satellite) -> bool:
+        """Selects `satellite` AND starts tracking it -- for Remote Access's "start" (its own explicit
+        action). On the desktop, selecting and starting are two steps the operator takes."""
+        if not self._select_satellite_for_tracking(satellite):
+            return False
+        self.tracking_button.setChecked(True)
         return True
 
     def select_transponder_remote(self, index: int):
@@ -3446,7 +3448,9 @@ class HamClockWindow(QWidget):
             self.transponder_combo.setCurrentIndex(index)
 
     def _on_transponder_changed(self, _index):
-        if self._active_satellite is not None:
+        # Only a pass that is running follows a change of transponder: before Start Tracking it is just a
+        # choice, and no radio is touched.
+        if self._active_satellite is not None and self.satellite_session.is_tracking():
             self.satellite_session.set_transponder(self.transponder_combo.currentData())
 
     def _on_tracking_toggled(self, checked):
@@ -3454,6 +3458,8 @@ class HamClockWindow(QWidget):
         if checked:
             if self._active_satellite is not None:
                 self.satellite_session.start(self._active_satellite)
+                # start() clears the transponder: apply the one chosen in the drop-down (also after a pause)
+                self.satellite_session.set_transponder(self.transponder_combo.currentData())
         else:
             self.satellite_session.stop()
 

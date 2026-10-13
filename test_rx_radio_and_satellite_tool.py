@@ -241,7 +241,9 @@ COMBO_SCRIPT = textwrap.dedent('''
     # selecting a satellite any other way (map, passes list, web) moves the drop-down to it, and tracking starts
     del dash._on_satellite_double_clicked
     assert dash._select_satellite_for_tracking(dash.satellites[1])
-    assert combo.currentData() == "AO-91" and dash.tracking_button.isChecked() and dash.satellite_session.is_tracking()
+    assert combo.currentData() == "AO-91"
+    assert not dash.tracking_button.isChecked() and not dash.satellite_session.is_tracking()      # selecting does not start anything
+    assert dash.tracking_button.isEnabled()                                                        # ...the operator does, when ready
     # the list changing (TLE refresh, satellite added) keeps the tracked one selected
     dash.satellites.append({"name": "FOX-1B", "transponders": []})
     dash._refresh_satellite_combo()
@@ -255,4 +257,80 @@ def test_satellite_name_is_a_drop_down_to_choose_the_satellite(tmp_path):
                XDG_CACHE_HOME=str(tmp_path / "cache"), QT_QPA_PLATFORM="offscreen")
     env.pop("PYTHONPATH", None)
     result = subprocess.run([sys.executable, "-c", COMBO_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
+
+
+MANUAL_SCRIPT = textwrap.dedent('''
+    import os, sys
+    sys.path.insert(0, %r)
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+    app = QApplication([])
+    s = QSettings("IcomRadioApp", "RadioControl")
+    s.setValue("operator_callsign", "KF0UQR"); s.setValue("operator_lat", 38.2); s.setValue("operator_lon", -97.5); s.sync()
+    import ham_dashboard
+    from workspace_host import WorkspaceHost
+    host = WorkspaceHost(); dash = ham_dashboard.HamClockWindow(); host.add_dashboard(dash)
+
+    class Radio:
+        """A radio in the pass: records what the session tells it to do."""
+        def __init__(self): self.calls = []
+        def apply_satellite_mode(self, transponder): self.calls.append(("mode", (transponder or {}).get("description")))
+        def apply_satellite_tick(self, *a): self.calls.append(("tick",)); return ""
+        def _on_tracking_changed(self, tracking): pass
+    radio = Radio()
+    dash.satellite_session.register(radio, "full_duplex")
+
+    fm = {"description": "FM voice", "downlink_mhz": "145.800", "uplink_mhz": "145.200", "mode": "FM"}
+    lin = {"description": "Linear", "downlink_mhz": "145.950", "uplink_mhz": "435.200", "mode": "USB", "uplink_mode": "LSB"}
+    tle = {"line1": "1 25544U 98067A   26286.50000000  .00010000  00000-0  10000-3 0  9990",
+           "line2": "2 25544  51.6400 100.0000 0005000  90.0000 270.0000 15.50000000400000"}
+    dash.satellites = [dict(name="SAT-A", transponders=[fm, lin], **tle), dict(name="SAT-B", transponders=[fm], **tle)]
+    dash._refresh_satellite_combo()
+
+    # choosing a satellite and a transponder touches nothing
+    dash.satellite_combo.setCurrentIndex(dash.satellite_combo.findData("SAT-A")); dash._on_satellite_combo_chosen(0)
+    assert dash.transponder_combo.count() == 2 and dash.transponder_combo.isEnabled() and dash.tracking_button.isEnabled()
+    dash.transponder_combo.setCurrentIndex(1)
+    app.processEvents()
+    assert radio.calls == [] and not dash.satellite_session.is_tracking() and not dash.tracking_button.isChecked()
+    assert dash.tracking_button.text() == "Start Tracking"
+
+    # pressing the button starts it, with the chosen transponder
+    dash.tracking_button.click()
+    assert dash.satellite_session.is_tracking() and dash.tracking_button.text() == "Stop Tracking"
+    assert radio.calls[0] == ("mode", "Linear") and ("tick",) in radio.calls
+
+    # changing the transponder while tracking applies at once
+    radio.calls.clear()
+    dash.transponder_combo.setCurrentIndex(0)
+    assert ("mode", "FM voice") in radio.calls
+
+    # stop, then start again: the choice is still there
+    dash.tracking_button.click()
+    assert not dash.satellite_session.is_tracking()
+    radio.calls.clear()
+    dash.transponder_combo.setCurrentIndex(1)
+    assert radio.calls == []
+    dash.tracking_button.click()
+    assert radio.calls[0] == ("mode", "Linear")
+
+    # choosing another satellite while tracking stops the pass until the button is pressed again
+    radio.calls.clear()
+    dash.satellite_combo.setCurrentIndex(dash.satellite_combo.findData("SAT-B")); dash._on_satellite_combo_chosen(0)
+    assert not dash.satellite_session.is_tracking() and not dash.tracking_button.isChecked() and radio.calls == []
+    assert dash.transponder_combo.count() == 1
+
+    # Remote Access's explicit "start" still selects AND starts
+    assert dash.start_tracking_satellite(dash.satellites[0])
+    assert dash.satellite_session.is_tracking() and dash.satellite_combo.currentData() == "SAT-A"
+    print("OK"); sys.stdout.flush(); os._exit(0)
+''' % os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_selecting_a_satellite_and_transponder_starts_nothing_until_the_operator_presses_start(tmp_path):
+    env = dict(os.environ, HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "cfg"),
+               XDG_CACHE_HOME=str(tmp_path / "cache"), QT_QPA_PLATFORM="offscreen")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", MANUAL_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr

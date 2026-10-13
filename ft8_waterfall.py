@@ -27,7 +27,7 @@ SIGNAL_WIDTH_HZ = {"FT8": 50.0, "FT4": 83.0}
 _AXIS_HEIGHT = 16
 
 
-SILENCE_DB = -40.0   # a row whose median level is below this is silence, not signal
+SILENCE_DB = -40.0   # a row whose loudest bin is below this is silence, not signal
 
 
 class SpectrumRows:
@@ -99,7 +99,7 @@ class WaterfallWidget(QWidget):
     def add_rows(self, rows):
         for row in rows:
             floor = float(np.median(row))
-            silent = floor < SILENCE_DB   # the radio sends no receive audio while transmitting
+            silent = float(np.max(row)) < SILENCE_DB   # the radio sends no receive audio while transmitting
             if not silent:
                 # Slow, so signals stand out -- but snap when the level jumps (the first rows
                 # after a transmission), or the whole row would paint saturated red.

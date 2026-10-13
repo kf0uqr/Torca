@@ -183,3 +183,76 @@ def test_satellite_tool_gives_radios_their_roles(tmp_path):
     env.pop("PYTHONPATH", None)
     result = subprocess.run([sys.executable, "-c", SCRIPT], env=env, capture_output=True, text=True, timeout=180)
     assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
+
+
+SETTINGS_SCRIPT = textwrap.dedent('''
+    import os, sys
+    sys.path.insert(0, %r)
+    from PySide6.QtCore import QSettings, Qt
+    from PySide6.QtWidgets import QApplication
+    app = QApplication([])
+    s = QSettings("IcomRadioApp", "RadioControl")
+    s.setValue("operator_callsign", "KF0UQR"); s.setValue("operator_lat", 38.2); s.setValue("operator_lon", -97.5); s.sync()
+    import ham_dashboard
+    from workspace_host import WorkspaceHost
+    host = WorkspaceHost(); dash = ham_dashboard.HamClockWindow(); host.add_dashboard(dash)
+    opened = []
+    dash._on_satellite_config_requested = lambda pos: opened.append(pos)
+    assert dash.satellite_button.contextMenuPolicy() != Qt.CustomContextMenu        # no right-click menu on the map button any more
+    assert "Right-click" not in dash.satellite_button.toolTip()
+    dash.satellite_settings_button.click()
+    assert opened == [None]
+    assert dash.satellite_settings_button.parent() is dash.satellite_passes_page or dash.satellite_passes_page.isAncestorOf(dash.satellite_settings_button)
+    print("OK"); sys.stdout.flush(); os._exit(0)
+''' % os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_satellite_settings_is_a_button_in_the_satellite_tool_not_a_right_click(tmp_path):
+    env = dict(os.environ, HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "cfg"),
+               XDG_CACHE_HOME=str(tmp_path / "cache"), QT_QPA_PLATFORM="offscreen")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", SETTINGS_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
+
+
+COMBO_SCRIPT = textwrap.dedent('''
+    import os, sys
+    sys.path.insert(0, %r)
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+    app = QApplication([])
+    s = QSettings("IcomRadioApp", "RadioControl")
+    s.setValue("operator_callsign", "KF0UQR"); s.setValue("operator_lat", 38.2); s.setValue("operator_lon", -97.5); s.sync()
+    import ham_dashboard
+    from workspace_host import WorkspaceHost
+    host = WorkspaceHost(); dash = ham_dashboard.HamClockWindow(); host.add_dashboard(dash)
+    dash.satellites = [{"name": "SO-50", "transponders": []}, {"name": "AO-91", "transponders": []}, {"name": "ISS", "transponders": []}]
+    dash._refresh_satellite_combo()
+    combo = dash.satellite_combo
+    names = [combo.itemText(i) for i in range(combo.count())]
+    assert names == ["No satellite selected", "AO-91", "ISS", "SO-50"], names        # a drop-down of the whole list, alphabetical
+    assert not hasattr(dash, "satellite_name_label")
+
+    chosen = []
+    dash._on_satellite_double_clicked = lambda name: chosen.append(name)
+    combo.setCurrentIndex(combo.findData("SO-50")); dash._on_satellite_combo_chosen(0)
+    assert chosen == ["SO-50"]                                                         # choosing one = double-clicking it
+
+    # selecting a satellite any other way (map, passes list, web) moves the drop-down to it, and tracking starts
+    del dash._on_satellite_double_clicked
+    assert dash._select_satellite_for_tracking(dash.satellites[1])
+    assert combo.currentData() == "AO-91" and dash.tracking_button.isChecked() and dash.satellite_session.is_tracking()
+    # the list changing (TLE refresh, satellite added) keeps the tracked one selected
+    dash.satellites.append({"name": "FOX-1B", "transponders": []})
+    dash._refresh_satellite_combo()
+    assert combo.currentData() == "AO-91" and "FOX-1B" in [combo.itemText(i) for i in range(combo.count())]
+    print("OK"); sys.stdout.flush(); os._exit(0)
+''' % os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_satellite_name_is_a_drop_down_to_choose_the_satellite(tmp_path):
+    env = dict(os.environ, HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "cfg"),
+               XDG_CACHE_HOME=str(tmp_path / "cache"), QT_QPA_PLATFORM="offscreen")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", COMBO_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr

@@ -1353,12 +1353,10 @@ class HamClockWindow(QWidget):
             "QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }"
         )
         self.satellite_button.setToolTip(
-            "Toggle satellite tracking on the map. Right-click to manage TLE "
-            "data, transponder info, and which satellites are shown."
+            "Toggle satellites on the map. TLE data, transponder info and which satellites "
+            "are shown are managed with Settings... in the Satellite Tool."
         )
         self.satellite_button.toggled.connect(self._on_satellite_toggled)
-        self.satellite_button.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.satellite_button.customContextMenuRequested.connect(self._on_satellite_config_requested)
 
         # ---- QSO map overlay ----
         # How many of the most recent logged QSOs to plot -- persisted
@@ -1650,7 +1648,14 @@ class HamClockWindow(QWidget):
         # ---- Satellite tracking controls (moved from RadioWindow --
         # now the single shared control point for however many radios
         # are cooperating on one pass, driving SatelliteSession) ----
-        self.satellite_name_label = QLabel("No satellite selected")
+        # Which satellite is being tracked: a drop-down of every satellite in the list (choosing one starts
+        # tracking it, exactly like double-clicking it on the map or in the passes list), and it follows
+        # whichever one gets selected some other way.
+        self.satellite_combo = QComboBox()
+        self.satellite_combo.setToolTip("The satellite to track. Pick one to start tracking it.")
+        self.satellite_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.satellite_combo.activated.connect(self._on_satellite_combo_chosen)
+        self._refresh_satellite_combo()
         self.transponder_combo = QComboBox()
         self.transponder_combo.setEnabled(False)
         self.transponder_combo.setToolTip(
@@ -1678,7 +1683,7 @@ class HamClockWindow(QWidget):
         self.tracking_button.toggled.connect(self._on_tracking_toggled)
 
         tracking_row = QHBoxLayout()
-        tracking_row.addWidget(self.satellite_name_label)
+        tracking_row.addWidget(self.satellite_combo)
         tracking_row.addWidget(self.transponder_combo, 1)
         tracking_row.addWidget(self.tracking_button)
 
@@ -1802,6 +1807,12 @@ class HamClockWindow(QWidget):
         passes_header_row.addStretch()
         passes_header_row.addWidget(QLabel("Min El:"))
         passes_header_row.addWidget(self.min_elevation_spin)
+        self.satellite_settings_button = QPushButton("Settings...")
+        self.satellite_settings_button.setToolTip(
+            "Manage the satellites: refresh TLE data, add satellites, fetch or edit transponder info, "
+            "and choose which satellites are shown on the map.")
+        self.satellite_settings_button.clicked.connect(lambda _c=False: self._on_satellite_config_requested(None))
+        passes_header_row.addWidget(self.satellite_settings_button)
 
         # A real widget (not just a layout) so take_data_pages() can hand
         # it to the workspace host as its own "Satellites" tab.
@@ -1968,6 +1979,7 @@ class HamClockWindow(QWidget):
         def persist(satellites):
             self.satellites = satellites
             save_satellite_data(self.satellites)
+            self._refresh_satellite_combo()
 
         # persist() also runs immediately on every transponder fetch/edit
         # inside the dialog (see SatelliteConfigDialog's on_change) -- so
@@ -3336,13 +3348,34 @@ class HamClockWindow(QWidget):
                 "to know where you're observing from."
             )
 
+    def _refresh_satellite_combo(self, select=None):
+        """Re-reads the satellite list into the drop-down (it can change: TLE refresh, satellites added or
+        removed) keeping the satellite being tracked (or `select`) chosen."""
+        combo = self.satellite_combo
+        current = select or (self._active_satellite.get("name") if getattr(self, "_active_satellite", None) else None)
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("No satellite selected", None)
+        for satellite in sorted(self.satellites, key=lambda sat: (sat.get("name") or "").lower()):
+            combo.addItem(satellite.get("name", "?"), satellite.get("name"))
+        index = combo.findData(current) if current else 0
+        combo.setCurrentIndex(max(index, 0))
+        combo.blockSignals(False)
+
+    def _on_satellite_combo_chosen(self, _index):
+        name = self.satellite_combo.currentData()
+        if name:
+            self._on_satellite_double_clicked(name)        # the same as double-clicking it
+        else:
+            self._refresh_satellite_combo()                 # "No satellite selected" is a label, not a choice
+
     def _select_satellite_for_tracking(self, satellite) -> bool:
         """The actual "start tracking this satellite" side effects --
         shared by _on_satellite_double_clicked (a real double-click)
         and Remote Access's /api/satellite/start (via bridge.py's
         SatelliteRemoteState, connected here through a queued Qt
         signal). Both need this exact set of widget updates
-        (self._active_satellite, satellite_name_label, transponder_
+        (self._active_satellite, satellite_combo, transponder_
         combo repopulated, tracking_button checked/enabled) so the
         desktop UI visibly reflects whichever satellite got selected,
         regardless of where the selection came from -- calling
@@ -3361,7 +3394,7 @@ class HamClockWindow(QWidget):
             return False
 
         self._active_satellite = satellite
-        self.satellite_name_label.setText(satellite.get("name", "?"))
+        self._refresh_satellite_combo(select=satellite.get("name"))
         self._update_tle_staleness_warning(satellite)  # don't wait for the first tracking tick
 
         self.transponder_combo.blockSignals(True)

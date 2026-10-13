@@ -10,12 +10,20 @@ polygons, all drawn on top.
 import datetime
 import math
 
+import numpy as np
+
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF, QFont
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPainterPath, QPolygonF, QFont, QImage, QLinearGradient
 from PySide6.QtWidgets import QWidget, QSizePolicy, QToolTip, QPushButton
 
 from solar_data import _solar_subpoint
 import map_tiles
+import voacap
+
+
+def _voacap_color(reliability):
+    """One RGBA colour of the reliability scale (for the legend)."""
+    return voacap.color_for(np.array([reliability]))[0]
 
 
 class WorldMapWidget(QWidget):
@@ -57,6 +65,9 @@ class WorldMapWidget(QWidget):
         self._pota_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_pota_markers
         self._aprs_markers = []  # list of {"lat", "lon", "tooltip"} -- see set_aprs_markers
         self._selected_park_marker = None  # {"lat", "lon"} or None -- see set_selected_park_marker
+        self._voacap_image = None   # QImage in the map's own projection (see voacap.render_rgba), or None
+        self._voacap_rgba = None    # the bytes that image is a view onto (kept alive)
+        self._voacap_label = ""
         # Hover tooltip needs mouseMoveEvent to fire without a button
         # held down -- off by default on a plain QWidget.
         self.setMouseTracking(True)
@@ -278,6 +289,14 @@ class WorldMapWidget(QWidget):
 
         now = datetime.datetime.now(datetime.timezone.utc)
 
+        if self._voacap_image is not None:
+            # Predicted reliability, in the same Mercator-style content space as the tiles
+            # (rows were computed for it), so it pans and zooms with the map.
+            painter.save()
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawImage(QRectF(0, 0, w, h), self._voacap_image)
+            painter.restore()
+
         self._draw_terminator(painter, w, h, now)
 
         # Geographic overlays that make sense to zoom WITH the map --
@@ -384,6 +403,9 @@ class WorldMapWidget(QWidget):
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(255, 215, 0))
             painter.drawEllipse(QPointF(sx, sy), 3, 3)
+
+        if self._voacap_image is not None:
+            self._draw_voacap_legend(painter, h)
 
         # Attribution -- required by both tile sources' own usage terms,
         # must stay visible unconditionally (not gated on a successful
@@ -527,6 +549,41 @@ class WorldMapWidget(QWidget):
         them, same shape as set_satellite_positions([])."""
         self._qso_markers = markers
         self.update()
+
+    def set_voacap_overlay(self, rgba, size, label=""):
+        """The VOACAP reliability picture: `rgba` is bytes of an RGBA image `size` = (width, height) pixels in
+        this map's projection (voacap.render_rgba), or None to remove it. `label` says what it shows."""
+        if rgba is None:
+            self._voacap_image = self._voacap_rgba = None
+            self._voacap_label = ""
+        else:
+            self._voacap_rgba = rgba
+            self._voacap_image = QImage(rgba, size[0], size[1], size[0] * 4, QImage.Format_RGBA8888)
+            self._voacap_label = label
+        self.update()
+
+    def _draw_voacap_legend(self, painter, h):
+        """A small fixed key bottom-left: what the colours mean, and the conditions they are for."""
+        painter.save()
+        text = self._voacap_label
+        box_w = max(220, painter.fontMetrics().horizontalAdvance(text) + 16)
+        top = h - 62
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(20, 20, 24, 190))
+        painter.drawRoundedRect(QRectF(6, top, box_w, 44), 4, 4)
+        painter.setPen(QColor(235, 235, 235))
+        painter.drawText(QPointF(14, top + 16), text)
+        bar = QRectF(14, top + 24, box_w - 16, 8)
+        gradient = QLinearGradient(bar.left(), 0, bar.right(), 0)
+        for stop in (0.0, 0.25, 0.5, 0.75, 1.0):
+            r, g, b, a = (int(v) for v in _voacap_color(stop))
+            gradient.setColorAt(stop, QColor(r, g, b, 230))
+        painter.fillRect(bar, gradient)
+        painter.setPen(QColor(200, 200, 200))
+        painter.drawText(QPointF(14, top + 42), "0%")
+        painter.drawText(QPointF(bar.right() - 36, top + 42), "100%")
+        painter.drawText(QPointF(bar.center().x() - 36, top + 42), "reliability")
+        painter.restore()
 
     def set_pskreporter_markers(self, markers):
         """markers: list of {"lat", "lon", "tooltip"} -- ham_dashboard.py's

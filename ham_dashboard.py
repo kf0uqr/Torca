@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QSpinBox,
     QFileDialog,
     QDialogButtonBox,
@@ -83,6 +84,7 @@ import adif
 import qso_log
 import ft8_qso
 import heard_spots
+import voacap
 import pskreporter
 import pskreporter_report
 from aprs_db import shared_database
@@ -891,6 +893,56 @@ class UpdatePerformWorker(QThread):
         self.succeeded.emit()
 
 
+class VoacapSettingsDialog(QDialog):
+    """Right-click the VOACAP button: what the propagation prediction assumes about your station
+    and what you want to do with the path."""
+
+    def __init__(self, mode, power_w, gain_dbi, noise, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("VOACAP Settings")
+        self.mode_combo = QComboBox()
+        for name, snr in voacap.MODES.items():
+            self.mode_combo.addItem(name, name)
+        self.mode_combo.setCurrentIndex(max(self.mode_combo.findData(mode), 0))
+        self.mode_combo.setToolTip(
+            "The weakest signal you would call usable: voice needs a much stronger signal than CW, and "
+            "FT8 works with signals far below what you can hear.")
+        self.power_spin = QSpinBox()
+        self.power_spin.setRange(1, 1500)
+        self.power_spin.setSuffix(" W")
+        self.power_spin.setValue(int(power_w))
+        self.gain_spin = QDoubleSpinBox()
+        self.gain_spin.setRange(-10.0, 25.0)
+        self.gain_spin.setDecimals(1)
+        self.gain_spin.setSuffix(" dBi")
+        self.gain_spin.setValue(float(gain_dbi))
+        self.gain_spin.setToolTip("Gain of your antenna at every angle (0 = isotropic, about 2 for a dipole, 5+ for a small beam).")
+        self.noise_combo = QComboBox()
+        for name in voacap.NOISE:
+            self.noise_combo.addItem(name, name)
+        self.noise_combo.setCurrentIndex(max(self.noise_combo.findData(noise), 0))
+        self.noise_combo.setToolTip("Man-made radio noise where the signal is received: quieter places can hear weaker signals.")
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form = QFormLayout()
+        form.addRow("Operating:", self.mode_combo)
+        form.addRow("Your power:", self.power_spin)
+        form.addRow("Antenna gain:", self.gain_spin)
+        form.addRow("Noise at the far end:", self.noise_combo)
+        note = QLabel("Predictions are from the VOACAP model for the current UTC hour, month and sunspot number, "
+                      "with you as the transmitter. They show likelihood, not a guarantee.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #aaa;")
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(note)
+        layout.addWidget(buttons)
+
+    def result(self):
+        return (self.mode_combo.currentData(), self.power_spin.value(), self.gain_spin.value(), self.noise_combo.currentData())
+
+
 # The map's mode filter: key -> label. Modes not listed here count as "OTHER".
 PSKREPORTER_MODE_FILTERS = {"FT8": "FT8", "FT4": "FT4", "WSPR": "WSPR", "OTHER": "Other"}
 
@@ -1329,6 +1381,39 @@ class HamClockWindow(QWidget):
         self.qso_map_button.setContextMenuPolicy(Qt.CustomContextMenu)
         self.qso_map_button.customContextMenuRequested.connect(self._on_qso_map_menu_requested)
 
+        # ---- VOACAP propagation overlay ----
+        self._voacap_mode = settings.value("voacap_mode", "SSB voice")
+        if self._voacap_mode not in voacap.MODES:
+            self._voacap_mode = "SSB voice"
+        self._voacap_power_w = settings.value("voacap_power_w", voacap.DEFAULT_POWER_W, type=int)
+        self._voacap_gain_dbi = settings.value("voacap_gain_dbi", voacap.DEFAULT_GAIN_DBI, type=float)
+        self._voacap_noise = settings.value("voacap_noise", voacap.DEFAULT_NOISE)
+        if self._voacap_noise not in voacap.NOISE:
+            self._voacap_noise = voacap.DEFAULT_NOISE
+        self._voacap_ssn = 100.0           # replaced by the observed sunspot number when it arrives
+        self._voacap_cache = {}            # key -> voacap.Grid (the last few pictures, so changing band back is instant)
+        self._voacap_worker = None
+        self._voacap_wanted_key = None
+        self.voacap_button = QPushButton("VOACAP: OFF")
+        self.voacap_button.setCheckable(True)
+        self.voacap_button.setStyleSheet("QPushButton:checked { background-color: #2a6; color: white; font-weight: bold; }")
+        self.voacap_button.setToolTip(
+            "Show on the map how likely each place is to be reachable from your station on the chosen band, right now "
+            "(VOACAP propagation prediction). Right-click to set your power, antenna, noise and what you are doing.")
+        self.voacap_button.toggled.connect(self._on_voacap_toggled)
+        self.voacap_button.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.voacap_button.customContextMenuRequested.connect(self._on_voacap_menu_requested)
+        self.voacap_band_combo = QComboBox()
+        for band, mhz in voacap.BANDS.items():
+            self.voacap_band_combo.addItem(f"{band}  ({mhz:g} MHz)", band)
+        saved_band = settings.value("voacap_band", "20m")
+        self.voacap_band_combo.setCurrentIndex(max(self.voacap_band_combo.findData(saved_band), 0))
+        self.voacap_band_combo.setToolTip("The band the VOACAP overlay shows.")
+        self.voacap_band_combo.currentIndexChanged.connect(self._on_voacap_band_changed)
+        self._voacap_hour_timer = QTimer(self)
+        self._voacap_hour_timer.setInterval(60_000)
+        self._voacap_hour_timer.timeout.connect(self._update_voacap)   # a new UTC hour means a new picture
+
         # ---- PSKReporter map overlay ----
         self._pskreporter_since_seconds = settings.value(
             "pskreporter_lookback_seconds", PSKREPORTER_LOOKBACK_OPTIONS[1][1], type=int
@@ -1701,7 +1786,8 @@ class HamClockWindow(QWidget):
             expanded=QSettings("IcomRadioApp", "RadioControl").value("filters_sidebar_expanded", True, type=bool),
         )
         for filter_control in (self.satellite_button, self.qso_map_button, self.pskreporter_button,
-                               self.pota_button, self.aprs_button, self.qso_band_filter_combo):
+                               self.pota_button, self.aprs_button, self.qso_band_filter_combo,
+                               self.voacap_button, self.voacap_band_combo):
             self.filters_sidebar.content_layout().addWidget(filter_control)
         self.filters_sidebar.toggled.connect(
             lambda expanded: QSettings("IcomRadioApp", "RadioControl").setValue("filters_sidebar_expanded", expanded)
@@ -2032,6 +2118,90 @@ class HamClockWindow(QWidget):
                     # which clears the map's markers -- no need to also do
                     # it here.
                     self.pskreporter_button.setChecked(False)
+
+    # ---- VOACAP overlay ----
+
+    def _on_voacap_toggled(self, checked):
+        self.voacap_button.setText("VOACAP: ON" if checked else "VOACAP: OFF")
+        if not checked:
+            self._voacap_hour_timer.stop()
+            self.map_widget.set_voacap_overlay(None, None)
+            return
+        if not voacap.is_available():
+            QMessageBox.information(self._action_parent(), "VOACAP",
+                                    "The VOACAP propagation overlay needs the VOACAP program, which isn't installed.\n\n"
+                                    + voacap.INSTALL_HINT + "\n\nThen turn the overlay on again.")
+            self.voacap_button.setChecked(False)
+            return
+        if self._observer_lat is None or self._observer_lon is None:
+            QMessageBox.information(self._action_parent(), "VOACAP",
+                                    "Set your location first (Profile): the prediction is from your station.")
+            self.voacap_button.setChecked(False)
+            return
+        self._voacap_hour_timer.start()
+        self._update_voacap()
+
+    def _on_voacap_band_changed(self, _index):
+        QSettings("IcomRadioApp", "RadioControl").setValue("voacap_band", self.voacap_band_combo.currentData())
+        if self.voacap_button.isChecked():
+            self._update_voacap()
+
+    def _on_voacap_menu_requested(self, _pos):
+        dialog = VoacapSettingsDialog(self._voacap_mode, self._voacap_power_w, self._voacap_gain_dbi, self._voacap_noise,
+                                      self._action_parent())
+        if dialog.exec() == QDialog.Accepted:
+            self._voacap_mode, self._voacap_power_w, self._voacap_gain_dbi, self._voacap_noise = dialog.result()
+            settings = QSettings("IcomRadioApp", "RadioControl")
+            settings.setValue("voacap_mode", self._voacap_mode)
+            settings.setValue("voacap_power_w", self._voacap_power_w)
+            settings.setValue("voacap_gain_dbi", self._voacap_gain_dbi)
+            settings.setValue("voacap_noise", self._voacap_noise)
+            if self.voacap_button.isChecked():
+                self._update_voacap()
+
+    def _voacap_request(self):
+        band = self.voacap_band_combo.currentData()
+        return voacap.current_params(band, self._voacap_mode, self._voacap_power_w, self._voacap_gain_dbi, self._voacap_noise,
+                                     self._observer_lat, self._observer_lon, self._voacap_ssn)
+
+    def _update_voacap(self):
+        """Shows the picture for the chosen band and the current hour: from the cache if it was made already,
+        otherwise worked out on a background thread (about a second)."""
+        if not self.voacap_button.isChecked() or self._observer_lat is None:
+            return
+        key, params = self._voacap_request()
+        self._voacap_wanted_key = key
+        grid = self._voacap_cache.get(key)
+        if grid is not None:
+            self._show_voacap(key, grid)
+            return
+        if self._voacap_worker is not None and self._voacap_worker.isRunning():
+            return       # one at a time; _on_voacap_done looks again when it finishes
+        self.voacap_button.setText("VOACAP: working...")
+        worker = voacap.VoacapWorker(key, params, self)
+        worker.done.connect(self._on_voacap_done)
+        worker.failed.connect(self._on_voacap_failed)
+        self._voacap_worker = worker
+        worker.start()
+
+    def _on_voacap_done(self, key, grid):
+        self._voacap_cache[key] = grid
+        while len(self._voacap_cache) > 12:
+            self._voacap_cache.pop(next(iter(self._voacap_cache)))
+        if self.voacap_button.isChecked():
+            self.voacap_button.setText("VOACAP: ON")
+            self._update_voacap()      # the choice may have changed while this was being worked out
+
+    def _on_voacap_failed(self, key, message):
+        self._voacap_worker = None
+        if self.voacap_button.isChecked():
+            self.voacap_button.setChecked(False)
+            QMessageBox.warning(self._action_parent(), "VOACAP", f"The propagation prediction failed:\n\n{message}")
+
+    def _show_voacap(self, key, grid):
+        band, mode, power, gain, noise_name = key[0], key[1], key[2], key[3], key[4]
+        label = (f"VOACAP {band} ({voacap.BANDS[band]:g} MHz)  {key[-1]:02d}:00 UTC  SSN {key[7]}  {power} W, {gain:g} dBi  {mode}")
+        self.map_widget.set_voacap_overlay(voacap.render_rgba(grid), voacap.IMAGE_SIZE, label)
 
     # ---- reporting what we hear ----
 
@@ -3302,6 +3472,10 @@ class HamClockWindow(QWidget):
             self.sfi_label.setText(f"SFI: {data['solar_flux']:.0f}")
         if "sunspot_number" in data:
             self.ssn_label.setText(f"SSN: {data['sunspot_number']}")
+            try:
+                self._voacap_ssn = float(data["sunspot_number"])
+            except (TypeError, ValueError):
+                pass
         if "band_conditions" in data:
             self._update_band_conditions_table(data["band_conditions"])
             self.band_conditions_page.update_vhf(data["band_conditions"])
@@ -4069,6 +4243,8 @@ class HamClockWindow(QWidget):
         print(f"[WSJT-X Auto-Log] {message}")
 
     def closeEvent(self, event):
+        if self._voacap_worker is not None:
+            self._voacap_worker.wait(5000)
         self._save_heard_spots()
         if self._pskreporter_uploader is not None:
             self._pskreporter_uploader.stop()   # report what is queued before quitting

@@ -167,6 +167,8 @@ Toggle **POTA** to plot currently active Parks on the Air activator spots on the
 
 Toggle **PSKReporter** to plot recent reception reports involving your callsign (who heard you, or who you were heard by, depending on direction) -- configurable lookback window in its settings dialog.
 
+The stations your own decoders hear are also remembered for 24 hours, even across restarts, so the map still shows them when PSKReporter's query service has less than its website does (it can hold older reports back).
+
 If PSKReporter can't be reached, or says it is being asked too often, the layer stays on: the button reads **PSKReporter: ON (server unavailable)** (hover for the reason), a one-time message says the server's spots are missing, and the map keeps showing the stations your own decoders have heard. TORCA then leaves the server alone for five minutes if it said "too many requests"; turn the layer off and on to try again.
 
 With the direction set to **Stations you are hearing** (or **Both**), the stations your FT8/FT4 tool decodes are plotted straight away, as you hear them (a station appears once a message from it has told TORCA its grid square; the tooltip shows band, mode, signal and time).

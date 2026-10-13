@@ -81,6 +81,7 @@ from log_book_window import LogBookWindow
 import adif
 import qso_log
 import ft8_qso
+import heard_spots
 import pskreporter
 import pskreporter_report
 from aprs_db import shared_database
@@ -1343,7 +1344,11 @@ class HamClockWindow(QWidget):
             else list(PSKREPORTER_MODE_FILTERS))
         self._pskreporter_spots_cache = []  # raw fetched spots (unfiltered by band) -- see _build_pskreporter_markers
         # What the decoders here have heard themselves (instant, no server round trip), shown as "you heard them".
-        self._pskreporter_local_spots = {}          # (callsign, band) -> spot dict
+        self._pskreporter_local_spots = {(s["callsign"], s["band"]): s for s in heard_spots.load()}   # (callsign, band) -> spot dict; survives restarts
+        self._heard_spots_save_timer = QTimer(self)
+        self._heard_spots_save_timer.setSingleShot(True)
+        self._heard_spots_save_timer.setInterval(30_000)
+        self._heard_spots_save_timer.timeout.connect(self._save_heard_spots)
         self._pskreporter_locators = {}             # callsign -> last grid heard from them
         self._pskreporter_report_enabled = settings.value("pskreporter_report_enabled", False, type=bool)
         self._pskreporter_uploader = None
@@ -2094,9 +2099,14 @@ class HamClockWindow(QWidget):
         cutoff = time.time() - pskreporter.MAX_LOOKBACK_SECONDS
         for key in [k for k, v in self._pskreporter_local_spots.items() if v["flow_start_seconds"] < cutoff]:
             del self._pskreporter_local_spots[key]
+        if stations and not self._heard_spots_save_timer.isActive():
+            self._heard_spots_save_timer.start()      # written soon, not on every decode
         if self.pskreporter_button.isChecked() and self._pskreporter_direction in (pskreporter.DIRECTION_HEARING, "both"):
             if not self._pskreporter_refresh_timer.isActive():
                 self._pskreporter_refresh_timer.start()
+
+    def _save_heard_spots(self):
+        heard_spots.save(list(self._pskreporter_local_spots.values()))
 
     def _refresh_pskreporter_markers(self):
         if self.pskreporter_button.isChecked():
@@ -2122,8 +2132,10 @@ class HamClockWindow(QWidget):
         """One line saying what the server returned -- so an empty map can be told apart from an empty answer."""
         stats = pskreporter.last_stats
         if stats["received"] == 0:
-            return (f"PSKReporter has no reports for {self._operator_callsign} in this time frame "
-                    f"({'stations you heard' if self._pskreporter_direction == pskreporter.DIRECTION_HEARING else 'stations that heard you' if self._pskreporter_direction == pskreporter.DIRECTION_HEARD_YOU else 'both directions'}).")
+            return (f"PSKReporter's query service has no reports for {self._operator_callsign} in this time frame "
+                    f"({'stations you heard' if self._pskreporter_direction == pskreporter.DIRECTION_HEARING else 'stations that heard you' if self._pskreporter_direction == pskreporter.DIRECTION_HEARD_YOU else 'both directions'}). "
+                    "It can hold less than the pskreporter.info website shows, so older reports may be missing; the stations "
+                    "you have heard yourself are shown regardless.")
         text = f"PSKReporter returned {stats['received']} report(s)"
         if stats["no_locator"]:
             text += f"; {stats['no_locator']} had no grid square, so they can't be plotted"
@@ -4109,6 +4121,7 @@ class HamClockWindow(QWidget):
         print(f"[WSJT-X Auto-Log] {message}")
 
     def closeEvent(self, event):
+        self._save_heard_spots()
         if self._pskreporter_uploader is not None:
             self._pskreporter_uploader.stop()   # report what is queued before quitting
         self._on_remote_access_stop()

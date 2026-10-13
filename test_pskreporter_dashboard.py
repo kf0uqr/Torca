@@ -177,3 +177,34 @@ def test_server_outage_keeps_the_layer_on_with_a_notice(tmp_path):
     env.pop("PYTHONPATH", None)
     result = subprocess.run([sys.executable, "-c", OUTAGE_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr
+
+
+PERSIST_SCRIPT = textwrap.dedent('''
+    import os, sys, time
+    sys.path.insert(0, %r)
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+    app = QApplication([])
+    s = QSettings("IcomRadioApp", "RadioControl")
+    s.setValue("operator_callsign", "KF0UQR"); s.setValue("operator_lat", 38.2); s.setValue("operator_lon", -97.5); s.sync()
+    import ham_dashboard, heard_spots, pskreporter
+    from workspace_host import WorkspaceHost
+    now = int(time.time())
+    host = WorkspaceHost(); dash = ham_dashboard.HamClockWindow(); host.add_dashboard(dash)
+    dash._on_stations_heard([{"callsign": "W1AW", "locator": "FN31", "frequency_hz": 14075200, "snr": -12, "mode": "FT8", "epoch": now}])
+    dash.close()                                                   # closing saves what was heard
+    assert [s["callsign"] for s in heard_spots.load()] == ["W1AW"]
+
+    host2 = WorkspaceHost(); dash2 = ham_dashboard.HamClockWindow(); host2.add_dashboard(dash2)     # "the next launch"
+    dash2._pskreporter_direction = pskreporter.DIRECTION_HEARING
+    assert [m["tooltip"].splitlines()[0] for m in dash2._build_pskreporter_markers()] == ["W1AW"]
+    print("OK"); sys.stdout.flush(); os._exit(0)
+''' % os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_heard_stations_survive_a_restart(tmp_path):
+    env = dict(os.environ, HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "cfg"),
+               XDG_CACHE_HOME=str(tmp_path / "cache"), QT_QPA_PLATFORM="offscreen")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", PERSIST_SCRIPT], env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0 and "OK" in result.stdout, result.stdout + result.stderr

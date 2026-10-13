@@ -20,7 +20,6 @@ import urllib.request
 from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -34,19 +33,25 @@ from PySide6.QtWidgets import (
 import solar_data
 
 HELIOVIEWER_URL = "https://api.helioviewer.org/v2"
-# Helioviewer's source ids for each view (AIA 193, AIA 304, HMI continuum, HMI magnetogram).
-HELIOVIEWER_SOURCES = {"0193": 11, "0304": 13, "HMIIC": 18, "HMIB": 19}
+# Helioviewer's source ids for each view.
+HELIOVIEWER_SOURCES = {"0094": 8, "0131": 9, "0171": 10, "0193": 11, "0211": 12, "0304": 13, "0335": 14, "HMIIC": 18, "HMIB": 19}
 SDO_URL = "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_512_{code}.jpg"   # the fallback
-# (code, title, what it shows) -- what an operator looks at for propagation.
+# (code, title, what it shows), in the order the arrow buttons step through them.
 SDO_VIEWS = [
-    ("0193", "193 Å  corona", "Hot corona. Dark areas are coronal holes: they send fast solar wind that disturbs the geomagnetic field a couple of days later."),
-    ("0304", "304 Å  chromosphere", "Cooler gas at the Sun's edge: prominences and the bright patches of flaring active regions."),
+    ("0193", "193 Å  corona", "Hot corona (about 1.2 million K). Dark areas are coronal holes: they send fast solar wind that disturbs the geomagnetic field a couple of days later."),
+    ("0304", "304 Å  chromosphere", "Cooler gas (about 50,000 K) at the Sun's edge: prominences and the bright patches of flaring active regions."),
     ("HMIIC", "Visible light", "What the eye would see: sunspots, which drive the sunspot number and solar flux."),
-    ("HMIB", "Magnetogram", "The Sun's magnetic field (black / white are opposite polarities). Tangled pairs mean flare-prone regions."),
+    ("HMIB", "Magnetogram", "The Sun's magnetic field (black and white are opposite polarities). Tangled pairs mean flare-prone regions."),
+    ("0171", "171 Å  quiet corona", "Corona at about 600,000 K: the loops of magnetic field that trace out active regions."),
+    ("0211", "211 Å  active regions", "Corona at about 2 million K: shows active regions and coronal holes."),
+    ("0335", "335 Å  active regions", "Corona at about 2.5 million K: the hottest, brightest parts of active regions."),
+    ("0094", "94 Å  flaring regions", "Corona at about 6 million K: lights up during flares."),
+    ("0131", "131 Å  flares", "Flaring plasma at about 10 million K: the fastest way to see a flare in progress."),
 ]
 REFRESH_MINUTES = 15
-MAX_PICTURE_PIXELS = 360    # each of the four pictures is shown no larger than this
-STALE_HOURS = 3           # an image older than this gets a warning
+MAX_PICTURE_PIXELS = 512    # the picture is shown no larger than this
+STALE_HOURS = 3           # an AIA image older than this gets a warning
+STALE_HOURS_HMI = 12      # the HMI ones normally run hours behind
 _NO_DATA = "--"
 
 _COLORS = {
@@ -153,24 +158,25 @@ class BandConditionsPage(QWidget):
         self.space_weather_label.setWordWrap(True)
         self.space_weather_label.setStyleSheet("color: #aaa;")
 
-        # ---- the Sun ----
-        self.sun_labels, self.caption_labels = {}, {}
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
-        for index, (code, title, tip) in enumerate(SDO_VIEWS):
-            picture = QLabel("loading...")
-            picture.setAlignment(Qt.AlignCenter)
-            picture.setMinimumSize(160, 160)
-            picture.setStyleSheet("background: black; color: #666;")
-            picture.setToolTip(tip)
-            caption = QLabel(title)
-            caption.setAlignment(Qt.AlignCenter)
-            caption.setToolTip(tip)
-            self.sun_labels[code], self.caption_labels[code] = picture, caption
-            cell = QVBoxLayout()
-            cell.addWidget(picture, 1)
-            cell.addWidget(caption)
-            grid.addLayout(cell, index // 2, index % 2)
+        # ---- the Sun: one picture, with arrows to step through the views ----
+        self._index = 0
+        self.picture = QLabel("loading...")
+        self.picture.setAlignment(Qt.AlignCenter)
+        self.picture.setStyleSheet("background: black; color: #666;")
+        self.title_label = QLabel("")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setStyleSheet("font-weight: bold;")
+        self.detail_label = QLabel("")
+        self.detail_label.setAlignment(Qt.AlignCenter)
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setStyleSheet("color: #aaa;")
+        self.prev_button = QPushButton("◀")
+        self.next_button = QPushButton("▶")
+        for button, tip in ((self.prev_button, "Previous picture"), (self.next_button, "Next picture")):
+            button.setToolTip(tip)
+            button.setFixedWidth(48)
+        self.prev_button.clicked.connect(lambda: self.step(-1))
+        self.next_button.clicked.connect(lambda: self.step(1))
         self.sun_status = QLabel("")
         self.sun_status.setWordWrap(True)
         self.refresh_button = QPushButton("Refresh")
@@ -180,6 +186,12 @@ class BandConditionsPage(QWidget):
         sun_header.addWidget(QLabel("<b>The Sun now</b>  (NASA Solar Dynamics Observatory)"))
         sun_header.addStretch()
         sun_header.addWidget(self.refresh_button)
+        viewer = QHBoxLayout()
+        viewer.addStretch(1)
+        viewer.addWidget(self.prev_button)
+        viewer.addWidget(self.picture)
+        viewer.addWidget(self.next_button)
+        viewer.addStretch(1)
 
         for table in (self.hf_table, self.vhf_table):
             self._fit(table)
@@ -190,13 +202,16 @@ class BandConditionsPage(QWidget):
         layout.addWidget(self.vhf_table)
         layout.addWidget(self.space_weather_label)
         layout.addLayout(sun_header)
-        layout.addLayout(grid)
+        layout.addLayout(viewer)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.detail_label)
         layout.addWidget(self.sun_status)
         layout.addStretch()
 
         self._timer = QTimer(self)
         self._timer.setInterval(REFRESH_MINUTES * 60 * 1000)
         self._timer.timeout.connect(lambda: self.refresh_sun(force=True))
+        self._show_current()
 
     # ---- VHF ----
 
@@ -249,11 +264,21 @@ class BandConditionsPage(QWidget):
             return
         self._last_fetch = time.time()
         self.sun_status.setText("Fetching the latest pictures of the Sun...")
-        self._fetcher = SdoFetcher([code for code, _t, _tip in SDO_VIEWS], self)
+        order = SDO_VIEWS[self._index:] + SDO_VIEWS[:self._index]       # the one on screen first, then the rest
+        self._fetcher = SdoFetcher([code for code, _t, _tip in order], self)
         self._fetcher.image_ready.connect(self._on_image)
         self._fetcher.failed.connect(self._on_failed)
-        self._fetcher.finished.connect(self._update_status)
+        self._fetcher.finished.connect(self._show_current)
         self._fetcher.start()
+
+    def step(self, direction):
+        """Show the next (+1) or previous (-1) picture, wrapping round."""
+        self._index = (self._index + direction) % len(SDO_VIEWS)
+        self._show_current()
+
+    @property
+    def current_code(self):
+        return SDO_VIEWS[self._index][0]
 
     def _on_image(self, code, data, modified, source="NASA"):
         pixmap = QPixmap()
@@ -264,45 +289,44 @@ class BandConditionsPage(QWidget):
         self._modified[code] = modified
         self._sources[code] = source
         self._errors.pop(code, None)
-        self._show_pixmap(code)
+        if code == self.current_code:
+            self._show_current()
 
     def _on_failed(self, code, message):
         self._errors[code] = message
-        if code not in self._pixmaps:
-            self.sun_labels[code].setText("unavailable")
-
-    def _show_pixmap(self, code):
-        pixmap = self._pixmaps.get(code)
-        if pixmap is None:
-            return
-        label = self.sun_labels[code]
-        side = max(160, min(MAX_PICTURE_PIXELS, label.width()))
-        label.setPixmap(pixmap.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if code == self.current_code:
+            self._show_current()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        for code in self._pixmaps:
-            self._show_pixmap(code)
+        self._show_current()
 
-    def _update_status(self):
-        now = time.time()
-        ages = [now - t for t in self._modified.values() if t]
-        text = ""
-        if ages:
-            newest, oldest = min(ages), max(ages)
-            text = f"Pictures taken {age_text(newest)}" + (f" (the oldest {age_text(oldest)})" if oldest - newest > 900 else "") + "."
-            if newest > STALE_HOURS * 3600:
-                text += (f"  ⚠ The newest picture is {age_text(newest)} old, so these may not show the Sun as it is now -- "
-                         "the image feed may not be updating.")
-            sources = sorted(set(self._sources.values()))
-            if sources:
-                text += f"  (From {' and '.join(sources)}.)"
-        if self._errors:
-            text += ("  " if text else "") + f"Couldn't fetch {len(self._errors)} picture(s): {next(iter(self._errors.values()))}."
-        self.sun_status.setText(text or "No pictures yet.")
-        for code, (_c, title, _t) in zip((c for c, _t, _tip in SDO_VIEWS), SDO_VIEWS):
-            modified = self._modified.get(code)
-            self.caption_labels[code].setText(f"{title}  ·  {age_text(now - modified)}" if modified else title)
+    def _show_current(self):
+        """Puts the selected view on screen with its title, age, source and a warning if it is old."""
+        code, title, tip = SDO_VIEWS[self._index]
+        self.title_label.setText(f"{title}   ({self._index + 1} of {len(SDO_VIEWS)})")
+        self.picture.setToolTip(tip)
+        pixmap = self._pixmaps.get(code)
+        side = max(280, min(MAX_PICTURE_PIXELS, self.width() - 140))     # a square, as big as fits
+        self.picture.setFixedSize(side, side)
+        if pixmap is not None:
+            self.picture.setPixmap(pixmap.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.picture.setPixmap(QPixmap())
+            self.picture.setText("unavailable" if code in self._errors else "loading...")
+        detail = tip
+        modified = self._modified.get(code)
+        if pixmap is not None and modified:
+            age = time.time() - modified
+            detail += f"\nTaken {age_text(age)}, from {self._sources.get(code, '?')}."
+            limit = STALE_HOURS_HMI if code.startswith("HMI") else STALE_HOURS
+            if age > limit * 3600:
+                detail += f"  ⚠ That is {age_text(age)} -- the image feed may not be updating, so this may not show the Sun as it is now."
+        elif code in self._errors:
+            detail += f"\nCouldn't fetch it: {self._errors[code]}"
+        self.detail_label.setText(detail)
+        if self._fetcher is not None and self._fetcher.isFinished():
+            self.sun_status.setText("" if self._pixmaps else "No pictures of the Sun could be fetched.")
 
     def closeEvent(self, event):
         if self._fetcher is not None:

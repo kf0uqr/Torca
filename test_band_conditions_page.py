@@ -149,27 +149,50 @@ def wait(app, condition, seconds=15.0):
     return False
 
 
-def test_pictures_are_fetched_shown_and_dated(app, monkeypatch):
+def loaded(page, n=len(bcp.SDO_VIEWS)):
+    return len(page._pixmaps) + len(page._errors) >= n and page._fetcher.isFinished()
+
+
+def test_one_picture_is_shown_fetched_and_dated(app, monkeypatch):
     sun = _Sun(age_seconds=600)
     point_at(monkeypatch, sun)
     page = bcp.BandConditionsPage(hf_table())
     try:
         page.resize(900, 900); page.show()                               # showing it fetches
-        assert wait(app, lambda: len(page._pixmaps) == 4 and page._fetcher.isFinished())
+        assert wait(app, lambda: loaded(page))
         app.processEvents()
-        closest = sorted(r.split("sourceId=")[1] for r in sun.requests if "getClosestImage" in r)
-        assert closest == sorted(str(i) for i in bcp.HELIOVIEWER_SOURCES.values())          # one question per view...
-        assert sum("takeScreenshot" in r for r in sun.requests) == 4                         # ...and one picture each
+        assert page.title_label.text() == "193 Å  corona   (1 of 9)" and not page.picture.pixmap().isNull()
+        assert "Taken 10 min ago, from Helioviewer." in page.detail_label.text() and "⚠" not in page.detail_label.text()
+        closest = [r.split("sourceId=")[1] for r in sun.requests if "getClosestImage" in r]
+        assert closest[0] == "11" and sorted(closest) == sorted(str(i) for i in bcp.HELIOVIEWER_SOURCES.values())   # the one on screen first, then all the rest
+        assert sum("takeScreenshot" in r for r in sun.requests) == 9
         assert not any(r.startswith("/latest_") for r in sun.requests)                        # NASA's static files are only a fallback
-        assert all(not label.pixmap().isNull() for label in page.sun_labels.values())
-        assert "10 min ago" in page.caption_labels["0193"].text()
-        assert "Pictures taken 10 min ago." in page.sun_status.text() and "⚠" not in page.sun_status.text()
-        assert "From Helioviewer" in page.sun_status.text()
         before = len(sun.requests)
         page.refresh_sun()                                                # fresh enough: no new requests
         assert len(sun.requests) == before
         page.refresh_button.click()                                       # the button always fetches
-        assert wait(app, lambda: len(sun.requests) == before + 8)
+        assert wait(app, lambda: len(sun.requests) == before + 18)
+    finally:
+        page.hide(); page._fetcher.wait(5000); sun.close()
+
+
+def test_the_arrows_step_through_every_picture_and_wrap_round(app, monkeypatch):
+    sun = _Sun()
+    point_at(monkeypatch, sun)
+    page = bcp.BandConditionsPage(hf_table())
+    try:
+        page.resize(900, 900); page.show()
+        assert wait(app, lambda: loaded(page))
+        seen = [page.title_label.text()]
+        for _ in range(len(bcp.SDO_VIEWS)):
+            page.next_button.click()
+            seen.append(page.title_label.text())
+            assert not page.picture.pixmap().isNull()                      # already fetched: no waiting between pictures
+        assert seen[0] == seen[-1] and len(set(seen)) == 9 and seen[1].endswith("(2 of 9)")
+        page.prev_button.click()
+        assert page.title_label.text().endswith("(9 of 9)")                # backwards from the first wraps to the last
+        assert bcp.SDO_VIEWS[page._index][1] in page.title_label.text()
+        assert bcp.SDO_VIEWS[page._index][2] in page.detail_label.text()    # what the picture shows is explained
     finally:
         page.hide(); page._fetcher.wait(5000); sun.close()
 
@@ -180,9 +203,24 @@ def test_an_old_picture_is_flagged_not_passed_off_as_current(app, monkeypatch):
     page = bcp.BandConditionsPage(hf_table())
     try:
         page.show()
-        assert wait(app, lambda: len(page._pixmaps) == 4 and page._fetcher.isFinished())
+        assert wait(app, lambda: loaded(page))
         app.processEvents()
-        assert "21 days ago" in page.sun_status.text() and "⚠" in page.sun_status.text() and "may not show the Sun as it is now" in page.sun_status.text()
+        assert "21 days ago" in page.detail_label.text() and "⚠" in page.detail_label.text() and "may not show the Sun as it is now" in page.detail_label.text()
+    finally:
+        page.hide(); page._fetcher.wait(5000); sun.close()
+
+
+def test_the_hmi_pictures_may_be_hours_old_before_they_are_flagged(app, monkeypatch):
+    sun = _Sun(age_seconds=5 * 3600)                                       # AIA 5 h old is stale; HMI 5 h old is normal
+    point_at(monkeypatch, sun)
+    page = bcp.BandConditionsPage(hf_table())
+    try:
+        page.show()
+        assert wait(app, lambda: loaded(page))
+        app.processEvents()
+        assert "⚠" in page.detail_label.text()                             # the corona picture
+        page.step(1); page.step(1)                                         # visible light
+        assert page.title_label.text().startswith("Visible light") and "5 h ago" in page.detail_label.text() and "⚠" not in page.detail_label.text()
     finally:
         page.hide(); page._fetcher.wait(5000); sun.close()
 
@@ -193,9 +231,9 @@ def test_when_helioviewer_is_down_nasas_static_pictures_are_used(app, monkeypatc
     page = bcp.BandConditionsPage(hf_table())
     try:
         page.show()
-        assert wait(app, lambda: len(page._pixmaps) == 4 and page._fetcher.isFinished())
+        assert wait(app, lambda: loaded(page))
         app.processEvents()
-        assert set(page._sources.values()) == {"NASA"} and "From NASA" in page.sun_status.text() and "20 min ago" in page.caption_labels["0304"].text()
+        assert set(page._sources.values()) == {"NASA"} and "Taken 20 min ago, from NASA." in page.detail_label.text()
     finally:
         page.hide(); page._fetcher.wait(5000); sun.close()
 
@@ -206,8 +244,14 @@ def test_a_missing_picture_is_reported_and_the_others_still_show(app, monkeypatc
     page = bcp.BandConditionsPage(hf_table())
     try:
         page.show()
-        assert wait(app, lambda: page._fetcher.isFinished() and "Couldn't fetch 1 picture" in page.sun_status.text())
-        assert sorted(page._pixmaps) == ["0193", "0304", "HMIIC"] and page.sun_labels["HMIB"].text() == "unavailable"
+        assert wait(app, lambda: loaded(page))
+        app.processEvents()
+        assert len(page._pixmaps) == 8 and "HMIB" in page._errors
+        page.step(1); page.step(1); page.step(1)                           # the magnetogram
+        assert page.title_label.text().startswith("Magnetogram") and page.picture.text() == "unavailable"
+        assert "Couldn't fetch it" in page.detail_label.text()
+        page.step(1)
+        assert not page.picture.pixmap().isNull()                          # the next one is fine
     finally:
         page.hide(); page._fetcher.wait(5000); sun.close()
 

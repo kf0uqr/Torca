@@ -11,10 +11,16 @@ is listed with its signal, callsign, grid, power and distance from you. Stations
 with a grid also appear on the map (the PSKReporter overlay, "stations you are
 hearing"). See wspr.py for how decoding works (it needs WSJT-X's `wsprd`).
 
-Receive only (no transmitting). Optionally uploads each spot to WSPRnet (wsprnet.py), off
-until the operator ticks "Upload spots to WSPRnet" and has been told what becomes public.
+It can also run a beacon: with "Enable Beacon" on, the tool transmits your callsign, grid square and power
+in a random share of the two-minute slots (the TX % box), through the radio the tool was opened on. The
+transmission starts a second into an even-minute slot and lasts 110.6 s, and it only goes out while that
+radio is on a standard WSPR frequency. The beacon is always off when the tool opens and is stopped by Halt TX,
+by turning it off, by closing the tool, or by the radio closing. Optionally uploads each spot to WSPRnet
+(wsprnet.py), off until the operator ticks "Upload spots to WSPRnet" and has been told what becomes public.
 """
 
+import math
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +35,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QCheckBox,
     QMessageBox,
+    QSpinBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -40,7 +47,7 @@ import ft8_decoder
 import ft8_qso
 import wspr
 import wsprnet
-from constants import AUDIO_DEFAULT_SAMPLE_RATE
+from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
 from rx_radio import ReceiveRadioSelector
 
 _SETTINGS_ORG = "IcomRadioApp"
@@ -74,6 +81,14 @@ class WsprToolWindow(QWidget):
         self._last_slot_summary = ""
         self._heard_calls = set()
         self._closing_for_real = False
+        self._rng = random.random          # replaced in tests
+        self._sending = False
+        self._decided_slot = None          # the slot index the beacon last decided about
+        self._will_transmit = False        # ...and what it decided
+        self._last_tx_slot = None
+        self._tx_slots = set()             # start times of slots we transmitted in: nothing to decode from them
+        self._confirmed_beacon = False
+        self._tx_cache = (None, None)
 
         self.band_combo = QComboBox()
         for band, dial in wspr.BAND_DIAL_MHZ.items():
@@ -92,6 +107,52 @@ class WsprToolWindow(QWidget):
         self.rx_selector.lost.connect(self._on_receive_radio_lost)
         clear_button = QPushButton("Clear")
         clear_button.clicked.connect(self._on_clear_clicked)
+
+        # ---- the beacon ----
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        self.beacon_button = QPushButton("Enable Beacon")
+        self.beacon_button.setCheckable(True)
+        self.beacon_button.setStyleSheet("QPushButton:checked { background-color: #a02020; color: white; font-weight: bold; }")
+        self.beacon_button.setToolTip("Transmit WSPR beacons automatically (off every time this tool opens).")
+        self.beacon_button.toggled.connect(self._on_beacon_toggled)
+        self.halt_button = QPushButton("Halt TX")
+        self.halt_button.setToolTip("Stop transmitting at once and turn the beacon off.")
+        self.halt_button.clicked.connect(self.halt_tx)
+        self.tx_percent_spin = QSpinBox()
+        self.tx_percent_spin.setRange(0, 100)
+        self.tx_percent_spin.setSuffix(" %")
+        self.tx_percent_spin.setValue(settings.value("wspr_tx_percent", 20, type=int))
+        self.tx_percent_spin.setToolTip("The share of two-minute slots the beacon transmits in, chosen at random (WSPR stations "
+                                        "share the band by taking turns; 10-25 % is usual).")
+        self.tx_freq_spin = QSpinBox()
+        self.tx_freq_spin.setRange(*wspr.TX_AUDIO_RANGE_HZ)
+        self.tx_freq_spin.setSuffix(" Hz")
+        self.tx_freq_spin.setValue(settings.value("wspr_tx_hz", 1500, type=int))
+        self.tx_freq_spin.setToolTip("Where in the audio passband the signal sits (the WSPR sub-band is 1400-1600 Hz).")
+        self.power_combo = QComboBox()
+        for dbm in wspr.VALID_POWERS_DBM:
+            self.power_combo.addItem(wspr.power_label(dbm), dbm)
+        self.power_combo.setCurrentIndex(max(self.power_combo.findData(settings.value("wspr_tx_dbm", 30, type=int)), 0))
+        self.power_combo.setToolTip("The power your station really puts out. It is sent in the message, so reports of your signal mean "
+                                    "something: set the radio's power (and the audio level) to match.")
+        self.level_spin = QSpinBox()
+        self.level_spin.setRange(1, 100)
+        self.level_spin.setSuffix(" %")
+        self.level_spin.setValue(settings.value("wspr_tx_level", 30, type=int))
+        self.level_spin.setToolTip("Audio level sent to the radio. WSPR is a constant-envelope signal: keep it low enough that the "
+                                   "ALC barely moves.")
+        self.beacon_status = QLabel("")
+        self.beacon_status.setStyleSheet("color: #aaa;")
+        beacon_row = QHBoxLayout()
+        beacon_row.addWidget(self.beacon_button)
+        beacon_row.addWidget(self.halt_button)
+        for text, widget in (("TX:", self.tx_percent_spin), ("Tone:", self.tx_freq_spin), ("Power:", self.power_combo), ("Level:", self.level_spin)):
+            beacon_row.addWidget(QLabel(text))
+            beacon_row.addWidget(widget)
+        beacon_row.addStretch()
+        self._beacon_timer = QTimer(self)
+        self._beacon_timer.setInterval(100)
+        self._beacon_timer.timeout.connect(lambda: self._beacon_tick())
 
         self.upload_check = QCheckBox("Upload spots to WSPRnet")
         self.upload_check.setToolTip(
@@ -142,6 +203,8 @@ class WsprToolWindow(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addLayout(row)
+        layout.addLayout(beacon_row)
+        layout.addWidget(self.beacon_status)
         layout.addWidget(self.hint_label)
         layout.addWidget(self.status_label)
         layout.addWidget(self.audio_warning_label)
@@ -238,6 +301,8 @@ class WsprToolWindow(QWidget):
         dial = self._radio_dial_mhz()
         if dial is None:
             return
+        if slot.slot_start in self._tx_slots:
+            return                               # we were transmitting in this slot: there is nothing to hear
         with self._pending_lock:
             if self._pending:
                 return                           # the last slot is still being decoded: skip rather than fall behind
@@ -284,6 +349,132 @@ class WsprToolWindow(QWidget):
             self.stations_heard.emit(list(heard.values()))
         if self.upload_check.isChecked():
             self._upload(spots)
+
+    # ---- the beacon ----
+
+    def _beacon_station(self):
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        call = (settings.value("operator_callsign", "") or "").strip().upper()
+        try:
+            grid = ft8_qso.latlon_to_grid(float(settings.value("operator_lat", 0.0) or 0.0),
+                                          float(settings.value("operator_lon", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            grid = ""
+        return call, grid
+
+    def _on_beacon_toggled(self, enabled):
+        if not enabled:
+            self._beacon_timer.stop()
+            self._stop_audio()
+            self.beacon_status.setText("Beacon off.")
+            return
+        problem = None
+        call, grid = self._beacon_station()
+        try:
+            wspr.beacon_message(call, grid, self.power_combo.currentData())
+        except ValueError as exc:
+            problem = str(exc)
+        if problem is None and not wspr.can_encode():
+            problem = "Transmitting needs `wsprsim`, which comes with WSJT-X (Debian/Ubuntu: sudo apt install wsjtx)."
+        if problem is None and not self._confirmed_beacon:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Start the WSPR beacon")
+            box.setText(
+                f"This will transmit {call} {grid} at {wspr.power_label(self.power_combo.currentData())} automatically, in about "
+                f"{self.tx_percent_spin.value()}% of the two-minute slots, through {self._radio_window.display_name()}, "
+                "without you pressing anything -- each transmission lasts almost two minutes.\n\n"
+                "You are responsible for transmitting only where and how your licence allows, and for the power "
+                "you send being the power you really use. Halt TX stops it at once.\n\nStart the beacon?")
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.No)
+            if box.exec() != QMessageBox.Yes:
+                problem = "Beacon not started."
+            else:
+                self._confirmed_beacon = True
+        if problem is not None:
+            self.beacon_status.setText(problem)
+            self.beacon_button.blockSignals(True)
+            self.beacon_button.setChecked(False)
+            self.beacon_button.blockSignals(False)
+            return
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        settings.setValue("wspr_tx_percent", self.tx_percent_spin.value())
+        settings.setValue("wspr_tx_hz", self.tx_freq_spin.value())
+        settings.setValue("wspr_tx_dbm", self.power_combo.currentData())
+        settings.setValue("wspr_tx_level", self.level_spin.value())
+        self._decided_slot = None
+        self._beacon_timer.start()
+        self._beacon_tick()
+
+    def halt_tx(self):
+        """Stops transmitting at once and turns the beacon off."""
+        self.beacon_button.setChecked(False)
+
+    def _stop_audio(self):
+        if self._sending:
+            self._radio_window.worker.stop_tx_audio_send()
+            self._sending = False
+
+    def _beacon_tick(self, now=None):
+        """Ten times a second while the beacon is on: at the start of each two-minute slot decide (at random,
+        TX % of the time) whether to transmit in it, and start the transmission a second into the slot."""
+        now = self._clock() if now is None else now
+        if not self.beacon_button.isChecked():
+            return
+        slot = math.floor(now / wspr.SLOT_SECONDS)
+        into = now - slot * wspr.SLOT_SECONDS
+        if slot != self._decided_slot:
+            self._decided_slot = slot
+            self._will_transmit = self._rng() * 100.0 < self.tx_percent_spin.value()
+        if self._sending:
+            return
+        if self._will_transmit and slot != self._last_tx_slot and wspr.SIGNAL_START - 0.1 <= into <= 4.0:
+            self._start_beacon_transmission(slot)
+            return
+        if not self._sending:
+            remaining = wspr.SLOT_SECONDS - into
+            what = "will transmit in this slot" if self._will_transmit and into < 4.0 else "listening"
+            self.beacon_status.setText(
+                f"Beacon on ({self.tx_percent_spin.value()}% of slots) -- {what}; next slot in {int(remaining // 60)}:{int(remaining % 60):02d}")
+
+    def _start_beacon_transmission(self, slot):
+        radio = self._radio_window
+        hz = getattr(radio, "_current_freq_hz", None) or 0
+        if wspr.nearest_band(hz) is None:
+            self._last_tx_slot = slot
+            self.beacon_status.setText(
+                f"Skipped a slot: {radio.display_name()} is not on a WSPR frequency ({hz / 1e6:.4f} MHz). Tune it to the band's WSPR dial frequency.")
+            return
+        if getattr(radio, "ptt_button", None) is not None and radio.ptt_button.isChecked():
+            self._last_tx_slot = slot
+            self.beacon_status.setText("Skipped a slot: the radio is already transmitting.")
+            return
+        call, grid = self._beacon_station()
+        dbm, hz_tone, level = self.power_combo.currentData(), self.tx_freq_spin.value(), self.level_spin.value()
+        key = (call, grid, dbm, hz_tone, level)
+        try:
+            if self._tx_cache[0] != key:
+                self._tx_cache = (key, wspr.beacon_audio(call, grid, dbm, hz_tone, level / 100.0, AUDIO_TX_PCM_SAMPLE_RATE))
+            message, pcm = self._tx_cache[1]
+        except (ValueError, RuntimeError) as exc:
+            self.halt_tx()
+            self.beacon_status.setText(str(exc))
+            return
+        self._last_tx_slot = slot
+        self._sending = True
+        self._tx_slots.add(float(slot * wspr.SLOT_SECONDS))
+        radio.worker.send_tx_audio_pcm(pcm)
+        duration = len(pcm) / (AUDIO_TX_PCM_SAMPLE_RATE * 2)
+        self.beacon_status.setText(f"TRANSMITTING: {message} on {wspr.nearest_band(hz)[0]} for {duration:.0f} s")
+        QTimer.singleShot(int((duration + 0.6) * 1000), self._on_beacon_finished)
+
+    def _on_beacon_finished(self):
+        if not self._sending:
+            return                                   # halted meanwhile
+        self._sending = False
+        if self.beacon_button.isChecked():
+            self.beacon_status.setText("Transmission finished; the beacon carries on.")
 
     # ---- WSPRnet upload ----
 
@@ -419,6 +610,8 @@ class WsprToolWindow(QWidget):
         self.close()
 
     def closeEvent(self, event):
+        if self.beacon_button.isChecked():
+            self.halt_tx()            # never leave a transmitter running behind a hidden window
         if self.decode_toggle_button.isChecked():
             self.decode_toggle_button.setChecked(False)
         if self._closing_for_real:

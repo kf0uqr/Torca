@@ -20,7 +20,7 @@ A PySide6 GUI for controlling amateur radios via [rigplane](https://pypi.org/pro
 - PSK31: BPSK31 send/decode with an adjustable audio tone, macro bank.
 - SSTV: continuous image decode (multiple modes auto-detected).
 - VOACAP propagation overlay: a band-selectable map layer of predicted HF reliability from your location, run through the `voacapl` program (`sudo apt install voacapl`).
-- WSPR: receive-only beacon decoding by band, with distances, map plotting and optional (opt-in) upload to WSPRnet (uses `wsprd` from a WSJT-X install).
+- WSPR: beacon decoding by band with distances, map plotting and optional (opt-in) upload to WSPRnet, plus a scheduled transmitting beacon (uses `wsprd` / `wsprsim` from a WSJT-X install).
 - FT8 / FT4: decode and make contacts in both modes through the radio's audio (no WSJT-X needed) -- double-click a station or call CQ and the exchange is sequenced and logged for you; built on the bundled ft8_lib.
 - APRS: full packet decode (position/Mic-E/compressed/status/object/item/messages/telemetry/weather/third-party-relayed), symbol translation, packet send, and an optional `direwolf`-backed decoder alongside the built-in one.
 

@@ -166,6 +166,45 @@ def distance_km(my_grid, grid):
     return 2 * 6371.0 * math.asin(math.sqrt(h))
 
 
+# ---- transmitting: the beacon -----------------------------------------------------
+
+# The power levels a WSPR message can carry, dBm (the message holds a number from this list, not any value).
+VALID_POWERS_DBM = (0, 3, 7, 10, 13, 17, 20, 23, 27, 30, 33, 37, 40, 43, 47, 50, 53, 57, 60)
+TX_AUDIO_RANGE_HZ = (1410, 1590)     # the 200 Hz WSPR sub-band is 1400-1600 Hz of audio; the signal itself is 6 Hz wide
+_STANDARD_CALL = re.compile(r"^[A-Z0-9]{1,2}[0-9][A-Z]{1,3}$")     # no prefix/suffix forms: those need WSPR's other message types
+
+
+def can_encode():
+    """Transmitting needs wsprsim (it comes with WSJT-X) to turn a message into WSPR's channel symbols."""
+    return shutil.which("wsprsim") is not None
+
+
+def power_label(dbm):
+    watts = 10 ** (dbm / 10.0) / 1000.0
+    return f"{dbm} dBm  ({watts:.3g} W)" if watts >= 1 else f"{dbm} dBm  ({watts * 1000:.3g} mW)"
+
+
+def beacon_message(callsign, grid, dbm):
+    """The WSPR message text "KF0UQR EM18 37", or raises ValueError saying what is wrong with it."""
+    callsign = (callsign or "").strip().upper()
+    grid = (grid or "").strip().upper()[:4]
+    if not _STANDARD_CALL.match(callsign):
+        raise ValueError(f"'{callsign or 'no callsign'}' can't be sent as a standard WSPR message "
+                         "(set your plain callsign in Profile; callsigns with a prefix or suffix aren't supported yet).")
+    if not re.fullmatch(r"[A-R]{2}\d{2}", grid):
+        raise ValueError("Your location isn't set (Profile), so there is no grid square to send.")
+    if dbm not in VALID_POWERS_DBM:
+        raise ValueError(f"{dbm} dBm is not a power WSPR can send.")
+    return f"{callsign} {grid} {dbm}"
+
+
+def beacon_audio(callsign, grid, dbm, audio_hz, level=0.3, sample_rate=48000):
+    """One WSPR transmission (110.6 s) as mono 16-bit PCM at `sample_rate`: (message text, pcm bytes)."""
+    message = beacon_message(callsign, grid, dbm)
+    symbols = channel_symbols(message)
+    return message, synthesize(symbols, audio_hz, amplitude=level, sample_rate=sample_rate, signal_only=True)
+
+
 # ---- for tests: a WSPR signal -----------------------------------------------------
 
 def channel_symbols(message):
@@ -182,12 +221,15 @@ def channel_symbols(message):
     return symbols
 
 
-def synthesize(symbols, audio_hz=1500.0, amplitude=0.1, sample_rate=DECODER_RATE):
-    """One slot of audio (mono 16-bit PCM, two minutes) carrying `symbols` from 1 s in."""
+def synthesize(symbols, audio_hz=1500.0, amplitude=0.1, sample_rate=DECODER_RATE, signal_only=False):
+    """One slot of audio (mono 16-bit PCM, two minutes) carrying `symbols` from 1 s in -- or, with
+    signal_only, just the 110.6 s of signal itself."""
     import numpy as np
     per_symbol = int(round(SYMBOL_SAMPLES * sample_rate / DECODER_RATE))
     tones = audio_hz + np.repeat(np.array(symbols, dtype=float), per_symbol) * TONE_SPACING_HZ
     phase = 2 * math.pi * np.cumsum(tones) / sample_rate
+    if signal_only:
+        return (np.clip(np.sin(phase) * amplitude, -1, 1) * 32767).astype("<i2").tobytes()
     signal = np.zeros(int(SLOT_SECONDS * sample_rate))
     start = int(SIGNAL_START * sample_rate)
     signal[start:start + len(phase)] = np.sin(phase) * amplitude

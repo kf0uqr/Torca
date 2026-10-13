@@ -42,6 +42,17 @@ NOAA_SUNSPOT_URL = "https://services.swpc.noaa.gov/json/solar-cycle/observed-sol
 HAMQSL_XML_URL = "https://www.hamqsl.com/solarxml.php"
 BAND_CONDITION_RANGES = ["80m-40m", "30m-20m", "17m-15m", "12m-10m"]
 
+# VHF conditions in the same feed: (phenomenon name, location) -> what it is, in display order.
+VHF_CONDITIONS = [
+    (("vhf-aurora", "northern_hemi"), "Aurora (northern hemisphere)"),
+    (("E-Skip", "north_america"), "2 m E-skip, North America"),
+    (("E-Skip", "europe"), "2 m E-skip, Europe"),
+    (("E-Skip", "europe_4m"), "4 m E-skip, Europe"),
+    (("E-Skip", "europe_6m"), "6 m E-skip, Europe"),
+]
+# Readings from the same feed worth showing beside them: (tag, label, unit).
+VHF_EXTRA_TAGS = ("aurora", "latdegree", "solarwind", "magneticfield", "xray", "aindex", "kindex", "protonflux")
+
 
 def _fetch_json(url, timeout=10):
     with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -73,8 +84,17 @@ def fetch_band_conditions():
     for elem in root.iter():
         name = elem.get("name")
         time_of_day = elem.get("time")
+        location = elem.get("location")
         if name and time_of_day and elem.text:
             conditions[(name.strip(), time_of_day.strip().lower())] = elem.text.strip()
+        elif name and location and elem.text:
+            # VHF phenomena: ("vhf-aurora", "northern_hemi") -> "Band Closed", ("E-Skip", "europe") -> ...
+            conditions[(name.strip(), location.strip().lower())] = elem.text.strip()
+    # The feed's own space-weather readings that matter for VHF (aurora, wind, field): ("extra", tag).
+    for tag in VHF_EXTRA_TAGS:
+        element = root.find(f".//{tag}")
+        if element is not None and element.text and element.text.strip():
+            conditions[("extra", tag)] = element.text.strip()
 
     if not conditions:
         # Didn't find the expected structure at all -- report what the

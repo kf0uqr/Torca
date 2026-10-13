@@ -214,6 +214,7 @@ The dialog shows three randomly generated access links/tokens -- **operator** (f
 
 | File | Purpose |
 | --- | --- |
+| `band_conditions_page.py` | The Band Conditions tab: HF, VHF (aurora / sporadic-E) and NASA SDO pictures of the Sun |
 | `ham_dashboard.py` | `HamClockWindow` -- the central window: map, satellites, logging, spot networks, radio/Virtual Cable/rigctld management |
 | `main_window.py` | `RadioWindow` -- the per-radio window: scope/waterfall, meters, band buttons, tool launchers |
 | `widgets.py` | `SpectrumWidget`, `WaterfallWidget`, `BandPlanOverlayWidget`, `MeterWidget`, `TuningKnobWidget` |

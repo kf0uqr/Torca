@@ -21,6 +21,7 @@ Step-by-step instructions for every feature in TORCA. See [README.md](README.md)
   - [WSPR](#wspr-tool)
 - [QSO Log Book](#qso-log-book)
 - [World map & overlays](#world-map--overlays)
+- [Band Conditions](#band-conditions)
 - [Spot networks](#spot-networks)
   - [POTA](#pota)
   - [PSKReporter](#pskreporter)
@@ -156,6 +157,10 @@ Opened from the Ham Dashboard's **Log Book...** button. Lists every QSO from a l
 ## World map & overlays
 
 The Ham Dashboard's day/night map shows the terminator, sub-solar point, your own location, and (while satellite tracking is on) satellite markers with footprint circles and ground tracks. A **Sat** button under the zoom controls toggles the background between OpenStreetMap and satellite imagery. Toggle buttons add: **QSO Map** (your logged contacts), **POTA**, **PSKReporter**, and **APRS** station markers -- see below for each.
+
+## Band Conditions
+
+Open **Band Conditions** from a workspace's **+** menu. It shows, top to bottom: the **HF conditions** (Good / Fair / Poor by band group, day and night -- N0NBH's calculation); the **VHF conditions** from the same feed -- aurora and 2 m / 4 m / 6 m sporadic-E -- with the space-weather readings behind them (aurora index and how far south it reaches, solar-wind speed, Bz, K and A index, X-ray level, protons); and **The Sun now**, four pictures from NASA's Solar Dynamics Observatory: the 193 Å corona (dark coronal holes), the 304 Å chromosphere (prominences, flare regions), visible light (sunspots) and a magnetogram. Each picture's caption says how old it is. The pictures refresh when the tab is shown and every 15 minutes while it stays open (or press **Refresh**). If NASA's "latest" pictures are hours old, the tab says so rather than letting an old picture pass for the current Sun.
 
 ## Spot networks
 

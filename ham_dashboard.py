@@ -67,6 +67,7 @@ from PySide6.QtWidgets import (
 )
 
 from solar_data import SolarDataWorker, BAND_CONDITION_RANGES
+from band_conditions_page import BandConditionsPage
 from audio_tab import AudioTab
 from workspace_host import present_window, retire_button
 from workspace_state import find_connection_profile
@@ -1221,7 +1222,8 @@ class HamClockWindow(QWidget):
         # sits in (see bottom_row, below) stays visually balanced
         # regardless of which tab is active.
         self.band_data_tabs = QTabWidget()
-        self.band_data_tabs.addTab(self.band_conditions_table, "Band Conditions")
+        self.band_conditions_page = BandConditionsPage(self.band_conditions_table)
+        self.band_data_tabs.addTab(self.band_conditions_page, "Band Conditions")
         self.band_data_tabs.addTab(contests_tab, "Contests")
         self.band_data_tabs.addTab(dx_spots_tab, "DX Spots")
         self.band_data_tabs.addTab(self.parks_tab, "Parks")
@@ -2628,7 +2630,7 @@ class HamClockWindow(QWidget):
         for _title, page in pages:
             page.setMinimumHeight(0)
             page.setMaximumHeight(16777215)
-        for table in (self.upcoming_passes_table, self.band_conditions_table):
+        for table in (self.upcoming_passes_table,):    # (the band-conditions tables size themselves, see BandConditionsPage)
             table.setMinimumHeight(0)
             table.setMaximumHeight(16777215)
 
@@ -3302,6 +3304,7 @@ class HamClockWindow(QWidget):
             self.ssn_label.setText(f"SSN: {data['sunspot_number']}")
         if "band_conditions" in data:
             self._update_band_conditions_table(data["band_conditions"])
+            self.band_conditions_page.update_vhf(data["band_conditions"])
 
         errors = {k: v for k, v in data.items() if k.endswith("_error")}
         for key, message in errors.items():

@@ -59,6 +59,11 @@ class PskReporterUnavailable(RuntimeError):
         self.rate_limited = rate_limited
 
 
+# What the last fetch found, for the dashboard to show: how many reports the server returned and
+# how many of them could not be plotted (no grid square). One fetch runs at a time.
+last_stats = {"received": 0, "no_locator": 0, "direction": "", "callsign": ""}
+
+
 def _looks_rate_limited(text):
     text = (text or "").lower()
     return "too many" in text or "rate limit" in text or "slow down" in text
@@ -111,7 +116,9 @@ def _fetch_reports(callsign: str, direction: str, since_seconds: int) -> list:
         raise PskReporterUnavailable("PSKReporter sent a reply TORCA could not read.") from exc
 
     reports = []
+    received = no_locator = 0
     for element in root.iter("receptionReport"):
+        received += 1
         attrs = element.attrib
         try:
             frequency_hz = int(attrs["frequency"])
@@ -128,6 +135,7 @@ def _fetch_reports(callsign: str, direction: str, since_seconds: int) -> list:
             other_callsign = attrs.get("senderCallsign")
             other_locator = attrs.get("senderLocator")
         if not other_callsign or not other_locator:
+            no_locator += 1
             continue  # nothing to plot without a locator
         reports.append({
             "callsign": other_callsign,
@@ -146,6 +154,8 @@ def _fetch_reports(callsign: str, direction: str, since_seconds: int) -> list:
             # above for filtering/sorting.
             "raw": dict(attrs),
         })
+    last_stats.update(received=received, no_locator=no_locator, direction=direction, callsign=callsign)
+    print(f"[PSKReporter] {direction} {callsign}: {received} report(s) from the server, {no_locator} without a grid square.")
     return reports
 
 

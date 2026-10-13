@@ -2118,8 +2118,21 @@ class HamClockWindow(QWidget):
         self._pskreporter_worker = worker
         worker.start()
 
+    def _pskreporter_fetch_summary(self, spots):
+        """One line saying what the server returned -- so an empty map can be told apart from an empty answer."""
+        stats = pskreporter.last_stats
+        if stats["received"] == 0:
+            return (f"PSKReporter has no reports for {self._operator_callsign} in this time frame "
+                    f"({'stations you heard' if self._pskreporter_direction == pskreporter.DIRECTION_HEARING else 'stations that heard you' if self._pskreporter_direction == pskreporter.DIRECTION_HEARD_YOU else 'both directions'}).")
+        text = f"PSKReporter returned {stats['received']} report(s)"
+        if stats["no_locator"]:
+            text += f"; {stats['no_locator']} had no grid square, so they can't be plotted"
+        return text + "."
+
     def _on_pskreporter_spots_ready(self, spots):
         self._set_pskreporter_problem("")
+        summary = self._pskreporter_fetch_summary(spots)
+        self.pskreporter_button.setToolTip(f"{self._pskreporter_base_tooltip}\n\n{summary}")
         self._pskreporter_spots_cache = spots
         if self.pskreporter_button.isChecked():
             self.map_widget.set_pskreporter_markers(self._build_pskreporter_markers())

@@ -150,3 +150,21 @@ def test_query_failures_are_turned_into_plain_unavailable_errors(monkeypatch):
     with pytest.raises(pskreporter.PskReporterUnavailable) as caught:
         pskreporter.fetch_pskreporter_spots("KF0UQR", "hearing", 3600)
     assert not caught.value.rate_limited and "could not read" in str(caught.value)
+
+
+def test_fetch_counts_what_the_server_returned_and_what_could_not_be_plotted(monkeypatch):
+    import pskreporter
+
+    xml = (b'<?xml version="1.0"?><receptionReports>'
+           b'<receptionReport receiverCallsign="KF0UQR" receiverLocator="EM18ge" senderCallsign="W1AW" senderLocator="FN31" frequency="14074500" flowStartSeconds="1791858000" mode="FT8" sNR="-9"/>'
+           b'<receptionReport receiverCallsign="KF0UQR" receiverLocator="EM18ge" senderCallsign="K1ABC" frequency="14074900" flowStartSeconds="1791858010" mode="FT8" sNR="-4"/>'
+           b'</receptionReports>')
+
+    class Page:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return xml
+    monkeypatch.setattr(pskreporter.urllib.request, "urlopen", lambda r, timeout=0: Page())
+    spots = pskreporter.fetch_pskreporter_spots("KF0UQR", "hearing", 3600)
+    assert [s["callsign"] for s in spots] == ["W1AW"]
+    assert (pskreporter.last_stats["received"], pskreporter.last_stats["no_locator"]) == (2, 1)

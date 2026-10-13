@@ -156,6 +156,9 @@ class WsprToolWindow(QWidget):
         error_signal = getattr(getattr(radio_window, "worker", None), "error", None)
         if error_signal is not None:
             error_signal.connect(self._on_worker_error)   # a failed key-up / audio push must not look like a quiet slot
+        progress_signal = getattr(getattr(radio_window, "worker", None), "audio_status", None)
+        if progress_signal is not None:
+            progress_signal.connect(self._on_worker_progress)
 
         self.upload_check = QCheckBox("Upload spots to WSPRnet")
         self.upload_check.setToolTip(
@@ -476,6 +479,10 @@ class WsprToolWindow(QWidget):
         if self._sending:
             self._sending = False
             self.beacon_status.setText(f"Transmission failed: {message}")
+
+    def _on_worker_progress(self, message):
+        if self._sending and message.startswith("Send TX audio"):
+            self.beacon_status.setText(f"{self.beacon_status.text().split(' | ')[0]} | {message}")
 
     def _on_beacon_finished(self):
         if not self._sending:

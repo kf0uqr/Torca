@@ -1136,7 +1136,15 @@ class RadioWorker(QThread):
 
         try:
             if start_name:
-                await getattr(self.radio, start_name)()
+                try:
+                    await getattr(self.radio, start_name)()
+                except Exception as exc:
+                    # A transmission that was cancelled (Halt TX, closing a tool) can leave the radio's
+                    # TX audio session open; close it and start again rather than failing every send after.
+                    if "already" not in str(exc).lower() or not stop_name:
+                        raise
+                    await getattr(self.radio, stop_name)()
+                    await getattr(self.radio, start_name)()
             # Pad to a whole number of AUDIO_TX_PCM_FRAME_BYTES-sized
             # frames with trailing silence -- push_audio_tx_pcm()
             # rejects any frame that isn't exactly that size (see this
@@ -1164,8 +1172,6 @@ class RadioWorker(QThread):
             finish = started + (len(padded) / AUDIO_TX_PCM_FRAME_BYTES) * frame_seconds + _TX_DRAIN_SECONDS
             if finish > time.monotonic():
                 await asyncio.sleep(finish - time.monotonic())
-            if stop_name:
-                await getattr(self.radio, stop_name)()
             self.audio_status.emit(f"Send TX audio: sent {len(pcm_bytes)} bytes.")
         except asyncio.CancelledError:
             self.audio_status.emit("Send TX audio: cancelled.")
@@ -1173,6 +1179,11 @@ class RadioWorker(QThread):
         except Exception as exc:
             self.error.emit(f"Send TX audio: {exc}")
         finally:
+            if stop_name:   # always close the TX audio session, including after a cancel or an error
+                try:
+                    await getattr(self.radio, stop_name)()
+                except BaseException:
+                    pass
             try:
                 await self.radio.set_ptt(False)
                 self.audio_status.emit("Send TX audio: radio.set_ptt(False) succeeded.")

@@ -86,3 +86,42 @@ def test_generated_tx_audio_is_paced_and_the_ptt_stays_on_until_it_has_played():
     assert pushes[-1] >= seconds - radio_worker._TX_PUSH_LEAD_SECONDS - 0.05        # not dumped all at once
     unkey = next(t for kind, on, t in events if kind == "ptt" and on is False)
     assert unkey >= seconds - 0.05                                                    # keyed for the whole transmission
+
+
+def test_a_cancelled_transmission_closes_the_tx_audio_session_so_the_next_one_starts():
+    """After Halt TX the radio still held its TX audio session open and every later send
+    failed with "Already transmitting"."""
+    from constants import AUDIO_TX_PCM_FRAME_BYTES
+
+    class Radio:
+        def __init__(self): self.open, self.ptt, self.started = False, [], 0
+        async def set_ptt(self, on): self.ptt.append(on)
+        async def start_audio_tx_pcm(self):
+            if self.open:
+                raise RuntimeError("Already transmitting")
+            self.open = True
+            self.started += 1
+        async def stop_audio_tx_pcm(self): self.open = False
+
+    async def push(frame): pass
+
+    radio = Radio()
+    worker = RadioWorker({"radio_model": "IC-9700"})
+    worker.radio = radio
+    worker._tx_push_target = lambda: push
+    pcm = b"\x00" * AUDIO_TX_PCM_FRAME_BYTES * 100
+
+    async def scenario():
+        task = asyncio.ensure_future(worker._send_tx_audio_pcm(pcm))
+        await asyncio.sleep(0.2)
+        task.cancel()                                            # Halt TX
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert not radio.open and radio.ptt[-1] is False
+        radio.open = True                                        # a session left open by something else
+        await worker._send_tx_audio_pcm(pcm[:AUDIO_TX_PCM_FRAME_BYTES * 2])
+        assert radio.started == 2 and not radio.open
+
+    asyncio.run(scenario())

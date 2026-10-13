@@ -27,6 +27,9 @@ SIGNAL_WIDTH_HZ = {"FT8": 50.0, "FT4": 83.0}
 _AXIS_HEIGHT = 16
 
 
+SILENCE_DB = -40.0   # a row whose median level is below this is silence, not signal
+
+
 class SpectrumRows:
     """Turns a stream of mono 16-bit PCM into spectrum rows: each is COLUMNS
     levels (dB) covering 0..MAX_HZ, one every ~0.25 s."""
@@ -96,8 +99,18 @@ class WaterfallWidget(QWidget):
     def add_rows(self, rows):
         for row in rows:
             floor = float(np.median(row))
-            self._floor = floor if self._floor is None else self._floor * 0.95 + floor * 0.05   # slow, so signals stand out
-            level = np.clip((row - self._floor) / DYNAMIC_RANGE_DB, 0.0, 1.0)
+            silent = floor < SILENCE_DB   # the radio sends no receive audio while transmitting
+            if not silent:
+                # Slow, so signals stand out -- but snap when the level jumps (the first rows
+                # after a transmission), or the whole row would paint saturated red.
+                if self._floor is None or abs(floor - self._floor) > 12.0:
+                    self._floor = floor
+                else:
+                    self._floor = self._floor * 0.95 + floor * 0.05
+            if silent or self._floor is None:
+                level = np.zeros(len(row))
+            else:
+                level = np.clip((row - self._floor) / DYNAMIC_RANGE_DB, 0.0, 1.0)
             indices = (level * 255).astype(int)
             self._image = self._image.copy(0, 0, COLUMNS, HISTORY_ROWS - 1)
             shifted = QImage(COLUMNS, HISTORY_ROWS, QImage.Format_RGB32)

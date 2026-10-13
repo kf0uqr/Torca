@@ -60,3 +60,17 @@ def test_rows_scroll_in_from_the_top_and_show_signals_brighter_than_noise(app):
     widget.clear()
     assert widget._image.pixelColor(250, 0).red() == 0
     widget.resize(600, 200); widget.grab()                                       # painting does not raise
+
+
+def test_waterfall_survives_silence_gap():
+    import numpy as np
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    w = wf.WaterfallWidget()
+    noise = np.random.default_rng(1).normal(40, 2, wf.COLUMNS).astype(np.float32)
+    silence = np.full(wf.COLUMNS, -90.0, dtype=np.float32)
+    w.add_rows([noise] * 20 + [silence] * 20 + [noise] * 3)
+    top = w._image.pixelColor(10, 0)
+    assert top.red() < 200, "first rows after transmit must not saturate"
+    gap = w._image.pixelColor(10, 10)
+    assert (gap.red(), gap.green(), gap.blue()) == (0, 0, 0)

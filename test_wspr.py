@@ -500,3 +500,25 @@ def test_beacon_settings_are_remembered(app, monkeypatch):
     assert (again.tx_percent_spin.value(), again.tx_freq_spin.value(), again.level_spin.value(), again.power_combo.currentData()) == (35, 1450, 22, 37)
     assert not again.beacon_button.isChecked()                           # but the beacon itself always starts off
     window.closing_for_real(); again.closing_for_real()
+
+
+def test_a_failed_transmission_is_reported_not_silent(app, monkeypatch):
+    from PySide6.QtCore import QObject, Signal
+
+    class Emitter(QObject):
+        error = Signal(str)
+
+    emitter = Emitter()
+    window, radio = beacon_window(monkeypatch)
+    window.closing_for_real()
+    radio.worker.error = emitter.error
+    window, radio = beacon_window(monkeypatch)
+    radio.worker.error = emitter.error
+    window2 = type(window)(radio)                # built with the worker's error signal present
+    window2.tx_percent_spin.setValue(100); window2._rng = lambda: 0.0
+    window2.beacon_button.click()
+    window2._beacon_tick(SLOT + 1.0)
+    assert window2._sending
+    emitter.error.emit("Send TX audio: PTT keying failed (boom) -- aborting send.")
+    assert not window2._sending and "Transmission failed" in window2.beacon_status.text() and "boom" in window2.beacon_status.text()
+    window2.closing_for_real(); window.closing_for_real()

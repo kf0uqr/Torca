@@ -32,7 +32,7 @@ Step-by-step instructions for every feature in TORCA. See [README.md](README.md)
 - [rigctld](#rigctld)
 - [Updating](#updating)
 - [Connecting a radio over the network](#connecting-a-radio-over-the-network)
-- [Remote Access over the Internet](#remote-access-over-the-internet)
+- [Remote Access](#remote-access)
 
 ---
 
@@ -211,6 +211,6 @@ In a radio's tab, click **Rigctld...** (below SWR Protect) to start a minimal Ha
 
 See [README.md](README.md#connecting-to-a-radio-over-the-network) for the full `torca-server` walkthrough (sharing a USB-only radio so any other TORCA instance can connect to it like a LAN radio).
 
-## Remote Access over the Internet
+## Remote Access
 
-See [README.md](README.md#remote-access-over-the-internet-cloudflare-tunnel) for the full Cloudflare Tunnel setup walkthrough. Once it's running, the **Remote Access...** button on the Ham Dashboard gives you a browser-based Ham Dashboard (with its own live map, and Satellites/QSO Map/PSKReporter/POTA/APRS overlay toggles) and, per connected radio, a control page (frequency/mode/PTT, meters, spectrum + waterfall, RX audio streaming) plus CW and APRS tool pages -- reachable both on your local network and, once set up, at your own domain over the internet.
+TORCA serves a browser-based Ham Dashboard (with its own live map and Satellites/QSO Map/PSKReporter/POTA/APRS overlay toggles) and, per connected radio, a control page (frequency/mode/PTT, meters, spectrum + waterfall, RX audio streaming) plus CW and APRS tool pages, as a **local web app**. Open **Remote Access...** from a workspace's **+** menu, choose the port and whether to listen on **this computer only** or the **local network**, and click **Start**; the dialog shows the address to open and the operator / guest / viewer tokens. Getting to it from outside your network is done by software of your own in front of that port (a reverse proxy, VPN or tunnel) -- TORCA no longer sets up or manages a Cloudflare Tunnel. See [README.md](README.md#remote-access-a-local-web-app) for details and cautions.

@@ -12,7 +12,7 @@ closing it (browser navigates away, clicks "Disable", or disconnects)
 unregisters it -- no separate start/stop protocol message needed.
 
 Opus, not WebRTC: WebRTC's ICE/UDP model doesn't fit cleanly through a
-Cloudflare Tunnel (plain HTTP/WS ingress only), whereas Opus frames
+proxy or tunnel (plain HTTP/WS ingress only), whereas Opus frames
 over the same WS transport everything else here already uses do.
 `opuslib` is already an installed dependency (a transitive rigplane
 one, per Phase 2's own research) -- this is simply the first place

@@ -5,10 +5,11 @@ radio_worker.py's RadioWorker already uses (a QThread that owns a
 private asyncio loop in run(), stopped by scheduling a callback onto
 that loop from another thread rather than touching it directly).
 
-Binds to 127.0.0.1 ONLY, never 0.0.0.0 -- this is meant to be reached
-from the internet exclusively through a Cloudflare Tunnel
-(cloudflare_tunnel.py), whose local origin connection is itself
-loopback-only. Nothing about this class opens the port to the LAN/WAN.
+Binds to 127.0.0.1 unless told otherwise (host="0.0.0.0" listens on every network
+interface -- the dashboard's Remote Access dialog offers that as "Local network"). It
+speaks plain HTTP and knows nothing about the internet: reaching it from elsewhere is
+done by software in front of it (a reverse proxy, VPN, tunnel...), which TORCA does not
+manage. The three access tokens are the only protection this class adds.
 
 uvicorn.Server.serve() is safe to call from a non-main thread as-is:
 its own capture_signals() (confirmed by reading uvicorn 0.52's source)
@@ -26,12 +27,15 @@ import uvicorn
 from web_remote.app import create_app
 
 
+DEFAULT_PORT = 8765
+
+
 class RemoteWebServer(QThread):
     started = Signal()
     stopped = Signal()
     error = Signal(str)
 
-    def __init__(self, dashboard, host="127.0.0.1", port=8765, operator_token=None,
+    def __init__(self, dashboard, host="127.0.0.1", port=DEFAULT_PORT, operator_token=None,
                  guest_token=None, viewer_token=None, audit=None, parent=None):
         super().__init__(parent)
         self.dashboard = dashboard

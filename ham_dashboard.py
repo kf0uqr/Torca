@@ -109,14 +109,7 @@ from web_remote.bridge import (
     SatelliteRemoteState,
     MapLayersRemoteState,
 )
-from cloudflare_tunnel import (
-    CloudflareTunnel,
-    CloudflareSetupWorker,
-    cloudflared_available,
-    cloudflared_authenticated,
-    DEFAULT_TUNNEL_NAME,
-    DEFAULT_LOCAL_PORT,
-)
+from web_remote.server import DEFAULT_PORT as DEFAULT_LOCAL_PORT
 import secrets
 from audio import (
     pactl_available,
@@ -336,26 +329,21 @@ class RigctldDialog(QDialog):
 
 
 class RemoteAccessDialog(QDialog):
-    """Configures and starts/stops Remote Access -- a local web server
-    (web_remote/) giving a browser its own Ham Dashboard page and one
-    page per connected radio, exposed to the internet at a stable
-    hostname on your own domain via a Cloudflare Tunnel
-    (cloudflare_tunnel.py). Same "dialog owns the fields, callbacks do
-    the real work in HamClockWindow" shape as RigctldDialog above.
+    """Starts and stops Remote Access -- a local web server (web_remote/) giving a browser its
+    own Ham Dashboard page and one page per connected radio. TORCA only serves the pages, on a
+    port of this computer; getting to them from elsewhere (over the internet, say) is up to
+    whatever you put in front of that port -- a reverse proxy, VPN, tunnel -- and is not managed
+    here. Same "dialog owns the fields, callbacks do the real work in HamClockWindow" shape as
+    RigctldDialog above."""
 
-    Two separate steps, both fired from here: "Run Setup" (one-time,
-    idempotent -- creates/looks-up the named tunnel, routes the given
-    hostname's DNS to it, writes this app's own cloudflared config) and
-    the Start/Stop toggle (brings up the local web server AND the
-    tunnel together, or tears both down). Setup only needs re-running
-    if the tunnel name, hostname, or local port changes."""
+    LISTEN_LOCAL = "local"        # 127.0.0.1: only this computer, e.g. a proxy or tunnel running on it
+    LISTEN_NETWORK = "network"    # 0.0.0.0: every address of this computer (the local network)
 
-    def __init__(self, is_running, port, tunnel_name, hostname,
+    def __init__(self, is_running, port, listen,
                  operator_token, guest_token, viewer_token,
-                 on_run_setup, on_start, on_stop, on_kill_tx, on_clear_tx_lock, audit=None, parent=None):
+                 on_start, on_stop, on_kill_tx, on_clear_tx_lock, audit=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Remote Access")
-        self._on_run_setup = on_run_setup
         self._on_start = on_start
         self._on_stop = on_stop
         self._on_kill_tx = on_kill_tx
@@ -365,17 +353,19 @@ class RemoteAccessDialog(QDialog):
         self.port_spinbox = QSpinBox()
         self.port_spinbox.setRange(1, 65535)
         self.port_spinbox.setValue(port)
-        self.port_spinbox.setToolTip("Local port the web server listens on (127.0.0.1 only -- reached over the internet only through the tunnel).")
+        self.port_spinbox.setToolTip("The port the web server listens on.")
         self.port_spinbox.setEnabled(not is_running)
 
-        self.tunnel_name_input = QLineEdit(tunnel_name)
-        self.tunnel_name_input.setToolTip("Name of the Cloudflare Tunnel this app creates/uses -- doesn't affect any other tunnel already on this machine.")
-        self.hostname_input = QLineEdit(hostname)
-        self.hostname_input.setToolTip("Public hostname on your own domain, e.g. torca.kf0uqr.com -- must be a domain already added to your Cloudflare account.")
-
-        setup_button = QPushButton("Run Cloudflare Setup...")
-        setup_button.setToolTip("One-time (safe to re-run): creates the tunnel, routes the hostname's DNS to it, writes this app's own tunnel config.")
-        setup_button.clicked.connect(self._on_setup_clicked)
+        self.listen_combo = QComboBox()
+        self.listen_combo.addItem("This computer only (127.0.0.1)", self.LISTEN_LOCAL)
+        self.listen_combo.addItem("Local network (all addresses)", self.LISTEN_NETWORK)
+        self.listen_combo.setCurrentIndex(max(self.listen_combo.findData(listen), 0))
+        self.listen_combo.setToolTip(
+            "This computer only: only programs on this machine can reach it -- the right choice when "
+            "a proxy, VPN or tunnel running here is what exposes it.\n"
+            "Local network: other devices on your network can connect directly to this computer's address. "
+            "It is plain HTTP, so keep it to a network you trust.")
+        self.listen_combo.setEnabled(not is_running)
 
         self.toggle_button = QPushButton("Stop" if is_running else "Start")
         self.toggle_button.setCheckable(True)
@@ -385,7 +375,7 @@ class RemoteAccessDialog(QDialog):
         )
         self.toggle_button.toggled.connect(self._on_toggled)
 
-        self.url_label = QLabel(f"https://{hostname}" if is_running else "")
+        self.url_label = QLabel(self.url_for(listen, port) if is_running else "")
         self.url_label.setStyleSheet("color: #5aa0ff;")
         self.url_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
@@ -442,9 +432,8 @@ class RemoteAccessDialog(QDialog):
         close_button.clicked.connect(self.accept)
 
         form = QFormLayout()
-        form.addRow("Local port:", self.port_spinbox)
-        form.addRow("Tunnel name:", self.tunnel_name_input)
-        form.addRow("Hostname:", self.hostname_input)
+        form.addRow("Port:", self.port_spinbox)
+        form.addRow("Listen on:", self.listen_combo)
         form.addRow("Operator link:", operator_row)
         form.addRow("Guest link:", guest_row)
         form.addRow("Viewer link:", viewer_row)
@@ -453,15 +442,15 @@ class RemoteAccessDialog(QDialog):
         kill_row.addWidget(self.kill_tx_button)
         kill_row.addWidget(self.clear_lock_button)
 
+        intro = QLabel(
+            "Serves a Ham Dashboard page and one page per connected radio as a local web app. To reach it "
+            "from outside your network, put a reverse proxy, VPN or tunnel of your own in front of this port "
+            "-- TORCA doesn't manage that, and the page itself is plain HTTP, so use HTTPS there."
+        )
+        intro.setWordWrap(True)
         layout = QVBoxLayout()
-        layout.addWidget(QLabel(
-            "Serves a Ham Dashboard page and one page per connected radio "
-            "over the local network, and (once set up) at the hostname "
-            "below over the internet via a Cloudflare Tunnel. Requires "
-            "cloudflared already installed and logged in -- see README.md."
-        ))
+        layout.addWidget(intro)
         layout.addLayout(form)
-        layout.addWidget(setup_button)
         layout.addWidget(self.toggle_button)
         layout.addWidget(self.url_label)
         layout.addLayout(kill_row)
@@ -470,6 +459,22 @@ class RemoteAccessDialog(QDialog):
         layout.addWidget(self.status_label)
         layout.addWidget(close_button)
         self.setLayout(layout)
+
+    @staticmethod
+    def lan_address():
+        """This computer's address on the local network (what other devices would type), or its hostname."""
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("192.0.2.1", 9))      # no packet is sent: it just picks the outgoing interface
+                return sock.getsockname()[0]
+        except OSError:
+            return socket.gethostname()
+
+    @classmethod
+    def url_for(cls, listen, port):
+        host = cls.lan_address() if listen == cls.LISTEN_NETWORK else "127.0.0.1"
+        return f"http://{host}:{port}"
 
     def _make_token_row(self, token, tooltip):
         """A read-only token QLineEdit + its own Copy button, wrapped in
@@ -496,13 +501,6 @@ class RemoteAccessDialog(QDialog):
         row.addWidget(copy_button)
         return token_input, row_widget
 
-    def _on_setup_clicked(self):
-        self._on_run_setup(
-            self.tunnel_name_input.text().strip(),
-            self.hostname_input.text().strip(),
-            self.port_spinbox.value(),
-        )
-
     def _on_kill_tx_clicked(self):
         self._on_kill_tx()
         self._refresh_activity()
@@ -524,11 +522,7 @@ class RemoteAccessDialog(QDialog):
 
     def _on_toggled(self, checked):
         if checked:
-            success = self._on_start(
-                self.port_spinbox.value(),
-                self.tunnel_name_input.text().strip(),
-                self.hostname_input.text().strip(),
-            )
+            success = self._on_start(self.port_spinbox.value(), self.listen_combo.currentData())
             if not success:
                 self.toggle_button.blockSignals(True)
                 self.toggle_button.setChecked(False)
@@ -536,11 +530,13 @@ class RemoteAccessDialog(QDialog):
                 return
             self.toggle_button.setText("Stop")
             self.port_spinbox.setEnabled(False)
-            self.url_label.setText(f"https://{self.hostname_input.text().strip()}")
+            self.listen_combo.setEnabled(False)
+            self.url_label.setText(self.url_for(self.listen_combo.currentData(), self.port_spinbox.value()))
         else:
             self._on_stop()
             self.toggle_button.setText("Start")
             self.port_spinbox.setEnabled(True)
+            self.listen_combo.setEnabled(True)
             self.url_label.setText("")
 
 
@@ -1476,13 +1472,11 @@ class HamClockWindow(QWidget):
         self._virtual_cable_source_output_ids = []
 
 
-        # ---- Remote Access (Ham Dashboard + per-radio pages over the
-        # web, tunneled out via Cloudflare -- see web_remote/ and
-        # cloudflare_tunnel.py) ----
+        # ---- Remote Access (Ham Dashboard + per-radio pages as a local web
+        # app -- see web_remote/; getting to it from elsewhere is up to
+        # software in front of it) ----
         self._next_remote_radio_id = 1  # RadioWindow.remote_id assigned in connection order, never reused
         self._remote_web_server = None
-        self._cloudflare_tunnel = None
-        self._remote_access_setup_worker = None
         _remote_settings = QSettings("IcomRadioApp", "RadioControl")
         # Three independent secrets (operator/guest/viewer -- see
         # web_remote/common.py's ROLE_* docstring for what each is
@@ -1510,17 +1504,17 @@ class HamClockWindow(QWidget):
 
         self.remote_access_button = QPushButton("Remote Access...")
         self.remote_access_button.setToolTip(
-            "Configure and start a web version of this Ham Dashboard and "
-            "each connected radio -- reachable locally, or over the "
-            "internet via a Cloudflare Tunnel to your own domain."
+            "Start a local web app version of this Ham Dashboard and each "
+            "connected radio, for a browser on this computer or your network "
+            "(or anything you put in front of it)."
         )
         self.remote_access_button.clicked.connect(self._on_remote_access_button_clicked)
         retire_button(self, self.remote_access_button)  # now an entry in a workspace's "+" menu (Actions)
 
         # Link-independent kill switch (47 CFR 97.213): stops every
         # connected radio's remote TX immediately from right here in
-        # the desktop process -- doesn't depend on the Cloudflare
-        # Tunnel, a browser, or any websocket being open at all, so it
+        # the desktop process -- doesn't depend on a proxy,
+        # a browser, or any websocket being open at all, so it
         # still works even if THOSE are what's misbehaving.
         self.kill_remote_tx_button = QPushButton("Kill All Remote TX")
         self.kill_remote_tx_button.setStyleSheet(
@@ -3856,13 +3850,11 @@ class HamClockWindow(QWidget):
     def _on_remote_access_button_clicked(self):
         settings = QSettings("IcomRadioApp", "RadioControl")
         port = settings.value("remote_access_port", DEFAULT_LOCAL_PORT, type=int)
-        tunnel_name = settings.value("remote_access_tunnel_name", DEFAULT_TUNNEL_NAME) or DEFAULT_TUNNEL_NAME
-        hostname = settings.value("remote_access_hostname", "") or ""
+        listen = settings.value("remote_access_listen", RemoteAccessDialog.LISTEN_LOCAL) or RemoteAccessDialog.LISTEN_LOCAL
         is_running = self._remote_web_server is not None
         dialog = RemoteAccessDialog(
-            is_running, port, tunnel_name, hostname,
+            is_running, port, listen,
             self._remote_access_token_operator, self._remote_access_token_guest, self._remote_access_token_viewer,
-            on_run_setup=self._on_remote_access_run_setup,
             on_start=self._on_remote_access_start,
             on_stop=self._on_remote_access_stop,
             on_kill_tx=self._on_kill_all_remote_tx,
@@ -3888,51 +3880,14 @@ class HamClockWindow(QWidget):
             if remote_state is not None:
                 remote_state.clear_tx_lock()
 
-    def _on_remote_access_run_setup(self, tunnel_name, hostname, port):
-        if not cloudflared_available():
-            QMessageBox.critical(
-                self, "Remote Access",
-                "The `cloudflared` executable wasn't found on PATH -- install it first (see README.md)."
-            )
-            return
-        if not cloudflared_authenticated():
-            QMessageBox.critical(
-                self, "Remote Access",
-                "cloudflared isn't logged in yet -- run `cloudflared tunnel login` once outside "
-                "this app (opens a browser to authorize against your Cloudflare account), then retry."
-            )
-            return
-        if not hostname:
-            QMessageBox.critical(self, "Remote Access", "Enter a hostname first (e.g. torca.kf0uqr.com).")
-            return
-        if self._remote_access_setup_worker is not None and self._remote_access_setup_worker.isRunning():
-            return  # already running -- avoid a second overlapping setup pass
-        settings = QSettings("IcomRadioApp", "RadioControl")
-        settings.setValue("remote_access_port", port)
-        settings.setValue("remote_access_tunnel_name", tunnel_name)
-        settings.setValue("remote_access_hostname", hostname)
-
-        worker = CloudflareSetupWorker(tunnel_name, hostname, port, self)
-        worker.status.connect(lambda msg: print(f"[Remote Access] {msg}"))
-        worker.finished_ok.connect(self._on_remote_access_setup_finished)
-        worker.failed.connect(self._on_remote_access_setup_failed)
-        self._remote_access_setup_worker = worker
-        worker.start()
-
-    def _on_remote_access_setup_finished(self, tunnel_id):
-        QMessageBox.information(
-            self, "Remote Access",
-            f"Cloudflare setup complete (tunnel {tunnel_id}). Click Start to bring Remote Access online."
-        )
-
-    def _on_remote_access_setup_failed(self, message):
-        QMessageBox.critical(self, "Remote Access", f"Cloudflare setup failed:\n\n{message}")
-
-    def _on_remote_access_start(self, port, tunnel_name, hostname) -> bool:
+    def _on_remote_access_start(self, port, listen) -> bool:
         if self._remote_web_server is not None:
             return True  # already running
+        settings = QSettings("IcomRadioApp", "RadioControl")
+        settings.setValue("remote_access_port", port)
+        settings.setValue("remote_access_listen", listen)
         server = RemoteWebServer(
-            self, port=port,
+            self, host="0.0.0.0" if listen == RemoteAccessDialog.LISTEN_NETWORK else "127.0.0.1", port=port,
             operator_token=self._remote_access_token_operator,
             guest_token=self._remote_access_token_guest,
             viewer_token=self._remote_access_token_viewer,
@@ -3942,19 +3897,9 @@ class HamClockWindow(QWidget):
         server.error.connect(lambda msg: QMessageBox.critical(self, "Remote Access", msg))
         server.start()
         self._remote_web_server = server
-
-        if hostname and cloudflared_available() and cloudflared_authenticated():
-            tunnel = CloudflareTunnel(tunnel_name, self)
-            tunnel.status.connect(lambda msg: print(f"[Remote Access] {msg}"))
-            tunnel.error.connect(lambda msg: QMessageBox.warning(self, "Remote Access", msg))
-            tunnel.start()
-            self._cloudflare_tunnel = tunnel
         return True
 
     def _on_remote_access_stop(self):
-        if self._cloudflare_tunnel is not None:
-            self._cloudflare_tunnel.stop()
-            self._cloudflare_tunnel = None
         if self._remote_web_server is not None:
             self._remote_web_server.stop()
             self._remote_web_server = None

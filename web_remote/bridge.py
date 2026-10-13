@@ -192,7 +192,7 @@ class RadioRemoteState(QObject):
     def kill_tx(self):
         """Link-independent in intent, not just in this method: the
         desktop's own toolbar button (ham_dashboard.py) calls this
-        directly, so it works even if the Cloudflare Tunnel or a
+        directly, so it works even if any proxy in front of the server or a
         guest's own network link is what's misbehaving -- this doesn't
         depend on any websocket being open at all."""
         self.state["tx_locked"] = True

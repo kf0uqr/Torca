@@ -6,9 +6,9 @@ conditions, satellite tracking, and now (see below) radio connection
 management, satellite Doppler control, Virtual Cables, rigctld, and
 WSJT-X launching. Constructed directly by main.py; no radio connects at
 startup any more -- radios are added from a workspace's "+" menu
-(Actions -> Connect New Radio...), each assigned a satellite role
-(RADIO_ROLES in constants.py) in ConnectionDialog, and get their own
-RadioWindow (main_window.py).
+(Actions -> Connect New Radio...) and get their own RadioWindow
+(main_window.py). A radio has no satellite role of its own: starting a
+Satellite tool on it (satellite_tool.py) is what puts it into one.
 
 Satellite/transponder selection, the Doppler-tracking clock, and per-
 role dispatch to however many radios are currently connected all live
@@ -85,6 +85,7 @@ import qso_log
 import ft8_qso
 import heard_spots
 import voacap
+from satellite_tool import SatelliteToolWindow
 import pskreporter
 import pskreporter_report
 from aprs_db import shared_database
@@ -2793,7 +2794,6 @@ class HamClockWindow(QWidget):
             title, page = tabs.tabText(0), tabs.widget(0)
             tabs.removeTab(0)
             pages.append((title, page))
-        pages.append(("Satellites", self.satellite_passes_page))
         self.audio_tab = AudioTab(self)
         pages.append(("Audio", self.audio_tab))
         self._data_pages = pages
@@ -2803,6 +2803,12 @@ class HamClockWindow(QWidget):
         for table in (self.upcoming_passes_table,):    # (the band-conditions tables size themselves, see BandConditionsPage)
             table.setMinimumHeight(0)
             table.setMaximumHeight(16777215)
+        # The satellite passes and tracking controls are not a page of their own any more: a Satellite tool
+        # (satellite_tool.py), started on a radio, takes this widget into itself. Until then it is not shown.
+        self.satellite_passes_page.setMinimumHeight(0)
+        self.satellite_passes_page.setMaximumHeight(16777215)
+        self.satellite_passes_page.hide()
+        self.satellite_passes_page.setParent(None)
 
         self._bottom_row.removeWidget(tabs)
         self._bottom_row.removeWidget(self.satellite_passes_page)
@@ -3553,12 +3559,7 @@ class HamClockWindow(QWidget):
             )
 
     def _on_connect_radio_clicked(self):
-        # Restricts the role combo to whatever still makes sense given
-        # already-connected radios (e.g. Downlink/Uplink hidden once a
-        # Full Duplex radio is connected) -- see
-        # connection_dialog.allowed_satellite_roles.
-        active_roles = {getattr(window, "_role", "non_sat") for window in self._connected_radios}
-        dialog = ConnectionDialog(self._action_parent(), active_roles=active_roles)
+        dialog = ConnectionDialog(self._action_parent())
         if dialog.exec() != QDialog.Accepted:
             return
         self._open_radio(dialog.details, place=self._menu_origin_placer())
@@ -3591,6 +3592,7 @@ class HamClockWindow(QWidget):
         workspace. Returns the new RadioWindow."""
         window = RadioWindow(details, self.satellite_session)
         window.closed.connect(self._on_radio_window_closed)
+        window.satellite_tool_builder = lambda radio, dashboard=self: SatelliteToolWindow(radio, dashboard)
         window.aprs_packet_decoded.connect(self._on_aprs_packet_decoded)
         window.ft8_stations_heard.connect(self._on_stations_heard)
         window.wspr_stations_heard.connect(self._on_stations_heard)
@@ -3633,7 +3635,7 @@ class HamClockWindow(QWidget):
         profile = find_connection_profile(identity, load_connection_profiles())
         if profile is None:
             return None
-        details = details_from_saved_profile(profile, role=identity.get("role"))
+        details = details_from_saved_profile(profile)
         return self._open_radio(details) if details else None
 
     def open_log_book(self):
@@ -3641,9 +3643,8 @@ class HamClockWindow(QWidget):
 
     @staticmethod
     def _radio_list_base_label(details):
-        role_label = _ROLE_LABELS.get(details.get("role", "non_sat"), details.get("role", "non_sat"))
         connection_label = details.get("host") or details.get("serial_port") or details.get("remote_host") or "?"
-        return f"{details['radio_model']} ({role_label}) -- {connection_label}"
+        return f"{details['radio_model']} -- {connection_label}"
 
     def _radio_status_suffix(self, window):
         """Rigctld/Virtual Cables status for one radio, shown on its own
@@ -3786,6 +3787,19 @@ class HamClockWindow(QWidget):
         self._close_update_progress_dialog()
         self.update_button.setEnabled(True)
         QMessageBox.critical(self._action_parent(), "Update Failed", f"Couldn't complete the update:\n{message}")
+
+    def claim_satellite_tool(self, tool):
+        """A Satellite tool is being started: it becomes the one that holds the pass controls and radios, and the
+        tool that had them (on another radio) is told they have moved."""
+        previous = getattr(self, "_satellite_tool", None)
+        if previous is not None and previous is not tool:
+            previous.release(moved_to=tool._radio.display_name())
+        self._satellite_tool = tool
+
+    def release_satellite_tool(self, tool):
+        if getattr(self, "_satellite_tool", None) is tool:
+            self._satellite_tool = None
+            self.satellite_session.stop()          # nothing is steering the radios any more
 
     def _on_radio_window_closed(self, window):
         """Connected to RadioWindow.closed, emitted from closeEvent

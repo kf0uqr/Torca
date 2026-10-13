@@ -59,9 +59,9 @@ class NewQsoDialog(QDialog):
         self.radio_combo = QComboBox()
         self.radio_combo.addItem("-- Manual entry only --", None)
         for window in getattr(dashboard, "_connected_radios", []):
-            role_label = _ROLE_LABELS.get(window._role, window._role)
+            role = "" if window._role == "non_sat" else f" ({_ROLE_LABELS.get(window._role, window._role)})"
             self.radio_combo.addItem(
-                f"{window._details['radio_model']} ({role_label}) -- {window._connection_label}", window
+                f"{window._details['radio_model']}{role} -- {window._connection_label}", window
             )
 
         now = datetime.datetime.now(datetime.timezone.utc)

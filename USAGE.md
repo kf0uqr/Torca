@@ -52,7 +52,6 @@ Click **Save Profile...** to save the whole thing under a name, so a shared stat
 From the Ham Dashboard, click **Radios**, then **Connect New Radio...**. Pick:
 
 - **Radio** -- IC-7300, IC-9700, IC-705, IC-7610, Xiegu X6200, Icom ID-5100, or Yaesu FTX-1. **IC-7610, X6200, ID-5100, and FTX-1 have not been tested against real hardware by this project** -- see [README.md's "Supported radios"](README.md#supported-radios) for what that means in practice before relying on one. Selecting FTX-1 hides the CI-V Address field (it uses Yaesu's own CAT protocol instead) and only offers a USB connection. ID-5100 is USB-only and only supports FM/FM-N/AM/AM-N/DV modes with no scope/DSP controls -- it's a 2m/70cm mobile, not an SDR-class rig.
-- **Satellite Role** -- Non-Sat (default), Satellite Full Duplex (one dual-receiver radio), or Satellite Downlink/Uplink (a pair of separate radios). Only roles that still make sense given already-connected radios are offered.
 - **Connection** -- Network (LAN), USB (Serial), or Remote Server (see [Connecting a radio over the network](#connecting-a-radio-over-the-network)).
 - **Audio Input/Output** -- which PortAudio devices to use for RX/TX, or "None" to skip audio entirely.
 
@@ -87,12 +86,15 @@ Memories persist across radios and app restarts (one shared bank, not per-radio-
 
 ## Satellite tracking + Doppler correction
 
-1. On the Ham Dashboard, click **Satellites** to turn tracking on. Right-click it to manage the tracked list: refresh TLEs from CelesTrak, add satellites by hand, fetch transponder data from SatNOGS DB, hand-edit transponders, and choose which satellites show on the map. This also populates **Upcoming Satellite Passes** with the next 10 AOS windows across whichever satellites are checked to show on the map -- a pass already in progress sorts to the top, showing time-to-LOS instead of time-to-AOS.
-2. Double-click a satellite marker on the map, *or* a row in Upcoming Satellite Passes. Both start live tracking: pick a transponder from the dropdown that appears on the dashboard, and every satellite-role radio's downlink gets continuously Doppler-corrected, with elevation/azimuth/Doppler/time-to-AOS-or-LOS overlaid on its scope. The tuning knob on a tracking radio adjusts an offset from the transponder's nominal downlink (applied before Doppler correction) instead of the radio directly -- use it to tune within a linear satellite's passband or nudge onto where it's actually transmitting.
-3. **Start/Stop Tracking** pauses/resumes re-tuning without losing the selection -- the satellite (and any tuning offset) stays put until you double-click a different one.
-4. How PTT drives the uplink depends on each radio's role, resolved automatically:
-   - **Satellite Full Duplex** (single dual-receiver radio, e.g. IC-9700): Main tracks the downlink while receiving; Sub takes over with the Doppler-corrected uplink for the duration of a transmission.
-   - **Satellite Downlink** + **Satellite Uplink** (a pair of single-receiver radios): the downlink radio tracks continuously; the uplink radio's **Split** turns on automatically and **PTT** swaps in the Doppler-corrected uplink for the transmission, back to the downlink frequency the instant you release.
+A radio has no satellite role when it connects. A satellite pass is run from a **Satellite Tool**, opened from a radio's tools menu (the **+** menu's "<radio> Tools" submenu): **that radio is the pass's transmit radio**, and by default it does everything itself.
+
+1. Open **Satellite Tool** on the radio you will transmit with. The tool holds the whole pass: the **Upcoming Satellite Passes** list (the next AOS windows for the satellites you track), the satellite and transponder pickers, **Start/Stop Tracking**, and the live Doppler readout. Right-click the **Satellites** button on the dashboard to manage the tracked list (refresh TLEs from CelesTrak, add satellites, fetch transponder data from SatNOGS DB, edit transponders, choose which satellites show on the map).
+2. Double-click a satellite marker on the map, *or* a row in the passes list, to start live tracking, then pick a transponder. Every radio taking part has its downlink continuously Doppler-corrected, with elevation/azimuth/Doppler/time-to-AOS-or-LOS on its scope. The tuning knob on a tracking radio adjusts an offset from the transponder's nominal downlink (applied before Doppler correction) -- use it to tune within a linear satellite's passband.
+3. **Start/Stop Tracking** pauses/resumes re-tuning without losing the selection.
+4. The tool's **Receive radio** box chooses how the pass is run:
+   - **This radio receives too** (the default): one radio does both -- a dual-receiver radio such as the IC-9700 tracks the downlink on one receiver and takes the Doppler-corrected uplink on the other for the duration of a transmission.
+   - **Another connected radio**: a "poor man's full duplex" pair. The radio the tool is on becomes uplink-only (its **Split** turns on automatically and **PTT** swaps in the Doppler-corrected uplink, back the instant you release) and the chosen radio becomes downlink-only (tracks continuously, never transmits; its PTT and Tune buttons are hidden).
+5. A radio taking part shows its role in its tab name ("IC-9700 - Satellite Uplink"). Closing the tool -- or starting a Satellite Tool on a different radio, which takes the controls and the pass over -- puts every radio back to being an ordinary radio. Only one Satellite Tool is active at a time, since there is one tracking session.
 
 ## Band-plan overlay
 
@@ -101,6 +103,8 @@ A thin colored strip directly under the waterfall, sharing its exact frequency a
 ## Digital mode tools
 
 Every tool below shares RX audio with normal listening (or an active Virtual Cable) -- you don't have to choose between them.
+
+Each tool has a **Receive radio** box beside its Start Decoding button. By default a tool decodes the radio it was opened on ("This radio"); pick another connected radio and it decodes THAT radio's audio instead -- for example transmit FT8 through the IC-9700 while decoding what the IC-7300 hears -- using that radio's frequency where the tool needs one (WSPR's band tuning, FT8's spot frequencies). Transmitting always goes through the radio the tool was opened on. The choice is remembered per tool, fixed while decoding, and falls back to "This radio" if the other radio is closed.
 
 ### CW Tool
 

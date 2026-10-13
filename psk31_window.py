@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 
 from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
 from psk31 import Psk31Decoder, build_psk31_pcm, DEFAULT_CENTER_HZ
+from rx_radio import ReceiveRadioSelector
 
 _MACROS_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "psk31_macros.json"
 
@@ -207,12 +208,16 @@ class Psk31ToolWindow(QWidget):
         self.decode_toggle_button = QPushButton("Start Decoding")
         self.decode_toggle_button.setCheckable(True)
         self.decode_toggle_button.toggled.connect(self._on_decode_toggled)
+        self.rx_selector = ReceiveRadioSelector(radio_window, "PSK31 Tool")
+        self.decode_toggle_button.toggled.connect(self.rx_selector.set_locked)   # fixed while decoding
+        self.rx_selector.lost.connect(self._on_receive_radio_lost)
 
         clear_button = QPushButton("Clear")
         clear_button.clicked.connect(self._on_clear_clicked)
 
         buttons_row = QHBoxLayout()
         buttons_row.addWidget(self.decode_toggle_button)
+        buttons_row.addWidget(self.rx_selector)
         buttons_row.addWidget(clear_button)
         buttons_row.addStretch()
 
@@ -315,8 +320,13 @@ class Psk31ToolWindow(QWidget):
 
     # ---- Decode ----
 
+    def _on_receive_radio_lost(self):
+        """The radio this tool was decoding was closed: stop decoding it (the choice is back to 'this radio')."""
+        if self.decode_toggle_button.isChecked():
+            self.decode_toggle_button.setChecked(False)
+
     def _on_decode_toggled(self, checked):
-        worker = self._radio_window.worker
+        worker = self.rx_selector.worker()   # the radio whose audio is decoded
         if checked:
             sample_rate = getattr(worker.radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
             self._decoder = Psk31Decoder(sample_rate, center_hz=self.tone_spin.value())

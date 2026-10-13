@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 import recording
+from rx_radio import ReceiveRadioSelector
 
 # Amplitude (post mono-average, in [-1, 1]) below which a waveform bucket
 # is painted as "silence" rather than "audio" -- chosen well above pure
@@ -226,6 +227,9 @@ class RecordingToolWindow(QWidget):
         controls_row = QHBoxLayout()
         controls_row.addWidget(QLabel("Source:"))
         controls_row.addWidget(self.source_combo)
+        self.rx_selector = ReceiveRadioSelector(radio_window, "Recording Tool")
+        self.rx_selector.lost.connect(self._on_receive_radio_lost)
+        controls_row.addWidget(self.rx_selector)
         controls_row.addWidget(self.rx_channel_label)
         controls_row.addWidget(self.rx_channel_combo)
         controls_row.addWidget(self.record_button)
@@ -345,9 +349,14 @@ class RecordingToolWindow(QWidget):
             self._stop_recording()
             self.record_button.setText("● Record")
 
+    def _on_receive_radio_lost(self):
+        """The radio being recorded as the receive side was closed: stop that recording."""
+        if self.record_button.isChecked():
+            self.record_button.setChecked(False)
+
     def _start_recording(self, satellite=None, auto=False):
-        worker = self._radio_window.worker
-        bridge = getattr(worker, "audio_bridge", None)
+        bridge = getattr(self.rx_selector.worker(), "audio_bridge", None)       # the receive audio: the chosen radio's
+        tx_bridge = getattr(self._radio_window.worker, "audio_bridge", None)    # what is transmitted: this tool's radio
         if bridge is None:
             self.status_label.setText("Can't record: no audio stream is active for this radio.")
             self.record_button.blockSignals(True)
@@ -370,7 +379,10 @@ class RecordingToolWindow(QWidget):
             rx_is_stereo=bridge.is_rx_stereo(),
         )
         bridge.add_extra_rx_raw_callback(self._recorder.on_rx_raw)
-        bridge.add_extra_tx_callback(self._recorder.on_tx)
+        self._recording_bridges = (bridge, tx_bridge)
+        if tx_bridge is not None:
+            tx_bridge.add_extra_tx_callback(self._recorder.on_tx)
+        self.rx_selector.set_locked(True)
         if self._radio_window.ptt_button.isChecked():
             self._recorder.set_tx_active(True)
 
@@ -403,10 +415,13 @@ class RecordingToolWindow(QWidget):
     def _stop_recording(self):
         if self._recorder is None:
             return
-        bridge = getattr(self._radio_window.worker, "audio_bridge", None)
-        if bridge is not None:
-            bridge.remove_extra_rx_raw_callback(self._recorder.on_rx_raw)
-            bridge.remove_extra_tx_callback(self._recorder.on_tx)
+        rx_bridge, tx_bridge = getattr(self, "_recording_bridges", (None, None))
+        if rx_bridge is not None:
+            rx_bridge.remove_extra_rx_raw_callback(self._recorder.on_rx_raw)
+        if tx_bridge is not None:
+            tx_bridge.remove_extra_tx_callback(self._recorder.on_tx)
+        self._recording_bridges = (None, None)
+        self.rx_selector.set_locked(False)
         duration = self._recorder.close()
         entry = self._recording_entry
         entry["duration_sec"] = duration

@@ -87,7 +87,7 @@ _LIVE_RADIO_WINDOWS = weakref.WeakSet()
 _TOOL_TITLES = (
     ("cw_window", "CW Tool"), ("aprs_window", "APRS Tool"), ("sstv_window", "SSTV Tool"),
     ("rtty_window", "RTTY Tool"), ("psk31_window", "PSK31 Tool"), ("ft8_window", "FT8 Tool"),
-    ("wspr_window", "WSPR Tool"),
+    ("wspr_window", "WSPR Tool"), ("satellite_window", "Satellite Tool"),
     ("recording_window", "Recording Tool"), ("memories_window", "Memories"),
 )
 
@@ -148,7 +148,9 @@ class RadioWindow(QWidget):
         # tool name appended, its tool tabs) across launches.
         self.identity = radio_identity(details)
         self.workspace_key = f"radio:{identity_key(self.identity)}"
-        self._role = details.get("role", "non_sat")
+        # "non_sat" until a Satellite tool puts this radio into a satellite role (see
+        # set_satellite_role): a radio has no role of its own when it connects.
+        self._role = "non_sat"
         self._satellite_session = satellite_session
         if details["connection_type"] == "network":
             self._connection_label = f"{details['host']} (LAN)"
@@ -444,6 +446,14 @@ class RadioWindow(QWidget):
         self.wspr_tool_button.clicked.connect(self._on_wspr_tool_clicked)
         retire_button(self, self.wspr_tool_button)  # reached from a workspace's "+" menu now
         self.wspr_window = None
+        # The Satellite tool: built through a factory the dashboard installs (it owns the shared pass controls the
+        # tool takes over); without one -- tests, headless use -- this radio simply has no Satellite tool.
+        self.satellite_tool_builder = None
+        self.satellite_tool_button = QPushButton("Satellite Tool...")
+        self.satellite_tool_button.setEnabled(False)
+        self.satellite_tool_button.clicked.connect(self._on_satellite_tool_clicked)
+        retire_button(self, self.satellite_tool_button)  # reached from a workspace's "+" menu now
+        self.satellite_window = None
 
         # Opens the per-radio APRS decode tool (aprs_window.py) -- same
         # singleton/lazy-construction/enable-on-connect pattern as the
@@ -992,14 +1002,8 @@ class RadioWindow(QWidget):
         # (joining mid-session, e.g. connecting a second radio partway
         # through a pass), register() applies the current mode
         # immediately rather than waiting for the next transponder change.
-        if self._role != "non_sat":
-            self._satellite_session.register(self, self._role)
-            # Covers joining mid-pass -- _on_tracking_changed's signal
-            # already fired for whatever session-wide start/stop most
-            # recently happened and won't fire again until the NEXT one,
-            # so a radio constructed while tracking is already running
-            # needs its own explicit sync here rather than waiting on it.
-            self._update_nominal_freq_display_visibility(self._satellite_session.is_tracking())
+        # (A radio joins satellite tracking only when a Satellite tool is started on it, or
+        # chosen as its receive radio -- see set_satellite_role -- never just by connecting.)
 
     @Slot()
     def _on_connected(self):
@@ -1018,6 +1022,7 @@ class RadioWindow(QWidget):
         self.psk31_tool_button.setEnabled(True)
         self.ft8_tool_button.setEnabled(True)
         self.wspr_tool_button.setEnabled(True)
+        self.satellite_tool_button.setEnabled(self.satellite_tool_builder is not None)
         self.aprs_tool_button.setEnabled(True)
         self.recording_tool_button.setEnabled(True)
         self.memories_button.setEnabled(True)
@@ -1135,6 +1140,26 @@ class RadioWindow(QWidget):
             self.ft8_window.workspace_key = self._tool_key("FT8 Tool")
         return self.ft8_window
 
+    def ensure_satellite_tool_window(self):
+        """The Satellite tool for this radio (None if this radio cannot have one). Every call (re)activates it,
+        which is what makes this radio the transmit radio of the pass: opening the tool IS starting it."""
+        if self.satellite_window is None:
+            if self.satellite_tool_builder is None:
+                return None
+            self.satellite_window = self.satellite_tool_builder(self)
+            self.satellite_window.workspace_key = self._tool_key("Satellite Tool")
+        self.satellite_window.activate()
+        return self.satellite_window
+
+    def _on_satellite_tool_clicked(self):
+        tool = self.ensure_satellite_tool_window()
+        if tool is not None:
+            present_window(tool)
+
+    def other_radios(self):
+        """The other radios currently open, for tools that can use more than one (receive radio choices)."""
+        return [w for w in list(_LIVE_RADIO_WINDOWS) if w is not self]
+
     def ensure_wspr_tool_window(self):
         if self.wspr_window is None:
             self.wspr_window = WsprToolWindow(self)
@@ -1194,6 +1219,7 @@ class RadioWindow(QWidget):
             ("PSK31 Tool", self.ensure_psk31_tool_window, self.psk31_window, self.psk31_tool_button),
             ("FT8 Tool", self.ensure_ft8_tool_window, self.ft8_window, self.ft8_tool_button),
             ("WSPR Tool", self.ensure_wspr_tool_window, self.wspr_window, self.wspr_tool_button),
+            ("Satellite Tool", self.ensure_satellite_tool_window, self.satellite_window, self.satellite_tool_button),
             ("Recording Tool", self.ensure_recording_tool_window, self.recording_window, self.recording_tool_button),
             ("Memories", self.ensure_memories_window, self.memories_window, self.memories_button),
         ):
@@ -1662,6 +1688,34 @@ class RadioWindow(QWidget):
             if nominal_freq_hz is not None:
                 self.nominal_freq_display.setText(f"{nominal_freq_hz / 1e6:.6f} MHz")
             self._update_band_button_highlight()
+
+    def set_satellite_role(self, role):
+        """Puts this radio into (or takes it out of) satellite Doppler control: "full_duplex" (one radio doing
+        both), "uplink" or "downlink" (a pair), or "non_sat" (an ordinary radio again). Only a Satellite tool
+        does this (satellite_tool.py), when it is started, when its receive radio changes, and when it closes."""
+        if role == self._role:
+            return
+        session = self._satellite_session
+        tracking = session.is_tracking()
+        if self._role == "full_duplex" and tracking:
+            self._on_tracking_changed(False)          # give the radio back its normal receiver first
+        self._role = role
+        if role == "non_sat":
+            session.unregister(self)
+        else:
+            session.register(self, role)              # applies the current satellite's mode if one is selected
+        # A downlink-only radio never transmits.
+        self.ptt_button.setVisible(role != "downlink")
+        self.tune_button.setVisible(role != "downlink")
+        if role == "full_duplex" and tracking:
+            self._on_tracking_changed(True)
+        else:
+            self._update_nominal_freq_display_visibility(tracking)
+        self._refresh_same_model_titles()
+
+    @property
+    def satellite_role(self):
+        return self._role
 
     def _update_nominal_freq_display_visibility(self, tracking):
         """nominal_freq_display (the left-side pre-Doppler-correction
@@ -2264,6 +2318,7 @@ class RadioWindow(QWidget):
             "SSTV Tool": self.ensure_sstv_tool_window, "RTTY Tool": self.ensure_rtty_tool_window,
             "PSK31 Tool": self.ensure_psk31_tool_window, "FT8 Tool": self.ensure_ft8_tool_window,
             "WSPR Tool": self.ensure_wspr_tool_window,
+            "Satellite Tool": self.ensure_satellite_tool_window,
             "Recording Tool": self.ensure_recording_tool_window,
             "Memories": self.ensure_memories_window,
         }
@@ -2284,7 +2339,9 @@ class RadioWindow(QWidget):
         return f"{tool_name} - {self.display_name()}"
 
     def refresh_titles(self):
-        self.setWindowTitle(f"{self.display_name()} - {_ROLE_LABELS.get(self._role, self._role)}")
+        # "IC-9700"; while it is working a satellite pass, "IC-9700 - Satellite Uplink" and so on.
+        role = "" if self._role == "non_sat" else f" - {_ROLE_LABELS.get(self._role, self._role)}"
+        self.setWindowTitle(f"{self.display_name()}{role}")
         for attribute, tool_name in _TOOL_TITLES:
             tool_window = getattr(self, attribute, None)
             if tool_window is not None:
@@ -2374,6 +2431,8 @@ class RadioWindow(QWidget):
             self.ft8_window.closing_for_real()
         if self.wspr_window is not None:
             self.wspr_window.closing_for_real()
+        if self.satellite_window is not None:
+            self.satellite_window.closing_for_real()
         if self.aprs_window is not None:
             self.aprs_window.closing_for_real()
         if self.memories_window is not None:

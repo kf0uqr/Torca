@@ -18,7 +18,7 @@ from workspace_host import WorkspaceHost
 import workspace_host
 
 DETAILS = {"radio_model": "IC-9700", "connection_type": "network", "host": "192.0.2.1",
-           "role": "non_sat", "username": "u", "password": "p", "port": 50001}
+           "username": "u", "password": "p", "port": 50001}
 
 
 @pytest.fixture
@@ -357,13 +357,20 @@ def test_band_buttons_still_select_their_band_after_wrapping(app, monkeypatch):
 
 def _titled_window(monkeypatch, model="IC-9700", role="non_sat", host="192.0.2.1"):
     monkeypatch.setattr(radio_worker.RadioWorker, "start", lambda self, *a, **k: None)
-    return main_window.RadioWindow(dict(DETAILS, radio_model=model, role=role, host=host), SatelliteSession())
+    window = main_window.RadioWindow(dict(DETAILS, radio_model=model, host=host), SatelliteSession())
+    if role != "non_sat":
+        window.set_satellite_role(role)         # only a Satellite tool does this in the app
+    return window
 
 
-def test_radio_window_title_is_model_dash_role(app, monkeypatch):
+def test_radio_window_title_is_the_model_and_gains_a_role_only_while_in_a_satellite_role(app, monkeypatch):
     window = _titled_window(monkeypatch)
     try:
-        assert window.windowTitle() == "IC-9700 - Non-Sat"
+        assert window.windowTitle() == "IC-9700"                       # no role when a radio connects
+        window.set_satellite_role("uplink")
+        assert window.windowTitle() == "IC-9700 - Satellite Uplink"
+        window.set_satellite_role("non_sat")
+        assert window.windowTitle() == "IC-9700"
     finally:
         window.close()
     for role, label in (("full_duplex", "Satellite Full Duplex"), ("downlink", "Satellite Downlink"), ("uplink", "Satellite Uplink")):
@@ -398,15 +405,15 @@ def test_tool_windows_are_titled_tool_name_dash_model(app, monkeypatch):
 def test_two_radios_of_the_same_model_are_told_apart_and_it_reverts_when_one_closes(app, monkeypatch):
     first = _titled_window(monkeypatch, host="192.0.2.1")
     first_cw = first.ensure_cw_tool_window()                              # built BEFORE the second radio exists
-    assert first.windowTitle() == "IC-9700 - Non-Sat" and first_cw.windowTitle() == "CW Tool - IC-9700"
+    assert first.windowTitle() == "IC-9700" and first_cw.windowTitle() == "CW Tool - IC-9700"
     second = _titled_window(monkeypatch, host="192.0.2.2")
     try:
-        assert first.windowTitle() == "IC-9700 (192.0.2.1 (LAN)) - Non-Sat"          # existing windows re-titled too
+        assert first.windowTitle() == "IC-9700 (192.0.2.1 (LAN))"          # existing windows re-titled too
         assert first_cw.windowTitle() == "CW Tool - IC-9700 (192.0.2.1 (LAN))"
-        assert second.windowTitle() == "IC-9700 (192.0.2.2 (LAN)) - Non-Sat"
+        assert second.windowTitle() == "IC-9700 (192.0.2.2 (LAN))"
         assert second.ensure_aprs_tool_window().windowTitle() == "APRS Tool - IC-9700 (192.0.2.2 (LAN))"
         second.close()
-        assert first.windowTitle() == "IC-9700 - Non-Sat"                            # back to the short form
+        assert first.windowTitle() == "IC-9700"                            # back to the short form
         assert first_cw.windowTitle() == "CW Tool - IC-9700"
     finally:
         first.close()
@@ -416,7 +423,7 @@ def test_different_models_never_get_a_connection_suffix(app, monkeypatch):
     nine = _titled_window(monkeypatch, model="IC-9700")
     seven = _titled_window(monkeypatch, model="IC-7300", host="192.0.2.9")
     try:
-        assert nine.windowTitle() == "IC-9700 - Non-Sat" and seven.windowTitle() == "IC-7300 - Non-Sat"
+        assert nine.windowTitle() == "IC-9700" and seven.windowTitle() == "IC-7300"
     finally:
         nine.close()
         seven.close()
@@ -428,7 +435,7 @@ def test_tab_text_follows_the_new_titles_in_the_workspace(app, monkeypatch):
     try:
         host.present(window)
         pane = host.panes[host.pane_of(window)]
-        assert pane.tabText(pane.indexOf(host._entries[window].page)) == "IC-9700 - Non-Sat"
+        assert pane.tabText(pane.indexOf(host._entries[window].page)) == "IC-9700"
         tool = window.ensure_cw_tool_window()
         host.present(tool)
         assert "CW Tool - IC-9700" in [pane.tabText(i) for i in range(pane.count())]

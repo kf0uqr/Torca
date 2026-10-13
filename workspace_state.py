@@ -22,7 +22,7 @@ back on the monitor it was on (and falls back sensibly if that monitor is gone).
 
 Every restorable tab has a stable string key: "map", "page:Contests",
 "logbook", "radio:<identity>", "tool:<identity>:<tool name>". A radio's
-"identity" says which radio it was (model, how it connects, its role) --
+"identity" says which radio it was (model, how it connects) --
 deliberately WITHOUT credentials: to reconnect, the identity is matched to
 the radio's entry in the saved connection profiles
 (connection_profiles.json), which is where the password already lives.
@@ -219,12 +219,11 @@ def save_state(profile_name, state, path=None):
 
 def radio_identity(details):
     """The non-secret facts that say which radio a connection was: model,
-    role, and where it connects. Used to re-find its saved connection
+    and where it connects. Used to re-find its saved connection
     profile on the next launch."""
     connection_type = details.get("connection_type")
     identity = {
         "radio_model": details.get("radio_model"),
-        "role": details.get("role"),
         "connection_type": connection_type,
     }
     if connection_type == "network":
@@ -251,8 +250,7 @@ def identity_key(identity):
 
 def find_connection_profile(identity, connection_profiles):
     """The saved connection profile (connection_profiles.json entry) for this
-    identity, or None. Matches on model + endpoint (not role: the role last
-    used is applied separately)."""
+    identity, or None. Matches on model + endpoint."""
     kind = identity.get("connection_type")
     fields = {
         "network": ("host", "port"),

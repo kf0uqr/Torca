@@ -96,6 +96,14 @@ def _make_window(tmp_path, monkeypatch):
     monkeypatch.setattr(aprs_window, "shared_database", lambda: db)
 
     class StubRadioWindow:
+        workspace_key = "radio:IC-7300@test"
+
+        def other_radios(self):
+            return []
+
+        def display_name(self):
+            return "IC-7300"
+
         _connection_label = "test-radio"
 
         def tool_title(self, name):
@@ -125,6 +133,14 @@ def test_window_reloads_history_on_open_and_clear_keeps_it(tmp_path, monkeypatch
     assert window.table.rowCount() == 0 and db.count() == 2
 
     class StubRadioWindow:
+        workspace_key = "radio:IC-7300@test"
+
+        def other_radios(self):
+            return []
+
+        def display_name(self):
+            return "IC-7300"
+
         _connection_label = "test-radio"
 
         def tool_title(self, name):

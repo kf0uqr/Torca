@@ -58,6 +58,7 @@ import ft8_decoder as ft8
 import ft8_qso
 import ft8_waterfall
 from constants import AUDIO_DEFAULT_SAMPLE_RATE, AUDIO_TX_PCM_SAMPLE_RATE
+from rx_radio import ReceiveRadioSelector
 
 _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
@@ -137,6 +138,9 @@ class Ft8ToolWindow(QWidget):
         self.decode_toggle_button = QPushButton("Start Decoding")
         self.decode_toggle_button.setCheckable(True)
         self.decode_toggle_button.toggled.connect(self._on_decode_toggled)
+        self.rx_selector = ReceiveRadioSelector(radio_window, "FT8 Tool")
+        self.decode_toggle_button.toggled.connect(self.rx_selector.set_locked)   # fixed while decoding
+        self.rx_selector.lost.connect(self._on_receive_radio_lost)
 
         clear_button = QPushButton("Clear")
         clear_button.clicked.connect(self._on_clear_clicked)
@@ -149,6 +153,7 @@ class Ft8ToolWindow(QWidget):
         buttons_row.addWidget(QLabel("Mode:"))
         buttons_row.addWidget(self.mode_combo)
         buttons_row.addWidget(self.decode_toggle_button)
+        buttons_row.addWidget(self.rx_selector)
         buttons_row.addWidget(clear_button)
         buttons_row.addWidget(self.build_button)
         buttons_row.addStretch()
@@ -329,8 +334,13 @@ class Ft8ToolWindow(QWidget):
 
     # ---- decode ----
 
+    def _on_receive_radio_lost(self):
+        """The radio this tool was decoding was closed: stop decoding it (the choice is back to 'this radio')."""
+        if self.decode_toggle_button.isChecked():
+            self.decode_toggle_button.setChecked(False)
+
     def _on_decode_toggled(self, checked):
-        worker = self._radio_window.worker
+        worker = self.rx_selector.worker()   # the radio whose audio is decoded
         if checked:
             if not ft8.is_available():
                 self._refresh_availability()
@@ -428,7 +438,7 @@ class Ft8ToolWindow(QWidget):
             self._react_to(message)
 
     def _publish_heard(self, messages):
-        dial = getattr(self._radio_window, "_current_freq_hz", None) or 0
+        dial = getattr(self.rx_selector.radio(), "_current_freq_hz", None) or 0   # the frequency of the radio being listened to
         if not dial:
             return   # without the radio's frequency there is nothing meaningful to report
         stations = {}

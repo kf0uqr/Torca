@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
 
 from constants import (
     RADIO_PROFILES,
-    RADIO_ROLES,
     DEFAULT_HOST,
     DEFAULT_PORT,
     DEFAULT_USERNAME,
@@ -76,32 +75,6 @@ def save_connection_profiles(profiles):
         print(f"[ERROR] Connection profiles: couldn't save profiles ({exc}).")
 
 
-def allowed_satellite_roles(active_roles):
-    """Given the set of roles already in use by connected radios,
-    returns the set of role VALUES (constants.RADIO_ROLES' second
-    tuple element) that make sense to offer for a NEW radio.
-
-    A satellite pass only makes sense driven one of two ways at a
-    time: one Full Duplex radio, or one Downlink + one Uplink pair --
-    never a mix, never a duplicate of either half of the pair, and
-    never a second Full Duplex radio once one is already handling
-    both directions -- there's no scenario needing more than one
-    transmit/receive slot for satellite work at a time. "Non-Sat" is
-    always available regardless, since it doesn't participate in
-    satellite tracking at all.
-    """
-    if "full_duplex" in active_roles:
-        return {"non_sat"}
-    if "downlink" in active_roles and "uplink" in active_roles:
-        # The pair is already complete.
-        return {"non_sat"}
-    if "downlink" in active_roles:
-        return {"uplink", "non_sat"}
-    if "uplink" in active_roles:
-        return {"downlink", "non_sat"}
-    return {"full_duplex", "downlink", "uplink", "non_sat"}
-
-
 class ConnectionDialog(QDialog):
     """Collects radio connection details before the main window opens.
 
@@ -110,10 +83,9 @@ class ConnectionDialog(QDialog):
     either a details dict or None if the user cancelled.
     """
 
-    def __init__(self, parent=None, active_roles=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Connect to Radio")
-        self._allowed_roles = allowed_satellite_roles(active_roles or set())
 
         self._profiles = load_connection_profiles()
 
@@ -128,27 +100,6 @@ class ConnectionDialog(QDialog):
         self.radio_combo.addItems(RADIO_PROFILES.keys())
         self.radio_combo.currentTextChanged.connect(self._on_radio_changed)
 
-        # Which role this radio plays in satellite Doppler control --
-        # see RADIO_ROLES's own comment in constants.py. Chosen here,
-        # per-connection, rather than as a separate post-connect prompt,
-        # since the dashboard needs to know it before registering the
-        # new radio with the shared satellite session.
-        self.role_combo = QComboBox()
-        for label, value in RADIO_ROLES:
-            if value in self._allowed_roles:
-                self.role_combo.addItem(label, value)
-        self.role_combo.setToolTip(
-            "Satellite Full Duplex: one dual-receiver radio (e.g. IC-9700) "
-            "handles both uplink and downlink itself.\n"
-            "Satellite Downlink / Satellite Uplink: a \"poor man's full "
-            "duplex\" pair -- pick these for two separate radios working "
-            "the same pass together.\n"
-            "Non-Sat: this radio isn't part of satellite tracking at all.\n"
-            "Options here are limited to what still makes sense given "
-            "already-connected radios -- e.g. once one radio is Satellite "
-            "Downlink, only Satellite Uplink (or Non-Sat) is offered for "
-            "the next one."
-        )
 
         self.connection_combo = QComboBox()
         self.connection_combo.addItem("Network (LAN)", "network")
@@ -226,7 +177,6 @@ class ConnectionDialog(QDialog):
         form.addRow("Profile:", profile_row)
 
         form.addRow("Radio:", self.radio_combo)
-        form.addRow("Satellite Role:", self.role_combo)
         form.addRow("Connection:", self.connection_combo)
         form.addRow("CI-V Address (hex):", self.addr_input)
 
@@ -346,7 +296,6 @@ class ConnectionDialog(QDialog):
         resolved against whatever's actually plugged in when loaded)."""
         return {
             "radio_model": self.radio_combo.currentText(),
-            "role": self.role_combo.currentData(),
             "connection_type": self.connection_combo.currentData(),
             "addr_hex": self.addr_input.text().strip(),
             "host": self.host_input.text().strip(),
@@ -366,10 +315,6 @@ class ConnectionDialog(QDialog):
         radio_model = profile.get("radio_model")
         if radio_model in RADIO_PROFILES:
             self.radio_combo.setCurrentText(radio_model)  # applies that radio's own addr/connection-type defaults first
-
-        role_index = self.role_combo.findData(profile.get("role"))
-        if role_index != -1:
-            self.role_combo.setCurrentIndex(role_index)
 
         connection_index = self.connection_combo.findData(profile.get("connection_type"))
         if connection_index != -1:
@@ -535,7 +480,6 @@ class ConnectionDialog(QDialog):
 
         details = {
             "radio_model": self.radio_combo.currentText(),
-            "role": self.role_combo.currentData(),
             "connection_type": connection_type,
             "addr": addr,
             "audio_input_device": self.audio_input_combo.currentData(),
@@ -586,21 +530,15 @@ class ConnectionDialog(QDialog):
         return None
 
 
-def details_from_saved_profile(profile, role=None):
+def details_from_saved_profile(profile):
     """The details dict ConnectionDialog would produce for this saved
     connection profile, without showing any dialog -- used to reconnect a
     radio when a saved workspace is restored. Goes through the dialog's own
     code (the same field handling and name -> audio-device resolution as a
-    manual connect) rather than duplicating it. `role` overrides the
-    profile's own role (the role last used may differ from what was saved).
-    Returns None if the profile can't be turned into valid details."""
+    manual connect) rather than duplicating it. Returns None if the profile can't be turned into valid details."""
     dialog = ConnectionDialog(None)
     try:
         dialog._apply_profile(profile)
-        if role is not None:
-            index = dialog.role_combo.findData(role)
-            if index != -1:
-                dialog.role_combo.setCurrentIndex(index)
         dialog._on_accept()
         return dialog.details
     finally:

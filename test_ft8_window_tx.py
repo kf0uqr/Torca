@@ -51,6 +51,14 @@ class FakeWorker:
 
 
 class FakeRadio:
+    workspace_key = "radio:IC-7300@test"      # a radio window's identity, as the receive-radio box uses it
+
+    def other_radios(self):
+        return []
+
+    def display_name(self):
+        return "IC-7300"
+
     def __init__(self):
         self.worker = FakeWorker()
         self._current_freq_hz = 14_074_000

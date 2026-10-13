@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 
 from constants import AUDIO_DEFAULT_SAMPLE_RATE
 from cw import CwDecoder, estimate_cw_send_duration_ms, MIN_ACCEPTED_WPM, MAX_ACCEPTED_WPM
+from rx_radio import ReceiveRadioSelector
 
 _MACROS_PATH = pathlib.Path.home() / ".icom_radio_app_cache" / "cw_macros.json"
 
@@ -268,12 +269,16 @@ class CwToolWindow(QWidget):
         self.decode_toggle_button = QPushButton("Start Decoding")
         self.decode_toggle_button.setCheckable(True)
         self.decode_toggle_button.toggled.connect(self._on_decode_toggled)
+        self.rx_selector = ReceiveRadioSelector(radio_window, "CW Tool")
+        self.decode_toggle_button.toggled.connect(self.rx_selector.set_locked)   # fixed while decoding
+        self.rx_selector.lost.connect(self._on_receive_radio_lost)
 
         self.clear_button = QPushButton("Clear")
         self.clear_button.clicked.connect(self._on_clear_clicked)
 
         decode_buttons_row = QHBoxLayout()
         decode_buttons_row.addWidget(self.decode_toggle_button)
+        decode_buttons_row.addWidget(self.rx_selector)
         decode_buttons_row.addWidget(self.clear_button)
         decode_buttons_row.addStretch()
 
@@ -484,8 +489,13 @@ class CwToolWindow(QWidget):
 
     # ---- Decode ----
 
+    def _on_receive_radio_lost(self):
+        """The radio this tool was decoding was closed: stop decoding it (the choice is back to 'this radio')."""
+        if self.decode_toggle_button.isChecked():
+            self.decode_toggle_button.setChecked(False)
+
     def _on_decode_toggled(self, checked):
-        worker = self._radio_window.worker
+        worker = self.rx_selector.worker()   # the radio whose audio is decoded
         if checked:
             sample_rate = getattr(worker.radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
             self._decoder = CwDecoder(sample_rate, self.pitch_spin.value())

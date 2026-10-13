@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
 import sstv_images
 from constants import AUDIO_DEFAULT_SAMPLE_RATE
 from sstv import SstvDecoder
+from rx_radio import ReceiveRadioSelector
 
 
 def _array_to_qimage(image_array):
@@ -92,6 +93,9 @@ class SstvToolWindow(QWidget):
         self.decode_toggle_button = QPushButton("Start Decoding")
         self.decode_toggle_button.setCheckable(True)
         self.decode_toggle_button.toggled.connect(self._on_decode_toggled)
+        self.rx_selector = ReceiveRadioSelector(radio_window, "SSTV Tool")
+        self.decode_toggle_button.toggled.connect(self.rx_selector.set_locked)   # fixed while decoding
+        self.rx_selector.lost.connect(self._on_receive_radio_lost)
 
         self.save_button = QPushButton("Save Image...")
         self.save_button.setEnabled(False)
@@ -99,6 +103,7 @@ class SstvToolWindow(QWidget):
 
         buttons_row = QHBoxLayout()
         buttons_row.addWidget(self.decode_toggle_button)
+        buttons_row.addWidget(self.rx_selector)
         buttons_row.addWidget(self.save_button)
         buttons_row.addStretch()
 
@@ -157,8 +162,13 @@ class SstvToolWindow(QWidget):
 
     # ---- Decode ----
 
+    def _on_receive_radio_lost(self):
+        """The radio this tool was decoding was closed: stop decoding it (the choice is back to 'this radio')."""
+        if self.decode_toggle_button.isChecked():
+            self.decode_toggle_button.setChecked(False)
+
     def _on_decode_toggled(self, checked):
-        worker = self._radio_window.worker
+        worker = self.rx_selector.worker()   # the radio whose audio is decoded
         if checked:
             sample_rate = getattr(worker.radio, "audio_sample_rate", None) or AUDIO_DEFAULT_SAMPLE_RATE
             self._decoder = SstvDecoder(sample_rate)

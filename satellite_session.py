@@ -32,6 +32,9 @@ WHEN to compute and WHO to tell, not HOW a given role acts on it. Roles:
   PTT pattern already does.
 - "non_sat": never registered with this class at all -- a plain,
   standalone connection, completely unaffected by satellite tracking.
+
+A radio's role is not chosen when it connects: a Satellite tool (satellite_tool.py) registers the
+radios taking part (RadioWindow.set_satellite_role) and unregisters them when it closes.
 """
 
 from PySide6.QtCore import QObject, Signal, QTimer

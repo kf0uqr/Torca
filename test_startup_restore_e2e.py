@@ -58,7 +58,7 @@ SECOND = PRELUDE + textwrap.dedent('''
     assert host.pane_of(dash) == 0
     assert host.pane_of(pages["Band Conditions"]) == 0
     assert host.pane_of(pages["Parks"]) == 1 and host.pane_of(pages["Contests"]) == 1
-    assert host.pane_of(pages["DX Spots"]) is None and host.pane_of(pages["Satellites"]) is None   # never opened
+    assert host.pane_of(pages["DX Spots"]) is None and host.pane_of(pages["Audio"]) is None   # never opened
     assert dash.log_book_window is not None and host.pane_of(dash.log_book_window) == 1
     saved_tabs = [host.panes[1].tabText(i) for i in range(host.panes[1].count())]
     assert saved_tabs == ["Parks", "Contests", "Log Book"] or sorted(saved_tabs) == ["Contests", "Log Book", "Parks"], saved_tabs
@@ -150,7 +150,7 @@ SWITCH_B = SWITCH_PRELUDE + textwrap.dedent('''
     assert problems == [] and host.workspace_count == 1            # POTA has no saved workspace yet: a normal start
     assert host.pane_of(pages["Parks"]) is None and host.pane_of(pages["Contests"]) is None
     host.add_workspace(0, "below")
-    host.open_in(pages["Satellites"], 1)
+    host.open_in(pages["Audio"], 1)
     settle()
     assert persistence.save_now()
     print("OK")
@@ -163,7 +163,7 @@ SWITCH_C = SWITCH_PRELUDE + textwrap.dedent('''
     assert problems == []
     assert host._tree == ("h", (0, 1)), host._tree                  # Home's own layout, not POTA's
     assert host.pane_of(pages["Parks"]) == 1 and host.pane_of(pages["Contests"]) == 0
-    assert host.pane_of(pages["Satellites"]) is None                 # POTA's tab did not leak into Home
+    assert host.pane_of(pages["Audio"]) is None                 # POTA's tab did not leak into Home
     pota = saved("POTA")
     assert pota is not None and pota["layout"] == ["v", [0, 1]]      # and POTA's was kept intact, separately
     print("OK")

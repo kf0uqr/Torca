@@ -196,7 +196,9 @@ The dialog shows three randomly generated access links/tokens -- **operator** (f
 | File | Purpose |
 | --- | --- |
 | `main.py` | Entry point -- shows the Operator Profile dialog, then opens the Ham Dashboard |
-| `constants.py` | Bands, meter/control/level tables, radio profiles, satellite roles |
+| `constants.py` | Bands, meter/control/level tables, radio profiles, satellite role names |
+| `satellite_tool.py` | The Satellite tool: gives a radio (and an optional receive radio) its satellite role and holds the pass controls |
+| `rx_radio.py` | The "Receive radio" box every tool carries (decode another connected radio's audio) |
 | `rig_discovery.py` | Shared "find the real method name" helper |
 | `audio.py` | `AudioBridge` + Linux virtual-audio-cable (PulseAudio/PipeWire) helpers |
 | `radio_worker.py` | `RadioWorker` (QThread owning one radio connection) |

@@ -41,6 +41,7 @@ import ft8_qso
 import wspr
 import wsprnet
 from constants import AUDIO_DEFAULT_SAMPLE_RATE
+from rx_radio import ReceiveRadioSelector
 
 _SETTINGS_ORG = "IcomRadioApp"
 _SETTINGS_APP = "RadioControl"
@@ -86,6 +87,9 @@ class WsprToolWindow(QWidget):
         self.decode_toggle_button = QPushButton("Start Decoding")
         self.decode_toggle_button.setCheckable(True)
         self.decode_toggle_button.toggled.connect(self._on_decode_toggled)
+        self.rx_selector = ReceiveRadioSelector(radio_window, "WSPR Tool")
+        self.decode_toggle_button.toggled.connect(self.rx_selector.set_locked)   # fixed while decoding
+        self.rx_selector.lost.connect(self._on_receive_radio_lost)
         clear_button = QPushButton("Clear")
         clear_button.clicked.connect(self._on_clear_clicked)
 
@@ -104,6 +108,7 @@ class WsprToolWindow(QWidget):
         row.addWidget(self.band_combo)
         row.addWidget(self.tune_button)
         row.addWidget(self.decode_toggle_button)
+        row.addWidget(self.rx_selector)
         row.addWidget(clear_button)
         row.addStretch()
         row.addWidget(self.upload_check)
@@ -166,7 +171,7 @@ class WsprToolWindow(QWidget):
         band = self.band_combo.currentData()
         QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue("wspr_band", band)
         dial = wspr.BAND_DIAL_MHZ[band]
-        worker = self._radio_window.worker
+        worker = self.rx_selector.worker()                      # tune the radio being listened to
         try:
             worker.set_frequency(int(round(dial * 1e6)), check_conflict=False)
             worker.set_control_value("mode", "USB")
@@ -178,11 +183,16 @@ class WsprToolWindow(QWidget):
     # ---- decode ----
 
     def _radio_dial_mhz(self):
-        hz = getattr(self._radio_window, "_current_freq_hz", None)
+        hz = getattr(self.rx_selector.radio(), "_current_freq_hz", None)     # the radio being listened to
         return hz / 1e6 if hz else None
 
+    def _on_receive_radio_lost(self):
+        """The radio this tool was decoding was closed: stop decoding it (the choice is back to 'this radio')."""
+        if self.decode_toggle_button.isChecked():
+            self.decode_toggle_button.setChecked(False)
+
     def _on_decode_toggled(self, checked):
-        worker = self._radio_window.worker
+        worker = self.rx_selector.worker()   # the radio whose audio is decoded
         if checked:
             if not wspr.is_available():
                 self._refresh_availability()

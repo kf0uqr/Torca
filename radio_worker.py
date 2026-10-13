@@ -1971,9 +1971,11 @@ class RadioWorker(QThread):
     def _normalize_level_value(raw):
         """Getter values might come back as a 0.0-1.0 float or, like the
         squelch setter turned out to want, a raw int on Icom's 0-255
-        CI-V level scale. Treat anything above 1.0 as the latter."""
+        CI-V level scale. An int is always the latter (a raw 1 is ~0%, not
+        100% -- an IC-7300 with its AF knob at zero showed 100%); a float
+        above 1.0 is treated the same way."""
         value = float(raw)
-        if value > 1.0:
+        if (isinstance(raw, int) and not isinstance(raw, bool)) or value > 1.0:
             value = value / 255.0
         return max(0.0, min(1.0, value))
 

@@ -125,3 +125,10 @@ def test_a_cancelled_transmission_closes_the_tx_audio_session_so_the_next_one_st
         assert radio.started == 2 and not radio.open
 
     asyncio.run(scenario())
+
+
+def test_a_raw_level_of_one_is_nearly_zero_not_full():
+    """An IC-7300 with the AF knob at zero reported a raw 1 on the 0-255 scale and the slider showed 100%."""
+    norm = RadioWorker._normalize_level_value
+    assert norm(1) == 1 / 255 and norm(0) == 0.0 and norm(255) == 1.0 and norm(128) == 128 / 255
+    assert norm(1.0) == 1.0 and norm(0.5) == 0.5 and norm(0.0) == 0.0

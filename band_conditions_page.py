@@ -2,14 +2,18 @@
 sporadic-E from the same N0NBH feed) with the space-weather readings behind them, and live
 pictures of the Sun from NASA's Solar Dynamics Observatory (SDO).
 
-SDO publishes a "latest" JPEG for each instrument/wavelength on sdo.gsfc.nasa.gov, refreshed
-every few minutes. The page fetches them (on a worker thread, never the GUI's) when it is
-shown and every REFRESH_MINUTES while it stays visible, and says how old each picture is --
-because if NASA's "latest" image is not being updated, an old picture of the Sun must not
-pass for the current one.
+The pictures come from Helioviewer (api.helioviewer.org, a NASA/ESA service that serves SDO's
+newest images within minutes of them being taken): the page asks which image is the newest for
+each instrument, then fetches a picture of it. If Helioviewer can't be reached it falls back to
+the "latest" JPEGs on sdo.gsfc.nasa.gov -- which can go stale (they once sat three weeks old).
+Either way the page fetches on a worker thread, never the GUI's, when it is shown and every
+REFRESH_MINUTES while it stays visible, and says how old each picture is and where it came
+from, so an old picture of the Sun can't pass for the current one.
 """
 
+import calendar
 import email.utils
+import json
 import time
 import urllib.request
 
@@ -29,7 +33,10 @@ from PySide6.QtWidgets import (
 
 import solar_data
 
-SDO_URL = "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_512_{code}.jpg"
+HELIOVIEWER_URL = "https://api.helioviewer.org/v2"
+# Helioviewer's source ids for each view (AIA 193, AIA 304, HMI continuum, HMI magnetogram).
+HELIOVIEWER_SOURCES = {"0193": 11, "0304": 13, "HMIIC": 18, "HMIB": 19}
+SDO_URL = "https://sdo.gsfc.nasa.gov/assets/img/latest/latest_512_{code}.jpg"   # the fallback
 # (code, title, what it shows) -- what an operator looks at for propagation.
 SDO_VIEWS = [
     ("0193", "193 Å  corona", "Hot corona. Dark areas are coronal holes: they send fast solar wind that disturbs the geomagnetic field a couple of days later."),
@@ -71,7 +78,7 @@ def parse_last_modified(value):
 
 class SdoFetcher(QThread):
     """Fetches the SDO pictures one after another; each is announced as it arrives."""
-    image_ready = Signal(str, bytes, object)    # code, JPEG bytes, last-modified epoch (or None)
+    image_ready = Signal(str, bytes, object, str)    # code, image bytes, when it was taken (epoch or None), where from
     failed = Signal(str, str)                   # code, why
 
     def __init__(self, codes, parent=None):
@@ -82,16 +89,40 @@ class SdoFetcher(QThread):
         for code in self._codes:
             if self.isInterruptionRequested():
                 return
-            try:
-                request = urllib.request.Request(
-                    SDO_URL.format(code=code), headers={"User-Agent": "TORCA/1.0 (desktop ham radio control application)"})
-                with urllib.request.urlopen(request, timeout=20) as response:
-                    data = response.read()
-                    modified = parse_last_modified(response.headers.get("Last-Modified"))
-            except Exception as exc:
-                self.failed.emit(code, str(exc))
-                continue
-            self.image_ready.emit(code, data, modified)
+            problems = []
+            for source, fetch in (("Helioviewer", self._from_helioviewer), ("NASA", self._from_nasa)):
+                try:
+                    data, taken = fetch(code)
+                except Exception as exc:
+                    problems.append(f"{source}: {exc}")
+                    continue
+                self.image_ready.emit(code, data, taken, source)
+                break
+            else:
+                self.failed.emit(code, "; ".join(problems))
+
+    @staticmethod
+    def _get(url):
+        request = urllib.request.Request(url, headers={"User-Agent": "TORCA/1.0 (desktop ham radio control application)"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read(), response.headers
+
+    def _from_helioviewer(self, code):
+        """The newest SDO image for this view, as a 512 px picture of the whole Sun, and when it was taken."""
+        source = HELIOVIEWER_SOURCES[code]
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        info = json.loads(self._get(f"{HELIOVIEWER_URL}/getClosestImage/?date={now}&sourceId={source}")[0])
+        taken_text = info["date"]                                  # "2026-10-13 08:47:05" (UTC)
+        taken = calendar.timegm(time.strptime(taken_text, "%Y-%m-%d %H:%M:%S"))
+        stamp = taken_text.replace(" ", "T") + "Z"
+        data, _ = self._get(
+            f"{HELIOVIEWER_URL}/takeScreenshot/?date={stamp}&imageScale=4.8&layers=[{source},1,100]"
+            "&x0=0&y0=0&width=512&height=512&display=true&watermark=false")
+        return data, taken
+
+    def _from_nasa(self, code):
+        data, headers = self._get(SDO_URL.format(code=code))
+        return data, parse_last_modified(headers.get("Last-Modified"))
 
 
 class BandConditionsPage(QWidget):
@@ -103,6 +134,7 @@ class BandConditionsPage(QWidget):
         self._last_fetch = 0.0
         self._pixmaps = {}          # code -> QPixmap
         self._modified = {}         # code -> epoch of the picture
+        self._sources = {}          # code -> "Helioviewer" or "NASA"
         self._errors = {}
 
         # ---- VHF ----
@@ -142,7 +174,7 @@ class BandConditionsPage(QWidget):
         self.sun_status = QLabel("")
         self.sun_status.setWordWrap(True)
         self.refresh_button = QPushButton("Refresh")
-        self.refresh_button.setToolTip("Fetch the latest pictures from NASA now.")
+        self.refresh_button.setToolTip("Fetch the latest pictures now.")
         self.refresh_button.clicked.connect(lambda: self.refresh_sun(force=True))
         sun_header = QHBoxLayout()
         sun_header.addWidget(QLabel("<b>The Sun now</b>  (NASA Solar Dynamics Observatory)"))
@@ -216,20 +248,21 @@ class BandConditionsPage(QWidget):
         if not force and time.time() - self._last_fetch < REFRESH_MINUTES * 60 and self._pixmaps:
             return
         self._last_fetch = time.time()
-        self.sun_status.setText("Fetching the latest pictures from NASA...")
+        self.sun_status.setText("Fetching the latest pictures of the Sun...")
         self._fetcher = SdoFetcher([code for code, _t, _tip in SDO_VIEWS], self)
         self._fetcher.image_ready.connect(self._on_image)
         self._fetcher.failed.connect(self._on_failed)
         self._fetcher.finished.connect(self._update_status)
         self._fetcher.start()
 
-    def _on_image(self, code, data, modified):
+    def _on_image(self, code, data, modified, source="NASA"):
         pixmap = QPixmap()
         if not pixmap.loadFromData(data):
-            self._on_failed(code, "NASA sent something that isn't a picture")
+            self._on_failed(code, f"{source} sent something that isn't a picture")
             return
         self._pixmaps[code] = pixmap
         self._modified[code] = modified
+        self._sources[code] = source
         self._errors.pop(code, None)
         self._show_pixmap(code)
 
@@ -259,8 +292,11 @@ class BandConditionsPage(QWidget):
             newest, oldest = min(ages), max(ages)
             text = f"Pictures taken {age_text(newest)}" + (f" (the oldest {age_text(oldest)})" if oldest - newest > 900 else "") + "."
             if newest > STALE_HOURS * 3600:
-                text += (f"  ⚠ NASA's 'latest' pictures are {age_text(newest)} old, so these may not show the Sun as it is now -- "
-                         "its image feed may not be updating.")
+                text += (f"  ⚠ The newest picture is {age_text(newest)} old, so these may not show the Sun as it is now -- "
+                         "the image feed may not be updating.")
+            sources = sorted(set(self._sources.values()))
+            if sources:
+                text += f"  (From {' and '.join(sources)}.)"
         if self._errors:
             text += ("  " if text else "") + f"Couldn't fetch {len(self._errors)} picture(s): {next(iter(self._errors.values()))}."
         self.sun_status.setText(text or "No pictures yet.")

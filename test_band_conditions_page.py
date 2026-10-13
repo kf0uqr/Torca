@@ -90,28 +90,53 @@ def test_age_text():
 
 
 class _Sun:
-    """A stand-in for NASA's image server."""
-    def __init__(self, age_seconds=600, missing=()):
+    """A stand-in for Helioviewer AND NASA's own static pictures. `age_seconds`: how old the newest image
+    is; `helioviewer=False` makes Helioviewer fail so the NASA fallback is used; `missing`: view codes
+    (or Helioviewer source ids) whose pictures cannot be had from either."""
+    def __init__(self, age_seconds=600, missing=(), helioviewer=True):
         outer = self
-        outer.requests, outer.age, outer.missing = [], age_seconds, set(missing)
+        outer.requests, outer.age, outer.missing, outer.helioviewer = [], age_seconds, set(missing), helioviewer
 
         class Handler(BaseHTTPRequestHandler):
+            def _send(self, body, ctype, extra=None):
+                self.send_response(200)
+                self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(body)))
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers(); self.wfile.write(body)
+
             def do_GET(self):
                 outer.requests.append(self.path)
-                if any(code in self.path for code in outer.missing):
+                path = self.path
+                if path.startswith("/hv/"):
+                    if not outer.helioviewer:
+                        self.send_response(503); self.end_headers(); return
+                    source = path.split("sourceId=")[1].split("&")[0] if "sourceId=" in path else path.split("layers=[")[1].split(",")[0]
+                    if any(f"={m}" in path or f"[{m}," in path for m in outer.missing):
+                        self.send_response(404); self.end_headers(); return
+                    if "/getClosestImage/" in path:
+                        when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - outer.age))
+                        self._send(('{"id":"1","date":"%s","name":"AIA"}' % when).encode(), "application/json")
+                    else:
+                        assert "date=" in path and "width=512" in path
+                        self._send(jpeg(), "image/png")
+                    return
+                if any(code in path for code in outer.missing):
                     self.send_response(404); self.end_headers(); return
-                body = jpeg()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", str(len(body)))
-                self.send_header("Last-Modified", formatdate(time.time() - outer.age, usegmt=True))
-                self.end_headers(); self.wfile.write(body)
+                self._send(jpeg(), "image/jpeg", {"Last-Modified": formatdate(time.time() - outer.age, usegmt=True)})
             def log_message(self, *a): pass
         self.httpd = HTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.httpd.server_port}/latest_512_{{code}}.jpg"
+        base = f"http://127.0.0.1:{self.httpd.server_port}"
+        self.url, self.hv = base + "/latest_512_{code}.jpg", base + "/hv"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
     def close(self):
         self.httpd.shutdown()
+
+
+def point_at(monkeypatch, sun):
+    monkeypatch.setattr(bcp, "SDO_URL", sun.url)
+    monkeypatch.setattr(bcp, "HELIOVIEWER_URL", sun.hv)
 
 
 def wait(app, condition, seconds=15.0):
@@ -126,28 +151,32 @@ def wait(app, condition, seconds=15.0):
 
 def test_pictures_are_fetched_shown_and_dated(app, monkeypatch):
     sun = _Sun(age_seconds=600)
-    monkeypatch.setattr(bcp, "SDO_URL", sun.url)
+    point_at(monkeypatch, sun)
     page = bcp.BandConditionsPage(hf_table())
     try:
         page.resize(900, 900); page.show()                               # showing it fetches
         assert wait(app, lambda: len(page._pixmaps) == 4 and page._fetcher.isFinished())
         app.processEvents()
-        assert sorted(sun.requests) == sorted(f"/latest_512_{c}.jpg" for c, *_ in bcp.SDO_VIEWS)
+        closest = sorted(r.split("sourceId=")[1] for r in sun.requests if "getClosestImage" in r)
+        assert closest == sorted(str(i) for i in bcp.HELIOVIEWER_SOURCES.values())          # one question per view...
+        assert sum("takeScreenshot" in r for r in sun.requests) == 4                         # ...and one picture each
+        assert not any(r.startswith("/latest_") for r in sun.requests)                        # NASA's static files are only a fallback
         assert all(not label.pixmap().isNull() for label in page.sun_labels.values())
         assert "10 min ago" in page.caption_labels["0193"].text()
         assert "Pictures taken 10 min ago." in page.sun_status.text() and "⚠" not in page.sun_status.text()
+        assert "From Helioviewer" in page.sun_status.text()
         before = len(sun.requests)
         page.refresh_sun()                                                # fresh enough: no new requests
         assert len(sun.requests) == before
         page.refresh_button.click()                                       # the button always fetches
-        assert wait(app, lambda: len(sun.requests) == before + 4)
+        assert wait(app, lambda: len(sun.requests) == before + 8)
     finally:
         page.hide(); page._fetcher.wait(5000); sun.close()
 
 
 def test_an_old_picture_is_flagged_not_passed_off_as_current(app, monkeypatch):
     sun = _Sun(age_seconds=21 * 86400)
-    monkeypatch.setattr(bcp, "SDO_URL", sun.url)
+    point_at(monkeypatch, sun)
     page = bcp.BandConditionsPage(hf_table())
     try:
         page.show()
@@ -158,9 +187,22 @@ def test_an_old_picture_is_flagged_not_passed_off_as_current(app, monkeypatch):
         page.hide(); page._fetcher.wait(5000); sun.close()
 
 
+def test_when_helioviewer_is_down_nasas_static_pictures_are_used(app, monkeypatch):
+    sun = _Sun(age_seconds=1200, helioviewer=False)
+    point_at(monkeypatch, sun)
+    page = bcp.BandConditionsPage(hf_table())
+    try:
+        page.show()
+        assert wait(app, lambda: len(page._pixmaps) == 4 and page._fetcher.isFinished())
+        app.processEvents()
+        assert set(page._sources.values()) == {"NASA"} and "From NASA" in page.sun_status.text() and "20 min ago" in page.caption_labels["0304"].text()
+    finally:
+        page.hide(); page._fetcher.wait(5000); sun.close()
+
+
 def test_a_missing_picture_is_reported_and_the_others_still_show(app, monkeypatch):
-    sun = _Sun(missing=("HMIB",))
-    monkeypatch.setattr(bcp, "SDO_URL", sun.url)
+    sun = _Sun(missing=("HMIB", "19"))
+    point_at(monkeypatch, sun)
     page = bcp.BandConditionsPage(hf_table())
     try:
         page.show()
